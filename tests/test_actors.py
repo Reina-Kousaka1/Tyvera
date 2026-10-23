@@ -116,6 +116,130 @@ fn main() {
             Interpreter(program, output).run()
         self.assertEqual(output.getvalue(), "false\n")
 
+    def test_one_for_one_restarts_only_crashed_child_and_resets_its_state(self) -> None:
+        output, _ = self.run_source('''actor Counter {
+    var value: Int
+    init(start: Int) { self.value = start }
+    on crash() { let failure: Float = 1 / 0 }
+    on report() { println(self.value) }
+}
+fn main() {
+    let supervisor = oneForOne(2, 1000)
+    let watched = supervisor.start(Counter(9))
+    let peer = spawn(Counter(4))
+    watched.crash()
+    watched.report()
+    peer.report()
+    match runActors() {
+        Ok(count) => println(count)
+        Err(reason) => println(reason)
+    }
+    println(supervisor.isAlive())
+    println(watched.isAlive())
+    println(peer.isAlive())
+    watched.report()
+    runActors()
+}''')
+        self.assertEqual(output, "4\n2\ntrue\ntrue\ntrue\n9\n")
+
+    def test_supervisor_restart_limit_stops_all_children(self) -> None:
+        output, _ = self.run_source('''actor Broken {
+    on fail() { let failure: Float = 1 / 0 }
+}
+actor Healthy {
+    on work() { println("worked") }
+}
+fn main() {
+    let supervisor = oneForOne(1, 1000)
+    let broken = supervisor.start(Broken())
+    let healthy = supervisor.start(Healthy())
+    broken.fail()
+    match runActors() {
+        Ok(_) => println("restarted")
+        Err(reason) => println(reason)
+    }
+    broken.fail()
+    healthy.work()
+    match runActors() {
+        Ok(_) => println("unexpected success")
+        Err(reason) => println(reason)
+    }
+    println(supervisor.isAlive())
+    println(broken.isAlive())
+    println(healthy.isAlive())
+}''')
+        self.assertTrue(output.startswith("restarted\nsupervisor restart limit exceeded for actor 'Broken' within 1000ms: "))
+        self.assertIn("actor 'Broken' crashed at actors.tyv:2:", output)
+        self.assertTrue(output.endswith("division by zero\nfalse\nfalse\nfalse\n"))
+
+    def test_supervisor_restart_window_uses_injected_monotonic_clock(self) -> None:
+        program, _ = compile_source('''actor Broken {
+    on fail() { let failure: Float = 1 / 0 }
+}
+fn main() {
+    let supervisor = oneForOne(1, 100)
+    let broken = supervisor.start(Broken())
+    broken.fail()
+    runActors()
+    broken.fail()
+    runActors()
+    println(broken.isAlive())
+}''', "clock.tyv")
+        output = io.StringIO()
+        # Advance beyond the configured window between the two crash/restart events.
+        ticks = iter([0.0, 0.101])
+        interpreter = Interpreter(program, output, clock=lambda: next(ticks, 0.101))
+        interpreter.run()
+        self.assertEqual(output.getvalue(), "true\n")
+
+    def test_supervisor_start_is_typed_and_lifecycle_is_explicit(self) -> None:
+        self.reject('''actor Counter { on report() {} }
+fn main() { let supervisor = oneForOne(2, 1000); supervisor.start(Counter(1)) }''', "expects 0 argument")
+        self.reject('''actor Counter { on report() {} }
+fn main() { let supervisor = oneForOne("two", 1000) }''', "expects Int, found String")
+        self.reject('''class Box {}
+fn main() { let supervisor = oneForOne(2, 1000); supervisor.start(Box()) }''', "is not an actor type")
+        output, _ = self.run_source('''actor Worker { on work() { println("wrong") } }
+fn main() {
+    let supervisor: Supervisor = oneForOne(0, 1000)
+    let worker = supervisor.start(Worker())
+    worker.work()
+    supervisor.stop()
+    println(supervisor.isAlive())
+    println(worker.isAlive())
+    match runActors() {
+        Ok(count) => println(count)
+        Err(reason) => println(reason)
+    }
+}''')
+        self.assertEqual(output, "false\nfalse\n0\n")
+
+    def test_supervisor_restart_limit_also_bounds_repeated_constructor_crashes(self) -> None:
+        program, _ = compile_source('''actor Broken {
+    var value: Int
+    init(start: Int) {
+        self.value = start
+        println("starting")
+        let failure: Float = 1 / 0
+    }
+}
+fn main() {
+    let supervisor = oneForOne(2, 1000)
+    let broken = supervisor.start(Broken(1))
+}''', "constructor_crash.tyv")
+        output = io.StringIO()
+        with self.assertRaisesRegex(Diagnostic, "supervisor restart limit exceeded"):
+            Interpreter(program, output).run()
+        self.assertEqual(output.getvalue(), "starting\nstarting\nstarting\n")
+
+    def test_supervisor_policy_rejects_invalid_runtime_limits(self) -> None:
+        program, _ = compile_source("fn main() { let supervisor = oneForOne(-1, 1000) }", "policy.tyv")
+        with self.assertRaisesRegex(Diagnostic, "maxRestarts must be zero or greater"):
+            Interpreter(program, io.StringIO()).run()
+        program, _ = compile_source("fn main() { let supervisor = oneForOne(1, 0) }", "policy.tyv")
+        with self.assertRaisesRegex(Diagnostic, "windowMilliseconds must be greater than zero"):
+            Interpreter(program, io.StringIO()).run()
+
     def test_actor_types_and_message_parameters_are_checked(self) -> None:
         self.reject('''actor Counter { on add(value: Int) {} }
 fn main() { let counter = spawn(Counter()); counter.add("wrong") }''', "expects Int, found String")

@@ -13,10 +13,15 @@ These core types and functions are currently available without an import:
 | `Map<K,V>` | `Map<K,V>()`, `put`, `get -> Option<V>`, `remove -> Option<V>`, `containsKey`, `keys`, `values`, `clear`, `.length`, and `for` over a snapshot of its keys. |
 | `Option<T>` | `Some(value)`, `None<T>()`, and pattern matching with `Some(value)`/`None`. |
 | `Result<T,E>` | `Ok<T,E>(value)`, `Err<T,E>(error)`, and pattern matching with `Ok(value)`/`Err(error)`. |
+| `Duration` | `milliseconds(Int)`, `seconds(Int)`, checked `+`/`-`, comparisons, and `inMilliseconds()`. Signed millisecond values use checked 64-bit arithmetic. |
+| `Timer` | `timerAfter(Duration)`, `isReady`, `remaining`, `cancel`, and `isCancelled`, backed by a monotonic clock. `ActorRef.sendAfter(Duration, handler, ...)` schedules a typed one-shot actor message. Timers never sleep or wake the runtime. |
+| Actor replies | `ActorRef.request(handler, ...)` and `requestWithin(Duration, handler, ...)` return `ReplyReceiver<T>` for handlers ending in `ReplySender<T>`. Receivers poll with `tryReceive`, can be cancelled, and receive errors on actor crash/stop or deadline. |
+| `Task<T>` | Calls to `async fn` create deferred typed tasks; bare `Task` means `Task<Void>`. `isDone()`, `isCancelled()`, `cancel()`, `detach()`, `withTimeout(Duration)`, and `tryResult()` expose lifecycle and values. `withTimeout` returns a `Task<T>` wrapper using a monotonic deadline; timeout cancels its source and fails the wrapper. `sleepFor(Duration)` returns `Task<Void>`; `runTasks()` drives ready work and returns `Result<Int,String>`. `await` suspends on `Task<T>`, `TaskGroup`, or `ReplyReceiver<T>` from nested blocks, branches, loops and match arms. Tasks created within an async task are owned children: cancellation/failure cascades, child failure fails owners, and normal owner return joins unfinished children. Tasks created by an actor constructor or handler are owned by that actor and cancelled on stop, crash, restart, or runtime shutdown. |
+| `TaskGroup` | `taskGroup()` creates a group owned by the current task (or synchronous root code). `add(Task<T>)` registers a direct child once and returns `Bool`; `isDone()` reports whether every registered task is terminal; `cancel()` cancels active members and returns the count. `await group` joins its members and returns no value. Membership does not transfer ownership, and owner return still joins every non-detached child. |
 | Text I/O | `readText`, `writeText`, `pathJoin`, `pathExists`, `println`, and `eprintln`; file errors use `Result`. |
 | Secrets | `secrets.NAME` reads `.tyvera.secrets` before the process environment and returns `Option<Secret<String>>`; `Secret.reveal()` is explicit. |
 | `Json` | `parseJson(String) -> Result<Json,String>`, `jsonStringify(Json) -> Result<String,String>`, typed constructors, and optional accessors for JSON values. |
-| Actor runtime | `spawn(Actor(...)) -> ActorRef<Actor>`, handler calls that enqueue typed messages, `runActors() -> Result<Int,String>`, `ActorRef.isAlive()` and `ActorRef.stop()`. The scheduler is cooperative and deterministic. |
+| Actor runtime | `spawn(Actor(...)) -> ActorRef<Actor>`, `oneForOne(maxRestarts, windowMilliseconds) -> Supervisor`, `Supervisor.start(Actor(...))`, `Supervisor.stop()`/`isAlive()`, handler calls that enqueue typed messages, `runActors() -> Result<Int,String>`, and `ActorRef.isAlive()`/`stop()`. Scheduling is cooperative and deterministic; supervised restarts rebuild child state from constructor arguments. `runTasks()` services one queued actor message between turns when a task awaits a reply. |
 
 See [the language reference](language.md#core-collections-and-iteration) for
 collection signatures, key restrictions, ordering, mutation and runtime error
@@ -34,10 +39,51 @@ The module paths below are design targets, not current imports:
 
 | Namespace | Planned APIs |
 | --- | --- |
-| `tyvera.time` | Duration, monotonic time and timers. |
+| `tyvera.time` | Importable wrappers around the implemented bootstrap `Duration` and `Timer` primitives. |
+| `tyvera.concurrent` | Importable wrappers around implemented task ownership, groups, timeout, and cancellation APIs. |
 | `tyvera.net` | Async HTTP and WebSocket clients. |
 | `tyvera.secrets` | A separately importable provider-backed secret library. |
 
-Timers and networking are not implemented. JSON, collection, I/O and secret
-operations are bootstrap intrinsics rather than source `.tyv` modules, so
-they are not yet imported through `tyvera.*` namespaces.
+Async tasks and timer-driven waiting are implemented in the bootstrap runtime;
+async I/O and networking are not. JSON, collection, I/O and secret operations
+are bootstrap intrinsics rather than source `.tyv` modules, so they are not
+yet imported through `tyvera.*` namespaces.
+
+Actor requests are non-blocking: call `runActors()` to process messages and
+then poll `ReplyReceiver.tryReceive()`, or `await` the receiver from an async
+function. Await resumes when a reply arrives; successful reply data remains in
+the receiver and is consumed once by `tryReceive()`. Cancellation and deadlines
+do not remove queued work or interrupt an actor handler. The interpreter's
+monotonic clock and sleep function are injectable so timer, timeout and task
+tests do not need wall-clock delays.
+
+`ActorRef.sendAfter` schedules delivery against the same monotonic clock.
+`runActors()` promotes messages whose deadlines have elapsed; it returns when
+no immediate messages remain instead of sleeping until a future timer.
+`runTasks()` waits until the next task or awaited actor deadline when all tasks
+are suspended, then resumes them. It does not create background threads.
+
+Async functions can return statically checked values. `await task` waits without
+binding a value; `let value: T = await task` binds a `Task<T>` or typed reply
+payload. `await` is supported in nested blocks, branches, loops and match arms
+inside an async function. Each scheduler turn advances one statement or
+continuation action; synchronous calls and expressions execute atomically and
+cannot be preempted. Tasks created while an async task runs are owned children.
+Owner cancellation or failure cancels descendants, child failure fails owners,
+and normal owner return joins unfinished children. `Task<T>.detach()` returns
+`true` only when called by its direct owner on an active child. Detaching removes
+the parent ownership edge and removes the task from any groups owned by that
+parent; the task continues as scheduler-root work, and its failure is still
+reported by `runTasks()`. Root and terminal tasks cannot be detached. Task and
+TaskGroup values cannot be sent through actor messages. `Task<T>.tryResult()` reports pending as
+`Ok(None)`, completion as `Ok(Some(value))`, and failure or cancellation as
+`Err`; for `Task<Void>` it returns `Result<Bool,String>` (`Ok(false)` pending,
+`Ok(true)` completed). Task arguments use ordinary function-call capture and
+reference behavior. `runTasks()` reports task failure as `Err` too.
+
+The interpreter runtime runs once. When `main` returns or fails, shutdown
+cancels every unfinished task (including detached roots), stops actors and
+supervisors, clears queued messages and timers, and fails pending replies.
+Detached task failures stay visible through `runTasks()` before shutdown. See
+[Runtime semantics](runtime.md) for ownership and scheduling details.
+

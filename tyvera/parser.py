@@ -3,6 +3,7 @@ from __future__ import annotations
 from .ast import (
     Assignment,
     ActorDeclaration,
+    AwaitStatement,
     Binary,
     BindingPattern,
     Block,
@@ -84,17 +85,26 @@ class Parser:
         self._skip_separators()
         while not self._check("EOF"):
             public = self._match("PUB")
+            is_async = self._match("ASYNC")
             if self._check("IMPORT"):
+                if is_async:
+                    self._error(self._previous(), "'async' can only modify a function declaration")
                 if public:
                     self._error(self._previous(), "imports cannot be declared public")
                 imports.append(self._import())
             elif self._check("FN"):
-                functions.append(self._function(public))
+                functions.append(self._function(public, is_async))
             elif self._check("CLASS"):
+                if is_async:
+                    self._error(self._previous(), "'async' can only modify a function declaration")
                 classes.append(self._class_declaration(public))
             elif self._check("INTERFACE"):
+                if is_async:
+                    self._error(self._previous(), "'async' can only modify a function declaration")
                 interfaces.append(self._interface_declaration(public))
             elif self._check("ACTOR"):
+                if is_async:
+                    self._error(self._previous(), "'async' can only modify a function declaration")
                 actors.append(self._actor_declaration(public))
             else:
                 self._error(self._current(), "expected an import or function, class, interface, or actor declaration")
@@ -117,13 +127,13 @@ class Parser:
             self._error(path, "module import paths must end in '.tyv'")
         return ImportDeclaration(path.value, alias.lexeme, token.location)
 
-    def _function(self, public: bool = False) -> Function:
+    def _function(self, public: bool = False, is_async: bool = False) -> Function:
         fn_token = self._expect("FN", "expected 'fn'")
         name_token = self._expect("IDENTIFIER", "expected a function name after 'fn'")
         type_parameters = self._type_parameters()
         name, parameters, return_type = self._function_header(name_token)
         body = self._block()
-        return Function(name, parameters, return_type, body, fn_token.location, public, type_parameters)
+        return Function(name, parameters, return_type, body, fn_token.location, public, type_parameters, is_async)
 
     def _function_header(self, name_token: Token | None = None) -> tuple[str, list[Parameter], str]:
         if name_token is None:
@@ -276,6 +286,9 @@ class Parser:
         return statements
 
     def _statement(self) -> Statement:
+        if self._match("AWAIT"):
+            token = self._previous()
+            return AwaitStatement(self._expression(), token.location)
         if self._match("LET", "VAR"):
             return self._let_statement(self._previous())
         if self._match("IF"):
@@ -316,6 +329,10 @@ class Parser:
         if self._match("COLON"):
             annotation = self._type_name("expected a type name after ':'")
         self._expect("EQUAL", "expected '=' in variable declaration")
+        if self._match("AWAIT"):
+            await_token = self._previous()
+            return AwaitStatement(self._expression(), await_token.location,
+                                  name.lexeme, annotation, let_token.kind == "VAR")
         value = self._expression()
         return LetStatement(name.lexeme, annotation, value, let_token.location, let_token.kind == "VAR")
 

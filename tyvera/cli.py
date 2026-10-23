@@ -5,8 +5,8 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .compiler import compile_project
-from .interpreter import Interpreter
+from .backend import ReferenceInterpreterBackend
+from .compiler import compile_checked_project
 from .project import create_project, find_manifest
 from .source import Diagnostic, Location
 
@@ -71,12 +71,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         entry, root, label = _entry_and_root(arguments.path)
-        program, _ = compile_project(entry, root)
+        checked = compile_checked_project(entry, root)
         if arguments.command == "run":
-            Interpreter(program, sys.stdout, project_root=root, error_output=sys.stderr).run()
+            ReferenceInterpreterBackend().execute(
+                checked, output=sys.stdout, error_output=sys.stderr, project_root=root,
+            )
         else:
             print(f"checked {label}")
     except Diagnostic as error:
         print(error.render(), file=sys.stderr)
         return 1
     return 0
+

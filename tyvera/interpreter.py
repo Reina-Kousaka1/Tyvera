@@ -3,14 +3,16 @@ from __future__ import annotations
 import json
 import math
 import sys
+import time
 from collections import ChainMap, deque
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
-from typing import TextIO
+from typing import Callable, TextIO
 
 from .ast import (
     ActorDeclaration,
     Assignment,
+    AwaitStatement,
     Binary,
     Block,
     Call,
@@ -40,12 +42,14 @@ from .ast import (
 )
 from .source import Diagnostic, Location
 from .secrets import SecretProvider, SecretProviderError
-from .typesys import INT_MAX, INT_MIN
+from .typesys import INT_MAX, INT_MIN, canonical_type
 
 
 _MISSING = object()
 _MAX_ACTOR_MAILBOX = 100_000
 _MAX_ACTOR_DELIVERIES = 100_000
+_MAX_SUPERVISOR_RESTARTS = 1_000
+_MAX_TASK_STEPS = 100_000
 
 
 @dataclass(slots=True)
@@ -72,12 +76,131 @@ class _ActorMessage:
     location: Location
 
 
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraReplyCell:
+    state: str = "pending"
+    value: object = None
+    error: str | None = None
+    started_at: float | None = None
+    timeout_milliseconds: int | None = None
+    clock: Callable[[], float] | None = None
+
+    def __repr__(self) -> str:
+        return "<ReplyChannel>"
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraReplySender:
+    cell: _TyveraReplyCell
+
+    def __repr__(self) -> str:
+        return "<ReplySender>"
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraReplyReceiver:
+    cell: _TyveraReplyCell
+
+    def __repr__(self) -> str:
+        return "<ReplyReceiver>"
+
+
+@dataclass(slots=True, frozen=True, order=True, repr=False)
+class _TyveraDuration:
+    milliseconds: int
+
+    def __repr__(self) -> str:
+        return "<Duration>"
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraTimer:
+    started_at: float
+    duration_milliseconds: int
+    clock: Callable[[], float]
+    cancelled: bool = False
+    scheduled_actor: _TyveraActor | None = None
+    scheduled_method: str | None = None
+    scheduled_arguments: list[object] = dataclass_field(default_factory=list)
+    scheduled_location: Location | None = None
+    delivered: bool = False
+
+    def __repr__(self) -> str:
+        return "<Timer>"
+
+
+@dataclass(slots=True, eq=False)
+class _AsyncBlockFrame:
+    body: list[Statement]
+    variables: ChainMap[str, object]
+    index: int = 0
+
+
+@dataclass(slots=True, eq=False)
+class _AsyncLoopFrame:
+    statement: WhileStatement | ForStatement
+    variables: ChainMap[str, object]
+    depth: int
+    items: tuple[object, ...] | None = None
+    index: int = 0
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraTask:
+    function: Function | None
+    variables: ChainMap[str, object] | None
+    location: Location
+    depth: int = 0
+    result_type: str = "Void"
+    state: str = "runnable"
+    frames: list[_AsyncBlockFrame | _AsyncLoopFrame] = dataclass_field(default_factory=list)
+    wait_target: object | None = None
+    wait_frame: _AsyncBlockFrame | None = None
+    wait_statement: AwaitStatement | None = None
+    due_at: float | None = None
+    timeout_target: _TyveraTask | None = None
+    error: str | None = None
+    result: object = None
+    parent: _TyveraTask | None = None
+    owner_actor: _TyveraActor | None = None
+    children: list[_TyveraTask] = dataclass_field(default_factory=list)
+
+    def __repr__(self) -> str:
+        return "<Task>"
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraTaskGroup:
+    owner: _TyveraTask | None
+    tasks: list[_TyveraTask] = dataclass_field(default_factory=list)
+
+    def __repr__(self) -> str:
+        return "<TaskGroup>"
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraSupervisor:
+    max_restarts: int
+    window_milliseconds: int
+    clock: Callable[[], float]
+    restart_times: deque[float] = dataclass_field(default_factory=deque)
+    children: list[_TyveraActor] = dataclass_field(default_factory=list)
+    status: str = "alive"
+
+    def __repr__(self) -> str:
+        return "<Supervisor>"
+
+
 @dataclass(slots=True, eq=False)
 class _TyveraActor:
     instance: _TyveraInstance
     status: str = "alive"
     mailbox: deque[_ActorMessage] = dataclass_field(default_factory=deque)
     queued: bool = False
+    supervisor: _TyveraSupervisor | None = None
+    declaration: ActorDeclaration | None = None
+    constructor_arguments: list[object] = dataclass_field(default_factory=list)
+    pending_replies: set[_TyveraReplyCell] = dataclass_field(default_factory=set)
 
 
 @dataclass(slots=True, eq=False, repr=False)
@@ -125,21 +248,61 @@ class Interpreter:
     def __init__(
         self, program: Program, output: TextIO, max_call_depth: int = 256, *,
         project_root: str | Path | None = None, error_output: TextIO | None = None,
+        clock: Callable[[], float] | None = None,
+        sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self.functions = {function.name: function for function in program.functions}
         self.classes: dict[str, ClassDeclaration] = {declaration.name: declaration for declaration in program.classes}
         self.actors: dict[str, ActorDeclaration] = {declaration.name: declaration for declaration in program.actors}
         self._ready_actors: deque[_TyveraActor] = deque()
+        self._actors: list[_TyveraActor] = []
+        self._supervisors: list[_TyveraSupervisor] = []
+        self._scheduled_timers: list[_TyveraTimer] = []
+        self._ready_tasks: deque[_TyveraTask] = deque()
+        self._tasks: list[_TyveraTask] = []
+        self._task_groups: list[_TyveraTaskGroup] = []
         self._current_actor: _TyveraActor | None = None
+        self._current_task: _TyveraTask | None = None
+        self._running_tasks = False
+        self._runtime_state = "ready"
+        self._scheduler_state = "idle"
         self.output = output
         self.error_output = error_output if error_output is not None else sys.stderr
         self.max_call_depth = max_call_depth
         self.project_root = Path.cwd() if project_root is None else Path(project_root)
         self.secret_provider = SecretProvider(self.project_root)
+        self._clock = time.monotonic if clock is None else clock
+        self._sleep = time.sleep if sleeper is None else sleeper
 
     def run(self) -> None:
         main = self.functions["main"]
-        self._call(main, [], main.location, 0)
+        if self._runtime_state != "ready":
+            raise Diagnostic(main.location, "runtime", "interpreter runtime can only run once")
+        self._runtime_state = "running"
+        try:
+            self._call(main, [], main.location, 0)
+        finally:
+            self._shutdown_runtime()
+
+    def _shutdown_runtime(self) -> None:
+        if self._runtime_state == "closed":
+            return
+        self._runtime_state = "shutting_down"
+        for task in self._tasks:
+            self._cancel_task(task)
+        for actor in self._actors:
+            self._stop_actor(actor, "runtime shut down before actor replied")
+        for supervisor in self._supervisors:
+            if supervisor.status == "alive":
+                supervisor.status = "stopped"
+        self._ready_tasks.clear()
+        self._ready_actors.clear()
+        for timer in self._scheduled_timers:
+            timer.cancelled = True
+        self._scheduled_timers.clear()
+        self._task_groups.clear()
+        self._scheduler_state = "closed"
+        self._runtime_state = "closed"
 
     def _call(self, function: Function, arguments: list[object], call_location: Location, depth: int) -> object:
         if depth >= self.max_call_depth:
@@ -175,6 +338,8 @@ class Interpreter:
             elif isinstance(statement, ReturnStatement):
                 value = None if statement.value is None else self._evaluate(statement.value, variables, depth)
                 raise _ReturnSignal(value)
+            elif isinstance(statement, AwaitStatement):
+                raise AssertionError("await statements are dispatched by the cooperative task scheduler")
             elif isinstance(statement, Block):
                 self._execute_block(statement.body, variables.new_child(), depth)
             elif isinstance(statement, IfStatement):
@@ -230,6 +395,12 @@ class Interpreter:
         if isinstance(expression, Name):
             return variables[expression.identifier]
         if isinstance(expression, Call):
+            if expression.callee == "taskGroup":
+                if self._current_actor is not None:
+                    raise Diagnostic(expression.location, "runtime", "task groups cannot be created inside actor message handlers")
+                group = _TyveraTaskGroup(self._current_task)
+                self._task_groups.append(group)
+                return group
             if expression.callee == "spawn":
                 construction = expression.arguments[0]
                 if not isinstance(construction, Call):
@@ -237,9 +408,38 @@ class Interpreter:
                 declaration = self.actors[construction.callee]
                 arguments = [self._evaluate(argument, variables, depth) for argument in construction.arguments]
                 return self._spawn_actor(declaration, arguments, expression.location, depth + 1)
+            if expression.callee == "oneForOne":
+                arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+                max_restarts, window_milliseconds = arguments
+                if max_restarts < 0:
+                    raise Diagnostic(expression.location, "runtime", "oneForOne maxRestarts must be zero or greater")
+                if max_restarts > _MAX_SUPERVISOR_RESTARTS:
+                    raise Diagnostic(expression.location, "runtime", f"oneForOne maxRestarts cannot exceed {_MAX_SUPERVISOR_RESTARTS}")
+                if window_milliseconds <= 0:
+                    raise Diagnostic(expression.location, "runtime", "oneForOne windowMilliseconds must be greater than zero")
+                supervisor = _TyveraSupervisor(max_restarts, window_milliseconds, self._clock)
+                self._supervisors.append(supervisor)
+                return supervisor
             if expression.callee == "runActors":
                 return self._run_actors(expression.location, depth)
+            if expression.callee == "runTasks":
+                return self._run_tasks(expression.location, depth)
             arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+            if expression.callee == "milliseconds":
+                return self._make_duration(arguments[0], expression.location)
+            if expression.callee == "seconds":
+                seconds = arguments[0]
+                return self._make_duration(seconds * 1000, expression.location)
+            if expression.callee == "timerAfter":
+                duration = arguments[0]
+                if not isinstance(duration, _TyveraDuration):
+                    raise AssertionError("checked timerAfter argument is not Duration")
+                return _TyveraTimer(self._clock(), duration.milliseconds, self._clock)
+            if expression.callee == "sleepFor":
+                duration = arguments[0]
+                if not isinstance(duration, _TyveraDuration):
+                    raise AssertionError("checked sleepFor argument is not Duration")
+                return self._create_sleep_task(duration, expression.location)
             if expression.callee == "println":
                 self.output.write(self._display(arguments[0]) + "\n")
                 return None
@@ -308,7 +508,10 @@ class Interpreter:
                 return _TyveraVariant("Err", arguments[0])
             if expression.callee in self.classes:
                 return self._construct(self.classes[expression.callee], arguments, expression.location, depth + 1)
-            return self._call(self.functions[expression.callee], arguments, expression.location, depth + 1)
+            function = self.functions[expression.callee]
+            if function.is_async:
+                return self._create_async_task(function, arguments, expression.location, depth)
+            return self._call(function, arguments, expression.location, depth + 1)
         if isinstance(expression, MemberAccess):
             if isinstance(expression.receiver, Name) and expression.receiver.identifier == "secrets":
                 try:
@@ -324,17 +527,182 @@ class Interpreter:
             return receiver.fields[expression.member]
         if isinstance(expression, MemberCall):
             receiver = self._evaluate(expression.receiver, variables, depth)
+            if isinstance(receiver, _TyveraSupervisor):
+                if expression.method == "start":
+                    if receiver.status != "alive":
+                        raise Diagnostic(expression.location, "runtime", f"cannot start a child on a {receiver.status} supervisor")
+                    construction = expression.arguments[0]
+                    if not isinstance(construction, Call):
+                        raise AssertionError("checked supervisor.start argument is not an actor construction")
+                    declaration = self.actors[construction.callee]
+                    arguments = [self._evaluate(argument, variables, depth) for argument in construction.arguments]
+                    return self._spawn_actor(declaration, arguments, expression.location, depth + 1, receiver)
+                if expression.method == "isAlive":
+                    return receiver.status == "alive"
+                if expression.method == "stop":
+                    if receiver.status == "alive":
+                        receiver.status = "stopped"
+                        for child in receiver.children:
+                            self._stop_actor(child)
+                    return None
+            if isinstance(receiver, _TyveraActorRef) and expression.method in {"request", "requestWithin", "sendAfter"}:
+                actor = receiver.actor
+                scheduled = expression.method == "sendAfter"
+                timed = expression.method in {"requestWithin", "sendAfter"}
+                prefix = 1 if timed else 0
+                duration = self._evaluate(expression.arguments[0], variables, depth) if timed else None
+                selector = expression.arguments[prefix]
+                if not isinstance(selector, Name):
+                    raise AssertionError("checked actor request selector is not a name")
+                request_arguments = [
+                    self._evaluate(argument, variables, depth)
+                    for argument in expression.arguments[prefix + 1:]
+                ]
+                if scheduled:
+                    if not isinstance(duration, _TyveraDuration):
+                        raise AssertionError("checked sendAfter duration is not Duration")
+                    if actor.status != "alive":
+                        raise Diagnostic(expression.location, "runtime", f"cannot schedule a message for a {actor.status} actor")
+                    timer = _TyveraTimer(
+                        self._clock(), duration.milliseconds, self._clock,
+                        scheduled_actor=actor,
+                        scheduled_method=selector.identifier,
+                        scheduled_arguments=request_arguments,
+                        scheduled_location=expression.location,
+                    )
+                    self._scheduled_timers.append(timer)
+                    return timer
+                cell = _TyveraReplyCell()
+                if duration is not None:
+                    if not isinstance(duration, _TyveraDuration):
+                        raise AssertionError("checked requestWithin timeout is not Duration")
+                    cell.started_at = self._clock()
+                    cell.timeout_milliseconds = duration.milliseconds
+                    cell.clock = self._clock
+                receiver_value = _TyveraReplyReceiver(cell)
+                self._enqueue_actor_message(
+                    actor, selector.identifier, [*request_arguments, _TyveraReplySender(cell)], expression.location,
+                )
+                return receiver_value
             arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+            if isinstance(receiver, _TyveraTaskGroup):
+                if self._current_actor is not None or receiver.owner is not self._current_task:
+                    raise Diagnostic(expression.location, "runtime", "TaskGroup may only be used by its creating task")
+                if expression.method == "add":
+                    task = arguments[0]
+                    if not isinstance(task, _TyveraTask) or task not in self._tasks or task.parent is not receiver.owner:
+                        raise Diagnostic(expression.location, "runtime", "TaskGroup.add accepts only a task created by the group's owner")
+                    if task in receiver.tasks:
+                        return False
+                    receiver.tasks.append(task)
+                    return True
+                if expression.method == "isDone":
+                    return all(task.state in {"completed", "failed", "cancelled"} for task in receiver.tasks)
+                if expression.method == "cancel":
+                    active = [task for task in receiver.tasks
+                              if task.state not in {"completed", "failed", "cancelled"}]
+                    for task in active:
+                        self._cancel_task(task)
+                    self._wake_waiting_tasks()
+                    return len(active)
             if isinstance(receiver, _TyveraActorRef):
                 actor = receiver.actor
                 if expression.method == "isAlive":
                     return actor.status == "alive"
                 if expression.method == "stop":
-                    actor.status = "stopped"
-                    actor.mailbox.clear()
+                    self._stop_actor(actor)
                     return None
                 self._enqueue_actor_message(actor, expression.method, arguments, expression.location)
                 return None
+            if isinstance(receiver, _TyveraReplySender) and expression.method == "send":
+                return self._send_reply(receiver.cell, arguments[0])
+            if isinstance(receiver, _TyveraReplyReceiver):
+                self._refresh_reply(receiver.cell)
+                cell = receiver.cell
+                if expression.method == "isReady":
+                    return cell.state != "pending"
+                if expression.method == "isCancelled":
+                    return cell.state == "cancelled"
+                if expression.method == "isTimedOut":
+                    return cell.state == "timed_out"
+                if expression.method == "cancel":
+                    if cell.state != "pending":
+                        return False
+                    cell.state = "cancelled"
+                    return True
+                if expression.method == "tryReceive":
+                    if cell.state == "sent":
+                        value = cell.value
+                        cell.value = None
+                        cell.state = "consumed"
+                        return _TyveraVariant("Ok", _TyveraVariant("Some", value))
+                    if cell.state in {"failed", "timed_out"}:
+                        return _TyveraVariant("Err", cell.error or "request failed")
+                    return _TyveraVariant("Ok", _TyveraVariant("None"))
+            if isinstance(receiver, _TyveraTask):
+                if expression.method == "isDone":
+                    return receiver.state in {"completed", "failed", "cancelled"}
+                if expression.method == "isCancelled":
+                    return receiver.state == "cancelled"
+                if expression.method == "cancel":
+                    if receiver.state in {"completed", "failed", "cancelled"}:
+                        return False
+                    self._cancel_task(receiver)
+                    self._wake_waiting_tasks()
+                    return True
+                if expression.method == "detach":
+                    parent = receiver.parent
+                    if (parent is None or parent is not self._current_task
+                            or receiver.state in {"completed", "failed", "cancelled"}):
+                        return False
+                    parent.children.remove(receiver)
+                    receiver.parent = None
+                    for group in self._task_groups:
+                        if group.owner is parent and receiver in group.tasks:
+                            group.tasks.remove(receiver)
+                    return True
+                if expression.method == "withTimeout":
+                    duration = arguments[0]
+                    if not isinstance(duration, _TyveraDuration):
+                        raise AssertionError("checked Task.withTimeout argument is not Duration")
+                    return self._create_timeout_task(receiver, duration, expression.location)
+                if expression.method == "tryResult":
+                    if receiver.state == "failed":
+                        return _TyveraVariant("Err", receiver.error or "task failed")
+                    if receiver.state == "cancelled":
+                        return _TyveraVariant("Err", "task was cancelled")
+                    if receiver.result_type == "Void":
+                        return _TyveraVariant("Ok", receiver.state == "completed")
+                    if receiver.state == "completed":
+                        return _TyveraVariant("Ok", _TyveraVariant("Some", receiver.result))
+                    return _TyveraVariant("Ok", _TyveraVariant("None"))
+            if isinstance(receiver, _TyveraDuration) and expression.method == "inMilliseconds":
+                return receiver.milliseconds
+            if isinstance(receiver, _TyveraTimer):
+                if expression.method == "isCancelled":
+                    return receiver.cancelled
+                if receiver.cancelled:
+                    if expression.method == "isReady":
+                        return False
+                    if expression.method == "remaining":
+                        return _TyveraDuration(0)
+                    if expression.method == "cancel":
+                        return False
+                elapsed = (receiver.clock() - receiver.started_at) * 1000.0
+                ready = elapsed >= receiver.duration_milliseconds
+                if expression.method == "isReady":
+                    return ready
+                if expression.method == "cancel":
+                    if ready:
+                        return False
+                    receiver.cancelled = True
+                    self._prune_scheduled_timers()
+                    return True
+                if expression.method == "remaining":
+                    if ready:
+                        return _TyveraDuration(0)
+                    remaining = math.ceil(receiver.duration_milliseconds - elapsed)
+                    return _TyveraDuration(max(0, min(remaining, INT_MAX)))
             if isinstance(receiver, _TyveraSecret) and expression.method == "reveal":
                 return receiver.value
             if isinstance(receiver, _TyveraJson):
@@ -593,19 +961,604 @@ class Interpreter:
 
     def _spawn_actor(
         self, declaration: ActorDeclaration, arguments: list[object], call_location: Location, depth: int,
+        supervisor: _TyveraSupervisor | None = None,
     ) -> _TyveraActorRef:
         instance = _TyveraInstance(declaration.name, {})
-        actor = _TyveraActor(instance)
+        actor = _TyveraActor(
+            instance,
+            supervisor=supervisor,
+            declaration=declaration,
+            constructor_arguments=[self._copy_actor_value(value) for value in arguments],
+        )
+        self._actors.append(actor)
         instance.actor = actor
-        constructor = next((method for method in declaration.handlers if method.name == "init"), None)
-        if constructor is not None:
-            try:
-                self._call_method(constructor, instance, arguments, call_location, depth)
-            except Diagnostic:
-                actor.status = "crashed"
-                actor.mailbox.clear()
+        if supervisor is not None:
+            supervisor.children.append(actor)
+        try:
+            self._initialize_actor(actor, arguments, call_location, depth)
+        except Diagnostic as error:
+            actor.status = "crashed"
+            actor.mailbox.clear()
+            if supervisor is None:
                 raise
+            failure = self._restart_supervised_actor(
+                actor, self._format_actor_failure(declaration, error), call_location, depth,
+            )
+            if failure is not None:
+                raise Diagnostic(call_location, "runtime", failure) from error
         return _TyveraActorRef(actor)
+
+    def _initialize_actor(
+        self, actor: _TyveraActor, arguments: list[object], call_location: Location, depth: int,
+    ) -> None:
+        declaration = actor.declaration
+        if declaration is None:
+            raise AssertionError("actor has no declaration")
+        actor.status = "starting"
+        actor.instance = _TyveraInstance(declaration.name, {}, actor)
+        constructor = next((method for method in declaration.handlers if method.name == "init"), None)
+        previous_actor = self._current_actor
+        self._current_actor = actor
+        try:
+            if constructor is not None:
+                self._call_method(constructor, actor.instance, arguments, call_location, depth)
+        finally:
+            self._current_actor = previous_actor
+        actor.status = "alive"
+
+    @staticmethod
+    def _copy_actor_value(value: object) -> object:
+        if isinstance(value, _TyveraActorRef):
+            return _TyveraActorRef(value.actor)
+        if isinstance(value, _TyveraDuration):
+            return value
+        if isinstance(value, _TyveraReplySender):
+            return _TyveraReplySender(value.cell)
+        if isinstance(value, _TyveraVariant):
+            return _TyveraVariant(value.variant, Interpreter._copy_actor_value(value.payload))
+        if value is None or type(value) in {bool, int, float, str}:
+            return value
+        raise AssertionError("checked actor constructor value is not transferable")
+
+    @staticmethod
+    def _format_actor_failure(declaration: ActorDeclaration, error: Diagnostic) -> str:
+        return (
+            f"actor '{declaration.name}' crashed at {error.location.filename}:"
+            f"{error.location.line}:{error.location.column}: {error.message}"
+        )
+
+    def _fail_pending_replies(self, actor: _TyveraActor, error: str) -> None:
+        self._cancel_actor_tasks(actor)
+        self._cancel_actor_timers(actor)
+        for cell in actor.pending_replies:
+            self._refresh_reply(cell)
+            if cell.state == "pending":
+                cell.state = "failed"
+                cell.error = error
+        actor.pending_replies.clear()
+
+    def _stop_actor(self, actor: _TyveraActor, reply_error: str = "actor stopped before replying") -> None:
+        self._cancel_actor_timers(actor)
+        self._cancel_actor_tasks(actor)
+        if actor.status in {"alive", "starting"}:
+            actor.status = "stopped"
+        for cell in actor.pending_replies:
+            self._refresh_reply(cell)
+            if cell.state == "pending":
+                cell.state = "failed"
+                cell.error = reply_error
+        actor.pending_replies.clear()
+        actor.mailbox.clear()
+
+    def _cancel_actor_tasks(self, actor: _TyveraActor) -> None:
+        for task in self._tasks:
+            if task.owner_actor is actor:
+                self._cancel_task(task)
+
+    def _cancel_actor_timers(self, actor: _TyveraActor) -> None:
+        for timer in self._scheduled_timers:
+            if timer.scheduled_actor is actor and not timer.delivered:
+                timer.cancelled = True
+        self._prune_scheduled_timers()
+
+    def _prune_scheduled_timers(self) -> None:
+        self._scheduled_timers = [
+            timer for timer in self._scheduled_timers if not timer.cancelled and not timer.delivered
+        ]
+
+    def _fail_supervisor(self, supervisor: _TyveraSupervisor) -> None:
+        supervisor.status = "failed"
+        for child in supervisor.children:
+            self._stop_actor(child)
+
+    def _create_async_task(
+        self, function: Function, arguments: list[object], location: Location, depth: int,
+    ) -> _TyveraTask:
+        if not function.is_async:
+            raise AssertionError("only async functions create Task values")
+        if depth >= self.max_call_depth:
+            raise Diagnostic(location, "runtime", f"maximum call depth ({self.max_call_depth}) exceeded")
+        variables = ChainMap({parameter.name: value for parameter, value in zip(function.parameters, arguments)})
+        task = _TyveraTask(function, variables, location, depth + 1, canonical_type(function.return_type))
+        task.parent = self._current_task
+        task.owner_actor = self._current_actor
+        if task.parent is not None:
+            task.parent.children.append(task)
+        task.frames.append(_AsyncBlockFrame(function.body, variables))
+        self._tasks.append(task)
+        self._ready_tasks.append(task)
+        return task
+
+    def _create_sleep_task(self, duration: _TyveraDuration, location: Location) -> _TyveraTask:
+        now = self._clock()
+        task = _TyveraTask(None, None, location, state="sleeping",
+                           due_at=now + max(0, duration.milliseconds) / 1000.0,
+                           parent=self._current_task, owner_actor=self._current_actor)
+        if task.parent is not None:
+            task.parent.children.append(task)
+        self._tasks.append(task)
+        return task
+
+    def _create_timeout_task(
+        self, target: _TyveraTask, duration: _TyveraDuration, location: Location,
+    ) -> _TyveraTask:
+        task = _TyveraTask(
+            None, None, location, state="timed_wait", result_type=target.result_type,
+            due_at=self._clock() + duration.milliseconds / 1000.0,
+            timeout_target=target, parent=self._current_task, owner_actor=self._current_actor,
+        )
+        if task.parent is not None:
+            task.parent.children.append(task)
+        self._tasks.append(task)
+        return task
+
+    def _run_tasks(self, location: Location, depth: int) -> _TyveraVariant:
+        if self._runtime_state != "running":
+            raise Diagnostic(location, "runtime", "runTasks requires an active interpreter runtime")
+        if self._current_actor is not None:
+            raise Diagnostic(location, "runtime", "runTasks cannot be called from an actor message handler")
+        if self._running_tasks:
+            raise Diagnostic(location, "runtime", "runTasks cannot be called recursively")
+
+        self._running_tasks = True
+        self._scheduler_state = "running"
+        steps = 0
+        scheduler_steps = 0
+        failure: str | None = None
+        try:
+            while True:
+                self._promote_sleeping_tasks()
+                self._settle_timed_tasks()
+                self._wake_waiting_tasks()
+                self._settle_joining_tasks()
+                if self._ready_tasks:
+                    if scheduler_steps >= _MAX_TASK_STEPS:
+                        failure = (
+                            f"task scheduler reached the {_MAX_TASK_STEPS}-step safety limit; "
+                            "cooperative work remains queued"
+                        )
+                        break
+                    task = self._ready_tasks.popleft()
+                    if task.state != "runnable":
+                        continue
+                    task.state = "running"
+                    previous_task = self._current_task
+                    self._current_task = task
+                    try:
+                        self._advance_async_task(task)
+                    except _ReturnSignal as signal:
+                        task.result = signal.value
+                        self._complete_task(task)
+                    except Diagnostic as error:
+                        self._fail_task(task, error.render())
+                    except _LoopSignal as signal:
+                        self._handle_async_loop_control(task, signal)
+                    finally:
+                        self._current_task = previous_task
+                    if task.state == "running":
+                        if task.frames:
+                            task.state = "runnable"
+                            self._ready_tasks.append(task)
+                        else:
+                            self._complete_task(task)
+                    steps += 1
+                    scheduler_steps += 1
+                    self._settle_timed_tasks()
+                    self._wake_waiting_tasks()
+                    self._settle_joining_tasks()
+                    if self._has_waiting_actor_reply() and self._ready_actors:
+                        actor_result = self._run_actors(
+                            location, depth + 1, delivery_limit=1, fail_on_limit=False,
+                        )
+                        if actor_result.variant == "Err" and failure is None:
+                            failure = str(actor_result.payload)
+                        scheduler_steps += int(actor_result.payload) if actor_result.variant == "Ok" else 1
+                        self._promote_due_timers()
+                        self._wake_waiting_tasks()
+                        self._settle_joining_tasks()
+                    continue
+
+                active = [task for task in self._tasks
+                          if task.state in {"runnable", "running", "waiting", "sleeping", "joining", "timed_wait"}]
+                if not active:
+                    break
+
+                if self._has_waiting_actor_reply(active) and self._ready_actors:
+                    if scheduler_steps >= _MAX_TASK_STEPS:
+                        failure = (
+                            f"task scheduler reached the {_MAX_TASK_STEPS}-step safety limit; "
+                            "cooperative work remains queued"
+                        )
+                        break
+                    actor_result = self._run_actors(
+                        location, depth + 1, delivery_limit=1, fail_on_limit=False,
+                    )
+                    if actor_result.variant == "Err":
+                        failure = failure or str(actor_result.payload)
+                        scheduler_steps += 1
+                    else:
+                        scheduler_steps += int(actor_result.payload)
+                    self._promote_due_timers()
+                    self._wake_waiting_tasks()
+                    self._settle_joining_tasks()
+                    if self._ready_tasks or (self._ready_actors and self._has_waiting_actor_reply()):
+                        continue
+
+                deadline = self._next_task_deadline()
+                if deadline is not None:
+                    delay = max(0.0, deadline - self._clock())
+                    if delay > 0:
+                        self._sleep(delay)
+                    continue
+
+                waiting_on_reply = self._has_waiting_actor_reply(active)
+                if waiting_on_reply:
+                    failure = failure or "task scheduler has an unresolved actor reply with no runnable work or deadline"
+                else:
+                    failure = failure or "task scheduler is deadlocked: pending tasks have no runnable or timed work"
+                break
+
+            failed_task = next((task for task in self._tasks if task.state == "failed"), None)
+            if failed_task is not None:
+                failure = failure or failed_task.error or "async task failed"
+            if failure is not None:
+                return _TyveraVariant("Err", failure)
+            return _TyveraVariant("Ok", steps)
+        finally:
+            self._running_tasks = False
+            self._scheduler_state = "idle" if self._runtime_state == "running" else "closed"
+
+    def _has_waiting_actor_reply(self, tasks: list[_TyveraTask] | None = None) -> bool:
+        candidates = self._tasks if tasks is None else tasks
+        return any(
+            task.state == "waiting" and isinstance(task.wait_target, _TyveraReplyReceiver)
+            and self._await_state(task.wait_target)[0] == "pending"
+            for task in candidates
+        )
+
+    def _advance_async_task(self, task: _TyveraTask) -> None:
+        if not task.frames:
+            return
+        frame = task.frames[-1]
+        if isinstance(frame, _AsyncLoopFrame):
+            statement = frame.statement
+            if isinstance(statement, WhileStatement):
+                if self._evaluate(statement.condition, frame.variables, task.depth):
+                    task.frames.append(_AsyncBlockFrame(statement.body, frame.variables.new_child()))
+                else:
+                    task.frames.pop()
+                return
+            if frame.items is None:
+                raise AssertionError("for-loop continuation has no snapshotted iterable")
+            if frame.index >= len(frame.items):
+                task.frames.pop()
+                return
+            scope = frame.variables.new_child()
+            scope[statement.name] = frame.items[frame.index]
+            frame.index += 1
+            task.frames.append(_AsyncBlockFrame(statement.body, scope))
+            return
+
+        if frame.index >= len(frame.body):
+            task.frames.pop()
+            return
+        statement = frame.body[frame.index]
+        if isinstance(statement, AwaitStatement):
+            target = self._evaluate(statement.value, frame.variables, task.depth)
+            if isinstance(target, _TyveraTaskGroup) and target.owner is not task:
+                raise Diagnostic(statement.location, "runtime", "TaskGroup may only be awaited by its creating task")
+            state, error = self._await_state(target)
+            if state == "ready":
+                self._complete_task_await(task, statement, target, frame.variables)
+                frame.index += 1
+            elif state == "failed":
+                self._fail_task(task, error or "awaited operation failed")
+            else:
+                task.state = "waiting"
+                task.wait_target = target
+                task.wait_frame = frame
+                task.wait_statement = statement
+            return
+        if isinstance(statement, Block):
+            frame.index += 1
+            task.frames.append(_AsyncBlockFrame(statement.body, frame.variables.new_child()))
+            return
+        if isinstance(statement, IfStatement):
+            body = statement.then_body if self._evaluate(statement.condition, frame.variables, task.depth) else statement.else_body
+            frame.index += 1
+            task.frames.append(_AsyncBlockFrame(body, frame.variables.new_child()))
+            return
+        if isinstance(statement, WhileStatement):
+            frame.index += 1
+            task.frames.append(_AsyncLoopFrame(statement, frame.variables, task.depth))
+            return
+        if isinstance(statement, ForStatement):
+            iterable = self._evaluate(statement.iterable, frame.variables, task.depth)
+            if isinstance(iterable, _TyveraList):
+                items = tuple(iterable.values)
+            elif isinstance(iterable, _TyveraMap):
+                items = tuple(iterable.values.keys())
+            else:
+                raise AssertionError("checked async for-loop value is not iterable")
+            frame.index += 1
+            task.frames.append(_AsyncLoopFrame(statement, frame.variables, task.depth, items))
+            return
+        if isinstance(statement, MatchStatement):
+            value = self._evaluate(statement.value, frame.variables, task.depth)
+            frame.index += 1
+            for arm in statement.arms:
+                matched, binding = self._matches(arm.pattern, value)
+                if not matched:
+                    continue
+                scope = frame.variables.new_child()
+                if binding is not _MISSING:
+                    pattern = arm.pattern
+                    name = pattern.name if isinstance(pattern, BindingPattern) else pattern.binding
+                    if name is not None:
+                        scope[name] = binding
+                task.frames.append(_AsyncBlockFrame(arm.body, scope))
+                break
+            return
+
+        self._execute_block([statement], frame.variables, task.depth)
+        frame.index += 1
+
+    def _handle_async_loop_control(self, task: _TyveraTask, signal: _LoopSignal) -> None:
+        loop_index = next(
+            (index for index in range(len(task.frames) - 1, -1, -1)
+             if isinstance(task.frames[index], _AsyncLoopFrame)),
+            None,
+        )
+        if loop_index is None:
+            self._fail_task(task, f"'{signal.kind}' escaped its loop in async task")
+            return
+        del task.frames[loop_index + (1 if signal.kind == "continue" else 0):]
+
+    def _promote_sleeping_tasks(self) -> None:
+        now = self._clock()
+        for task in self._tasks:
+            if task.state == "sleeping" and task.due_at is not None and now + 1e-12 >= task.due_at:
+                task.state = "completed"
+        self._wake_waiting_tasks()
+
+    def _settle_timed_tasks(self) -> None:
+        now = self._clock()
+        for task in self._tasks:
+            if task.state != "timed_wait" or task.timeout_target is None:
+                continue
+            target = task.timeout_target
+            if target.state == "completed":
+                task.result = target.result
+                task.timeout_target = None
+                task.due_at = None
+                task.state = "completed"
+            elif target.state == "failed":
+                task.timeout_target = None
+                task.due_at = None
+                self._fail_task(task, target.error or "timed task failed")
+            elif target.state == "cancelled":
+                task.timeout_target = None
+                task.due_at = None
+                self._fail_task(task, "timed task was cancelled")
+            elif task.due_at is not None and now + 1e-12 >= task.due_at:
+                task.timeout_target = None
+                task.due_at = None
+                self._cancel_task(target)
+                self._fail_task(task, "task timed out")
+
+    def _await_state(self, target: object) -> tuple[str, str | None]:
+        if isinstance(target, _TyveraTask):
+            if target.state == "completed":
+                return "ready", None
+            if target.state == "failed":
+                return "failed", target.error or "awaited task failed"
+            if target.state == "cancelled":
+                return "failed", "awaited task was cancelled"
+            return "pending", None
+        if isinstance(target, _TyveraTaskGroup):
+            failed_task = next((task for task in target.tasks if task.state == "failed"), None)
+            if failed_task is not None:
+                return "failed", failed_task.error or "task group member failed"
+            if all(task.state in {"completed", "failed", "cancelled"} for task in target.tasks):
+                return "ready", None
+            return "pending", None
+        if isinstance(target, _TyveraReplyReceiver):
+            cell = target.cell
+            self._refresh_reply(cell)
+            if cell.state == "sent":
+                return "ready", None
+            if cell.state == "pending":
+                return "pending", None
+            return "failed", cell.error or (
+                "reply was already consumed" if cell.state == "consumed" else "actor request did not complete"
+            )
+        raise AssertionError("type-checked await target is not awaitable")
+
+    def _wake_waiting_tasks(self) -> None:
+        for task in self._tasks:
+            if task.state != "waiting" or task.wait_target is None:
+                continue
+            target = task.wait_target
+            state, error = self._await_state(target)
+            if state == "pending":
+                continue
+            task.wait_target = None
+            frame = task.wait_frame
+            statement = task.wait_statement
+            task.wait_frame = None
+            task.wait_statement = None
+            if state == "failed":
+                self._fail_task(task, error or "awaited operation failed")
+            else:
+                if frame is None or statement is None:
+                    raise AssertionError("waiting task has no suspended await continuation")
+                self._complete_task_await(task, statement, target, frame.variables)
+                frame.index += 1
+                task.state = "runnable"
+                self._ready_tasks.append(task)
+
+    @staticmethod
+    def _complete_task_await(
+        task: _TyveraTask, statement: AwaitStatement, target: object,
+        variables: ChainMap[str, object],
+    ) -> None:
+        if statement.binding_name is None:
+            return
+        if isinstance(target, _TyveraTask):
+            value = target.result
+        elif isinstance(target, _TyveraTaskGroup):
+            return
+        elif isinstance(target, _TyveraReplyReceiver):
+            cell = target.cell
+            if cell.state != "sent":
+                raise AssertionError("type-checked reply await is not ready")
+            value = cell.value
+            cell.value = None
+            cell.state = "consumed"
+        else:
+            raise AssertionError("type-checked await target is not awaitable")
+        variables[statement.binding_name] = value
+
+    def _complete_task(self, task: _TyveraTask) -> None:
+        task.frames.clear()
+        task.wait_target = None
+        task.wait_frame = None
+        task.wait_statement = None
+        if any(child.state in {"runnable", "running", "waiting", "sleeping", "joining", "timed_wait"}
+               for child in task.children):
+            task.state = "joining"
+        else:
+            task.state = "completed"
+
+    def _settle_joining_tasks(self) -> None:
+        for task in self._tasks:
+            if task.state != "joining":
+                continue
+            failed_child = next((child for child in task.children if child.state == "failed"), None)
+            if failed_child is not None:
+                self._fail_task(task, f"owned child task failed: {failed_child.error or 'async task failed'}")
+            elif not any(child.state in {"runnable", "running", "waiting", "sleeping", "joining", "timed_wait"}
+                         for child in task.children):
+                task.state = "completed"
+
+    def _cancel_task(self, task: _TyveraTask) -> None:
+        if task.state in {"completed", "failed", "cancelled"}:
+            return
+        task.state = "cancelled"
+        task.wait_target = None
+        task.wait_frame = None
+        task.wait_statement = None
+        task.frames.clear()
+        if task.timeout_target is not None:
+            self._cancel_task(task.timeout_target)
+            task.timeout_target = None
+        for child in task.children:
+            self._cancel_task(child)
+
+    def _fail_task(self, task: _TyveraTask, error: str) -> None:
+        if task.state in {"completed", "failed", "cancelled"}:
+            return
+        task.state = "failed"
+        task.error = error
+        task.wait_target = None
+        task.wait_frame = None
+        task.wait_statement = None
+        task.frames.clear()
+        for child in task.children:
+            self._cancel_task(child)
+        if task.parent is not None:
+            self._fail_task(task.parent, f"owned child task failed: {error}")
+
+    def _next_task_deadline(self) -> float | None:
+        deadlines = [
+            task.due_at for task in self._tasks
+            if task.state in {"sleeping", "timed_wait"} and task.due_at is not None
+        ]
+        waiting_for_reply = any(
+            task.state == "waiting" and isinstance(task.wait_target, _TyveraReplyReceiver)
+            and self._await_state(task.wait_target)[0] == "pending"
+            for task in self._tasks
+        )
+        if waiting_for_reply:
+            deadlines.extend(
+                timer.started_at + timer.duration_milliseconds / 1000.0
+                for timer in self._scheduled_timers
+                if not timer.cancelled and not timer.delivered and timer.scheduled_actor is not None
+            )
+        for task in self._tasks:
+            target = task.wait_target
+            if task.state != "waiting" or not isinstance(target, _TyveraReplyReceiver):
+                continue
+            cell = target.cell
+            if cell.state == "pending" and cell.started_at is not None and cell.timeout_milliseconds is not None:
+                deadlines.append(cell.started_at + cell.timeout_milliseconds / 1000.0)
+        return min(deadlines) if deadlines else None
+
+    def _restart_supervised_actor(
+        self, actor: _TyveraActor, failure: str, call_location: Location, depth: int,
+    ) -> str | None:
+        self._fail_pending_replies(actor, failure)
+        actor.mailbox.clear()
+        supervisor = actor.supervisor
+        if supervisor is None:
+            return failure
+        if supervisor.status != "alive":
+            actor.status = "stopped"
+            return failure
+
+        declaration = actor.declaration
+        if declaration is None:
+            raise AssertionError("supervised actor has no declaration")
+        window_seconds = supervisor.window_milliseconds / 1000.0
+        while True:
+            now = self._clock()
+            while supervisor.restart_times and now - supervisor.restart_times[0] > window_seconds:
+                supervisor.restart_times.popleft()
+            if len(supervisor.restart_times) >= supervisor.max_restarts:
+                self._fail_supervisor(supervisor)
+                return (
+                    f"supervisor restart limit exceeded for actor '{declaration.name}' "
+                    f"within {supervisor.window_milliseconds}ms: {failure}"
+                )
+
+            supervisor.restart_times.append(now)
+            actor.mailbox.clear()
+            try:
+                self._initialize_actor(
+                    actor,
+                    [self._copy_actor_value(value) for value in actor.constructor_arguments],
+                    call_location,
+                    depth + 1,
+                )
+            except Diagnostic as error:
+                actor.status = "crashed"
+                failure = self._format_actor_failure(declaration, error)
+                continue
+            except _LoopSignal as signal:
+                actor.status = "crashed"
+                failure = f"actor '{declaration.name}' crashed: '{signal.kind}' escaped its constructor"
+                continue
+            return None
 
     def _enqueue_actor_message(
         self, actor: _TyveraActor, method: str, arguments: list[object], location: Location,
@@ -614,17 +1567,24 @@ class Interpreter:
             raise Diagnostic(location, "runtime", f"cannot send a message to a {actor.status} actor")
         if len(actor.mailbox) >= _MAX_ACTOR_MAILBOX:
             raise Diagnostic(location, "runtime", f"actor mailbox capacity ({_MAX_ACTOR_MAILBOX}) exceeded")
+        for argument in arguments:
+            if isinstance(argument, _TyveraReplySender):
+                actor.pending_replies.add(argument.cell)
         actor.mailbox.append(_ActorMessage(method, arguments, location))
         if not actor.queued:
             actor.queued = True
             self._ready_actors.append(actor)
 
-    def _run_actors(self, location: Location, depth: int) -> _TyveraVariant:
+    def _run_actors(
+        self, location: Location, depth: int, *, delivery_limit: int = _MAX_ACTOR_DELIVERIES,
+        fail_on_limit: bool = True,
+    ) -> _TyveraVariant:
         if self._current_actor is not None:
             raise Diagnostic(location, "runtime", "runActors cannot be called from an actor message handler")
         processed = 0
         first_crash: str | None = None
-        while self._ready_actors and processed < _MAX_ACTOR_DELIVERIES:
+        self._promote_due_timers()
+        while self._ready_actors and processed < delivery_limit:
             actor = self._ready_actors.popleft()
             actor.queued = False
             if actor.status != "alive" or not actor.mailbox:
@@ -638,28 +1598,48 @@ class Interpreter:
                 self._call_method(method, actor.instance, message.arguments, message.location, depth + 1)
             except Diagnostic as error:
                 actor.status = "crashed"
-                actor.mailbox.clear()
-                if first_crash is None:
-                    first_crash = (
-                        f"actor '{declaration.name}' crashed at {error.location.filename}:"
-                        f"{error.location.line}:{error.location.column}: {error.message}"
-                    )
+                failure = self._restart_supervised_actor(
+                    actor, self._format_actor_failure(declaration, error), message.location, depth + 1,
+                )
+                if failure is not None and first_crash is None:
+                    first_crash = failure
             except _LoopSignal as signal:
                 actor.status = "crashed"
-                actor.mailbox.clear()
-                if first_crash is None:
-                    first_crash = f"actor '{declaration.name}' crashed: '{signal.kind}' escaped its loop"
+                failure = self._restart_supervised_actor(
+                    actor, f"actor '{declaration.name}' crashed: '{signal.kind}' escaped its loop",
+                    message.location, depth + 1,
+                )
+                if failure is not None and first_crash is None:
+                    first_crash = failure
             finally:
                 self._current_actor = None
+            actor.pending_replies = {cell for cell in actor.pending_replies if cell.state == "pending"}
+            self._promote_due_timers()
             if actor.status == "alive" and actor.mailbox and not actor.queued:
                 actor.queued = True
                 self._ready_actors.append(actor)
-        if self._ready_actors and processed >= _MAX_ACTOR_DELIVERIES:
+        if fail_on_limit and self._ready_actors and processed >= delivery_limit:
             if first_crash is None:
-                first_crash = f"actor scheduler reached the {_MAX_ACTOR_DELIVERIES}-message safety limit; messages remain queued"
+                first_crash = f"actor scheduler reached the {delivery_limit}-message safety limit; messages remain queued"
         if first_crash is not None:
             return _TyveraVariant("Err", first_crash)
         return _TyveraVariant("Ok", processed)
+
+    def _promote_due_timers(self) -> None:
+        for timer in self._scheduled_timers:
+            if timer.cancelled or timer.delivered or timer.scheduled_actor is None:
+                continue
+            if timer.clock() + 1e-12 < timer.started_at + timer.duration_milliseconds / 1000.0:
+                continue
+            timer.delivered = True
+            method = timer.scheduled_method
+            location = timer.scheduled_location
+            if method is None or location is None:
+                raise AssertionError("scheduled actor timer is missing its message")
+            self._enqueue_actor_message(
+                timer.scheduled_actor, method, timer.scheduled_arguments, location,
+            )
+        self._prune_scheduled_timers()
 
     def _call_method(
         self, method: Method, receiver: _TyveraInstance, arguments: list[object],
@@ -682,8 +1662,35 @@ class Interpreter:
     def _check_numeric_result(value: object, location: Location) -> None:
         if type(value) is int and not INT_MIN <= value <= INT_MAX:
             raise Diagnostic(location, "runtime", "Int overflow: result is outside the signed 64-bit range")
+        if isinstance(value, _TyveraDuration) and not INT_MIN <= value.milliseconds <= INT_MAX:
+            raise Diagnostic(location, "runtime", "Duration overflow: result is outside signed 64-bit milliseconds")
         if isinstance(value, float) and not math.isfinite(value):
             raise Diagnostic(location, "runtime", "Float overflow: result is outside the supported range")
+
+    @staticmethod
+    def _make_duration(milliseconds: object, location: Location) -> _TyveraDuration:
+        if type(milliseconds) is not int:
+            raise AssertionError("checked Duration input is not Int")
+        if not INT_MIN <= milliseconds <= INT_MAX:
+            raise Diagnostic(location, "runtime", "Duration overflow: value is outside signed 64-bit milliseconds")
+        return _TyveraDuration(milliseconds)
+
+    @staticmethod
+    def _refresh_reply(cell: _TyveraReplyCell) -> None:
+        if (cell.state == "pending" and cell.started_at is not None
+                and cell.timeout_milliseconds is not None and cell.clock is not None
+                and cell.clock() + 1e-12 >= cell.started_at + cell.timeout_milliseconds / 1000.0):
+            cell.state = "timed_out"
+            cell.error = "request timed out"
+
+    @classmethod
+    def _send_reply(cls, cell: _TyveraReplyCell, value: object) -> bool:
+        cls._refresh_reply(cell)
+        if cell.state != "pending":
+            return False
+        cell.state = "sent"
+        cell.value = value
+        return True
 
     @staticmethod
     def _apply_binary(operator: str, left: object, right: object) -> object:
@@ -692,8 +1699,12 @@ class Interpreter:
         if operator == "or":
             return bool(left or right)
         if operator == "+":
+            if isinstance(left, _TyveraDuration) and isinstance(right, _TyveraDuration):
+                return _TyveraDuration(left.milliseconds + right.milliseconds)
             return left + right  # type: ignore[operator]
         if operator == "-":
+            if isinstance(left, _TyveraDuration) and isinstance(right, _TyveraDuration):
+                return _TyveraDuration(left.milliseconds - right.milliseconds)
             return left - right  # type: ignore[operator]
         if operator == "*":
             return left * right  # type: ignore[operator]
@@ -718,3 +1729,4 @@ class Interpreter:
         if isinstance(value, bool):
             return "true" if value else "false"
         return str(value)
+

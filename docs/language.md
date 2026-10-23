@@ -2,7 +2,9 @@
 
 Tyvera is an independent, statically typed language. Java, Elixir and C++ inform
 its design; they are not compatibility targets. TypeScript is not part of the
-design. Python hosts the bootstrap implementation only.
+design. Python hosts the bootstrap and reference interpreter only; Python
+runtime behavior is not part of Tyvera's language contract. The current value,
+resource, and host-dependency limits are recorded in the [Memory Model](memory-model.md).
 
 ## Files, declarations and statements
 
@@ -12,6 +14,10 @@ returning `Void`. Functions, types and methods can use declarations that appear
 later in the same module. Functions can recurse. Parameters require types and
 are immutable. Return annotations use `-> Type`; an omitted annotation means
 `Void`.
+
+Top-level functions may be declared `async fn`; calling one returns a deferred
+`Task<T>` where `T` is its declared return type. Bare `Task` means
+`Task<Void>`. `main` remains synchronous.
 
 ```tyv
 fn max(a: Int, b: Int) -> Int {
@@ -42,20 +48,21 @@ precedence below):
 block       = "{" [statements] "}" ;
 import      = "import" string "as" identifier ;
 top-level   = import | ["pub"] (function | class | interface | actor) ;
-declaration = ("let" | "var") identifier [":" type] "=" expression ;
+declaration = ("let" | "var") identifier [":" type] "=" (expression | await) ;
 assignment  = identifier "=" expression ;
 field-set   = expression "." identifier "=" expression ;
 conditional = "if" expression block ["else" (block | conditional)] ;
 loop        = "while" expression block | for-loop ;
 match       = "match" expression "{" {pattern "=>" (block | statement)} "}" ;
 return      = "return" [expression] ;
-statement   = declaration | assignment | field-set | conditional | loop | match | return
+statement   = declaration | assignment | field-set | conditional | loop | match | return | await
             | "break" | "continue" | block | function-call ;
+await       = "await" expression ;
 for-loop    = "for" identifier "in" expression block ;
-function    = "fn" identifier ["<" identifier {"," identifier} ">"] "(" [parameters] ")" ["->" type] block ;
+function    = ["async"] "fn" identifier ["<" identifier {"," identifier} ">"] "(" [parameters] ")" ["->" type] block ;
 class       = "class" identifier ["<" identifier {"," identifier} ">"] ["implements" type-list] "{" {field | method} "}" ;
 field       = ("let" | "var") identifier ":" type ;
-method      = function ;
+method      = "fn" identifier ["<" identifier {"," identifier} ">"] "(" [parameters] ")" ["->" type] block ;
 interface   = "interface" identifier "{" {method-signature} "}" ;
 actor       = "actor" identifier "{" {actor-field | actor-init | actor-handler} "}" ;
 actor-field = ("let" | "var") identifier ":" type ;
@@ -67,6 +74,10 @@ parameters  = identifier ":" type {"," identifier ":" type} ;
 type        = identifier {"." identifier} ["<" type {"," type} ">"] ;
 pattern     = literal | "_" | identifier | ("Some" | "Ok" | "Err") "(" [identifier | "_"] ")" | "None" ;
 ```
+
+Actor references additionally support `request`, `requestWithin`, and
+`sendAfter`. Their handler selector is a bare identifier naming a declared
+handler.
 
 Assignments are statements, not expressions. Function and method calls can be
 used as expression statements. Local declarations require an initializer;
@@ -91,8 +102,8 @@ the constructor.
 | --- | --- |
 | `Int` | Signed 64-bit integers, −9223372036854775808 through 9223372036854775807. Out-of-range literals are static errors; arithmetic overflow is a located runtime error. |
 | `Float` | Finite IEEE binary64 values. Decimal literals round to binary64. Non-finite literals and arithmetic overflow are errors; ordinary binary64 rounding and underflow apply. |
-| `Bool` | Exactly `true` or `false`; no truthiness conversion. |
-| `String` | Text, concatenation and equality. No indexing or implicit string conversion. |
+| `Bool` | Exactly `true` or `false`, printed in lowercase; no truthiness conversion. |
+| `String` | UTF-8 source and text-file input; string values compare exact Unicode text and concatenate. No indexing or implicit string conversion. Length, normalization, and indexing rules remain unspecified because no such operations exist yet. |
 | `Void` | No return value; not allowed for bindings or parameters. No literal. |
 
 `Unit` remains an exact compatibility alias for `Void`; signatures and
@@ -256,6 +267,12 @@ iteration. Loop bindings are immutable and scoped to the loop body; `break`
 and `continue` target the innermost loop. A `for` loop may execute zero times
 and cannot by itself satisfy a non-`Void` function's return-path requirement.
 
+The bootstrap currently stores map entries in a Python dictionary. Tyvera's
+portable key equality and hashing contract is not complete, and some key types
+accepted by the checker can fail at runtime. Do not rely on Python hash values
+or cross-type key equivalence; this limitation is tracked in the
+[Memory Model](memory-model.md).
+
 These core types are available without an import. A separately packaged
 `tyvera.collections` module is not implemented yet.
 
@@ -330,18 +347,208 @@ per actor per round, while preserving FIFO order within each actor. It is not
 parallel and does not preempt a running handler. Handlers cannot recursively
 drive `runActors()`.
 
-Message and constructor arguments are transferable Tyvera values of type `Int`,
-`Float`, `Bool`, `String`, `Option<T>`, `Result<T,E>`, or `ActorRef<A>` when the
-nested types are also transferable. Mutable collections, ordinary class
-instances and secrets cannot cross a mailbox. A runtime diagnostic in a
-handler marks that actor crashed, discards its queued messages, and lets other
-actors continue; `runActors()` reports the first crash as `Err`. `stop()` stops
-an actor immediately and drops its pending mailbox; `isAlive()` reports whether
-it can receive more messages. Ordinary `Result` failures remain application
-values, separate from actor crashes. Supervisors, restarts, reply channels,
-parallel execution and async I/O are not implemented. A mailbox holds at most
-100,000 pending messages and one `runActors()` call delivers at most 100,000;
-an endless handler still blocks this cooperative scheduler.
+Constructor arguments and ordinary message arguments are transferable Tyvera
+values of type `Int`, `Float`, `Bool`, `String`, `Duration`, `Option<T>`,
+`Result<T,E>`, or `ActorRef<A>` when the nested types are also transferable.
+Mutable collections, ordinary class instances and secrets cannot cross a
+mailbox. Request messages additionally carry a `ReplySender<T>` as their final
+parameter; `T` must itself be transferable. A runtime diagnostic in a handler
+marks that actor crashed, discards its queued messages, and lets other actors
+continue; an unsupervised crash is returned as `Err`. Ordinary `Result`
+failures remain application values, separate from actor crashes.
+
+`oneForOne(maxRestarts, windowMilliseconds) -> Supervisor` creates a
+supervisor. `maxRestarts` must be from 0 through 1,000 and the time window must
+be positive. `supervisor.start(Actor(...))` starts a child and returns its
+`ActorRef`; the constructor arguments are retained as transferable values so a
+restart can rebuild fresh actor state. After a handler crash, the supervisor
+drops the failed actor's pending mailbox and restarts only that child. The
+reference remains valid and `isAlive()` becomes true after a successful
+restart. Restart attempts across all children share the configured limit and
+use a monotonic clock; events exactly on the window boundary still count.
+Exceeding the limit fails the supervisor, stops its children and makes
+`runActors()` return `Err`. A child's explicit `stop()` is graceful and does not
+trigger a restart. `supervisor.stop()` stops all children and
+`supervisor.isAlive()` reports the supervisor lifecycle. A stopped or failed
+supervisor cannot start new children. The current strategy is only
+`one_for_one`; `one_for_all` and `rest_for_one` are not implemented.
+
+Supervised restarts are recoveries: `runActors()` returns `Ok` when a crashing
+child was successfully restarted. An exhausted restart limit is a runtime
+failure reported as `Err`. Restarting reconstructs the child's state from its
+initial constructor arguments; it does not restore the state at the moment of
+the crash. A mailbox holds at most 100,000 pending messages and one
+`runActors()` call delivers at most 100,000. The round-robin scheduler is
+cooperative rather than parallel or preemptive; a handler that does not return
+can block every actor and the runtime.
+
+### Typed requests and replies
+
+An actor handler can accept `ReplySender<T>` as its final parameter. Calling
+`actor.request(handlerName, arguments...)` creates a one-shot reply channel,
+enqueues the handler with its typed sender, and returns `ReplyReceiver<T>`.
+`requestWithin(duration, handlerName, arguments...)` adds a monotonic deadline.
+
+```tyv
+actor Counter {
+    var value: Int
+    init(start: Int) { self.value = start }
+    on read(reply: ReplySender<Int>) { reply.send(self.value) }
+}
+
+fn main() {
+    let counter = spawn(Counter(15))
+    let response = counter.request(read)
+    runActors()
+    match response.tryReceive() {
+        Ok(value) => {
+            match value {
+                Some(number) => println(number)
+                None => println("not available yet")
+            }
+        }
+        Err(reason) => eprintln(reason)
+    }
+}
+```
+
+`ReplySender.send(value) -> Bool` succeeds only while the request is pending;
+later sends return `false`. `ReplyReceiver.tryReceive() ->
+Result<Option<T>,String>` is non-blocking and consumes a successful response at
+most once. `Ok(None)` means no value is available (including after
+cancellation); check `isReady()` and `isCancelled()` to distinguish those
+states, and `isTimedOut()` identifies deadline expiry. Actor crashes and stops
+complete outstanding requests with `Err`, and timeouts return
+`Err("request timed out")` when the receiver is next polled or a sender next
+tries to reply. `cancel()` returns `true` only
+when it changes a pending request. Cancellation and timeout stop the caller
+from receiving a reply; they do not remove the queued message or interrupt a
+running handler. A handler may inspect the `Bool` returned by `send` before
+performing follow-up work. Reply senders are only accepted as a handler's final
+parameter and cannot be forwarded through ordinary actor messages.
+
+Requests never block or implicitly run the scheduler. Call `runActors()` to
+deliver queued messages, then poll the receiver or poll again from a later
+actor message. Reply channels are single-assignment capabilities; they do not
+grant access to actor state.
+
+### Durations and timers
+
+`milliseconds(Int)` and `seconds(Int)` construct signed, 64-bit `Duration`
+values in millisecond resolution. `Duration` supports addition, subtraction,
+comparisons, and `inMilliseconds()`. Arithmetic and unit conversion are
+checked for overflow. `timerAfter(Duration)` creates a one-shot `Timer` using
+the runtime's monotonic clock. Timers expose `isReady()`, `remaining()`,
+`cancel()`, and `isCancelled()`; cancelling an elapsed timer returns `false`.
+`ActorRef.sendAfter(duration, handlerName, arguments...) -> Timer` schedules a
+typed actor message for one-shot delivery after the duration. The selected
+handler must not require a reply sender. Cancelling before delivery prevents
+the message; stopping or crashing the target actor cancels its scheduled
+messages. Negative durations are already elapsed when used for a timer or
+request deadline.
+
+Timers never block or sleep. Due actor messages are promoted when
+`runActors()` is called; the runtime does not wait for a future deadline or
+wake itself. The interpreter accepts an injected monotonic clock for
+deterministic tests.
+
+### Cooperative tasks
+
+An `async fn` declares a function that creates a deferred `Task<T>` when called.
+The function body does not start until `runTasks()` drives the task scheduler.
+Async functions use ordinary checked return annotations and return-path
+analysis; `main` remains synchronous. Calling one evaluates its arguments
+immediately and captures them for later execution. Primitive values follow
+ordinary Tyvera value behavior; mutable lists and class instances retain the
+same shared-reference behavior as synchronous function arguments. Tasks execute
+serially and cannot be sent through actor messages.
+
+```tyv
+async fn announce() {
+    println("started")
+    await sleepFor(milliseconds(5))
+    println("resumed")
+}
+
+fn main() {
+    let task = announce()
+    match runTasks() {
+        Ok(_) => println(task.isDone())
+        Err(reason) => println(reason)
+    }
+}
+```
+
+`sleepFor(Duration) -> Task<Void>` creates a timer-backed task. An `await`
+statement suspends the current async function until a task or task group is
+ready. `Task<T>.withTimeout(Duration) -> Task<T>` creates a typed wrapper with
+a monotonic deadline that starts when the method is called. If the source task
+does not complete by the deadline, the wrapper cancels it and fails with
+`"task timed out"`; cancelling the wrapper also cancels its source. A negative
+duration is already expired. A source that is already complete succeeds.
+`let value: T = await task` also binds a typed task result; the same form can
+bind a typed actor reply. An unbound `await replyReceiver` leaves its reply
+available for `tryReceive()`. Failure, cancellation, or timeout of an awaited
+operation fails the awaiting task. `Task<T>.isDone()`, `isCancelled()`,
+`cancel()`, `detach()`, and `tryResult()` expose lifecycle and value status.
+For non-`Void` tasks, `tryResult()` returns `Result<Option<T>,String>`; for `Task<Void>` it
+returns `Result<Bool,String>`. `runTasks() -> Result<Int,String>` advances
+ready tasks round-robin, drives actor messages needed by awaited replies, and
+waits until a deadline when no task can otherwise run. A deadlock with pending
+work but no runnable task or deadline is returned as `Err`.
+
+An interpreter runtime is one-shot: `main` starts it and runtime shutdown runs
+when `main` returns or raises. `runTasks()` may be called repeatedly while
+`main` is active; it is idle between calls and cannot be pumped recursively or
+from an actor constructor/handler. Shutdown cancels every unfinished task,
+including detached and never-started root tasks, stops live actors and
+supervisors, clears mailboxes and timers, and fails outstanding replies. No
+work survives that interpreter instance.
+
+The scheduler preserves block scopes and loop state across suspension, so
+`await` is supported inside nested blocks, `if` branches, `while` and `for`
+bodies, and `match` arms. Each continuation step is scheduled round-robin;
+synchronous function calls and individual expressions remain atomic. `await`
+is a statement and cannot be embedded in an expression.
+
+Tasks created while an async task is running are owned by that task. A task
+created by synchronous `main` is a root task. Cancelling or failing an owner
+cancels its unfinished descendants; a child failure fails its owners and
+cancels sibling work. When an async function returns normally, it joins its
+unfinished children and does not complete until they do.
+
+`taskGroup()` creates a `TaskGroup` owned by the current async task, or by the
+synchronous root when called from `main`. `group.add(task)` registers a direct
+child task once and returns `true`; duplicate registration returns `false`.
+`group.isDone()` is true when every registered member is completed, failed or
+cancelled. `group.cancel()` cancels active members and returns how many it
+cancelled. `await group` suspends until every member is terminal; a failed
+member fails the await. Group membership is an explicit join/cancellation view,
+not ownership transfer: the owner still implicitly joins every child, including
+children never added to a group. Only the creating task can operate on or await
+its group, and a group cannot cross actor message boundaries. Actor handlers
+cannot create or operate on task groups; task scopes belong to the cooperative
+task runtime, not to actor message turns.
+
+`task.detach()` explicitly drops the parent ownership edge for an active direct
+child and returns `true`; calling it on a root, terminal task or non-child
+returns `false`. Detaching also removes that task from groups owned by the
+parent, so group joins do not wait for it. The detached task continues as
+scheduler-root work, and its failure remains visible as an error from
+`runTasks()`. Cancellation does not interrupt a running statement. Task and
+TaskGroup values cannot be sent between actors. A detached task can outlive its
+former parent task; runtime shutdown remains the final cancellation boundary.
+A task started directly by an actor constructor or message handler belongs to
+that actor and is cancelled on actor stop, crash, or supervised restart. Actor
+handlers cannot detach their direct tasks because they run synchronously.
+The task scheduler is single-threaded; it provides cooperative concurrency,
+not parallel execution. When tasks await actor replies, the scheduler delivers
+at most one queued actor message between task turns, so a continuously runnable
+task cannot starve the reply. Synchronous calls, expressions, and actor
+handlers are atomic and can still delay other work. `runTasks()` waits against
+the injected monotonic clock for task or awaited-reply deadlines; `runActors()`
+never sleeps for a future message. Both schedulers have bounded safety limits.
+Async I/O and networking are not implemented.
 
 ## JSON values
 
@@ -461,7 +668,10 @@ operands and function arguments evaluate left to right.
 Mixed numeric equality/order compare numeric values without first rounding an
 `Int` to binary64; e.g. an integer beyond binary64's exact range is not equal
 to a different rounded Float. Strings compare exact text; Bool is never a
-number. No other operator combinations or conversions are permitted.
+number. `==` on mutable class instances, lists, maps, actors, tasks, and other
+identity handles compares object identity. Scalars compare by value. `Option`,
+`Result`, and `Json` equality details are not all specified yet and must not be
+used as a portability guarantee. No other operator combinations or conversions are permitted.
 Both sides of a short-circuit expression are still statically checked.
 
 ## Conditions, loops and returns
@@ -501,13 +711,16 @@ limit (or the bootstrap host stack limit, if reached sooner).
 `tyvera run file.tyv` checks and interprets the AST.
 
 Current limits: classes, interfaces and the deterministic cooperative actor
-slice are supported, but there is no
+runtime with bounded `one_for_one` supervision are supported, but there is no
 inheritance, generic methods/interfaces/constraints, collection literals,
-`try`/`catch`, actor supervisors/restarts, parallel process scheduling, async runtime,
-networking API, importable standard-library modules, external secret-store
-provider, native interop, garbage collector
-implementation, package manager or Discord SDK. No compiler backend or
-performance claim. No termination checking or loop execution budget; users can
-write infinite loops. Parsing and execution use the host stack, so extremely
-deeply nested source is not supported. The interpreter is replaceable bootstrap
-technology, not part of Tyvera semantics.
+`try`/`catch`, parallel process scheduling, async I/O, networking API,
+importable standard-library modules, external secret-store provider, native
+interop, garbage collector implementation, package manager or compiler
+backend. `await` remains statement-only; synchronous calls are atomic.
+`runActors()` remains non-blocking; `runTasks()` waits for task deadlines.
+Actor request timeouts do not interrupt work. No performance claim is made. No
+termination checking or loop execution budget is provided;
+users can write infinite loops. Parsing and execution use
+the host stack, so extremely deeply nested source is not supported. The
+interpreter is replaceable bootstrap technology, not part of Tyvera semantics.
+

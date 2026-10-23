@@ -16,6 +16,8 @@ class Token:
 
 KEYWORDS = {
     "fn": "FN",
+    "async": "ASYNC",
+    "await": "AWAIT",
     "let": "LET",
     "var": "VAR",
     "if": "IF",

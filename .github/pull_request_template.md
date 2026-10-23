@@ -1,37 +1,29 @@
-## What changed?
+## Summary and motivation
 
+What changed, and what problem or use case does it address?
 
-## Why is this change needed?
+## Impact
 
+- Change type: bug fix / language / runtime / standard library / toolchain / docs / CI / other
+- Language areas and semantics affected (or `none`):
+- Lexer / parser / AST (or `none`):
+- Typechecker (or `none`):
+- Runtime / actors / tasks (or `none`):
+- Standard library / toolchain (or `none`):
+- New or changed syntax; breaking change and migration (or `none`):
+- Security and performance impact (or `none`):
+- Native compiler / backend impact (or `none`):
 
-## Language and architecture impact
-
-- Language semantics affected (or `none`):
-- New or changed syntax (or `none`):
-- Compiler stages affected (lexer, parser, AST, typechecker, interpreter/runtime):
-- Standard library impact (or `none`):
-- Actor/runtime model impact (or `none`):
-- Future native compiler/backend impact (or `none`):
-- Breaking change? If yes, describe migration:
-
-## Tests and documentation
+## Verification
 
 - Tests added or updated:
 - Documentation/specification updated:
-- Local checks run:
-
-## Security and licensing
-
-- Security impact (or `none`):
-- Secrets affected? Describe only the handling; **never include secret values**:
-- This contribution can be distributed under the repository's GPLv3 license.
+- Checks run locally:
 
 ## Checklist
 
-- [ ] Tests added or updated where behavior changed.
-- [ ] Full test suite passes locally.
-- [ ] Documentation and language specification match the implementation.
+- [ ] Tests cover the changed behavior; the full suite passes locally.
+- [ ] Documentation describes only implemented behavior and matches the specification.
 - [ ] No secrets, tokens, or `.tyvera.secrets` file are included.
-- [ ] GPLv3-compatible contribution and existing license notices preserved.
-- [ ] Existing behavior remains compatible, or breaking changes are documented.
-- [ ] New syntax and semantic effects are covered across the affected compiler/runtime stages.
+- [ ] No unintended breaking changes; intentional ones are documented.
+- [ ] The contribution is compatible with GPLv3 and preserves existing notices.

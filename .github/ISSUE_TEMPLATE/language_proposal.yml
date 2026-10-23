@@ -1,68 +1,64 @@
-name: Feature request / language proposal
-description: Propose a library, toolchain, or language change with its semantics made explicit.
-title: "[Proposal]: "
+name: Language Proposal / RFC
+description: Discuss a substantial Tyvera syntax, semantics, type-system, runtime, or compiler design change.
+title: "[RFC]: "
 body:
   - type: markdown
     attributes:
       value: |
-        Ideas are starting points for design review; filing a proposal does not mean it will be accepted as a language feature. **Do not include tokens, credentials, or `.tyvera.secrets` values.**
+        Use this form for a design change with cross-cutting language or architecture consequences. Smaller library, tooling, or documentation ideas can use the Feature Request form. Filing an RFC starts discussion; it does not imply acceptance. **Never post tokens, passwords, credentials, or `.tyvera.secrets` contents.**
   - type: textarea
     id: motivation
     attributes:
       label: Problem and motivation
-      description: What concrete use case or limitation should this address?
+      description: What concrete limitation or use case motivates this proposal?
     validations:
       required: true
   - type: textarea
     id: syntax
     attributes:
-      label: Proposed syntax
-      description: Show a short Tyvera example, if syntax is relevant.
+      label: Proposed syntax and examples
+      description: Show representative Tyvera code, including useful edge cases.
     validations:
-      required: false
+      required: true
   - type: textarea
     id: semantics
     attributes:
       label: Proposed semantics
-      description: Describe typing, evaluation, errors, and edge cases precisely.
+      description: Explain typing, evaluation, errors, scope, and lifecycle behavior as applicable.
     validations:
       required: true
-  - type: textarea
-    id: alternatives
-    attributes:
-      label: Alternatives considered
-    validations:
-      required: false
   - type: textarea
     id: type-system
     attributes:
       label: Type-system impact
-      description: Include inference, compatibility, and diagnostics where relevant.
+      description: Consider inference, constraints, compatibility, and diagnostics.
     validations:
       required: false
   - type: textarea
     id: runtime
     attributes:
-      label: Runtime and toolchain impact
-      description: Consider interpreter, actors, standard library, and future compiler backends.
+      label: Runtime and standard-library impact
+      description: Include effects on actors, tasks, resources, and public APIs where relevant.
+    validations:
+      required: false
+  - type: textarea
+    id: compiler
+    attributes:
+      label: Compiler and backend impact
+      description: Consider the current interpreter and future native backends.
     validations:
       required: false
   - type: textarea
     id: compatibility
     attributes:
-      label: Backward-compatibility impact
+      label: Backward compatibility
+      description: Identify migration needs and whether existing programs change behavior.
     validations:
       required: false
-  - type: dropdown
-    id: influence
+  - type: textarea
+    id: alternatives
     attributes:
-      label: Relevant design direction
-      description: Tyvera combines independent design goals; a proposal may have no direct influence.
-      multiple: true
-      options:
-        - Java-inspired structure and static typing
-        - Elixir-inspired concurrency and fault tolerance
-        - C++-inspired performance and native access
-        - No direct influence
+      label: Alternatives and drawbacks
+      description: Include rejected designs, complexity, costs, or other possible downsides.
     validations:
-      required: false
+      required: true

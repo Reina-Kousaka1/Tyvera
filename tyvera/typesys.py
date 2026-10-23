@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from .ast import (
     ActorDeclaration,
     Assignment,
+    AwaitStatement,
     Binary,
     Block,
     Call,
@@ -41,11 +42,15 @@ from .source import Diagnostic, Location
 from .type_names import make_type, split_type, substitute_type
 
 
-_BUILTIN_TYPES = {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json", "ActorRef"}
+_BUILTIN_TYPES = {
+    "Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result",
+    "Secret", "Json", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup",
+}
 _BUILTIN_FUNCTIONS = {
     "println", "eprintln", "readText", "writeText", "pathJoin", "pathExists",
     "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool",
-    "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors",
+    "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors", "oneForOne",
+    "milliseconds", "seconds", "timerAfter", "sleepFor", "runTasks", "taskGroup",
 }
 _DISPLAYABLE_TYPES = {"Int", "Float", "Bool", "String"}
 _NUMERIC_TYPES = {"Int", "Float"}
@@ -54,7 +59,12 @@ INT_MAX = (1 << 63) - 1
 
 
 def canonical_type(name: str) -> str:
-    return "Void" if name == "Unit" else name
+    if name == "Unit":
+        return "Void"
+    base, arguments = split_type(name)
+    if base == "Task" and not arguments:
+        arguments = ["Void"]
+    return make_type(base, [canonical_type(argument) for argument in arguments])
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +79,7 @@ class Signature:
     return_type: str
     location: Location
     type_parameters: tuple[str, ...] = ()
+    is_async: bool = False
 
 
 @dataclass(slots=True)
@@ -95,7 +106,10 @@ class TypeChecker:
         self.actors: dict[str, ClassInfo] = {}
         self.actor_names: set[str] = set()
         self.type_names: set[str] = set(_BUILTIN_TYPES)
-        self.generic_arities: dict[str, int] = {"List": 1, "Map": 2, "Option": 1, "Result": 2, "Secret": 1, "ActorRef": 1}
+        self.generic_arities: dict[str, int] = {
+            "List": 1, "Map": 2, "Option": 1, "Result": 2, "Secret": 1, "ActorRef": 1,
+            "ReplySender": 1, "ReplyReceiver": 1, "Task": 1,
+        }
         self.active_type_variables: set[str] = set()
 
     def check(self) -> dict[str, Signature]:
@@ -109,6 +123,8 @@ class TypeChecker:
             raise Diagnostic(entry.location, "type", "entry point 'main' must not have parameters")
         if entry.return_type != "Void":
             raise Diagnostic(entry.location, "type", "entry point 'main' must return Void")
+        if entry.is_async:
+            raise Diagnostic(entry.location, "type", "entry point 'main' must be synchronous; start tasks from 'main' and call runTasks()")
         self._check_interface_implementations()
         for function in self.program.functions:
             self._check_function(function, self.signatures[function.name])
@@ -182,8 +198,8 @@ class TypeChecker:
                 fields[member.name] = member
             handlers: dict[str, Signature] = {}
             for method in declaration.handlers:
-                if method.name in {"stop", "isAlive"}:
-                    raise Diagnostic(method.location, "type", f"actor handler name '{method.name}' is reserved by ActorRef lifecycle methods")
+                if method.name in {"stop", "isAlive", "request", "requestWithin", "sendAfter"}:
+                    raise Diagnostic(method.location, "type", f"actor handler name '{method.name}' is reserved by ActorRef methods")
                 if method.name in handlers:
                     raise Diagnostic(method.location, "type", f"actor handler '{method.name}' is already declared")
                 if method.name in fields:
@@ -191,8 +207,16 @@ class TypeChecker:
                 signature = self._method_signature(method)
                 if method.name != "init" and signature.return_type != "Void":
                     raise Diagnostic(method.location, "type", "actor message handlers must return Void")
-                for parameter, parameter_type in zip(method.parameters, signature.parameter_types):
-                    if not self._is_actor_message_type(parameter_type):
+                for index, (parameter, parameter_type) in enumerate(zip(method.parameters, signature.parameter_types)):
+                    base, arguments = split_type(parameter_type)
+                    is_reply_sender = base == "ReplySender" and len(arguments) == 1
+                    if is_reply_sender and (method.name == "init" or index != len(signature.parameter_types) - 1):
+                        raise Diagnostic(parameter.location, "type", "ReplySender<T> is only allowed as the final parameter of an actor message handler")
+                    transferable = (
+                        self._is_actor_handler_message_type(parameter_type)
+                        if method.name != "init" else self._is_actor_message_type(parameter_type)
+                    )
+                    if not transferable:
                         purpose = "actor constructor" if method.name == "init" else "actor message"
                         raise Diagnostic(parameter.location, "type", f"{purpose} cannot carry mutable or process-local value type '{parameter_type}'")
                 handlers[method.name] = signature
@@ -202,7 +226,7 @@ class TypeChecker:
 
     def _is_actor_message_type(self, type_name: str) -> bool:
         base, arguments = split_type(type_name)
-        if base in {"Int", "Float", "Bool", "String"} and not arguments:
+        if base in {"Int", "Float", "Bool", "String", "Duration"} and not arguments:
             return True
         if base == "ActorRef" and len(arguments) == 1:
             actor_base, actor_arguments = split_type(arguments[0])
@@ -212,6 +236,12 @@ class TypeChecker:
         if base == "Result" and len(arguments) == 2:
             return all(self._is_actor_message_type(argument) for argument in arguments)
         return False
+
+    def _is_actor_handler_message_type(self, type_name: str) -> bool:
+        base, arguments = split_type(type_name)
+        if base == "ReplySender" and len(arguments) == 1:
+            return self._is_actor_message_type(arguments[0])
+        return self._is_actor_message_type(type_name)
 
     def _collect_signatures(self) -> None:
         all_names = set(self.classes) | set(self.interfaces) | set(self.actors)
@@ -257,8 +287,9 @@ class TypeChecker:
                 raise Diagnostic(parameter.location, "type", "parameters cannot have type Void")
             parameter_types.append(canonical_type(parameter.type_name))
         self._require_known_type(function.return_type, function.location, known_variables)
+        is_async = bool(getattr(function, "is_async", False))
         return Signature(tuple(parameter_types), canonical_type(function.return_type), function.location,
-                         tuple(declared_parameters))
+                         tuple(declared_parameters), is_async)
 
     def _require_known_type(
         self, type_name: str, location: Location, type_variables: set[str] | None = None,
@@ -277,6 +308,8 @@ class TypeChecker:
         if base in self.actor_names and not allow_actor:
             raise Diagnostic(location, "type", f"actor type '{base}' can only be used inside ActorRef<{base}>")
         expected_arity = self.generic_arities.get(base, 0)
+        if base == "Task" and not arguments:
+            return
         if len(arguments) != expected_arity:
             if expected_arity:
                 raise Diagnostic(location, "type", f"type '{base}' expects {expected_arity} type argument(s), got {len(arguments)}")
@@ -284,7 +317,7 @@ class TypeChecker:
                 raise Diagnostic(location, "type", f"type '{base}' does not accept type arguments")
         for argument in arguments:
             self._require_known_type(argument, location, known_variables, allow_actor=(base == "ActorRef"))
-            if canonical_type(argument) == "Void":
+            if canonical_type(argument) == "Void" and base != "Task":
                 raise Diagnostic(location, "type", "type arguments cannot be Void")
         if base == "ActorRef" and arguments:
             actor_base, actor_arguments = split_type(arguments[0])
@@ -321,7 +354,8 @@ class TypeChecker:
         self.active_type_variables = set(signature.type_parameters)
         variables = ChainMap({p.name: Binding(canonical_type(p.type_name)) for p in function.parameters})
         try:
-            outcomes = self._check_block(function.body, variables, signature.return_type, 0)
+            outcomes = self._check_block(function.body, variables, signature.return_type, 0,
+                                         async_allowed=function.is_async)
             self._require_return_paths(function.name, signature.return_type, outcomes, function.location)
         finally:
             self.active_type_variables = previous
@@ -347,7 +381,7 @@ class TypeChecker:
     def _check_block(
         self, body: list[Statement], variables: ChainMap[str, Binding],
         return_type: str, loop_depth: int, owner: ClassInfo | None = None,
-        method_name: str | None = None,
+        method_name: str | None = None, async_allowed: bool = False,
     ) -> set[str]:
         outcomes = {"next"}
         for statement in body:
@@ -396,19 +430,51 @@ class TypeChecker:
                 value_type = "Void" if statement.value is None else self._expression_type(statement.value, variables, owner)
                 self._require_same_type(return_type, value_type, statement.location)
                 exits = {"return"}
+            elif isinstance(statement, AwaitStatement):
+                if not async_allowed:
+                    raise Diagnostic(statement.location, "type", "'await' is only valid inside an async function")
+                awaited_type = self._expression_type(statement.value, variables, owner)
+                base, arguments = split_type(awaited_type)
+                if base == "Task" and len(arguments) == 1:
+                    result_type = arguments[0]
+                elif base == "ReplyReceiver" and len(arguments) == 1:
+                    result_type = arguments[0]
+                elif base == "TaskGroup" and not arguments:
+                    result_type = "Void"
+                else:
+                    raise Diagnostic(statement.value.location, "type", f"'await' expects Task<T>, TaskGroup, or ReplyReceiver<T>, found {awaited_type}")
+                if statement.binding_name is not None:
+                    name = statement.binding_name
+                    if name in {"self", "secrets", *_BUILTIN_FUNCTIONS}:
+                        raise Diagnostic(statement.location, "type", f"'{name}' is reserved and cannot be bound by await")
+                    if name in variables.maps[0]:
+                        raise Diagnostic(statement.location, "type", f"variable '{name}' is already declared")
+                    if canonical_type(result_type) == "Void":
+                        raise Diagnostic(statement.location, "type", "a Void task cannot initialize a variable")
+                    if statement.annotation is not None:
+                        self._require_known_type(statement.annotation, statement.location)
+                        if canonical_type(statement.annotation) == "Void":
+                            raise Diagnostic(statement.location, "type", "variables cannot have type Void")
+                        self._require_same_type(canonical_type(statement.annotation), result_type, statement.location)
+                        result_type = canonical_type(statement.annotation)
+                    variables[name] = Binding(result_type, statement.mutable)
             elif isinstance(statement, Block):
-                exits = self._check_block(statement.body, variables.new_child(), return_type, loop_depth, owner, method_name)
+                exits = self._check_block(statement.body, variables.new_child(), return_type, loop_depth,
+                                          owner, method_name, async_allowed)
             elif isinstance(statement, IfStatement):
                 self._require_same_type("Bool", self._expression_type(statement.condition, variables, owner), statement.condition.location)
-                then_exits = self._check_block(statement.then_body, variables.new_child(), return_type, loop_depth, owner, method_name)
-                else_exits = self._check_block(statement.else_body, variables.new_child(), return_type, loop_depth, owner, method_name)
+                then_exits = self._check_block(statement.then_body, variables.new_child(), return_type, loop_depth,
+                                               owner, method_name, async_allowed)
+                else_exits = self._check_block(statement.else_body, variables.new_child(), return_type, loop_depth,
+                                               owner, method_name, async_allowed)
                 if isinstance(statement.condition, Literal):
                     exits = then_exits if statement.condition.value else else_exits
                 else:
                     exits = then_exits | else_exits
             elif isinstance(statement, WhileStatement):
                 self._require_same_type("Bool", self._expression_type(statement.condition, variables, owner), statement.condition.location)
-                body_exits = self._check_block(statement.body, variables.new_child(), return_type, loop_depth + 1, owner, method_name)
+                body_exits = self._check_block(statement.body, variables.new_child(), return_type, loop_depth + 1,
+                                               owner, method_name, async_allowed)
                 literal = isinstance(statement.condition, Literal)
                 exits = set()
                 if not literal or statement.condition.value:
@@ -428,7 +494,8 @@ class TypeChecker:
                     raise Diagnostic(statement.iterable.location, "type", f"for-loop value must be a List or Map, found {iterable_type}")
                 loop_variables = variables.new_child()
                 loop_variables[statement.name] = Binding(element_type)
-                body_exits = self._check_block(statement.body, loop_variables, return_type, loop_depth + 1, owner, method_name)
+                body_exits = self._check_block(statement.body, loop_variables, return_type, loop_depth + 1,
+                                               owner, method_name, async_allowed)
                 exits = {"next"} | (body_exits & {"return"})
             elif isinstance(statement, MatchStatement):
                 subject_type = self._expression_type(statement.value, variables, owner)
@@ -457,7 +524,8 @@ class TypeChecker:
                         arm_variables[pattern.name] = Binding(subject_type)
                     elif isinstance(pattern, VariantPattern) and pattern.binding is not None:
                         arm_variables[pattern.binding] = Binding(self._variant_payload_type(pattern, subject_type))
-                    exits |= self._check_block(arm.body, arm_variables, return_type, loop_depth, owner, method_name)
+                    exits |= self._check_block(arm.body, arm_variables, return_type, loop_depth,
+                                               owner, method_name, async_allowed)
                 if not self._match_is_exhaustive(subject_type, coverage, has_catchall):
                     exits.add("next")
             elif isinstance(statement, LoopControl):
@@ -504,11 +572,43 @@ class TypeChecker:
                 self._check_arguments(construction.arguments, argument_types, expected, construction.location,
                                       f"{construction.callee} actor constructor")
                 return f"ActorRef<{construction.callee}>"
-            if expression.callee == "runActors":
+            if expression.callee in {"runActors", "runTasks"}:
+                if owner is not None and isinstance(owner.declaration, ActorDeclaration):
+                    raise Diagnostic(expression.location, "type", "scheduler pumps cannot be called inside actor handlers")
                 if expression.type_arguments or expression.arguments:
-                    raise Diagnostic(expression.location, "type", "'runActors' expects no arguments")
+                    raise Diagnostic(expression.location, "type", f"'{expression.callee}' expects no arguments")
                 return "Result<Int,String>"
+            if expression.callee == "taskGroup":
+                if owner is not None and isinstance(owner.declaration, ActorDeclaration):
+                    raise Diagnostic(expression.location, "type", "task groups cannot be created inside actor handlers")
+                if expression.type_arguments or expression.arguments:
+                    raise Diagnostic(expression.location, "type", "'taskGroup' expects no arguments")
+                return "TaskGroup"
             argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
+            if expression.callee == "oneForOne":
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'oneForOne' does not accept type arguments")
+                self._check_arguments(expression.arguments, argument_types, ("Int", "Int"),
+                                      expression.location, "oneForOne")
+                return "Supervisor"
+            if expression.callee in {"milliseconds", "seconds"}:
+                self._check_arguments(expression.arguments, argument_types, ("Int",),
+                                      expression.location, expression.callee)
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", f"'{expression.callee}' does not accept type arguments")
+                return "Duration"
+            if expression.callee == "timerAfter":
+                self._check_arguments(expression.arguments, argument_types, ("Duration",),
+                                      expression.location, "timerAfter")
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'timerAfter' does not accept type arguments")
+                return "Timer"
+            if expression.callee == "sleepFor":
+                self._check_arguments(expression.arguments, argument_types, ("Duration",),
+                                      expression.location, "sleepFor")
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'sleepFor' does not accept type arguments")
+                return "Task<Void>"
             if expression.callee == "println":
                 if expression.type_arguments:
                     raise Diagnostic(expression.location, "type", "'println' does not accept type arguments")
@@ -596,7 +696,8 @@ class TypeChecker:
                 signature.type_parameters, expression.type_arguments, signature.parameter_types, argument_types,
                 expression.arguments, expression.location, expression.callee,
             )
-            return substitute_type(signature.return_type, substitutions)
+            result_type = substitute_type(signature.return_type, substitutions)
+            return make_type("Task", [result_type]) if signature.is_async else result_type
         if isinstance(expression, MemberAccess):
             field_type, _ = self._member_field(expression, variables, owner)
             return field_type
@@ -604,16 +705,166 @@ class TypeChecker:
             if expression.type_arguments:
                 raise Diagnostic(expression.location, "type", "generic methods are not supported yet")
             receiver_type = self._expression_type(expression.receiver, variables, owner)
-            argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
             if expression.method == "init":
                 raise Diagnostic(expression.location, "type", "constructors can only run when creating an instance")
             receiver_base, receiver_arguments = split_type(receiver_type)
+            if receiver_base == "Supervisor":
+                if receiver_arguments:
+                    raise Diagnostic(expression.location, "type", "Supervisor does not accept type arguments")
+                if expression.method == "start":
+                    if len(expression.arguments) != 1 or not isinstance(expression.arguments[0], Call):
+                        raise Diagnostic(expression.location, "type", "Supervisor.start expects one actor construction, for example supervisor.start(Counter(0))")
+                    construction = expression.arguments[0]
+                    actor = self.actors.get(construction.callee)
+                    if actor is None:
+                        raise Diagnostic(construction.location, "type", f"'{construction.callee}' is not an actor type")
+                    if construction.type_arguments:
+                        raise Diagnostic(construction.location, "type", "actor types do not accept type arguments")
+                    constructor = actor.methods.get("init")
+                    expected = () if constructor is None else constructor.parameter_types
+                    argument_types = [self._expression_type(argument, variables, owner)
+                                      for argument in construction.arguments]
+                    self._check_arguments(construction.arguments, argument_types, expected,
+                                          construction.location, f"{construction.callee} actor constructor")
+                    return f"ActorRef<{construction.callee}>"
+                if expression.method in {"stop", "isAlive"}:
+                    argument_types = [self._expression_type(argument, variables, owner)
+                                      for argument in expression.arguments]
+                    self._check_arguments(expression.arguments, argument_types, (), expression.location,
+                                          f"Supervisor.{expression.method}")
+                    return "Void" if expression.method == "stop" else "Bool"
+                raise Diagnostic(expression.location, "type", f"Supervisor has no method '{expression.method}'")
+            if receiver_base == "ActorRef" and expression.method in {"request", "requestWithin", "sendAfter"}:
+                if len(receiver_arguments) != 1 or receiver_arguments[0] not in self.actors:
+                    raise Diagnostic(expression.location, "type", "invalid actor reference type")
+                scheduled = expression.method == "sendAfter"
+                timed = expression.method in {"requestWithin", "sendAfter"}
+                prefix = 1 if timed else 0
+                minimum = prefix + 1
+                if len(expression.arguments) < minimum:
+                    example = (
+                        "worker.request(get)" if not timed
+                        else "worker.sendAfter(milliseconds(500), tick)" if scheduled
+                        else "worker.requestWithin(milliseconds(500), get)"
+                    )
+                    raise Diagnostic(expression.location, "type", f"ActorRef.{expression.method} expects a handler name and its arguments, for example {example}")
+                if timed:
+                    duration_type = self._expression_type(expression.arguments[0], variables, owner)
+                    self._check_arguments(expression.arguments[:1], [duration_type], ("Duration",),
+                                          expression.location, f"ActorRef.{expression.method}")
+                selector = expression.arguments[prefix]
+                if not isinstance(selector, Name):
+                    raise Diagnostic(selector.location, "type", "actor message handler must be named directly, without a value")
+                actor = self.actors[receiver_arguments[0]]
+                signature = actor.methods.get(selector.identifier)
+                if signature is None or selector.identifier == "init":
+                    raise Diagnostic(selector.location, "type", f"actor '{actor.declaration.name}' has no message handler '{selector.identifier}'")
+                if scheduled:
+                    if signature.parameter_types and split_type(signature.parameter_types[-1])[0] == "ReplySender":
+                        raise Diagnostic(selector.location, "type", "sendAfter cannot schedule a request handler that requires ReplySender<T>")
+                    expected_types = signature.parameter_types
+                else:
+                    if not signature.parameter_types:
+                        raise Diagnostic(selector.location, "type", f"handler '{selector.identifier}' must end with ReplySender<T> to be requested")
+                    reply_base, reply_arguments = split_type(signature.parameter_types[-1])
+                    if reply_base != "ReplySender" or len(reply_arguments) != 1:
+                        raise Diagnostic(selector.location, "type", f"handler '{selector.identifier}' must end with ReplySender<T> to be requested")
+                    expected_types = signature.parameter_types[:-1]
+                supplied_arguments = expression.arguments[prefix + 1:]
+                supplied_types = [self._expression_type(argument, variables, owner) for argument in supplied_arguments]
+                self._check_arguments(supplied_arguments, supplied_types, expected_types,
+                                      expression.location, f"{actor.declaration.name}.{selector.identifier} message")
+                if scheduled:
+                    return "Timer"
+                return make_type("ReplyReceiver", [reply_arguments[0]])
+            argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
             if receiver_base == "Secret" and expression.method == "reveal":
                 if expression.arguments:
                     raise Diagnostic(expression.location, "type", "Secret.reveal() expects no arguments")
                 if len(receiver_arguments) != 1:
                     raise Diagnostic(expression.location, "type", "Secret requires one type argument")
                 return receiver_arguments[0]
+            if receiver_base == "ReplySender" and expression.method == "send":
+                if len(receiver_arguments) != 1:
+                    raise Diagnostic(expression.location, "type", "ReplySender requires one type argument")
+                self._check_arguments(expression.arguments, argument_types, (receiver_arguments[0],),
+                                      expression.location, "ReplySender.send")
+                return "Bool"
+            if receiver_base == "ReplyReceiver":
+                if len(receiver_arguments) != 1:
+                    raise Diagnostic(expression.location, "type", "ReplyReceiver requires one type argument")
+                methods = {
+                    "isReady": ((), "Bool"),
+                    "isCancelled": ((), "Bool"),
+                    "isTimedOut": ((), "Bool"),
+                    "cancel": ((), "Bool"),
+                    "tryReceive": ((), make_type("Result", [make_type("Option", [receiver_arguments[0]]), "String"])),
+                }
+                method_signature = methods.get(expression.method)
+                if method_signature is None:
+                    raise Diagnostic(expression.location, "type", f"ReplyReceiver<{receiver_arguments[0]}> has no method '{expression.method}'")
+                expected_types, result_type = method_signature
+                self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
+                                      f"ReplyReceiver.{expression.method}")
+                return result_type
+            if receiver_base == "Task":
+                if len(receiver_arguments) != 1:
+                    raise Diagnostic(expression.location, "type", "Task requires one type argument")
+                task_value_type = canonical_type(receiver_arguments[0])
+                methods = {
+                    "isDone": ((), "Bool"),
+                    "isCancelled": ((), "Bool"),
+                    "cancel": ((), "Bool"),
+                    "detach": ((), "Bool"),
+                    "withTimeout": (("Duration",), make_type("Task", [task_value_type])),
+                }
+                methods["tryResult"] = (
+                    (), "Result<Bool,String>" if task_value_type == "Void"
+                    else make_type("Result", [make_type("Option", [task_value_type]), "String"]),
+                )
+                method_signature = methods.get(expression.method)
+                if method_signature is None:
+                    raise Diagnostic(expression.location, "type", f"Task has no method '{expression.method}'")
+                expected_types, result_type = method_signature
+                self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
+                                      f"Task.{expression.method}")
+                return result_type
+            if receiver_base == "TaskGroup":
+                if receiver_arguments:
+                    raise Diagnostic(expression.location, "type", "TaskGroup does not accept type arguments")
+                if expression.method == "add":
+                    if len(argument_types) != 1:
+                        raise Diagnostic(expression.location, "type", "TaskGroup.add expects one Task argument")
+                    task_base, task_arguments = split_type(argument_types[0])
+                    if task_base != "Task" or len(task_arguments) != 1:
+                        raise Diagnostic(expression.arguments[0].location, "type", f"TaskGroup.add expects Task<T>, found {argument_types[0]}")
+                    return "Bool"
+                methods = {"isDone": ((), "Bool"), "cancel": ((), "Int")}
+                method_signature = methods.get(expression.method)
+                if method_signature is None:
+                    raise Diagnostic(expression.location, "type", f"TaskGroup has no method '{expression.method}'")
+                expected_types, result_type = method_signature
+                self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
+                                      f"TaskGroup.{expression.method}")
+                return result_type
+            if receiver_base == "Duration" and expression.method == "inMilliseconds":
+                self._check_arguments(expression.arguments, argument_types, (), expression.location,
+                                      "Duration.inMilliseconds")
+                return "Int"
+            if receiver_base == "Timer":
+                methods = {
+                    "isReady": ((), "Bool"),
+                    "isCancelled": ((), "Bool"),
+                    "cancel": ((), "Bool"),
+                    "remaining": ((), "Duration"),
+                }
+                method_signature = methods.get(expression.method)
+                if method_signature is None:
+                    raise Diagnostic(expression.location, "type", f"Timer has no method '{expression.method}'")
+                expected_types, result_type = method_signature
+                self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
+                                      f"Timer.{expression.method}")
+                return result_type
             if receiver_base == "ActorRef":
                 if len(receiver_arguments) != 1 or receiver_arguments[0] not in self.actors:
                     raise Diagnostic(expression.location, "type", "invalid actor reference type")
@@ -629,6 +880,8 @@ class TypeChecker:
                 signature = actor.methods.get(expression.method)
                 if signature is None or expression.method == "init":
                     raise Diagnostic(expression.location, "type", f"actor '{actor.declaration.name}' has no message handler '{expression.method}'")
+                if any(split_type(argument_type)[0] == "ReplySender" for argument_type in argument_types):
+                    raise Diagnostic(expression.location, "type", "ReplySender values cannot be forwarded as ordinary messages; issue a typed request instead")
                 self._check_arguments(expression.arguments, argument_types, signature.parameter_types,
                                       expression.location, f"{actor.declaration.name}.{expression.method} message")
                 return "Void"
@@ -903,6 +1156,11 @@ class TypeChecker:
             return "Bool"
         if operator == "+" and left == right == "String":
             return "String"
+        if left == right == "Duration":
+            if operator in {"+", "-"}:
+                return "Duration"
+            if operator in {"==", "!=", "<", "<=", ">", ">="}:
+                return "Bool"
         if operator in {"+", "-", "*", "/"}:
             if left not in _NUMERIC_TYPES or right not in _NUMERIC_TYPES:
                 raise Diagnostic(expression.location, "type", f"operator '{operator}' expects numeric operands, found {left} and {right}")
@@ -1044,3 +1302,4 @@ class TypeChecker:
                 if missing:
                     name = sorted(missing)[0]
                     raise Diagnostic(constructor.location, "type", f"constructor does not initialize field '{name}' on all paths")
+

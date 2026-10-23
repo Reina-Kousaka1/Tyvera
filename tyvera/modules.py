@@ -6,6 +6,7 @@ from pathlib import Path
 from .ast import (
     ActorDeclaration,
     Assignment,
+    AwaitStatement,
     Binary,
     Block,
     Call,
@@ -113,7 +114,7 @@ class ModuleLoader:
 
     @staticmethod
     def _declarations(module: _Module) -> dict[str, tuple[str, object]]:
-        builtin_functions = {"println", "eprintln", "readText", "writeText", "pathJoin", "pathExists", "spawn", "runActors"}
+        builtin_functions = {"println", "eprintln", "readText", "writeText", "pathJoin", "pathExists", "spawn", "runActors", "runTasks", "sleepFor", "taskGroup", "oneForOne", "milliseconds", "seconds", "timerAfter"}
         declarations: dict[str, tuple[str, object]] = {}
         all_declarations = [
             *(('function', declaration) for declaration in module.program.functions),
@@ -122,7 +123,7 @@ class ModuleLoader:
             *(('actor', declaration) for declaration in module.program.actors),
         ]
         for kind, declaration in all_declarations:
-            if declaration.name in {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json", "ActorRef"}:
+            if declaration.name in {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup"}:
                 raise Diagnostic(declaration.location, "type", f"type name '{declaration.name}' is reserved")
             if declaration.name == "secrets":
                 raise Diagnostic(declaration.location, "type", "'secrets' is a reserved namespace")
@@ -154,7 +155,7 @@ class ModuleLoader:
             for declaration in module.program.imports:
                 path = (module.path.parent / declaration.path).resolve()
                 imported = self.modules[path]
-                if declaration.alias in {"secrets", "println", "eprintln", "readText", "writeText", "pathJoin", "pathExists", "spawn", "runActors"}:
+                if declaration.alias in {"secrets", "println", "eprintln", "readText", "writeText", "pathJoin", "pathExists", "spawn", "runActors", "runTasks", "sleepFor", "taskGroup", "oneForOne", "milliseconds", "seconds", "timerAfter", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup"}:
                     raise Diagnostic(declaration.location, "module", f"'{declaration.alias}' is a reserved name")
                 if declaration.alias in imports:
                     raise Diagnostic(declaration.location, "module", f"import alias '{declaration.alias}' is already declared")
@@ -287,6 +288,12 @@ class ModuleLoader:
                     self._rewrite_block(arm.body, module, local, imports, known)
             elif isinstance(statement, ReturnStatement) and statement.value is not None:
                 statement.value = self._rewrite_expression(statement.value, module, local, imports, known)
+            elif isinstance(statement, AwaitStatement):
+                statement.value = self._rewrite_expression(statement.value, module, local, imports, known)
+                if statement.annotation is not None:
+                    statement.annotation = self._resolve_type(
+                        statement.annotation, module, local, imports, known, statement.location,
+                    )
             elif isinstance(statement, ExpressionStatement):
                 statement.expression = self._rewrite_expression(statement.expression, module, local, imports, known)
 
@@ -331,6 +338,9 @@ class ModuleLoader:
             for statement in body:
                 if isinstance(statement, LetStatement) and statement.name in aliases:
                     raise Diagnostic(statement.location, "module", f"'{statement.name}' is reserved as an import alias in this module")
+                if isinstance(statement, AwaitStatement) and statement.binding_name in aliases:
+                    name = statement.binding_name
+                    raise Diagnostic(statement.location, "module", f"'{name}' is reserved as an import alias in this module")
                 if isinstance(statement, ForStatement) and statement.name in aliases:
                     raise Diagnostic(statement.location, "module", f"'{statement.name}' is reserved as an import alias in this module")
                 if isinstance(statement, MatchStatement):

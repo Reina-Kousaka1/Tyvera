@@ -6,11 +6,30 @@ Tyvera is an independent, statically typed programming language with a design di
 
 ## Core language bootstrap
 
-The repository contains a working bootstrap toolchain: a lexer, parser and AST, static type checker, source-located diagnostics, and interpreter. It uses Python only as the current implementation host; Tyvera syntax and semantics are defined separately.
+The repository contains a working bootstrap toolchain: a lexer, parser and AST,
+static type checker, source-located diagnostics, and interpreter. Python is the
+bootstrap host and current reference implementation for Tyvera semantics; it
+is not part of the long-term language contract. The present toolchain requires
+Python 3.10 or newer. Native executables that run without Python remain a
+planned goal, and no native backend exists yet.
 
-Supported and tested: `Int`, `Float`, `Bool`, `String`, `Void`; generic functions/classes; typed `List<T>` and `Map<K,V>`; `Option<T>`/`Result<T,E>` and statement-level pattern matching; `for` iteration; checked text-file I/O and path helpers; local/environment-backed `Secret<String>` access with explicit reveal; typed JSON parsing, access and encoding; checked returns and lexical scopes; `let`/`var`; arithmetic, comparisons, `if`/`else`, and `while` with `break`/`continue`. Classes support constructors, fields, `self`, methods and checked initialization. Interfaces support exact contracts, multiple implementation and dynamic dispatch. Multi-file projects support explicit relative imports and `pub` exports. A deterministic cooperative actor runtime supports typed messages, isolated actor state, mailboxes and crash reporting. `Unit`, `and`, and `or` remain compatibility spellings.
+The implemented language includes `Int`, `Float`, `Bool`, `String`, `Void`,
+generic functions and classes, typed `List<T>` and `Map<K,V>`, `Option<T>` and
+`Result<T,E>`, statement-level pattern matching, `for`, checked text I/O and
+path helpers, secrets, typed JSON, checked returns, lexical scopes, arithmetic,
+comparisons, conditionals, and loops. Classes, interfaces, and multi-file
+projects support checked initialization, dynamic dispatch, relative imports,
+and `pub` exports.
 
-Requirements: Python 3.10 or newer. The toolchain has no third-party runtime dependencies.
+The deterministic actor runtime supports typed messages, isolated state, FIFO
+mailboxes, crash isolation, bounded `one_for_one` supervision, request/reply,
+cancellation, and delayed delivery. The cooperative task runtime supports
+`async fn`, typed `await`, `TaskGroup`, child detachment, timeouts, cancellation
+and explicit joins. Runtime shutdown, detached task failures, and fairness for
+tasks waiting on actor replies are specified and tested. `Unit`, `and`, and
+`or` remain compatibility spellings.
+
+Bootstrap requirements: Python 3.10 or newer. The toolchain has no third-party runtime dependencies.
 
 Tyvera is licensed under **GNU GPLv3**; see [LICENSE](LICENSE).
 
@@ -66,6 +85,12 @@ tyvera check examples/json.tyv
 tyvera run examples/json.tyv
 tyvera check examples/actors.tyv
 tyvera run examples/actors.tyv
+tyvera check examples/supervision.tyv
+tyvera run examples/supervision.tyv
+tyvera check examples/runtime_foundations.tyv
+tyvera run examples/runtime_foundations.tyv
+tyvera check examples/async_tasks.tyv
+tyvera run examples/async_tasks.tyv
 ```
 
 Run the test suite from the repository root:
@@ -74,18 +99,33 @@ Run the test suite from the repository root:
 python -m unittest discover -v
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the local quality checks and pull
-request workflow. Bug reports and language proposals use the repository's
-[issue forms](.github/ISSUE_TEMPLATE); vulnerability reports follow the
-[security policy](SECURITY.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local checks and the pull-request
+workflow. The [issue chooser](https://github.com/Reina-Kousaka1/Tyvera/issues/new/choose)
+routes bug, feature, language-proposal, documentation, and development-question
+reports. Also see the [support guide](SUPPORT.md), [Code of Conduct](CODE_OF_CONDUCT.md),
+[security policy](SECURITY.md), and [changelog](CHANGELOG.md).
 
-The detailed supported grammar and type rules are in [the language reference](docs/language.md). Current and planned library APIs are in [the standard library reference](docs/standard-library.md). CLI commands are listed in [the CLI reference](docs/cli.md). The staged toolchain and recorded architecture decisions are in [the architecture note](docs/architecture.md). Planned stages toward a general-purpose bot runtime are in [the roadmap](docs/roadmap.md).
+The detailed grammar and type rules are in the [language reference](docs/language.md).
+Current and planned library APIs are in the [standard library reference](docs/standard-library.md).
+CLI commands are listed in the [CLI reference](docs/cli.md). Architecture decisions
+are in the [architecture note](docs/architecture.md), and planned stages are in
+the [roadmap](docs/roadmap.md).
+
+The implemented scheduler lifecycle is specified in [Runtime semantics](docs/runtime.md).
+The proposed value and resource rules are in the [Memory Model](docs/memory-model.md).
+The backend boundary, runtime contract, target plan, and native compiler options
+are in [Backend Architecture](docs/backend-architecture.md).
 
 ## Direction
 
 The object-system slice, multi-file modules, generics, collections, optional
 and result values, pattern matching, text I/O, local/environment-backed
-secrets, typed JSON and the cooperative actor runtime are implemented. True
-parallel scheduling, supervision, async/network I/O, external secret stores
-and native backends remain planned and are not represented as working features. See the
-[roadmap](docs/roadmap.md) for sequence and scope.
+secrets, typed JSON, deterministic actor supervision, one-shot actor replies,
+and a cooperative task scheduler with nested `await`, scoped cancellation,
+implicit child joining, owner-local task groups, explicit child detachment,
+and task deadlines are implemented. True parallel execution, async/network
+I/O, separate standard-library modules, external secret stores, and native
+backends remain planned. See the [roadmap](docs/roadmap.md) for sequence and
+scope, and [release/versioning notes](docs/release-process.md) for the
+pre-1.0 release approach.
+

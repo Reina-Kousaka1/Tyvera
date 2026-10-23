@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest a general improvement that does not require a language-design RFC.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For substantial changes to syntax, semantics, the type system, runtime model, or compiler architecture, use the Language Proposal / RFC form. A request is design input, not a commitment to implement it. **Never post tokens, passwords, credentials, or `.tyvera.secrets` contents.**
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What limitation or need should this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed improvement
+      description: Describe the behavior or outcome you would like.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: textarea
+    id: impact
+    attributes:
+      label: Areas affected
+      description: Mention language, runtime, standard library, toolchain, or documentation if known.
+    validations:
+      required: false

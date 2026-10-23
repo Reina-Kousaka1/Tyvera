@@ -1,0 +1,16 @@
+async fn calculate() -> Int {
+    await sleepFor(milliseconds(2))
+    return 42
+}
+
+fn main() {
+    let timed = calculate().withTimeout(milliseconds(20))
+    runTasks()
+    match timed.tryResult() {
+        Ok(value) => match value {
+            Some(answer) => println(answer)
+            None => println("still pending")
+        }
+        Err(reason) => println(reason)
+    }
+}
