@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import math
 import sys
-from collections import ChainMap
-from dataclasses import dataclass
+from collections import ChainMap, deque
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import TextIO
 
 from .ast import (
+    ActorDeclaration,
     Assignment,
     Binary,
     Block,
@@ -43,6 +44,8 @@ from .typesys import INT_MAX, INT_MIN
 
 
 _MISSING = object()
+_MAX_ACTOR_MAILBOX = 100_000
+_MAX_ACTOR_DELIVERIES = 100_000
 
 
 @dataclass(slots=True)
@@ -59,6 +62,30 @@ class _LoopSignal(Exception):
 class _TyveraInstance:
     class_name: str
     fields: dict[str, object]
+    actor: _TyveraActor | None = None
+
+
+@dataclass(slots=True)
+class _ActorMessage:
+    method: str
+    arguments: list[object]
+    location: Location
+
+
+@dataclass(slots=True, eq=False)
+class _TyveraActor:
+    instance: _TyveraInstance
+    status: str = "alive"
+    mailbox: deque[_ActorMessage] = dataclass_field(default_factory=deque)
+    queued: bool = False
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraActorRef:
+    actor: _TyveraActor
+
+    def __repr__(self) -> str:
+        return "<ActorRef>"
 
 
 @dataclass(slots=True, eq=False)
@@ -101,6 +128,9 @@ class Interpreter:
     ) -> None:
         self.functions = {function.name: function for function in program.functions}
         self.classes: dict[str, ClassDeclaration] = {declaration.name: declaration for declaration in program.classes}
+        self.actors: dict[str, ActorDeclaration] = {declaration.name: declaration for declaration in program.actors}
+        self._ready_actors: deque[_TyveraActor] = deque()
+        self._current_actor: _TyveraActor | None = None
         self.output = output
         self.error_output = error_output if error_output is not None else sys.stderr
         self.max_call_depth = max_call_depth
@@ -200,6 +230,15 @@ class Interpreter:
         if isinstance(expression, Name):
             return variables[expression.identifier]
         if isinstance(expression, Call):
+            if expression.callee == "spawn":
+                construction = expression.arguments[0]
+                if not isinstance(construction, Call):
+                    raise AssertionError("checked spawn expression is not an actor construction")
+                declaration = self.actors[construction.callee]
+                arguments = [self._evaluate(argument, variables, depth) for argument in construction.arguments]
+                return self._spawn_actor(declaration, arguments, expression.location, depth + 1)
+            if expression.callee == "runActors":
+                return self._run_actors(expression.location, depth)
             arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
             if expression.callee == "println":
                 self.output.write(self._display(arguments[0]) + "\n")
@@ -286,6 +325,16 @@ class Interpreter:
         if isinstance(expression, MemberCall):
             receiver = self._evaluate(expression.receiver, variables, depth)
             arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+            if isinstance(receiver, _TyveraActorRef):
+                actor = receiver.actor
+                if expression.method == "isAlive":
+                    return actor.status == "alive"
+                if expression.method == "stop":
+                    actor.status = "stopped"
+                    actor.mailbox.clear()
+                    return None
+                self._enqueue_actor_message(actor, expression.method, arguments, expression.location)
+                return None
             if isinstance(receiver, _TyveraSecret) and expression.method == "reveal":
                 return receiver.value
             if isinstance(receiver, _TyveraJson):
@@ -296,6 +345,9 @@ class Interpreter:
                 return self._call_map_method(receiver, expression.method, arguments, expression.location)
             if not isinstance(receiver, _TyveraInstance):
                 raise AssertionError("checked method receiver is not an instance")
+            if receiver.actor is not None:
+                self._enqueue_actor_message(receiver.actor, expression.method, arguments, expression.location)
+                return None
             declaration = self.classes[receiver.class_name]
             method = next(method for method in declaration.methods if method.name == expression.method)
             return self._call_method(method, receiver, arguments, expression.location, depth + 1)
@@ -538,6 +590,76 @@ class Interpreter:
         if constructor is not None:
             self._call_method(constructor, instance, arguments, call_location, depth)
         return instance
+
+    def _spawn_actor(
+        self, declaration: ActorDeclaration, arguments: list[object], call_location: Location, depth: int,
+    ) -> _TyveraActorRef:
+        instance = _TyveraInstance(declaration.name, {})
+        actor = _TyveraActor(instance)
+        instance.actor = actor
+        constructor = next((method for method in declaration.handlers if method.name == "init"), None)
+        if constructor is not None:
+            try:
+                self._call_method(constructor, instance, arguments, call_location, depth)
+            except Diagnostic:
+                actor.status = "crashed"
+                actor.mailbox.clear()
+                raise
+        return _TyveraActorRef(actor)
+
+    def _enqueue_actor_message(
+        self, actor: _TyveraActor, method: str, arguments: list[object], location: Location,
+    ) -> None:
+        if actor.status != "alive":
+            raise Diagnostic(location, "runtime", f"cannot send a message to a {actor.status} actor")
+        if len(actor.mailbox) >= _MAX_ACTOR_MAILBOX:
+            raise Diagnostic(location, "runtime", f"actor mailbox capacity ({_MAX_ACTOR_MAILBOX}) exceeded")
+        actor.mailbox.append(_ActorMessage(method, arguments, location))
+        if not actor.queued:
+            actor.queued = True
+            self._ready_actors.append(actor)
+
+    def _run_actors(self, location: Location, depth: int) -> _TyveraVariant:
+        if self._current_actor is not None:
+            raise Diagnostic(location, "runtime", "runActors cannot be called from an actor message handler")
+        processed = 0
+        first_crash: str | None = None
+        while self._ready_actors and processed < _MAX_ACTOR_DELIVERIES:
+            actor = self._ready_actors.popleft()
+            actor.queued = False
+            if actor.status != "alive" or not actor.mailbox:
+                continue
+            message = actor.mailbox.popleft()
+            processed += 1
+            declaration = self.actors[actor.instance.class_name]
+            method = next(handler for handler in declaration.handlers if handler.name == message.method)
+            self._current_actor = actor
+            try:
+                self._call_method(method, actor.instance, message.arguments, message.location, depth + 1)
+            except Diagnostic as error:
+                actor.status = "crashed"
+                actor.mailbox.clear()
+                if first_crash is None:
+                    first_crash = (
+                        f"actor '{declaration.name}' crashed at {error.location.filename}:"
+                        f"{error.location.line}:{error.location.column}: {error.message}"
+                    )
+            except _LoopSignal as signal:
+                actor.status = "crashed"
+                actor.mailbox.clear()
+                if first_crash is None:
+                    first_crash = f"actor '{declaration.name}' crashed: '{signal.kind}' escaped its loop"
+            finally:
+                self._current_actor = None
+            if actor.status == "alive" and actor.mailbox and not actor.queued:
+                actor.queued = True
+                self._ready_actors.append(actor)
+        if self._ready_actors and processed >= _MAX_ACTOR_DELIVERIES:
+            if first_crash is None:
+                first_crash = f"actor scheduler reached the {_MAX_ACTOR_DELIVERIES}-message safety limit; messages remain queued"
+        if first_crash is not None:
+            return _TyveraVariant("Err", first_crash)
+        return _TyveraVariant("Ok", processed)
 
     def _call_method(
         self, method: Method, receiver: _TyveraInstance, arguments: list[object],

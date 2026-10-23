@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .ast import (
+    ActorDeclaration,
     Assignment,
     Binary,
     Block,
@@ -40,7 +41,7 @@ class _Module:
 
     @property
     def location(self) -> Location:
-        declarations = [*self.program.functions, *self.program.classes, *self.program.interfaces]
+        declarations = [*self.program.functions, *self.program.classes, *self.program.interfaces, *self.program.actors]
         return declarations[0].location if declarations else Location(str(self.path), 1, 1)
 
 
@@ -112,20 +113,23 @@ class ModuleLoader:
 
     @staticmethod
     def _declarations(module: _Module) -> dict[str, tuple[str, object]]:
-        builtin_functions = {"println", "eprintln", "readText", "writeText", "pathJoin", "pathExists"}
+        builtin_functions = {"println", "eprintln", "readText", "writeText", "pathJoin", "pathExists", "spawn", "runActors"}
         declarations: dict[str, tuple[str, object]] = {}
         all_declarations = [
             *(('function', declaration) for declaration in module.program.functions),
             *(('class', declaration) for declaration in module.program.classes),
             *(('interface', declaration) for declaration in module.program.interfaces),
+            *(('actor', declaration) for declaration in module.program.actors),
         ]
         for kind, declaration in all_declarations:
-            if declaration.name in {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json"}:
+            if declaration.name in {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json", "ActorRef"}:
                 raise Diagnostic(declaration.location, "type", f"type name '{declaration.name}' is reserved")
             if declaration.name == "secrets":
                 raise Diagnostic(declaration.location, "type", "'secrets' is a reserved namespace")
             if kind == "function" and declaration.name in builtin_functions:
                 raise Diagnostic(declaration.location, "type", f"'{declaration.name}' is a built-in function name")
+            if kind == "actor" and declaration.name in builtin_functions:
+                raise Diagnostic(declaration.location, "type", f"'{declaration.name}' is reserved for a built-in function")
             if declaration.name in declarations:
                 raise Diagnostic(declaration.location, "module", f"symbol '{declaration.name}' is declared more than once in module '{module.name}'")
             declarations[declaration.name] = (kind, declaration)
@@ -150,7 +154,7 @@ class ModuleLoader:
             for declaration in module.program.imports:
                 path = (module.path.parent / declaration.path).resolve()
                 imported = self.modules[path]
-                if declaration.alias in {"secrets", "println", "eprintln", "readText", "writeText", "pathJoin", "pathExists"}:
+                if declaration.alias in {"secrets", "println", "eprintln", "readText", "writeText", "pathJoin", "pathExists", "spawn", "runActors"}:
                     raise Diagnostic(declaration.location, "module", f"'{declaration.alias}' is a reserved name")
                 if declaration.alias in imports:
                     raise Diagnostic(declaration.location, "module", f"import alias '{declaration.alias}' is already declared")
@@ -163,6 +167,7 @@ class ModuleLoader:
         functions: list[Function] = []
         classes: list[ClassDeclaration] = []
         interfaces: list[InterfaceDeclaration] = []
+        actors: list[ActorDeclaration] = []
         for module in self.modules.values():
             local = local_names[module.path]
             imports = imported_modules[module.path]
@@ -179,8 +184,12 @@ class ModuleLoader:
                 self._rewrite_interface(interface_decl, module, local, imports, known)
                 interface_decl.name = local[interface_decl.name]
                 interfaces.append(interface_decl)
+            for actor_decl in module.program.actors:
+                self._rewrite_actor(actor_decl, module, local, imports, known)
+                actor_decl.name = local[actor_decl.name]
+                actors.append(actor_decl)
 
-        return Program(functions, classes, interfaces)
+        return Program(functions, classes, interfaces, [], actors)
 
     def _resolve_imported(
         self, qualifier: str, symbol: str, module: _Module, imports: dict[str, _Module],
@@ -207,11 +216,11 @@ class ModuleLoader:
         if "." in base:
             qualifier, symbol = base.split(".", 1)
             if qualifier in imports:
-                base = self._resolve_imported(qualifier, symbol, module, imports, location, {"class", "interface"})
+                base = self._resolve_imported(qualifier, symbol, module, imports, location, {"class", "interface", "actor"})
             return make_type(base, [self._resolve_type(argument, module, local, imports, known, location)
                                    for argument in arguments])
         target = known.get(base)
-        if target is not None and target[0] in {"class", "interface"}:
+        if target is not None and target[0] in {"class", "interface", "actor"}:
             base = local[base]
         return make_type(base, [self._resolve_type(argument, module, local, imports, known, location)
                                 for argument in arguments])
@@ -240,6 +249,15 @@ class ModuleLoader:
             for parameter in method.parameters:
                 parameter.type_name = self._resolve_type(parameter.type_name, module, local, imports, known, parameter.location)
             method.return_type = self._resolve_type(method.return_type, module, local, imports, known, method.location)
+
+    def _rewrite_actor(self, declaration, module, local, imports, known) -> None:
+        for field in declaration.fields:
+            field.type_name = self._resolve_type(field.type_name, module, local, imports, known, field.location)
+        for handler in declaration.handlers:
+            for parameter in handler.parameters:
+                parameter.type_name = self._resolve_type(parameter.type_name, module, local, imports, known, parameter.location)
+            handler.return_type = self._resolve_type(handler.return_type, module, local, imports, known, handler.location)
+            self._rewrite_block(handler.body, module, local, imports, known)
 
     def _rewrite_block(self, body: list[Statement], module, local, imports, known) -> None:
         for statement in body:
@@ -285,7 +303,7 @@ class ModuleLoader:
         if isinstance(expression, MemberCall):
             if isinstance(expression.receiver, Name) and expression.receiver.identifier in imports:
                 callee = self._resolve_imported(expression.receiver.identifier, expression.method, module, imports,
-                                                expression.location, {"function", "class", "interface"})
+                                                expression.location, {"function", "class", "interface", "actor"})
                 return Call(callee, [self._rewrite_expression(arg, module, local, imports, known)
                                      for arg in expression.arguments], expression.location,
                             [self._resolve_type(argument, module, local, imports, known, expression.location)
@@ -339,7 +357,7 @@ class ModuleLoader:
                 if parameter.name in aliases:
                     raise Diagnostic(parameter.location, "module", f"'{parameter.name}' is reserved as an import alias in this module")
             block(function.body)
-        for declaration in module.program.classes:
+        for declaration in [*module.program.classes, *module.program.actors]:
             for method in declaration.methods:
                 for parameter in method.parameters:
                     if parameter.name in aliases:

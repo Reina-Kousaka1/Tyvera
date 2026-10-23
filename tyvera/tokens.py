@@ -32,6 +32,8 @@ KEYWORDS = {
     "and": "AND",
     "or": "OR",
     "class": "CLASS",
+    "actor": "ACTOR",
+    "on": "ON",
     "interface": "INTERFACE",
     "implements": "IMPLEMENTS",
     "import": "IMPORT",

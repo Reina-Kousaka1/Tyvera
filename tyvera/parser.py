@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .ast import (
     Assignment,
+    ActorDeclaration,
     Binary,
     BindingPattern,
     Block,
@@ -79,6 +80,7 @@ class Parser:
         classes: list[ClassDeclaration] = []
         interfaces: list[InterfaceDeclaration] = []
         imports: list[ImportDeclaration] = []
+        actors: list[ActorDeclaration] = []
         self._skip_separators()
         while not self._check("EOF"):
             public = self._match("PUB")
@@ -92,8 +94,10 @@ class Parser:
                 classes.append(self._class_declaration(public))
             elif self._check("INTERFACE"):
                 interfaces.append(self._interface_declaration(public))
+            elif self._check("ACTOR"):
+                actors.append(self._actor_declaration(public))
             else:
-                self._error(self._current(), "expected an import or function, class, or interface declaration")
+                self._error(self._current(), "expected an import or function, class, interface, or actor declaration")
             if not self._check_any("NEWLINE", "SEMICOLON", "EOF"):
                 self._error(self._current(), "expected a line break after the declaration")
             self._skip_separators()
@@ -102,7 +106,7 @@ class Parser:
             if declaration.alias in aliases:
                 raise Diagnostic(declaration.location, "module", f"import alias '{declaration.alias}' is already declared")
             aliases.add(declaration.alias)
-        return Program(functions, classes, interfaces, imports)
+        return Program(functions, classes, interfaces, imports, actors)
 
     def _import(self) -> ImportDeclaration:
         token = self._expect("IMPORT", "expected 'import'")
@@ -225,6 +229,39 @@ class Parser:
             self._skip_separators()
         self._expect("RBRACE", "expected '}' to close interface body")
         return InterfaceDeclaration(name.lexeme, methods, interface_token.location, public)
+
+    def _actor_declaration(self, public: bool = False) -> ActorDeclaration:
+        actor_token = self._expect("ACTOR", "expected 'actor'")
+        name = self._expect("IDENTIFIER", "expected an actor name after 'actor'")
+        self._expect("LBRACE", "expected '{' after actor name")
+        fields: list[Field] = []
+        handlers: list[Method] = []
+        self._skip_separators()
+        while not self._check_any("RBRACE", "EOF"):
+            if self._match("LET", "VAR"):
+                declaration = self._previous()
+                field_name = self._expect("IDENTIFIER", "expected an actor state field name")
+                self._expect("COLON", "expected ':' after actor state field name")
+                field_type = self._type_name("expected an actor state type after ':'")
+                fields.append(Field(field_name.lexeme, field_type, declaration.kind == "VAR", declaration.location))
+            elif self._check("IDENTIFIER") and self._current().lexeme == "init":
+                method_token = self._advance()
+                method_name, parameters, return_type = self._function_header(method_token)
+                handlers.append(Method(method_name, parameters, return_type, self._block(), method_token.location))
+            elif self._match("ON"):
+                method_token = self._previous()
+                handler_name = self._expect("IDENTIFIER", "expected a message name after 'on'")
+                if handler_name.lexeme == "init":
+                    self._error(handler_name, "'init' is the actor constructor and cannot be declared as a message handler")
+                _, parameters, return_type = self._function_header(handler_name)
+                handlers.append(Method(handler_name.lexeme, parameters, return_type, self._block(), method_token.location))
+            else:
+                self._error(self._current(), "expected an actor state field, 'init' constructor, or 'on' message handler")
+            if not self._check_any("NEWLINE", "SEMICOLON", "RBRACE", "EOF"):
+                self._error(self._current(), "expected a line break or ';' after actor member")
+            self._skip_separators()
+        self._expect("RBRACE", "expected '}' to close actor body")
+        return ActorDeclaration(name.lexeme, fields, handlers, actor_token.location, public)
 
     def _block(self) -> list[Statement]:
         self._expect("LBRACE", "expected '{' to start the block")

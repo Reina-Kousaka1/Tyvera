@@ -9,7 +9,8 @@ A source file passes through four explicit stages:
 3. `typesys.py` collects and validates declarations, expressions, calls,
    constructors, interface contracts and the entry point before execution.
 4. `interpreter.py` evaluates only a successfully checked AST, including
-   Tyvera-owned object instances and method dispatch.
+   Tyvera-owned object instances, actor references, mailbox scheduling and
+   method dispatch.
 
 `source.py` owns shared file/line/column locations and user-facing diagnostics.
 `modules.py` resolves relative imports, checks visibility and links source
@@ -66,6 +67,15 @@ and `--version`. The implementation uses Python's standard library only.
   literal and variant pattern types, arm scopes, duplicate coverage, and
   exhaustiveness for `Bool`, `Option` and `Result`. These ordinary error values
   remain separate from runtime diagnostics and future actor crashes.
+- Actor declarations have a checked message protocol and private state. The
+  bootstrap scheduler owns FIFO mailboxes and schedules one message per actor
+  per round. It is cooperative and deterministic, not parallel. Messages are
+  restricted to transferable immutable primitives, nested `Option`/`Result`
+  values, and actor references; ordinary mutable objects cannot be shared.
+  Handler diagnostics crash only their actor, clear its mailbox, and are
+  reported with source location by `runActors()` as `Result<Int,String>` while
+  other actors continue. Mailboxes and each scheduler drain have a 100,000
+  message limit; a nonterminating handler can still block the cooperative loop.
 - JSON uses a Tyvera-owned opaque `Json` value and checked constructors,
   accessors and `Result`-returning parse/encode intrinsics. The bootstrap uses
   Python's standard JSON codec internally, but rejects duplicate keys,
@@ -95,10 +105,12 @@ Each module is parsed separately and its references are resolved to stable
 module-qualified names before the existing semantic checker sees the linked
 program. Imports are relative `.tyv` files, aliases are explicit, `pub` is
 required for cross-module access, and paths cannot escape the project root.
-The manifest currently has only `name` and `entry`; dependencies are not yet
-supported. Calls still execute synchronously in one process. `try`/`catch`,
-actors, supervisors, async I/O, JSON and external secret stores are not
-implemented. These boundaries are reflected in the
+Actors participate in that linker and can be exported and imported. The
+manifest currently has only `name` and `entry`; dependencies are not yet
+supported. Ordinary functions and I/O execute synchronously; actor handlers
+run only when the cooperative scheduler is explicitly pumped. `try`/`catch`,
+supervisors, parallel scheduling, async I/O, HTTP, WebSockets and external
+secret stores are not implemented. These boundaries are reflected in the
 [language reference](language.md) and [roadmap](roadmap.md).
 
 ## Native backend direction

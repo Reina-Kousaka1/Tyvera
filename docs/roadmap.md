@@ -12,7 +12,7 @@ Roadmap items below are plans unless marked implemented.
 | 2. Object system | First slice implemented | Classes, fields, `self`, constructors, methods, interfaces, multiple interface implementation, interface dispatch, generic classes and generic functions. Generic methods/interfaces/constraints and inheritance remain open. |
 | 3. Modules | First slice implemented | Relative `.tyv` imports, aliases, `pub` exports, module graph linking, visibility/missing/duplicate diagnostics, cycle detection and project-root containment. Local package dependencies are still planned. |
 | 4. Standard library | Core slice implemented | Generic collections, `for`, `Option<T>`, `Result<T,E>`, core matching, text I/O/path helpers, local/environment secret providers and typed JSON parse/access/encode. Separate stdlib modules, timers and networking remain planned. |
-| 5. Actor runtime | Planned | Isolated process state, typed messages, mailboxes, sequenced message handling and lifecycle, with deterministic runtime tests. |
+| 5. Actor runtime | First slice implemented | Actor declarations, typed immutable message transfer, isolated state, FIFO mailboxes, deterministic round-robin cooperative scheduling, stop/alive lifecycle, and isolated crash reporting. True parallel scheduling, replies, cancellation, configurable capacity and backpressure remain open. |
 | 6. Supervisors | Planned | Child lifecycle, crash detection, restart and an initial `one_for_one` policy, separate from ordinary recoverable errors. |
 | 7. Networking | Planned | Async runtime abstraction, timers, HTTP and WebSocket client support, and event dispatch without Promise-specific language semantics. |
 | 8. Native backend | Planned | Separate compiler backend, documented value/resource model, efficient value types and a narrow typed FFI. No unsafe native surface before its ownership and ABI rules are testable. |
@@ -21,12 +21,13 @@ Roadmap items below are plans unless marked implemented.
 
 ## Near-term sequence
 
-1. Move or wrap collection, I/O, JSON and secret operations behind normal
-   `tyvera.*` modules, then define typed message and actor lifecycle semantics
-   before implementing concurrency.
-2. Add deterministic actor/mailbox tests, then supervisors; only after those
-   lifecycle and failure rules stabilize should async I/O and networking begin.
-3. Keep backend work independent from the Python interpreter. Establish
+1. Add an actor supervisor with deterministic `one_for_one` restarts and
+   restart limits, preserving the current explicit cooperative scheduling.
+2. Define reply channels and cancellation on top of typed messages, then
+   introduce timer-backed async tasks before HTTP/WebSocket support.
+3. Move or wrap collection, I/O, JSON and secret operations behind normal
+   `tyvera.*` modules as that library module model stabilizes.
+4. Keep backend work independent from the Python interpreter. Establish
    language-level conformance programs before implementing native codegen.
 
 ## Native and C++-inspired direction
@@ -43,8 +44,8 @@ Tyvera errors.
 ## Current Discord-readiness gap
 
 The object system, relative file modules, generic collections, file I/O,
-provider-backed secrets and typed JSON core are usable. Tyvera cannot yet
-perform asynchronous I/O or connect over HTTP/WebSocket, so it cannot yet
-implement or run a real Discord bot. The next deliverable is a specified
-actor/mailbox lifecycle with deterministic tests; networking and a Discord
-SDK follow after async operations and WebSocket behavior exist.
+provider-backed secrets, typed JSON core and cooperative actor/mailbox slice
+are usable. Tyvera cannot yet perform asynchronous I/O or connect over
+HTTP/WebSocket, so it cannot yet implement or run a real Discord bot. The next
+deliverable is deterministic actor supervision, followed by reply channels,
+timers and an async I/O model before HTTP/WebSocket and a Discord SDK.

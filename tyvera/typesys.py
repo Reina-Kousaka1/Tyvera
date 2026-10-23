@@ -5,6 +5,7 @@ from collections import ChainMap
 from dataclasses import dataclass
 
 from .ast import (
+    ActorDeclaration,
     Assignment,
     Binary,
     Block,
@@ -40,11 +41,11 @@ from .source import Diagnostic, Location
 from .type_names import make_type, split_type, substitute_type
 
 
-_BUILTIN_TYPES = {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json"}
+_BUILTIN_TYPES = {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json", "ActorRef"}
 _BUILTIN_FUNCTIONS = {
     "println", "eprintln", "readText", "writeText", "pathJoin", "pathExists",
     "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool",
-    "jsonNull", "jsonArray", "jsonObject",
+    "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors",
 }
 _DISPLAYABLE_TYPES = {"Int", "Float", "Bool", "String"}
 _NUMERIC_TYPES = {"Int", "Float"}
@@ -72,7 +73,7 @@ class Signature:
 
 @dataclass(slots=True)
 class ClassInfo:
-    declaration: ClassDeclaration
+    declaration: ClassDeclaration | ActorDeclaration
     fields: dict[str, Field]
     methods: dict[str, Signature]
     type_parameters: tuple[str, ...] = ()
@@ -91,8 +92,10 @@ class TypeChecker:
         self.signatures: dict[str, Signature] = {}
         self.classes: dict[str, ClassInfo] = {}
         self.interfaces: dict[str, InterfaceInfo] = {}
+        self.actors: dict[str, ClassInfo] = {}
+        self.actor_names: set[str] = set()
         self.type_names: set[str] = set(_BUILTIN_TYPES)
-        self.generic_arities: dict[str, int] = {"List": 1, "Map": 2, "Option": 1, "Result": 2, "Secret": 1}
+        self.generic_arities: dict[str, int] = {"List": 1, "Map": 2, "Option": 1, "Result": 2, "Secret": 1, "ActorRef": 1}
         self.active_type_variables: set[str] = set()
 
     def check(self) -> dict[str, Signature]:
@@ -109,7 +112,7 @@ class TypeChecker:
         self._check_interface_implementations()
         for function in self.program.functions:
             self._check_function(function, self.signatures[function.name])
-        for class_info in self.classes.values():
+        for class_info in [*self.classes.values(), *self.actors.values()]:
             for method in class_info.declaration.methods:
                 signature = class_info.methods[method.name]
                 self._check_method(method, signature, class_info)
@@ -120,15 +123,19 @@ class TypeChecker:
 
     def _collect_types(self) -> None:
         names: dict[str, Location] = {}
-        for declaration in [*self.program.classes, *self.program.interfaces]:
+        declarations = [*self.program.classes, *self.program.interfaces, *self.program.actors]
+        for declaration in declarations:
             if declaration.name == "secrets":
                 raise Diagnostic(declaration.location, "type", "'secrets' is a reserved namespace")
             if declaration.name in _BUILTIN_TYPES:
                 raise Diagnostic(declaration.location, "type", f"type name '{declaration.name}' is reserved")
+            if isinstance(declaration, ActorDeclaration) and declaration.name in _BUILTIN_FUNCTIONS:
+                raise Diagnostic(declaration.location, "type", f"'{declaration.name}' is reserved for a built-in function")
             if declaration.name in names:
                 raise Diagnostic(declaration.location, "type", f"type '{declaration.name}' is already declared")
             names[declaration.name] = declaration.location
         self.type_names.update(names)
+        self.actor_names = {actor.name for actor in self.program.actors}
         for declaration in self.program.classes:
             self._validate_type_parameters(declaration.type_parameters, declaration.location)
             self.generic_arities[declaration.name] = len(declaration.type_parameters)
@@ -164,8 +171,50 @@ class TypeChecker:
                 raise Diagnostic(declaration.location, "type", f"class '{declaration.name}' declares fields and requires an 'init' constructor")
             self.classes[declaration.name] = ClassInfo(declaration, fields, methods, tuple(declaration.type_parameters))
 
+        for declaration in self.program.actors:
+            fields: dict[str, Field] = {}
+            for member in declaration.fields:
+                if member.name in fields:
+                    raise Diagnostic(member.location, "type", f"actor state field '{member.name}' is already declared")
+                self._require_known_type(member.type_name, member.location)
+                if canonical_type(member.type_name) == "Void":
+                    raise Diagnostic(member.location, "type", "actor state fields cannot have type Void")
+                fields[member.name] = member
+            handlers: dict[str, Signature] = {}
+            for method in declaration.handlers:
+                if method.name in {"stop", "isAlive"}:
+                    raise Diagnostic(method.location, "type", f"actor handler name '{method.name}' is reserved by ActorRef lifecycle methods")
+                if method.name in handlers:
+                    raise Diagnostic(method.location, "type", f"actor handler '{method.name}' is already declared")
+                if method.name in fields:
+                    raise Diagnostic(method.location, "type", f"actor handler '{method.name}' conflicts with a state field")
+                signature = self._method_signature(method)
+                if method.name != "init" and signature.return_type != "Void":
+                    raise Diagnostic(method.location, "type", "actor message handlers must return Void")
+                for parameter, parameter_type in zip(method.parameters, signature.parameter_types):
+                    if not self._is_actor_message_type(parameter_type):
+                        purpose = "actor constructor" if method.name == "init" else "actor message"
+                        raise Diagnostic(parameter.location, "type", f"{purpose} cannot carry mutable or process-local value type '{parameter_type}'")
+                handlers[method.name] = signature
+            if fields and "init" not in handlers:
+                raise Diagnostic(declaration.location, "type", f"actor '{declaration.name}' declares state and requires an 'init' constructor")
+            self.actors[declaration.name] = ClassInfo(declaration, fields, handlers)
+
+    def _is_actor_message_type(self, type_name: str) -> bool:
+        base, arguments = split_type(type_name)
+        if base in {"Int", "Float", "Bool", "String"} and not arguments:
+            return True
+        if base == "ActorRef" and len(arguments) == 1:
+            actor_base, actor_arguments = split_type(arguments[0])
+            return actor_base in self.actor_names and not actor_arguments
+        if base == "Option" and len(arguments) == 1:
+            return self._is_actor_message_type(arguments[0])
+        if base == "Result" and len(arguments) == 2:
+            return all(self._is_actor_message_type(argument) for argument in arguments)
+        return False
+
     def _collect_signatures(self) -> None:
-        all_names = set(self.classes) | set(self.interfaces)
+        all_names = set(self.classes) | set(self.interfaces) | set(self.actors)
         for function in self.program.functions:
             if function.name in _BUILTIN_FUNCTIONS:
                 raise Diagnostic(function.location, "type", f"'{function.name}' is a built-in function name")
@@ -213,6 +262,7 @@ class TypeChecker:
 
     def _require_known_type(
         self, type_name: str, location: Location, type_variables: set[str] | None = None,
+        allow_actor: bool = False,
     ) -> None:
         known_variables = self.active_type_variables if type_variables is None else type_variables
         if type_name in known_variables:
@@ -224,6 +274,8 @@ class TypeChecker:
             return
         if base not in self.type_names:
             raise Diagnostic(location, "type", f"unknown type '{base}'")
+        if base in self.actor_names and not allow_actor:
+            raise Diagnostic(location, "type", f"actor type '{base}' can only be used inside ActorRef<{base}>")
         expected_arity = self.generic_arities.get(base, 0)
         if len(arguments) != expected_arity:
             if expected_arity:
@@ -231,9 +283,13 @@ class TypeChecker:
             if arguments:
                 raise Diagnostic(location, "type", f"type '{base}' does not accept type arguments")
         for argument in arguments:
-            self._require_known_type(argument, location, known_variables)
+            self._require_known_type(argument, location, known_variables, allow_actor=(base == "ActorRef"))
             if canonical_type(argument) == "Void":
                 raise Diagnostic(location, "type", "type arguments cannot be Void")
+        if base == "ActorRef" and arguments:
+            actor_base, actor_arguments = split_type(arguments[0])
+            if actor_arguments or actor_base not in self.actor_names:
+                raise Diagnostic(location, "type", "ActorRef requires one actor type, such as ActorRef<Counter>")
         if base == "Map" and arguments:
             key_base, _ = split_type(arguments[0])
             allowed_keys = _DISPLAYABLE_TYPES | set(self.classes) | set(self.interfaces)
@@ -431,6 +487,27 @@ class TypeChecker:
                 raise Diagnostic(expression.location, "type", f"unknown variable '{expression.identifier}'")
             return binding.type_name
         if isinstance(expression, Call):
+            if expression.callee == "spawn":
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'spawn' does not accept type arguments")
+                if len(expression.arguments) != 1 or not isinstance(expression.arguments[0], Call):
+                    raise Diagnostic(expression.location, "type", "spawn expects one actor construction, for example spawn(Counter(0))")
+                construction = expression.arguments[0]
+                actor = self.actors.get(construction.callee)
+                if actor is None:
+                    raise Diagnostic(construction.location, "type", f"'{construction.callee}' is not an actor type")
+                if construction.type_arguments:
+                    raise Diagnostic(construction.location, "type", "actor types do not accept type arguments")
+                constructor = actor.methods.get("init")
+                expected = () if constructor is None else constructor.parameter_types
+                argument_types = [self._expression_type(argument, variables, owner) for argument in construction.arguments]
+                self._check_arguments(construction.arguments, argument_types, expected, construction.location,
+                                      f"{construction.callee} actor constructor")
+                return f"ActorRef<{construction.callee}>"
+            if expression.callee == "runActors":
+                if expression.type_arguments or expression.arguments:
+                    raise Diagnostic(expression.location, "type", "'runActors' expects no arguments")
+                return "Result<Int,String>"
             argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
             if expression.callee == "println":
                 if expression.type_arguments:
@@ -506,6 +583,8 @@ class TypeChecker:
                     expression.arguments, expression.location, expression.callee,
                 )
                 return make_type(expression.callee, [substitutions[name] for name in class_info.type_parameters])
+            if expression.callee in self.actors:
+                raise Diagnostic(expression.location, "type", f"actor '{expression.callee}' can only be created with spawn({expression.callee}(...))")
             signature = self.signatures.get(expression.callee)
             if signature is None:
                 if expression.type_arguments:
@@ -535,6 +614,24 @@ class TypeChecker:
                 if len(receiver_arguments) != 1:
                     raise Diagnostic(expression.location, "type", "Secret requires one type argument")
                 return receiver_arguments[0]
+            if receiver_base == "ActorRef":
+                if len(receiver_arguments) != 1 or receiver_arguments[0] not in self.actors:
+                    raise Diagnostic(expression.location, "type", "invalid actor reference type")
+                actor = self.actors[receiver_arguments[0]]
+                if expression.method == "isAlive":
+                    self._check_arguments(expression.arguments, argument_types, (), expression.location,
+                                          "ActorRef.isAlive")
+                    return "Bool"
+                if expression.method == "stop":
+                    self._check_arguments(expression.arguments, argument_types, (), expression.location,
+                                          "ActorRef.stop")
+                    return "Void"
+                signature = actor.methods.get(expression.method)
+                if signature is None or expression.method == "init":
+                    raise Diagnostic(expression.location, "type", f"actor '{actor.declaration.name}' has no message handler '{expression.method}'")
+                self._check_arguments(expression.arguments, argument_types, signature.parameter_types,
+                                      expression.location, f"{actor.declaration.name}.{expression.method} message")
+                return "Void"
             if receiver_base == "Json":
                 methods = {
                     "kind": ((), "String"),
@@ -566,6 +663,10 @@ class TypeChecker:
                     substitutions = dict(zip(class_info.type_parameters, receiver_arguments))
                 else:
                     substitutions = {name: name for name in class_info.type_parameters}
+            elif receiver_base in self.actors:
+                actor = self.actors[receiver_base]
+                signature = actor.methods.get(expression.method)
+                substitutions = {}
             elif receiver_base in self.interfaces:
                 signature = self.interfaces[receiver_base].methods.get(expression.method)
                 substitutions = {}
@@ -611,7 +712,7 @@ class TypeChecker:
         receiver_base, receiver_arguments = split_type(receiver_type)
         if receiver_base in {"List", "Map"} and expression.member == "length":
             return "Int", Field("length", "Int", False, expression.location)
-        class_info = self.classes.get(receiver_base)
+        class_info = self.classes.get(receiver_base) or self.actors.get(receiver_base)
         field = None if class_info is None else class_info.fields.get(expression.member)
         if field is None:
             raise Diagnostic(expression.location, "type", f"type '{receiver_type}' has no field '{expression.member}'")

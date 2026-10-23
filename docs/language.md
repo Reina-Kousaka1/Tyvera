@@ -41,7 +41,7 @@ precedence below):
 ```text
 block       = "{" [statements] "}" ;
 import      = "import" string "as" identifier ;
-top-level   = import | ["pub"] (function | class | interface) ;
+top-level   = import | ["pub"] (function | class | interface | actor) ;
 declaration = ("let" | "var") identifier [":" type] "=" expression ;
 assignment  = identifier "=" expression ;
 field-set   = expression "." identifier "=" expression ;
@@ -57,6 +57,10 @@ class       = "class" identifier ["<" identifier {"," identifier} ">"] ["impleme
 field       = ("let" | "var") identifier ":" type ;
 method      = function ;
 interface   = "interface" identifier "{" {method-signature} "}" ;
+actor       = "actor" identifier "{" {actor-field | actor-init | actor-handler} "}" ;
+actor-field = ("let" | "var") identifier ":" type ;
+actor-init  = "init" "(" [parameters] ")" ["->" type] block ;
+actor-handler = "on" identifier "(" [parameters] ")" ["->" type] block ;
 method-signature = "fn" identifier "(" [parameters] ")" ["->" type] ;
 type-list   = identifier {"," identifier} ;
 parameters  = identifier ":" type {"," identifier ":" type} ;
@@ -289,6 +293,56 @@ match response {
 This is a first sum-type slice; destructuring nested values, guards, and
 message-pattern matching are not implemented.
 
+## Cooperative actors
+
+Actors own state that cannot be read through their reference. Fields use the
+same `let`/`var` rules as classes. A stateful actor needs an `init` constructor;
+the checker verifies that every field is initialized on every constructor
+path. `on name(parameters)` declares a typed, `Void`-returning message handler.
+Handler names and parameter types form that actor's message protocol.
+
+```tyv
+actor Counter {
+    var value: Int
+
+    init(start: Int) { self.value = start }
+    on add(amount: Int) { self.value = self.value + amount }
+    on report() { println(self.value) }
+}
+
+fn main() {
+    let counter: ActorRef<Counter> = spawn(Counter(10))
+    counter.add(5)
+    counter.report()
+    match runActors() {
+        Ok(processed) => println(processed)
+        Err(reason) => eprintln(reason)
+    }
+}
+```
+
+`spawn(Actor(...))` creates an `ActorRef<Actor>`. Calling a handler name on
+that reference enqueues a message and returns `Void`; it does not run the
+handler inline. `runActors()` drains pending mailboxes and returns
+`Result<Int,String>` with the number of delivered messages on success. The
+bootstrap scheduler is deterministic and cooperative: it processes one message
+per actor per round, while preserving FIFO order within each actor. It is not
+parallel and does not preempt a running handler. Handlers cannot recursively
+drive `runActors()`.
+
+Message and constructor arguments are transferable Tyvera values of type `Int`,
+`Float`, `Bool`, `String`, `Option<T>`, `Result<T,E>`, or `ActorRef<A>` when the
+nested types are also transferable. Mutable collections, ordinary class
+instances and secrets cannot cross a mailbox. A runtime diagnostic in a
+handler marks that actor crashed, discards its queued messages, and lets other
+actors continue; `runActors()` reports the first crash as `Err`. `stop()` stops
+an actor immediately and drops its pending mailbox; `isAlive()` reports whether
+it can receive more messages. Ordinary `Result` failures remain application
+values, separate from actor crashes. Supervisors, restarts, reply channels,
+parallel execution and async I/O are not implemented. A mailbox holds at most
+100,000 pending messages and one `runActors()` call delivers at most 100,000;
+an endless handler still blocks this cooperative scheduler.
+
 ## JSON values
 
 `Json` is an opaque, typed value. `parseJson(text) -> Result<Json,String>`
@@ -446,9 +500,10 @@ limit (or the bootstrap host stack limit, if reached sooner).
 `tyvera check file.tyv` checks without running;
 `tyvera run file.tyv` checks and interprets the AST.
 
-Current limits: classes and interfaces are supported, but there is no
+Current limits: classes, interfaces and the deterministic cooperative actor
+slice are supported, but there is no
 inheritance, generic methods/interfaces/constraints, collection literals,
-`try`/`catch`, actor/process model, messaging, supervisor, async runtime,
+`try`/`catch`, actor supervisors/restarts, parallel process scheduling, async runtime,
 networking API, importable standard-library modules, external secret-store
 provider, native interop, garbage collector
 implementation, package manager or Discord SDK. No compiler backend or

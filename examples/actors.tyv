@@ -1,0 +1,26 @@
+actor Counter {
+    var value: Int
+
+    init(start: Int) {
+        self.value = start
+    }
+
+    on increment(amount: Int) {
+        self.value = self.value + amount
+    }
+
+    on report() {
+        println(self.value)
+    }
+}
+
+fn main() {
+    let counter: ActorRef<Counter> = spawn(Counter(10))
+    counter.increment(5)
+    counter.report()
+
+    match runActors() {
+        Ok(processed) => println(processed)
+        Err(reason) => eprintln(reason)
+    }
+}

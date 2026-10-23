@@ -12,6 +12,7 @@ class Program:
     classes: list[ClassDeclaration] = field(default_factory=list)
     interfaces: list[InterfaceDeclaration] = field(default_factory=list)
     imports: list[ImportDeclaration] = field(default_factory=list)
+    actors: list[ActorDeclaration] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -63,6 +64,19 @@ class InterfaceDeclaration:
     methods: list[MethodSignature]
     location: Location
     public: bool = False
+
+
+@dataclass(slots=True)
+class ActorDeclaration:
+    name: str
+    fields: list[Field]
+    handlers: list[Method]
+    location: Location
+    public: bool = False
+
+    @property
+    def methods(self) -> list[Method]:
+        return self.handlers
 
 
 @dataclass(slots=True)
