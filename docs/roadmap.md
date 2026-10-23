@@ -10,7 +10,7 @@ Roadmap items below are plans unless marked implemented.
 | --- | --- | --- |
 | 1. Core language | Implemented | Primitive types, functions, checked returns, lexical scopes, mutable/immutable bindings, operators, conditionals, `while`, `break` and `continue`, covered by tests. |
 | 2. Object system | First slice implemented | Classes, fields, `self`, constructors, methods, interfaces, multiple interface implementation and interface dispatch. Next: generics, then review visibility and inheritance requirements before adding them. |
-| 3. Modules | Next | Multi-file compilation, explicit imports, public symbols, duplicate/missing symbol diagnostics and deterministic circular-import handling. |
+| 3. Modules | First slice implemented | Relative `.tyv` imports, aliases, `pub` exports, module graph linking, visibility/missing/duplicate diagnostics, cycle detection and project-root containment. Local package dependencies are still planned. |
 | 4. Standard library | Planned | Typed `List<T>` and `Map<K,V>`, `for` iteration, environment access, and JSON parse/encode APIs with explicit error results. |
 | 5. Actor runtime | Planned | Isolated process state, typed messages, mailboxes, sequenced message handling and lifecycle, with deterministic runtime tests. |
 | 6. Supervisors | Planned | Child lifecycle, crash detection, restart and an initial `one_for_one` policy, separate from ordinary recoverable errors. |
@@ -21,17 +21,14 @@ Roadmap items below are plans unless marked implemented.
 
 ## Near-term sequence
 
-1. Add multi-file modules and imports. This is the immediate next milestone
-   because both a standard library and a Discord SDK need independently
-   compiled, reusable modules.
-2. Implement generic classes and functions, then typed collections and `for`.
-3. Add an explicit error-result model and JSON/environment APIs before
+1. Implement generic classes and functions, then typed collections and `for`.
+2. Add an explicit error-result model and JSON/environment APIs before
    networking, so missing configuration and parse failures remain ordinary,
    testable program outcomes.
-4. Define async operations and actor message semantics before any Discord
+3. Define async operations and actor message semantics before any Discord
    gateway client. Add supervisors only after actor lifecycle and failure
    behavior have deterministic tests.
-5. Keep backend work independent from the Python interpreter. Establish
+4. Keep backend work independent from the Python interpreter. Establish
    language-level conformance programs before implementing native codegen.
 
 ## Native and C++-inspired direction
@@ -47,9 +44,9 @@ Tyvera errors.
 
 ## Current Discord-readiness gap
 
-The object system is usable for domain models, but Tyvera cannot yet import
-libraries, store collections, read a token from the environment, parse JSON,
-perform asynchronous I/O, or connect over HTTP/WebSocket. It therefore cannot
-yet implement or run a real Discord bot. The next deliverable is the module
-system, followed by generics and standard-library foundations; an SDK should
-come only after networking and error semantics work as ordinary libraries.
+The object system and relative file modules are usable for domain models, but
+Tyvera cannot yet use generic collections, read a token from the environment,
+parse JSON, perform asynchronous I/O, or connect over HTTP/WebSocket. It
+therefore cannot yet implement or run a real Discord bot. The next deliverable
+is generics and typed collection foundations; an SDK should come only after
+networking and error semantics work as ordinary libraries.

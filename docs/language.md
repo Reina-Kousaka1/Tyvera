@@ -6,12 +6,12 @@ design. Python hosts the bootstrap implementation only.
 
 ## Files, declarations and statements
 
-Source files use `.tyv`. The current compiler accepts one source file per
-program. It can contain functions, classes and interfaces, including a global
-`fn main()` returning `Void`. Functions, types and methods can use declarations
-that appear later in the same file. Functions can recurse. Parameters require
-types and are immutable. Return annotations use `-> Type`; an omitted
-annotation means `Void`.
+Source files use `.tyv`. A program can contain multiple modules connected with
+explicit relative file imports. The entry module defines a global `fn main()`
+returning `Void`. Functions, types and methods can use declarations that appear
+later in the same module. Functions can recurse. Parameters require types and
+are immutable. Return annotations use `-> Type`; an omitted annotation means
+`Void`.
 
 ```tyv
 fn max(a: Int, b: Int) -> Int {
@@ -40,6 +40,8 @@ precedence below):
 
 ```text
 block       = "{" [statements] "}" ;
+import      = "import" string "as" identifier ;
+top-level   = import | ["pub"] (function | class | interface) ;
 declaration = ("let" | "var") identifier [":" type] "=" expression ;
 assignment  = identifier "=" expression ;
 field-set   = expression "." identifier "=" expression ;
@@ -56,7 +58,7 @@ interface   = "interface" identifier "{" {method-signature} "}" ;
 method-signature = "fn" identifier "(" [parameters] ")" ["->" type] ;
 type-list   = identifier {"," identifier} ;
 parameters  = identifier ":" type {"," identifier ":" type} ;
-type        = identifier ;
+type        = identifier {"." identifier} ;
 ```
 
 Assignments are statements, not expressions. Function and method calls can be
@@ -182,8 +184,33 @@ parameter and return types. A class implementing an interface can be assigned
 to an interface-typed binding or passed to an interface-typed parameter;
 method calls dispatch to the instance's class implementation. Interfaces have
 no fields, default methods or inheritance. Classes/interfaces and global
-functions share one declaration namespace. Visibility is currently uniform and
-public within the single source file.
+functions share one declaration namespace within each module. Module
+declarations are private by default; `pub fn`, `pub class` and `pub interface`
+make a declaration importable. Class fields and methods remain public once the
+class itself is imported.
+
+## Modules and projects
+
+Each file is one module. Imports name a `.tyv` file relative to the importing
+file and bind it to an alias:
+
+```tyv
+import "models/user.tyv" as models
+
+fn main() {
+    let user: models.User = models.User("Charlotte")
+    println(user.name)
+}
+```
+
+Calls and construction use `alias.symbol(...)`; types use `alias.Type`.
+Unqualified names resolve only inside the current module. Imported symbols
+must be explicitly public. Import aliases are unique and reserved against
+local variables and parameters in that module. Imports are linked before type
+checking; duplicate/missing symbols, missing files, root-escaping paths and
+circular imports produce source-located diagnostics. A project can declare
+`name` and `entry` string keys in a minimal `tyvera.toml`; there is no package
+registry or dependency manager yet.
 
 ## Operators
 
@@ -256,9 +283,8 @@ limit (or the bootstrap host stack limit, if reached sooner).
 `tyvera check file.tyv` checks without running;
 `tyvera run file.tyv` checks and interprets the AST.
 
-Current limits: one source file per program; classes and interfaces are
-supported, but there is no inheritance, visibility modifier, generic type,
-collection, `for` loop, module/import system, pattern matching, `try`/`catch`,
+Current limits: classes and interfaces are supported, but there is no
+inheritance, generic type, collection, `for` loop, pattern matching, `try`/`catch`,
 actor/process model, messaging, supervisor, async/I/O or networking API, JSON
 library, environment-variable API, native interop, garbage collector
 implementation, package manager or Discord SDK. No compiler backend or

@@ -11,6 +11,7 @@ from .ast import (
     Field,
     Function,
     IfStatement,
+    ImportDeclaration,
     InterfaceDeclaration,
     LetStatement,
     Literal,
@@ -70,26 +71,46 @@ class Parser:
         functions: list[Function] = []
         classes: list[ClassDeclaration] = []
         interfaces: list[InterfaceDeclaration] = []
+        imports: list[ImportDeclaration] = []
         self._skip_separators()
         while not self._check("EOF"):
-            if self._check("FN"):
-                functions.append(self._function())
+            public = self._match("PUB")
+            if self._check("IMPORT"):
+                if public:
+                    self._error(self._previous(), "imports cannot be declared public")
+                imports.append(self._import())
+            elif self._check("FN"):
+                functions.append(self._function(public))
             elif self._check("CLASS"):
-                classes.append(self._class_declaration())
+                classes.append(self._class_declaration(public))
             elif self._check("INTERFACE"):
-                interfaces.append(self._interface_declaration())
+                interfaces.append(self._interface_declaration(public))
             else:
-                self._error(self._current(), "expected a function, class, or interface declaration")
+                self._error(self._current(), "expected an import or function, class, or interface declaration")
             if not self._check_any("NEWLINE", "SEMICOLON", "EOF"):
                 self._error(self._current(), "expected a line break after the declaration")
             self._skip_separators()
-        return Program(functions, classes, interfaces)
+        aliases: set[str] = set()
+        for declaration in imports:
+            if declaration.alias in aliases:
+                raise Diagnostic(declaration.location, "module", f"import alias '{declaration.alias}' is already declared")
+            aliases.add(declaration.alias)
+        return Program(functions, classes, interfaces, imports)
 
-    def _function(self) -> Function:
+    def _import(self) -> ImportDeclaration:
+        token = self._expect("IMPORT", "expected 'import'")
+        path = self._expect("STRING", "expected a quoted .tyv module path after 'import'")
+        self._expect("AS", "expected 'as' and a module alias after the import path")
+        alias = self._expect("IDENTIFIER", "expected an import alias after 'as'")
+        if not path.value.endswith(".tyv"):
+            self._error(path, "module import paths must end in '.tyv'")
+        return ImportDeclaration(path.value, alias.lexeme, token.location)
+
+    def _function(self, public: bool = False) -> Function:
         fn_token = self._expect("FN", "expected 'fn'")
         name, parameters, return_type = self._function_header()
         body = self._block()
-        return Function(name, parameters, return_type, body, fn_token.location)
+        return Function(name, parameters, return_type, body, fn_token.location, public)
 
     def _function_header(self) -> tuple[str, list[Parameter], str]:
         name_token = self._expect("IDENTIFIER", "expected a function name after 'fn'")
@@ -99,8 +120,8 @@ class Parser:
             while True:
                 parameter_name = self._expect("IDENTIFIER", "expected a parameter name")
                 self._expect("COLON", "expected ':' after parameter name")
-                type_token = self._expect("IDENTIFIER", "expected a type name after ':'")
-                parameters.append(Parameter(parameter_name.lexeme, type_token.lexeme, parameter_name.location))
+                type_name = self._type_name("expected a type name after ':'")
+                parameters.append(Parameter(parameter_name.lexeme, type_name, parameter_name.location))
                 if not self._match("COMMA"):
                     break
                 if self._check("RPAREN"):
@@ -108,16 +129,22 @@ class Parser:
         self._expect("RPAREN", "expected ')' after parameters")
         return_type = "Void"
         if self._match("ARROW"):
-            return_type = self._expect("IDENTIFIER", "expected a return type after '->'").lexeme
+            return_type = self._type_name("expected a return type after '->'")
         return name_token.lexeme, parameters, return_type
 
-    def _class_declaration(self) -> ClassDeclaration:
+    def _type_name(self, message: str) -> str:
+        parts = [self._expect("IDENTIFIER", message).lexeme]
+        while self._match("DOT"):
+            parts.append(self._expect("IDENTIFIER", "expected a type name after '.'").lexeme)
+        return ".".join(parts)
+
+    def _class_declaration(self, public: bool = False) -> ClassDeclaration:
         class_token = self._expect("CLASS", "expected 'class'")
         name = self._expect("IDENTIFIER", "expected a class name after 'class'")
         interfaces: list[str] = []
         if self._match("IMPLEMENTS"):
             while True:
-                interfaces.append(self._expect("IDENTIFIER", "expected an interface name after 'implements'").lexeme)
+                interfaces.append(self._type_name("expected an interface name after 'implements'"))
                 if not self._match("COMMA"):
                     break
         self._expect("LBRACE", "expected '{' after class header")
@@ -129,8 +156,8 @@ class Parser:
                 declaration = self._previous()
                 field_name = self._expect("IDENTIFIER", "expected a field name")
                 self._expect("COLON", "expected ':' after field name")
-                field_type = self._expect("IDENTIFIER", "expected a field type after ':'")
-                fields.append(Field(field_name.lexeme, field_type.lexeme, declaration.kind == "VAR", declaration.location))
+                field_type = self._type_name("expected a field type after ':'")
+                fields.append(Field(field_name.lexeme, field_type, declaration.kind == "VAR", declaration.location))
             elif self._check("FN"):
                 method_token = self._advance()
                 method_name, parameters, return_type = self._function_header()
@@ -142,9 +169,9 @@ class Parser:
                 self._error(self._current(), "expected a line break or ';' after class member")
             self._skip_separators()
         self._expect("RBRACE", "expected '}' to close class body")
-        return ClassDeclaration(name.lexeme, interfaces, fields, methods, class_token.location)
+        return ClassDeclaration(name.lexeme, interfaces, fields, methods, class_token.location, public)
 
-    def _interface_declaration(self) -> InterfaceDeclaration:
+    def _interface_declaration(self, public: bool = False) -> InterfaceDeclaration:
         interface_token = self._expect("INTERFACE", "expected 'interface'")
         name = self._expect("IDENTIFIER", "expected an interface name after 'interface'")
         self._expect("LBRACE", "expected '{' after interface name")
@@ -160,7 +187,7 @@ class Parser:
                 self._error(self._current(), "expected a line break or ';' after interface method")
             self._skip_separators()
         self._expect("RBRACE", "expected '}' to close interface body")
-        return InterfaceDeclaration(name.lexeme, methods, interface_token.location)
+        return InterfaceDeclaration(name.lexeme, methods, interface_token.location, public)
 
     def _block(self) -> list[Statement]:
         self._expect("LBRACE", "expected '{' to start the block")
@@ -205,7 +232,7 @@ class Parser:
         name = self._expect("IDENTIFIER", f"expected a variable name after '{let_token.lexeme}'")
         annotation: str | None = None
         if self._match("COLON"):
-            annotation = self._expect("IDENTIFIER", "expected a type name after ':'").lexeme
+            annotation = self._type_name("expected a type name after ':'")
         self._expect("EQUAL", "expected '=' in variable declaration")
         value = self._expression()
         return LetStatement(name.lexeme, annotation, value, let_token.location, let_token.kind == "VAR")

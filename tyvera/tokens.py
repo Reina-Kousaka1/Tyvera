@@ -31,6 +31,9 @@ KEYWORDS = {
     "class": "CLASS",
     "interface": "INTERFACE",
     "implements": "IMPLEMENTS",
+    "import": "IMPORT",
+    "as": "AS",
+    "pub": "PUB",
 }
 
 SINGLE_CHAR_TOKENS = {

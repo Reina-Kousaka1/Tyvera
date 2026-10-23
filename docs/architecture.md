@@ -12,15 +12,17 @@ A source file passes through four explicit stages:
    Tyvera-owned object instances and method dispatch.
 
 `source.py` owns shared file/line/column locations and user-facing diagnostics.
-`cli.py` provides `tyvera run` and `tyvera check`. The implementation uses
-Python's standard library only.
+`modules.py` resolves relative imports, checks visibility and links source
+modules before the shared type checker runs. `project.py` reads the small
+manifest and creates starter projects. `cli.py` provides `new`, `run`, `check`
+and `--version`. The implementation uses Python's standard library only.
 
 ## Design decisions
 
 - **Own source model:** Grammar, type names, operators, AST and diagnostics are
   Tyvera-specific. No Java, Elixir, C++, TypeScript or Python parser/runtime is
   embedded.
-- **Check before running:** The complete file is parsed and type-checked before
+- **Check before running:** The complete reachable module graph is parsed and type-checked before
   `main` can print anything. Static errors are deterministic and cannot be
   hidden by earlier execution effects.
 - **Defined numeric widths:** `Int` uses a checked signed 64-bit range and
@@ -63,10 +65,14 @@ Python's standard library only.
   Numeric promotion, finite `Float` and checked 64-bit `Int` rules are explicit
   Tyvera semantics rather than host defaults.
 
-The compiler currently accepts one source file per program. Calls execute
-synchronously in one process. Modules, collections, generics, error handling,
-pattern matching, actors, supervisors, async I/O, JSON and environment access
-are not implemented. These boundaries are reflected in the
+Each module is parsed separately and its references are resolved to stable
+module-qualified names before the existing semantic checker sees the linked
+program. Imports are relative `.tyv` files, aliases are explicit, `pub` is
+required for cross-module access, and paths cannot escape the project root.
+The manifest currently has only `name` and `entry`; dependencies are not yet
+supported. Calls still execute synchronously in one process. Collections,
+generics, error handling, pattern matching, actors, supervisors, async I/O,
+JSON and environment/secret access are not implemented. These boundaries are reflected in the
 [language reference](language.md) and [roadmap](roadmap.md).
 
 ## Native backend direction
@@ -74,9 +80,11 @@ are not implemented. These boundaries are reflected in the
 The C++ influence is an architectural goal, not a current performance or
 interop claim. Keep a future compiler backend separate from the interpreter
 and define Tyvera's value, integer-overflow, floating-point and resource
-semantics before selecting a target ABI. A native layer should use explicit
+semantics before selecting a target ABI. The module linker keeps the AST/type
+checker independent from loading so a later IR can consume the same resolved
+program graph. A native layer should use explicit
 ownership or resource handles, value types with documented layout rules and a
 narrow, typed FFI boundary. Avoid exposing raw C++ object layouts or host
-exceptions as Tyvera semantics. Prototype a backend and ABI after modules,
-generics and the core library stabilize; retain the interpreter as the
+exceptions as Tyvera semantics. Prototype a backend and ABI after generics and
+the core library stabilize; retain the interpreter as the
 executable reference implementation during that transition.

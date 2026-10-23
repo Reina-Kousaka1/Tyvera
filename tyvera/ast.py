@@ -11,6 +11,14 @@ class Program:
     functions: list[Function]
     classes: list[ClassDeclaration] = field(default_factory=list)
     interfaces: list[InterfaceDeclaration] = field(default_factory=list)
+    imports: list[ImportDeclaration] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ImportDeclaration:
+    path: str
+    alias: str
+    location: Location
 
 
 @dataclass(slots=True)
@@ -45,6 +53,7 @@ class ClassDeclaration:
     fields: list[Field]
     methods: list[Method]
     location: Location
+    public: bool = False
 
 
 @dataclass(slots=True)
@@ -52,6 +61,7 @@ class InterfaceDeclaration:
     name: str
     methods: list[MethodSignature]
     location: Location
+    public: bool = False
 
 
 @dataclass(slots=True)
@@ -68,6 +78,7 @@ class Function:
     return_type: str
     body: list[Statement]
     location: Location
+    public: bool = False
 
 
 class Statement:

@@ -21,6 +21,33 @@ Expected output:
 Hello from Tyvera!
 ```
 
+## Projects and modules
+
+Tyvera supports small multi-file projects. `tyvera new my_app` creates a
+`tyvera.toml` manifest and two `.tyv` modules. `tyvera check` and `tyvera run`
+accept a project directory or source file. Imports use explicit relative paths
+and aliases; only `pub` declarations are visible across modules:
+
+```tyv
+import "models/user.tyv" as models
+
+fn main() {
+    let user: models.User = models.User("Charlotte")
+    println(user.name)
+}
+```
+
+The loader checks public visibility, missing files/symbols, duplicate names,
+cyclic imports and project-root boundaries. `.tyvera.secrets` is gitignored,
+but secret loading is not implemented yet.
+
+```sh
+tyvera new my_app
+tyvera check my_app
+tyvera run my_app
+tyvera --version
+```
+
 Check a program without running it:
 
 ```sh
@@ -37,8 +64,12 @@ Run the test suite from the repository root:
 python -m unittest discover -v
 ```
 
-The detailed supported grammar and type rules are in [the language reference](docs/language.md). The staged toolchain and recorded architecture decisions are in [the architecture note](docs/architecture.md). Planned stages toward a general-purpose bot runtime are in [the roadmap](docs/roadmap.md).
+The detailed supported grammar and type rules are in [the language reference](docs/language.md). CLI commands are listed in [the CLI reference](docs/cli.md). The staged toolchain and recorded architecture decisions are in [the architecture note](docs/architecture.md). Planned stages toward a general-purpose bot runtime are in [the roadmap](docs/roadmap.md).
 
 ## Direction
 
-The first object-system slice is now implemented. The next milestone is a multi-file module and import system with explicit public symbols; typed collections and iteration follow so a standard library can be built without Discord-specific compiler features. Generics, pattern matching, error handling, actors, supervision, async/network I/O, JSON, environment access, and native backends remain planned and are not represented as working features. See the [roadmap](docs/roadmap.md) for sequence and scope.
+The first object-system slice and explicit multi-file modules are implemented.
+Generics, collections, pattern matching, error handling, actors, supervision,
+async/network I/O, JSON, environment/secret access and native backends remain
+planned and are not represented as working features. See the
+[roadmap](docs/roadmap.md) for sequence and scope.
