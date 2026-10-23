@@ -63,9 +63,11 @@ and `--version`. The implementation uses Python's standard library only.
 - Generic function, class, record, enum and newtype signatures retain type
   parameters in the checked type representation. Calls infer parameters from
   actual arguments or accept explicit type arguments; recursive substitution
-  validates nested applications before execution. Generic methods, interfaces
-  and constraints are not supported. The interpreter erases type arguments in
-  runtime records; dispatch still uses statically selected nominal methods.
+  validates nested applications before execution. Generic functions support
+  interface bounds with statically checked constrained method calls. Generic
+  methods/interfaces and bounds on generic type declarations are not supported.
+  The interpreter erases type arguments in runtime values; dispatch still uses
+  statically selected nominal methods.
 - `List<T>` and `Map<K,V>` expose Tyvera-specific typed APIs through private
   bootstrap value records. The checker owns their method signatures and
   iteration element types. A `for` evaluates its collection once and the

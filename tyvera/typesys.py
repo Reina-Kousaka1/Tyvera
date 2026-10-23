@@ -88,6 +88,7 @@ class Signature:
     location: Location
     type_parameters: tuple[str, ...] = ()
     is_async: bool = False
+    type_constraints: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 @dataclass(slots=True)
@@ -133,6 +134,7 @@ class TypeChecker:
         self.generic_substitutions: dict[Location, dict[str, str]] = {}
         self.match_coverage: dict[Location, frozenset[str]] = {}
         self.match_exhaustiveness: dict[Location, bool] = {}
+        self.active_type_constraints: dict[str, tuple[str, ...]] = {}
         self.actors: dict[str, ClassInfo] = {}
         self.actor_names: set[str] = set()
         self.type_names: set[str] = set(_BUILTIN_TYPES)
@@ -385,6 +387,9 @@ class TypeChecker:
     ) -> Signature:
         declared_parameters = list(getattr(function, "type_parameters", []))
         self._validate_type_parameters(declared_parameters, function.location)
+        declared_constraints = self._validate_function_constraints(
+            declared_parameters, getattr(function, "type_constraints", {}), function.location,
+        )
         known_variables = set(type_variables or ()) | set(declared_parameters)
         parameter_names: set[str] = set()
         parameter_types: list[str] = []
@@ -405,7 +410,29 @@ class TypeChecker:
         self._require_known_type(function.return_type, function.location, known_variables)
         is_async = bool(getattr(function, "is_async", False))
         return Signature(tuple(parameter_types), self._canonical_type(function.return_type), function.location,
-                         tuple(declared_parameters), is_async)
+                         tuple(declared_parameters), is_async, declared_constraints)
+
+    def _validate_function_constraints(
+        self, parameters: list[str], constraints: dict[str, list[str]], location: Location,
+    ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        parameter_set = set(parameters)
+        checked: list[tuple[str, tuple[str, ...]]] = []
+        for parameter, bounds in constraints.items():
+            if parameter not in parameter_set:
+                raise Diagnostic(location, "type", f"constraint refers to undeclared type parameter '{parameter}'")
+            seen: set[str] = set()
+            for bound in bounds:
+                base, arguments = split_type(bound)
+                if arguments:
+                    raise Diagnostic(location, "type", "generic function constraints must name non-generic interfaces")
+                if base not in self.interfaces:
+                    raise Diagnostic(location, "type", f"generic constraint '{bound}' is not a declared interface")
+                if bound in seen:
+                    raise Diagnostic(location, "type", f"generic constraint '{bound}' is repeated for '{parameter}'")
+                seen.add(bound)
+            if bounds:
+                checked.append((parameter, tuple(bounds)))
+        return tuple(checked)
 
     def _require_known_type(
         self, type_name: str, location: Location, type_variables: set[str] | None = None,
@@ -522,7 +549,9 @@ class TypeChecker:
 
     def _check_function(self, function: Function, signature: Signature) -> None:
         previous = self.active_type_variables
+        previous_constraints = self.active_type_constraints
         self.active_type_variables = set(signature.type_parameters)
+        self.active_type_constraints = dict(signature.type_constraints)
         variables = ChainMap({p.name: Binding(self._canonical_type(p.type_name)) for p in function.parameters})
         try:
             outcomes = self._check_block(function.body, variables, signature.return_type, 0,
@@ -530,6 +559,7 @@ class TypeChecker:
             self._require_return_paths(function.name, signature.return_type, outcomes, function.location)
         finally:
             self.active_type_variables = previous
+            self.active_type_constraints = previous_constraints
 
     def _check_method(self, method: Method, signature: Signature, owner: ClassInfo) -> None:
         if method.name == "init" and signature.return_type != "Void":
@@ -898,7 +928,7 @@ class TypeChecker:
                 raise Diagnostic(expression.location, "type", f"unknown function '{expression.callee}'")
             substitutions = self._resolve_type_arguments(
                 signature.type_parameters, expression.type_arguments, signature.parameter_types, argument_types,
-                expression.arguments, expression.location, expression.callee,
+                expression.arguments, expression.location, expression.callee, signature.type_constraints,
             )
             result_type = substitute_type(signature.return_type, substitutions)
             return make_type("Task", [result_type]) if signature.is_async else result_type
@@ -1164,10 +1194,26 @@ class TypeChecker:
             elif receiver_base in self.interfaces:
                 signature = self.interfaces[receiver_base].methods.get(expression.method)
                 substitutions = {}
+            elif receiver_base in self.active_type_constraints:
+                candidates = [self.interfaces[interface_name].methods[expression.method]
+                              for interface_name in self.active_type_constraints[receiver_base]
+                              if expression.method in self.interfaces[interface_name].methods]
+                if candidates and any(
+                    candidate.parameter_types != candidates[0].parameter_types
+                    or candidate.return_type != candidates[0].return_type
+                    for candidate in candidates[1:]
+                ):
+                    raise Diagnostic(expression.location, "type", f"constraints on '{receiver_base}' require incompatible '{expression.method}' signatures")
+                signature = candidates[0] if candidates else None
+                substitutions = {}
             else:
                 signature = None
                 substitutions = {}
             if signature is None:
+                if receiver_base in self.active_type_constraints:
+                    raise Diagnostic(expression.location, "type", f"type parameter '{receiver_base}' has no constrained method '{expression.method}'")
+                if receiver_base in self.active_type_variables:
+                    raise Diagnostic(expression.location, "type", f"type parameter '{receiver_base}' has no interface constraint providing method '{expression.method}'")
                 raise Diagnostic(expression.location, "type", f"type '{receiver_type}' has no method '{expression.method}'")
             parameter_types = tuple(substitute_type(item, substitutions) for item in signature.parameter_types)
             self._check_arguments(expression.arguments, argument_types, parameter_types, expression.location,
@@ -1236,6 +1282,7 @@ class TypeChecker:
     def _resolve_type_arguments(
         self, type_parameters: tuple[str, ...], explicit: list[str], formal_types: tuple[str, ...],
         actual_types: list[str], arguments: list[Expression], location: Location, callee: str,
+        type_constraints: tuple[tuple[str, tuple[str, ...]], ...] = (),
     ) -> dict[str, str]:
         if len(actual_types) != len(formal_types):
             raise Diagnostic(location, "type", f"'{callee}' expects {len(formal_types)} argument(s), got {len(actual_types)}")
@@ -1264,8 +1311,37 @@ class TypeChecker:
 
         resolved_parameters = tuple(substitute_type(item, substitutions) for item in formal_types)
         self._check_arguments(arguments, actual_types, resolved_parameters, location, callee)
+        self._check_generic_constraints(type_constraints, substitutions, location, callee)
         self.generic_substitutions[location] = dict(substitutions)
         return substitutions
+
+    def _check_generic_constraints(
+        self,
+        constraints: tuple[tuple[str, tuple[str, ...]], ...],
+        substitutions: dict[str, str],
+        location: Location,
+        callee: str,
+    ) -> None:
+        for parameter, bounds in constraints:
+            actual = substitutions.get(parameter)
+            if actual is None:
+                raise Diagnostic(location, "type", f"cannot validate constraints for uninferred type parameter '{parameter}'")
+            for interface_name in bounds:
+                if not self._satisfies_interface_constraint(actual, interface_name):
+                    raise Diagnostic(
+                        location, "type",
+                        f"type '{actual}' does not satisfy constraint '{interface_name}' for '{parameter}' in call to '{callee}'",
+                    )
+
+    def _satisfies_interface_constraint(self, type_name: str, interface_name: str) -> bool:
+        type_name = self._canonical_type(type_name)
+        base, _ = split_type(type_name)
+        if base == interface_name:
+            return True
+        class_info = self.classes.get(base)
+        if class_info is not None and interface_name in class_info.declaration.interfaces:
+            return True
+        return interface_name in self.active_type_constraints.get(base, ())
 
     def _collection_method(
         self, collection: str, type_arguments: tuple[str, ...], method: str, location: Location,

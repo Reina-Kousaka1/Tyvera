@@ -159,10 +159,12 @@ class Parser:
     def _function(self, public: bool = False, is_async: bool = False) -> Function:
         fn_token = self._expect("FN", "expected 'fn'")
         name_token = self._expect("IDENTIFIER", "expected a function name after 'fn'")
-        type_parameters = self._type_parameters()
+        type_parameters = self._type_parameters(allow_constraints=True)
+        type_constraints = {name: list(bounds) for name, bounds in self._last_type_constraints.items()}
         name, parameters, return_type = self._function_header(name_token)
         body = self._block()
-        return Function(name, parameters, return_type, body, fn_token.location, public, type_parameters, is_async)
+        return Function(name, parameters, return_type, body, fn_token.location, public, type_parameters, is_async,
+                        type_constraints)
 
     def _function_header(self, name_token: Token | None = None) -> tuple[str, list[Parameter], str]:
         if name_token is None:
@@ -217,12 +219,24 @@ class Parser:
         self._expect("GREATER", "expected '>' after type arguments")
         return arguments
 
-    def _type_parameters(self) -> list[str]:
+    def _type_parameters(self, *, allow_constraints: bool = False) -> list[str]:
+        self._last_type_constraints: dict[str, list[str]] = {}
         if not self._match("LESS"):
             return []
-        parameters = [self._expect("IDENTIFIER", "expected a type parameter after '<'").lexeme]
-        while self._match("COMMA"):
-            parameters.append(self._expect("IDENTIFIER", "expected a type parameter after ','").lexeme)
+        parameters: list[str] = []
+        while True:
+            name = self._expect("IDENTIFIER", "expected a type parameter after '<' or ','").lexeme
+            parameters.append(name)
+            bounds: list[str] = []
+            if self._match("COLON"):
+                if not allow_constraints:
+                    self._error(self._previous(), "constraints are currently supported only on generic functions")
+                bounds.append(self._type_name("expected an interface constraint after ':'"))
+                while self._match("PLUS"):
+                    bounds.append(self._type_name("expected an interface constraint after '+'"))
+            self._last_type_constraints[name] = bounds
+            if not self._match("COMMA"):
+                break
         self._expect("GREATER", "expected '>' after type parameters")
         if len(set(parameters)) != len(parameters):
             self._error(self._previous(), "generic type parameters must be unique")

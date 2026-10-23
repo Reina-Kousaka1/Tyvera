@@ -11,7 +11,7 @@ implemented.
 | Stage | Status | Scope and exit condition |
 | --- | --- | --- |
 | 1. Core language | Implemented | Primitive types, functions, checked returns, lexical scopes, mutable/immutable bindings, operators, conditionals, `while`, `break` and `continue`, covered by tests. |
-| 2. Object and value types | First slice implemented | Classes, fields, `self`, constructors, methods, interfaces and dispatch, plus generic immutable records, enums, tuples, newtypes, transparent aliases, portable value equality, and statically hashable Map keys. Generic constraints, generic methods/interfaces, recursive exhaustiveness analysis and inheritance remain open. |
+| 2. Object and value types | First slice implemented | Classes, fields, `self`, constructors, methods, interfaces and dispatch, plus generic immutable records, enums, tuples, newtypes, transparent aliases, interface-constrained generic functions, portable value equality, and statically hashable Map keys. Generic methods/interfaces, bounds on generic type declarations, recursive exhaustiveness analysis and inheritance remain open. |
 | 3. Modules | First slice implemented | Relative `.tyv` imports, aliases, `pub` exports, module graph linking, visibility/missing/duplicate diagnostics, cycle detection and project-root containment. Local package dependencies are still planned. |
 | 4. Standard library | Core slice implemented | Generic collections, `for`, `Option<T>`, `Result<T,E>`, core matching, text I/O/path helpers, local/environment secret providers, typed JSON, signed `Duration`, monotonic one-shot timers, timer-backed sleep tasks, cooperative parent-scoped lifecycle, owner-local `TaskGroup` joins/cancellation, explicit child detachment, actor-owned task cancellation, one-shot runtime shutdown and typed task deadlines. Separate stdlib modules remain planned. |
 | 5. Actor runtime | First slice implemented | Actor declarations, typed immutable message transfer, isolated state, FIFO mailboxes, deterministic round-robin cooperative scheduling, typed one-shot request/reply, cancellation, request deadlines, delayed typed messages, stop/alive lifecycle, and isolated crash reporting. Parallel scheduling and backpressure remain open. |
@@ -23,8 +23,9 @@ implemented.
 
 ## Near-term sequence
 
-1. Extend generic constraints and nested pattern exhaustiveness; keep adding
-   conformance cases for structural types and backend-independent equality.
+1. Extend generic constraints to type declarations and nested pattern
+   exhaustiveness; keep adding conformance cases for structural types and
+   backend-independent equality.
 2. Design deterministic resource ownership and cleanup before async I/O, native
    handles, or a foreign-function interface.
 3. Move or wrap collection, I/O, JSON, and secret operations behind normal

@@ -143,6 +143,7 @@ class Function:
     public: bool = False
     type_parameters: list[str] = field(default_factory=list)
     is_async: bool = False
+    type_constraints: dict[str, list[str]] = field(default_factory=dict)
 
 
 class Statement:

@@ -14,7 +14,7 @@ Python 3.10 or newer. Native executables that run without Python remain a
 planned goal, and no native backend exists yet.
 
 The implemented language includes `Int`, `Float`, `Bool`, `String`, `Void`,
-generic functions, classes, records, enums and newtypes, transparent type
+interface-constrained generic functions, classes, records, enums and newtypes, transparent type
 aliases, typed tuples, `List<T>` and `Map<K,V>`, `Option<T>` and `Result<T,E>`,
 nested statement-level pattern matching, checked equality and map keyability,
 `for`, checked text I/O and path helpers, secrets, typed JSON, checked returns,

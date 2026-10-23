@@ -59,7 +59,9 @@ statement   = declaration | assignment | field-set | conditional | loop | match 
             | "break" | "continue" | block | function-call ;
 await       = "await" expression ;
 for-loop    = "for" identifier "in" expression block ;
-function    = ["async"] "fn" identifier ["<" identifier {"," identifier} ">"] "(" [parameters] ")" ["->" type] block ;
+function    = ["async"] "fn" identifier [function-type-parameters] "(" [parameters] ")" ["->" type] block ;
+function-type-parameters = "<" function-type-parameter {"," function-type-parameter} ">" ;
+function-type-parameter = identifier [":" type {"+" type}] ;
 class       = "class" identifier ["<" identifier {"," identifier} ">"] ["implements" type-list] "{" {field | method} "}" ;
 record      = "record" identifier ["<" identifier {"," identifier} ">"] "{" {identifier ":" type} "}" ;
 enum        = "enum" identifier ["<" identifier {"," identifier} ">"] "{" {identifier ["(" type {"," type} ")"]} "}" ;
@@ -274,7 +276,7 @@ as `Int`. `newtype UserId = Int` instead creates a distinct nominal value. Its
 constructor is `UserId(value)`, its wrapped value is read through `.value`, and
 `UserId(value)` patterns destructure it. Newtypes compare by nominal type and
 wrapped value. Records, tuples, enums and newtypes can be generic. Generic type
-constraints are not implemented yet.
+declaration constraints are not implemented yet.
 
 ## Generics
 
@@ -300,9 +302,20 @@ fn main() {
 
 Type arguments are checked recursively and cannot be `Void`. Generic types are
 invariant. Generic methods, generic interfaces and type-parameter constraints
-are not supported. The checker substitutes concrete types at each call; the
-bootstrap interpreter erases type arguments in runtime object records, and no
-runtime cast or dynamic generic dispatch is exposed.
+on generic type declarations are not supported. Generic functions may constrain
+their parameters to one or more declared non-generic interfaces:
+
+```tyv
+interface Named { fn name() -> String }
+fn display<T: Named>(value: T) -> String { return value.name() }
+```
+
+The checker exposes only those interface methods inside the function and
+verifies the bound against each concrete or already-constrained type argument
+at a call. Generic functions cannot use a method that is absent from their
+bounds. The checker substitutes concrete types at each call; the bootstrap
+interpreter erases type arguments in runtime values, and no runtime cast or
+dynamic generic dispatch is exposed.
 
 ## Core collections and iteration
 
@@ -792,7 +805,8 @@ limit (or the bootstrap host stack limit, if reached sooner).
 
 Current limits: classes, interfaces and the deterministic cooperative actor
 runtime with bounded `one_for_one` supervision are supported, but there is no
-inheritance, generic methods/interfaces/constraints, collection literals,
+inheritance, generic methods/interfaces, generic type-declaration constraints,
+collection literals,
 `try`/`catch`, parallel process scheduling, async I/O, networking API,
 importable standard-library modules, external secret-store provider, native
 interop, garbage collector implementation, package manager or compiler

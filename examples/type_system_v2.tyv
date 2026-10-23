@@ -12,6 +12,26 @@ enum Lookup<T> {
     Missing
 }
 
+interface Named {
+    fn name() -> String
+}
+
+class Person implements Named {
+    let displayName: String
+
+    fn init(displayName: String) {
+        self.displayName = displayName
+    }
+
+    fn name() -> String {
+        return self.displayName
+    }
+}
+
+fn display<T: Named>(person: T) -> String {
+    return person.name()
+}
+
 fn main() {
     let user = User<UserId>(17, "Mira")
     let copy = User(17, "Mira")
@@ -40,4 +60,6 @@ fn main() {
     match order {
         OrderId(raw) => println(raw)
     }
+
+    println(display(Person("Ada")))
 }

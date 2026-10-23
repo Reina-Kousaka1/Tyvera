@@ -265,6 +265,11 @@ class ModuleLoader:
                                 for argument in arguments])
 
     def _rewrite_function(self, function, module, local, imports, known) -> None:
+        function.type_constraints = {
+            parameter: [self._resolve_type(bound, module, local, imports, known, function.location)
+                        for bound in bounds]
+            for parameter, bounds in function.type_constraints.items()
+        }
         for parameter in function.parameters:
             parameter.type_name = self._resolve_type(parameter.type_name, module, local, imports, known, parameter.location)
         function.return_type = self._resolve_type(function.return_type, module, local, imports, known, function.location)
