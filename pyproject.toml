@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tyvera"
+version = "0.1.0"
+description = "Bootstrap toolchain for the Tyvera programming language"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Tyvera contributors" }]
+dependencies = []
+
+[project.scripts]
+tyvera = "tyvera.cli:main"
+
+[tool.setuptools]
+packages = ["tyvera"]
