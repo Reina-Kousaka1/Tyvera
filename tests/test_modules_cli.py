@@ -59,6 +59,30 @@ class ModuleProjectTests(unittest.TestCase):
         })
         self.assertEqual(self._run(root), "Mira\n")
 
+    def test_imported_records_enums_newtypes_and_aliases_link_with_their_types(self) -> None:
+        root = self._project({
+            "src/main.tyv": (
+                'import "model.tyv" as model\n'
+                'fn main() {\n'
+                '    let count: model.Count = 4\n'
+                '    let id = model.UserId(count)\n'
+                '    let user = model.User(id, "Ada")\n'
+                '    let state = model.Status.Ready(user)\n'
+                '    match state {\n'
+                '        model.Status.Ready(model.User(value, name)) => { println(value.value)\n println(name) }\n'
+                '        model.Status.Empty => println("empty")\n'
+                '    }\n'
+                '}\n'
+            ),
+            "src/model.tyv": (
+                'pub type Count = Int\n'
+                'pub newtype UserId = Count\n'
+                'pub record User { id: UserId, name: String }\n'
+                'pub enum Status { Ready(User) Empty }\n'
+            ),
+        })
+        self.assertEqual(self._run(root), "4\nAda\n")
+
     def test_private_symbol_cannot_be_imported(self) -> None:
         root = self._project({
             "src/main.tyv": 'import "library.tyv" as lib\nfn main() { println(lib.hidden()) }\n',

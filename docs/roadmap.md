@@ -11,7 +11,7 @@ implemented.
 | Stage | Status | Scope and exit condition |
 | --- | --- | --- |
 | 1. Core language | Implemented | Primitive types, functions, checked returns, lexical scopes, mutable/immutable bindings, operators, conditionals, `while`, `break` and `continue`, covered by tests. |
-| 2. Object system | First slice implemented | Classes, fields, `self`, constructors, methods, interfaces, multiple interface implementation, interface dispatch, generic classes and generic functions. Generic methods/interfaces/constraints and inheritance remain open. |
+| 2. Object and value types | First slice implemented | Classes, fields, `self`, constructors, methods, interfaces and dispatch, plus generic immutable records, enums, tuples, newtypes, transparent aliases, portable value equality, and statically hashable Map keys. Generic constraints, generic methods/interfaces, recursive exhaustiveness analysis and inheritance remain open. |
 | 3. Modules | First slice implemented | Relative `.tyv` imports, aliases, `pub` exports, module graph linking, visibility/missing/duplicate diagnostics, cycle detection and project-root containment. Local package dependencies are still planned. |
 | 4. Standard library | Core slice implemented | Generic collections, `for`, `Option<T>`, `Result<T,E>`, core matching, text I/O/path helpers, local/environment secret providers, typed JSON, signed `Duration`, monotonic one-shot timers, timer-backed sleep tasks, cooperative parent-scoped lifecycle, owner-local `TaskGroup` joins/cancellation, explicit child detachment, actor-owned task cancellation, one-shot runtime shutdown and typed task deadlines. Separate stdlib modules remain planned. |
 | 5. Actor runtime | First slice implemented | Actor declarations, typed immutable message transfer, isolated state, FIFO mailboxes, deterministic round-robin cooperative scheduling, typed one-shot request/reply, cancellation, request deadlines, delayed typed messages, stop/alive lifecycle, and isolated crash reporting. Parallel scheduling and backpressure remain open. |
@@ -23,9 +23,8 @@ implemented.
 
 ## Near-term sequence
 
-1. Finish backend-independent contracts for equality, map keyability, string
-   representation, and tagged values; add conformance cases as each rule is
-   fixed.
+1. Extend generic constraints and nested pattern exhaustiveness; keep adding
+   conformance cases for structural types and backend-independent equality.
 2. Design deterministic resource ownership and cleanup before async I/O, native
    handles, or a foreign-function interface.
 3. Move or wrap collection, I/O, JSON, and secret operations behind normal
@@ -39,9 +38,10 @@ implemented.
 
 The future native path should preserve the same source grammar, AST, type
 checking and diagnostics while replacing only execution/code generation.
-Integer, Float, Bool, left-to-right evaluation, and core string equality rules
-are specified; complete tagged-value equality, portable Map hashing, string
-length/indexing, resource ownership, and FFI error mapping still need contracts.
+Integer, Float, Bool, left-to-right evaluation, Unicode scalar string equality,
+tagged-value equality, and portable Map keyability are specified in the
+bootstrap language contract. String indexing, resource ownership, and FFI error
+mapping still need contracts and implementations.
 The implemented backend boundary and the comparison of LLVM, Cranelift, C
 transpilation, and a custom backend are in
 [Backend Architecture](backend-architecture.md). Proposed ownership rules are
@@ -59,7 +59,8 @@ branches, loops and match arms. True parallelism, structured async I/O,
 resource ownership, standard library modules, networking and a native backend
 are still missing. Runtime ownership, shutdown, detached task failures, timed
 wrappers, and actor reply fairness now have explicit semantics and tests. The
-next runtime/compiler dependency is a portable value and resource contract,
-followed by stable standard-library module boundaries and cross-backend
-conformance programs.
+portable value and equality contract is now implemented in the bootstrap. The
+next runtime/compiler dependency is deterministic resource ownership, followed
+by stable standard-library module boundaries and cross-backend conformance
+programs.
 

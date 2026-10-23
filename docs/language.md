@@ -47,7 +47,7 @@ precedence below):
 ```text
 block       = "{" [statements] "}" ;
 import      = "import" string "as" identifier ;
-top-level   = import | ["pub"] (function | class | interface | actor) ;
+top-level   = import | ["pub"] (function | class | interface | actor | record | enum | newtype | type-alias) ;
 declaration = ("let" | "var") identifier [":" type] "=" (expression | await) ;
 assignment  = identifier "=" expression ;
 field-set   = expression "." identifier "=" expression ;
@@ -61,6 +61,10 @@ await       = "await" expression ;
 for-loop    = "for" identifier "in" expression block ;
 function    = ["async"] "fn" identifier ["<" identifier {"," identifier} ">"] "(" [parameters] ")" ["->" type] block ;
 class       = "class" identifier ["<" identifier {"," identifier} ">"] ["implements" type-list] "{" {field | method} "}" ;
+record      = "record" identifier ["<" identifier {"," identifier} ">"] "{" {identifier ":" type} "}" ;
+enum        = "enum" identifier ["<" identifier {"," identifier} ">"] "{" {identifier ["(" type {"," type} ")"]} "}" ;
+newtype     = "newtype" identifier ["<" identifier {"," identifier} ">"] "=" type ;
+type-alias  = "type" identifier ["<" identifier {"," identifier} ">"] "=" type ;
 field       = ("let" | "var") identifier ":" type ;
 method      = "fn" identifier ["<" identifier {"," identifier} ">"] "(" [parameters] ")" ["->" type] block ;
 interface   = "interface" identifier "{" {method-signature} "}" ;
@@ -71,8 +75,12 @@ actor-handler = "on" identifier "(" [parameters] ")" ["->" type] block ;
 method-signature = "fn" identifier "(" [parameters] ")" ["->" type] ;
 type-list   = identifier {"," identifier} ;
 parameters  = identifier ":" type {"," identifier ":" type} ;
-type        = identifier {"." identifier} ["<" type {"," type} ">"] ;
-pattern     = literal | "_" | identifier | ("Some" | "Ok" | "Err") "(" [identifier | "_"] ")" | "None" ;
+type        = identifier {"." identifier} ["<" type {"," type} ">"] | "(" type "," type {"," type} ")" ;
+pattern     = literal | "_" | identifier | tuple-pattern | record-pattern | enum-pattern
+            | ("Some" | "Ok" | "Err") "(" pattern ")" | "None" ;
+tuple-pattern = "(" pattern "," pattern {"," pattern} ")" ;
+record-pattern = identifier "(" [pattern {"," pattern}] ")" ;
+enum-pattern = identifier "." identifier ["(" [pattern {"," pattern}] ")"] ;
 ```
 
 Actor references additionally support `request`, `requestWithin`, and
@@ -103,7 +111,7 @@ the constructor.
 | `Int` | Signed 64-bit integers, −9223372036854775808 through 9223372036854775807. Out-of-range literals are static errors; arithmetic overflow is a located runtime error. |
 | `Float` | Finite IEEE binary64 values. Decimal literals round to binary64. Non-finite literals and arithmetic overflow are errors; ordinary binary64 rounding and underflow apply. |
 | `Bool` | Exactly `true` or `false`, printed in lowercase; no truthiness conversion. |
-| `String` | UTF-8 source and text-file input; string values compare exact Unicode text and concatenate. No indexing or implicit string conversion. Length, normalization, and indexing rules remain unspecified because no such operations exist yet. |
+| `String` | Unicode scalar sequence decoded from UTF-8 source and text-file input; equality compares exact scalar sequence without normalization. Concatenation is supported; no indexing, slicing, or implicit string conversion exists. |
 | `Void` | No return value; not allowed for bindings or parameters. No literal. |
 
 `Unit` remains an exact compatibility alias for `Void`; signatures and
@@ -203,15 +211,76 @@ to an interface-typed binding or passed to an interface-typed parameter;
 method calls dispatch to the instance's class implementation. Interfaces have
 no fields, default methods or inheritance. Classes/interfaces and global
 functions share one declaration namespace within each module. Module
-declarations are private by default; `pub fn`, `pub class` and `pub interface`
-make a declaration importable. Class fields and methods remain public once the
-class itself is imported.
+declarations are private by default; `pub` makes a function, type, record,
+enum, newtype or alias importable. Class fields and methods remain public once
+the class itself is imported.
+
+## Records, tuples, enums and nominal wrappers
+
+Records are immutable value types. Their fields are declared in order, and
+construction supplies one value for each field in that order. Field access is
+read-only. A record compares structurally when it has the same nominal record
+type; fields follow their own equality rules. A record containing a mutable
+collection is still shallowly immutable, so that collection can change through
+its methods.
+
+```tyv
+record User<T> {
+    id: T
+    name: String
+}
+
+fn main() {
+    let user = User<Int>(17, "Mira")
+    println(user.name)
+    match user {
+        User(id, name) => println(id)
+    }
+}
+```
+
+Tuple types use `(T1, T2, ...)` and require at least two statically known
+elements. Values use `(first, second, ...)`, positional reads use `.0`, `.1`,
+and tuple patterns destructure elements in order. Tuples are immutable values;
+their equality is elementwise.
+
+Enums are nominal sum types. Each variant can carry zero or more typed
+payloads. Construct a case with `EnumName.Case(values...)`; a case without
+payloads can also be written `EnumName.Case`. Generic enums infer type
+parameters from payloads, or accept them on the case call when no payload
+provides enough information. Enum patterns use `EnumName.Case(patterns...)`.
+Matches over an enum are exhaustive when every case is handled, and a case only
+counts as covered when its payload patterns accept every payload value.
+
+```tyv
+enum LoginResult<T> {
+    Success(T)
+    InvalidPassword
+    Locked(Duration)
+}
+
+fn main() {
+    let result = LoginResult.Success<Int>(7)
+    match result {
+        LoginResult.Success(value) => println(value)
+        LoginResult.InvalidPassword => println("invalid")
+        LoginResult.Locked(duration) => println(duration.inMilliseconds())
+    }
+}
+```
+
+`type UserId = Int` declares a transparent alias; it has exactly the same type
+as `Int`. `newtype UserId = Int` instead creates a distinct nominal value. Its
+constructor is `UserId(value)`, its wrapped value is read through `.value`, and
+`UserId(value)` patterns destructure it. Newtypes compare by nominal type and
+wrapped value. Records, tuples, enums and newtypes can be generic. Generic type
+constraints are not implemented yet.
 
 ## Generics
 
-Generic functions and classes use named type parameters. Calls infer parameters
-from value arguments when possible; explicit type arguments are available when
-inference has no input:
+Generic functions, classes, records, enums and newtypes use named type
+parameters. Calls infer parameters from value arguments when possible;
+explicit type arguments are available when inference has no input:
 
 ```tyv
 fn identity<T>(value: T) -> T { return value }
@@ -259,19 +328,24 @@ removals return `None`; invalid writes or insertions produce runtime diagnostics
 
 `Map<K,V>` supports `put(K,V)`, `get(K) -> Option<V>`, `remove(K) -> Option<V>`,
 `containsKey(K) -> Bool`, `keys() -> List<K>`, `values() -> List<V>`,
-`clear()` and read-only `.length`. Keys must be primitive values or class/
-interface references. Iterating a map
-visits keys in insertion order. A `for` loop evaluates its collection once and
+`clear()` and read-only `.length`. Keys must have a statically hashable type:
+the primitive values, `Duration`, `Json`, identity-based class/interface and
+`ActorRef` references, or immutable records, tuples, newtypes, enums, `Option`
+and `Result` whose nested values are also hashable. Mutable `List` and `Map`
+values are rejected as keys. Value keys use structural equality; reference keys
+use stable identity for their lifetime. Map key equality and hashing obey the
+same contract, and hashes are not exposed as Tyvera values. Iterating a map
+visits keys in insertion order. Updating an existing key keeps its position; a
+removed key added later appears at the end. A `for` loop evaluates its collection once and
 iterates a snapshot, so mutations during the loop do not alter its current
 iteration. Loop bindings are immutable and scoped to the loop body; `break`
 and `continue` target the innermost loop. A `for` loop may execute zero times
 and cannot by itself satisfy a non-`Void` function's return-path requirement.
 
-The bootstrap currently stores map entries in a Python dictionary. Tyvera's
-portable key equality and hashing contract is not complete, and some key types
-accepted by the checker can fail at runtime. Do not rely on Python hash values
-or cross-type key equivalence; this limitation is tracked in the
-[Memory Model](memory-model.md).
+The bootstrap uses a Tyvera-defined 64-bit hash and equality check for map
+lookup. Its concrete hash bytes are an implementation detail; Tyvera programs
+cannot observe a hash value. Python's `hash()` is not part of the language
+semantics.
 
 These core types are available without an import. A separately packaged
 `tyvera.collections` module is not implemented yet.
@@ -292,13 +366,13 @@ automatically unwrap either type.
 ## Pattern matching
 
 `match` is a statement; each arm has a pattern and a statement or block body.
-Supported patterns are primitive literals, `_`, a binding name, and the
-`Some(value)`, `None`, `Ok(value)`, `Err(error)` variants. A binding is immutable
-and visible only in its arm. Literal types must exactly match the subject type.
-Option/Result and Bool matches are checked for exhaustiveness; other types may
-use a wildcard/binding default. A non-exhaustive match simply executes no arm
-when no pattern matches. Duplicate cases and arms after exhaustive coverage
-are errors.
+Supported patterns include primitive literals, `_`, bindings, nested tuple and
+record destructuring, newtype wrappers, built-in Option/Result cases, and
+user-defined enum cases. A binding is immutable and visible only in its arm.
+Literal types must match the subject type. Option/Result, Bool and enum matches
+are checked for exhaustiveness; other partial patterns may use a
+wildcard/binding default. A non-exhaustive match simply executes no arm when no
+pattern matches. Duplicate cases and arms after exhaustive coverage are errors.
 
 ```tyv
 match response {
@@ -307,7 +381,7 @@ match response {
 }
 ```
 
-This is a first sum-type slice; destructuring nested values, guards, and
+Nested patterns are supported. Match guards, named-field patterns, and
 message-pattern matching are not implemented.
 
 ## Cooperative actors
@@ -575,8 +649,10 @@ Their payload type is the corresponding primitive, length, `Json`, or
 `List<String>`. A wrong container kind, missing key, or out-of-range index
 returns `None`; there are no implicit numeric conversions. JSON values can be
 inspected or encoded, but automatic mapping to user-defined classes is not yet
-implemented. These operations are bootstrap intrinsics and do not yet live in
-an importable `tyvera.json` source module.
+implemented. Records and enum variants do not yet have derived JSON codecs;
+typed serialization needs an explicit schema and validation policy. These
+operations are bootstrap intrinsics and do not yet live in an importable
+`tyvera.json` source module.
 
 ```tyv
 match parseJson("{\"ready\":true}") {
@@ -667,11 +743,15 @@ operands and function arguments evaluate left to right.
 
 Mixed numeric equality/order compare numeric values without first rounding an
 `Int` to binary64; e.g. an integer beyond binary64's exact range is not equal
-to a different rounded Float. Strings compare exact text; Bool is never a
-number. `==` on mutable class instances, lists, maps, actors, tasks, and other
-identity handles compares object identity. Scalars compare by value. `Option`,
-`Result`, and `Json` equality details are not all specified yet and must not be
-used as a portability guarantee. No other operator combinations or conversions are permitted.
+to a different rounded Float. `Float` equality follows finite IEEE binary64
+comparison, so positive and negative zero compare equal; NaN and infinities are
+not representable. Strings compare exact Unicode scalar sequences without
+normalization, and Bool is never a number. Class instances, actor references,
+tasks, timers, supervisors and reply handles compare by identity. Lists and
+maps compare structurally; map equality does not depend on insertion order.
+Tuples, records, newtypes, enums, `Option`, `Result`, and `Json` compare by
+their tagged value structure, recursively applying the nested type's rules.
+No other operator combinations or conversions are permitted.
 Both sides of a short-circuit expression are still statically checked.
 
 ## Conditions, loops and returns

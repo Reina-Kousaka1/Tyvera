@@ -10,6 +10,16 @@ features.
 - Classes, `List<T>`, and `Map<K,V>` are mutable reference values. Passing one
   through a function or storing it in another binding shares the same object.
   `let` prevents rebinding; it does not freeze the referenced object.
+- Records, tuples, enums, and newtypes are immutable tagged values. Record and
+  newtype immutability is shallow: a contained list or map remains mutable.
+  `type` aliases are transparent and do not create runtime wrappers.
+- Lists, maps, records, tuples, enums, newtypes, `Option`, `Result`, and `Json`
+  use Tyvera-defined structural equality. Class and runtime-handle equality is
+  identity-based. Mixed `Int`/`Float` equality compares the exact represented
+  numeric values; Bool is a separate type.
+- Map storage uses a Tyvera-defined stable hash/equality contract. Keys are
+  restricted to recursively hashable values and stable identity references;
+  mutable collections and values containing them cannot be keys.
 - Actor state is isolated. Actor messages accept the types described in the
   [language reference](language.md#actors). Transferable value payloads are
   copied; an `ActorRef` continues to identify the same actor.
@@ -20,10 +30,10 @@ features.
   objects. That allocation strategy is not a Tyvera guarantee. Tyvera has no
   deterministic file, stream, socket, or native-handle cleanup yet.
 
-The bootstrap currently relies on Python dictionary behavior for map storage
-and hashing. The type checker does not yet express a complete `Map` keyability
-constraint, so some statically accepted key types can still fail at runtime.
-This limitation must be removed before maps can define a portable native ABI.
+The bootstrap's internal 64-bit hash algorithm is not exposed as a language
+value. Backends may choose different hash bytes as long as equality, key
+stability, and lookup behavior remain the same. A portable native Map ABI is
+still future work.
 
 ## Proposed Memory Model V1
 
@@ -34,19 +44,21 @@ mutable state. It does not require a general borrow checker.
 
 | Category | V1 direction | Status |
 | --- | --- | --- |
-| `Int`, `Float`, `Bool`, `Duration` | Immutable scalar values; assignment copies the value. | Core behavior implemented; numeric limits are specified. |
-| `String` | Immutable Unicode scalar sequence; equality compares exact sequence, without normalization. | Text operations are implemented; a full encoding/indexing contract is still open. |
-| `Json`, `Option<T>`, `Result<T,E>` | Immutable tagged values; equality is structural, and each payload follows its own value or reference rule. | Types exist; complete equality semantics are not frozen. |
-| Class instances, lists, maps | Mutable references with stable object identity. Assignment copies the reference; fields and collection contents remain shared. | Implemented for the current object/collection slice. |
+| `Int`, `Float`, `Bool`, `Duration` | Immutable scalar values; assignment copies the value. | Implemented; signed 64-bit and finite binary64 rules are specified. |
+| `String` | Immutable Unicode scalar sequence; equality compares exact sequence, without normalization. | Implemented for source and file I/O; indexing and grapheme APIs remain open. |
+| `Json`, `Option<T>`, `Result<T,E>`, enums, newtypes, tuples | Immutable tagged values with structural equality; nested references retain their own identity/value behavior. | Implemented in the bootstrap; native representation remains planned. |
+| Records | Immutable nominal value records; fields compare structurally. Nested mutable references remain shared. | Implemented, including generic types, destructuring, and safe derived map keys. |
+| Class instances, lists, maps | Classes use stable identity; lists and maps compare by contents. Assignment copies references; collection contents remain shared. | Implemented in the bootstrap. |
 | Actor references, tasks, reply handles, timers, supervisors | Opaque identity handles. Copying a handle does not copy the actor, task, or operation it names. | Implemented in the interpreter; public runtime ABI is planned. |
 | Resource handles | Affine owners: one live owner, explicit transfer, deterministic release. | Planned; no resource type or syntax exists. |
 
-For ordinary references, `==` compares identity. Value equality applies to
-scalars and should compare immutable tagged values structurally. The exact
-equality and hashing rules for `Option`, `Result`, `Json`, and `Map` keys remain
-open where the bootstrap currently inherits host behavior; they must be
-specified and tested before a native backend relies on them. Tyvera will not
-expose Python's `id()`, `hash()`, or object layout.
+For mutable ordinary references, `==` compares identity. Value equality
+compares scalar and immutable tagged values structurally, recursively applying
+the nested value's rule. Lists and maps are mutable but intentionally compare
+by current contents; they cannot be map keys. Class, actor, task, timer,
+supervisor and reply identities use runtime identity tokens rather than Python
+object addresses. Tyvera exposes neither Python's `id()`, `hash()`, nor object
+layout. The numerical hash representation remains a bootstrap detail.
 
 ### Mutability and sharing
 

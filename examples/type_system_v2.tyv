@@ -1,0 +1,43 @@
+type UserId = Int
+
+newtype OrderId = Int
+
+record User<T> {
+    id: T
+    name: String
+}
+
+enum Lookup<T> {
+    Found(T)
+    Missing
+}
+
+fn main() {
+    let user = User<UserId>(17, "Mira")
+    let copy = User(17, "Mira")
+    println(user == copy)
+
+    let row = (user.id, user.name)
+    println(row.0)
+
+    let users: Map<User<UserId>, String> = Map<User<UserId>, String>()
+    users.put(user, "active")
+    match users.get(copy) {
+        Some(status) => println(status)
+        None => println("missing")
+    }
+
+    let result: Lookup<User<UserId>> = Lookup.Found(user)
+    match result {
+        Lookup.Found(User(id, name)) => {
+            println(id)
+            println(name)
+        }
+        Lookup.Missing => println("missing")
+    }
+
+    let order = OrderId(42)
+    match order {
+        OrderId(raw) => println(raw)
+    }
+}

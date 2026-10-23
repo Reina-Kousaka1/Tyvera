@@ -11,6 +11,9 @@ from .ast import (
     Call,
     Expression,
     ExpressionStatement,
+    EnumDeclaration,
+    EnumPattern,
+    EnumVariant,
     Field,
     ForStatement,
     Function,
@@ -31,7 +34,13 @@ from .ast import (
     Parameter,
     Program,
     ReturnStatement,
+    RecordDeclaration,
+    RecordPattern,
+    NewtypeDeclaration,
+    TypeAliasDeclaration,
     Statement,
+    TupleExpression,
+    TuplePattern,
     Unary,
     VariantPattern,
     WildcardPattern,
@@ -82,6 +91,10 @@ class Parser:
         interfaces: list[InterfaceDeclaration] = []
         imports: list[ImportDeclaration] = []
         actors: list[ActorDeclaration] = []
+        records: list[RecordDeclaration] = []
+        enums: list[EnumDeclaration] = []
+        newtypes: list[NewtypeDeclaration] = []
+        type_aliases: list[TypeAliasDeclaration] = []
         self._skip_separators()
         while not self._check("EOF"):
             public = self._match("PUB")
@@ -106,8 +119,24 @@ class Parser:
                 if is_async:
                     self._error(self._previous(), "'async' can only modify a function declaration")
                 actors.append(self._actor_declaration(public))
+            elif self._check("RECORD"):
+                if is_async:
+                    self._error(self._previous(), "'async' can only modify a function declaration")
+                records.append(self._record_declaration(public))
+            elif self._check("ENUM"):
+                if is_async:
+                    self._error(self._previous(), "'async' can only modify a function declaration")
+                enums.append(self._enum_declaration(public))
+            elif self._check("NEWTYPE"):
+                if is_async:
+                    self._error(self._previous(), "'async' can only modify a function declaration")
+                newtypes.append(self._newtype_declaration(public))
+            elif self._check("TYPE"):
+                if is_async:
+                    self._error(self._previous(), "'async' can only modify a function declaration")
+                type_aliases.append(self._type_alias_declaration(public))
             else:
-                self._error(self._current(), "expected an import or function, class, interface, or actor declaration")
+                self._error(self._current(), "expected an import or function, class, interface, actor, record, enum, type alias, or newtype declaration")
             if not self._check_any("NEWLINE", "SEMICOLON", "EOF"):
                 self._error(self._current(), "expected a line break after the declaration")
             self._skip_separators()
@@ -116,7 +145,7 @@ class Parser:
             if declaration.alias in aliases:
                 raise Diagnostic(declaration.location, "module", f"import alias '{declaration.alias}' is already declared")
             aliases.add(declaration.alias)
-        return Program(functions, classes, interfaces, imports, actors)
+        return Program(functions, classes, interfaces, imports, actors, records, enums, newtypes, type_aliases)
 
     def _import(self) -> ImportDeclaration:
         token = self._expect("IMPORT", "expected 'import'")
@@ -157,6 +186,17 @@ class Parser:
         return name_token.lexeme, parameters, return_type
 
     def _type_name(self, message: str) -> str:
+        if self._match("LPAREN"):
+            elements = [self._type_name("expected a tuple element type")]
+            if not self._match("COMMA"):
+                self._error(self._current(), "tuple types require at least two element types")
+            elements.append(self._type_name("expected a tuple element type after ','"))
+            while self._match("COMMA"):
+                if self._check("RPAREN"):
+                    break
+                elements.append(self._type_name("expected a tuple element type after ','"))
+            self._expect("RPAREN", "expected ')' after tuple type")
+            return "Tuple<" + ",".join(elements) + ">"
         parts = [self._expect("IDENTIFIER", message).lexeme]
         while self._match("DOT"):
             parts.append(self._expect("IDENTIFIER", "expected a type name after '.'").lexeme)
@@ -221,6 +261,69 @@ class Parser:
             self._skip_separators()
         self._expect("RBRACE", "expected '}' to close class body")
         return ClassDeclaration(name.lexeme, interfaces, fields, methods, class_token.location, public, type_parameters)
+
+    def _record_declaration(self, public: bool = False) -> RecordDeclaration:
+        record_token = self._expect("RECORD", "expected 'record'")
+        name = self._expect("IDENTIFIER", "expected a record name after 'record'")
+        type_parameters = self._type_parameters()
+        self._expect("LBRACE", "expected '{' after record name")
+        fields: list[Field] = []
+        self._skip_separators()
+        while not self._check_any("RBRACE", "EOF"):
+            field_name = self._expect("IDENTIFIER", "expected a record field name")
+            self._expect("COLON", "expected ':' after record field name")
+            field_type = self._type_name("expected a record field type after ':'")
+            fields.append(Field(field_name.lexeme, field_type, False, field_name.location))
+            if self._match("COMMA"):
+                self._skip_separators()
+            elif not self._check_any("NEWLINE", "SEMICOLON", "RBRACE", "EOF", "IDENTIFIER"):
+                self._error(self._current(), "expected a line break, ',', or ';' after record field")
+            self._skip_separators()
+        self._expect("RBRACE", "expected '}' to close record declaration")
+        return RecordDeclaration(name.lexeme, fields, record_token.location, public, type_parameters)
+
+    def _enum_declaration(self, public: bool = False) -> EnumDeclaration:
+        enum_token = self._expect("ENUM", "expected 'enum'")
+        name = self._expect("IDENTIFIER", "expected an enum name after 'enum'")
+        type_parameters = self._type_parameters()
+        self._expect("LBRACE", "expected '{' after enum name")
+        variants: list[EnumVariant] = []
+        self._skip_separators()
+        while not self._check_any("RBRACE", "EOF"):
+            variant = self._expect("IDENTIFIER", "expected an enum variant name")
+            payload_types: list[str] = []
+            if self._match("LPAREN"):
+                if not self._check("RPAREN"):
+                    payload_types.append(self._type_name("expected a variant payload type"))
+                    while self._match("COMMA"):
+                        payload_types.append(self._type_name("expected a variant payload type after ','"))
+                self._expect("RPAREN", "expected ')' after enum payload types")
+            variants.append(EnumVariant(variant.lexeme, payload_types, variant.location))
+            if self._match("COMMA"):
+                self._skip_separators()
+            elif not self._check_any("NEWLINE", "SEMICOLON", "RBRACE", "EOF", "IDENTIFIER"):
+                self._error(self._current(), "expected a line break, ',', or ';' after enum variant")
+            self._skip_separators()
+        self._expect("RBRACE", "expected '}' to close enum declaration")
+        if not variants:
+            self._error(enum_token, "enum must declare at least one variant")
+        return EnumDeclaration(name.lexeme, variants, enum_token.location, public, type_parameters)
+
+    def _newtype_declaration(self, public: bool = False) -> NewtypeDeclaration:
+        newtype_token = self._expect("NEWTYPE", "expected 'newtype'")
+        name = self._expect("IDENTIFIER", "expected a newtype name after 'newtype'")
+        type_parameters = self._type_parameters()
+        self._expect("EQUAL", "expected '=' after newtype name")
+        underlying_type = self._type_name("expected a representation type after '='")
+        return NewtypeDeclaration(name.lexeme, underlying_type, newtype_token.location, public, type_parameters)
+
+    def _type_alias_declaration(self, public: bool = False) -> TypeAliasDeclaration:
+        alias_token = self._expect("TYPE", "expected 'type'")
+        name = self._expect("IDENTIFIER", "expected a type alias name after 'type'")
+        type_parameters = self._type_parameters()
+        self._expect("EQUAL", "expected '=' after type alias name")
+        target_type = self._type_name("expected a target type after '='")
+        return TypeAliasDeclaration(name.lexeme, target_type, alias_token.location, public, type_parameters)
 
     def _interface_declaration(self, public: bool = False) -> InterfaceDeclaration:
         interface_token = self._expect("INTERFACE", "expected 'interface'")
@@ -378,7 +481,10 @@ class Parser:
                 continue
             if self._check("DOT"):
                 dot = self._advance()
-                member = self._expect("IDENTIFIER", "expected a field or method name after '.'")
+                if self._check_any("IDENTIFIER", "INTEGER"):
+                    member = self._advance()
+                else:
+                    self._error(self._current(), "expected a field, tuple index, or method name after '.'")
                 type_arguments: list[str] = []
                 if self._check("LESS"):
                     saved = self.index
@@ -426,6 +532,18 @@ class Parser:
             return Unary(operator, self._expression(7), token.location)
         if token.kind == "LPAREN":
             expression = self._expression()
+            if self._match("COMMA"):
+                elements = [expression]
+                while True:
+                    if self._check("RPAREN"):
+                        break
+                    elements.append(self._expression())
+                    if not self._match("COMMA"):
+                        break
+                self._expect("RPAREN", "expected ')' after tuple expression")
+                if len(elements) < 2:
+                    self._error(token, "tuple values require at least two elements")
+                return TupleExpression(elements, token.location)
             self._expect("RPAREN", "expected ')' after expression")
             return expression
         self._error(token, "expected an expression")
@@ -453,6 +571,18 @@ class Parser:
 
     def _pattern(self):
         token = self._current()
+        if self._match("LPAREN"):
+            first = self._pattern()
+            if not self._match("COMMA"):
+                self._expect("RPAREN", "expected ')' after grouped pattern")
+                return first
+            elements = [first, self._pattern()]
+            while self._match("COMMA"):
+                if self._check("RPAREN"):
+                    break
+                elements.append(self._pattern())
+            self._expect("RPAREN", "expected ')' after tuple pattern")
+            return TuplePattern(elements, token.location)
         if token.kind == "MINUS":
             self._advance()
             number = self._advance()
@@ -470,13 +600,45 @@ class Parser:
             self._advance()
             if token.lexeme == "_":
                 return WildcardPattern(token.location)
+            if self._match("DOT"):
+                type_or_variant = self._expect("IDENTIFIER", "expected a type or enum variant after '.'")
+                enum_name = token.lexeme
+                variant = type_or_variant
+                if self._match("DOT"):
+                    enum_name = f"{token.lexeme}.{type_or_variant.lexeme}"
+                    variant = self._expect("IDENTIFIER", "expected an enum variant after enum type")
+                payload_patterns: list = []
+                if self._match("LPAREN"):
+                    if not self._check("RPAREN"):
+                        payload_patterns.append(self._pattern())
+                        while self._match("COMMA"):
+                            if self._check("RPAREN"):
+                                break
+                            payload_patterns.append(self._pattern())
+                    self._expect("RPAREN", "expected ')' after enum variant pattern")
+                return EnumPattern(enum_name, variant.lexeme, payload_patterns, token.location)
             if self._match("LPAREN"):
                 if token.lexeme == "None":
                     self._error(token, "None pattern does not take a payload")
-                binding_token = self._expect("IDENTIFIER", "expected a binding or '_' inside variant pattern")
-                binding = None if binding_token.lexeme == "_" else binding_token.lexeme
-                self._expect("RPAREN", "expected ')' after variant pattern")
-                return VariantPattern(token.lexeme, binding, token.location)
+                patterns: list = []
+                if not self._check("RPAREN"):
+                    patterns.append(self._pattern())
+                    while self._match("COMMA"):
+                        if self._check("RPAREN"):
+                            break
+                        patterns.append(self._pattern())
+                self._expect("RPAREN", "expected ')' after constructor pattern")
+                if token.lexeme in {"Some", "Ok", "Err"}:
+                    if len(patterns) != 1:
+                        self._error(token, f"'{token.lexeme}' pattern requires exactly one payload pattern")
+                    payload_pattern = patterns[0]
+                    binding = payload_pattern.name if isinstance(payload_pattern, BindingPattern) else None
+                    return VariantPattern(token.lexeme, binding, token.location, payload_pattern)
+                return RecordPattern(token.lexeme, patterns, token.location)
+            if token.lexeme == "None":
+                return VariantPattern("None", None, token.location)
+            if token.lexeme in {"Some", "Ok", "Err"}:
+                self._error(token, f"'{token.lexeme}' pattern requires a payload")
             return BindingPattern(token.lexeme, token.location)
         self._error(token, "expected a literal, wildcard, binding, or variant pattern")
 

@@ -47,7 +47,9 @@ The module paths below are design targets, not current imports:
 Async tasks and timer-driven waiting are implemented in the bootstrap runtime;
 async I/O and networking are not. JSON, collection, I/O and secret operations
 are bootstrap intrinsics rather than source `.tyv` modules, so they are not
-yet imported through `tyvera.*` namespaces.
+yet imported through `tyvera.*` namespaces. JSON codecs for records and ADTs
+are also not implemented; callers currently inspect or construct `Json`
+explicitly.
 
 Actor requests are non-blocking: call `runActors()` to process messages and
 then poll `ReplyReceiver.tryReceive()`, or `await` the receiver from an async

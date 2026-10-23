@@ -6,6 +6,7 @@ import sys
 import time
 from collections import ChainMap, deque
 from dataclasses import dataclass, field as dataclass_field
+from itertools import count
 from pathlib import Path
 from typing import Callable, TextIO
 
@@ -19,6 +20,7 @@ from .ast import (
     ClassDeclaration,
     Expression,
     ExpressionStatement,
+    EnumPattern,
     Function,
     ForStatement,
     IfStatement,
@@ -34,7 +36,11 @@ from .ast import (
     Name,
     Program,
     ReturnStatement,
+    RecordPattern,
+    NewtypeDeclaration,
     Statement,
+    TupleExpression,
+    TuplePattern,
     Unary,
     VariantPattern,
     WildcardPattern,
@@ -50,6 +56,8 @@ _MAX_ACTOR_MAILBOX = 100_000
 _MAX_ACTOR_DELIVERIES = 100_000
 _MAX_SUPERVISOR_RESTARTS = 1_000
 _MAX_TASK_STEPS = 100_000
+_IDENTITY_SEQUENCE = count(1)
+_HASH_MASK = (1 << 64) - 1
 
 
 @dataclass(slots=True)
@@ -67,6 +75,7 @@ class _TyveraInstance:
     class_name: str
     fields: dict[str, object]
     actor: _TyveraActor | None = None
+    identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
 
 @dataclass(slots=True)
@@ -84,6 +93,7 @@ class _TyveraReplyCell:
     started_at: float | None = None
     timeout_milliseconds: int | None = None
     clock: Callable[[], float] | None = None
+    identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
     def __repr__(self) -> str:
         return "<ReplyChannel>"
@@ -124,6 +134,7 @@ class _TyveraTimer:
     scheduled_arguments: list[object] = dataclass_field(default_factory=list)
     scheduled_location: Location | None = None
     delivered: bool = False
+    identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
     def __repr__(self) -> str:
         return "<Timer>"
@@ -164,6 +175,7 @@ class _TyveraTask:
     parent: _TyveraTask | None = None
     owner_actor: _TyveraActor | None = None
     children: list[_TyveraTask] = dataclass_field(default_factory=list)
+    identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
     def __repr__(self) -> str:
         return "<Task>"
@@ -173,6 +185,7 @@ class _TyveraTask:
 class _TyveraTaskGroup:
     owner: _TyveraTask | None
     tasks: list[_TyveraTask] = dataclass_field(default_factory=list)
+    identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
     def __repr__(self) -> str:
         return "<TaskGroup>"
@@ -186,6 +199,7 @@ class _TyveraSupervisor:
     restart_times: deque[float] = dataclass_field(default_factory=deque)
     children: list[_TyveraActor] = dataclass_field(default_factory=list)
     status: str = "alive"
+    identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
     def __repr__(self) -> str:
         return "<Supervisor>"
@@ -201,6 +215,7 @@ class _TyveraActor:
     declaration: ActorDeclaration | None = None
     constructor_arguments: list[object] = dataclass_field(default_factory=list)
     pending_replies: set[_TyveraReplyCell] = dataclass_field(default_factory=set)
+    identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
 
 @dataclass(slots=True, eq=False, repr=False)
@@ -216,20 +231,81 @@ class _TyveraList:
     values: list[object]
 
 
+@dataclass(slots=True, frozen=True, eq=False)
+class _TyveraTuple:
+    values: tuple[object, ...]
+
+
+@dataclass(slots=True, eq=False)
+class _TyveraRecord:
+    type_name: str
+    fields: dict[str, object]
+
+
+@dataclass(slots=True, frozen=True, eq=False)
+class _TyveraNewtype:
+    type_name: str
+    value: object
+
+
 @dataclass(slots=True, eq=False)
 class _TyveraMap:
-    values: dict[object, object]
+    entries: list[tuple[int, object, object]] = dataclass_field(default_factory=list)
+
+    def _find(self, key: object, key_hash: int | None = None) -> int | None:
+        hash_value = _tyvera_hash(key) if key_hash is None else key_hash
+        for index, (entry_hash, entry_key, _) in enumerate(self.entries):
+            if entry_hash == hash_value and _tyvera_equal(entry_key, key):
+                return index
+        return None
+
+    def put(self, key: object, value: object) -> None:
+        key_hash = _tyvera_hash(key)
+        index = self._find(key, key_hash)
+        if index is None:
+            self.entries.append((key_hash, key, value))
+        else:
+            _, entry_key, _ = self.entries[index]
+            self.entries[index] = (key_hash, entry_key, value)
+
+    def get(self, key: object, default: object = _MISSING) -> object:
+        index = self._find(key)
+        return default if index is None else self.entries[index][2]
+
+    def remove(self, key: object) -> object:
+        index = self._find(key)
+        if index is None:
+            return _MISSING
+        return self.entries.pop(index)[2]
+
+    def contains_key(self, key: object) -> bool:
+        return self._find(key) is not None
+
+    def keys(self) -> list[object]:
+        return [key for _, key, _ in self.entries]
+
+    def values(self) -> list[object]:
+        return [value for _, _, value in self.entries]
+
+    def clear(self) -> None:
+        self.entries.clear()
+
+    def __len__(self) -> int:
+        return len(self.entries)
 
 
 @dataclass(slots=True, eq=False)
 class _TyveraVariant:
     variant: str
     payload: object = None
+    enum_name: str | None = None
+    payload_arity: int | None = None
 
 
 @dataclass(slots=True, eq=False, repr=False)
 class _TyveraSecret:
     value: str
+    identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
     def __repr__(self) -> str:
         return "<Secret redacted>"
@@ -244,6 +320,171 @@ class _TyveraJson:
         return "<Json value redacted>"
 
 
+def _hash_bytes(data: bytes) -> int:
+    result = 0xCBF29CE484222325
+    for byte in data:
+        result = ((result ^ byte) * 0x100000001B3) & _HASH_MASK
+    return result
+
+
+def _encode_hash_integer(value: int) -> bytes:
+    magnitude = abs(value)
+    width = max(1, (magnitude.bit_length() + 7) // 8)
+    return (b"-" if value < 0 else b"+") + width.to_bytes(4, "big") + magnitude.to_bytes(width, "big")
+
+
+def _hash_parts(tag: bytes, *parts: int) -> int:
+    data = bytearray(tag)
+    data.append(0)
+    for part in parts:
+        encoded = _encode_hash_integer(int(part))
+        data.extend(len(encoded).to_bytes(4, "big"))
+        data.extend(encoded)
+    return _hash_bytes(bytes(data))
+
+
+def _hash_number(numerator: int, denominator: int = 1) -> int:
+    return _hash_parts(b"number", numerator, denominator)
+
+
+def _tyvera_equal(left: object, right: object, seen: set[tuple[int, int]] | None = None) -> bool:
+    """Tyvera equality, independent of Python dataclass and container equality."""
+    if type(left) is bool or type(right) is bool:
+        return type(left) is bool and type(right) is bool and left is right
+    if type(left) is int and type(right) is int:
+        return left == right
+    if type(left) is float and type(right) is float:
+        return left == right
+    if type(left) is int and type(right) is float:
+        return right.is_integer() and int(right) == left
+    if type(left) is float and type(right) is int:
+        return left.is_integer() and int(left) == right
+    if isinstance(left, str) or isinstance(right, str):
+        return isinstance(left, str) and isinstance(right, str) and left == right
+    if left is None or right is None:
+        return left is None and right is None
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, _TyveraDuration):
+        return left.milliseconds == right.milliseconds
+    if isinstance(left, _TyveraInstance):
+        return left.identity == right.identity
+    if isinstance(left, _TyveraActorRef):
+        return left.actor.identity == right.actor.identity
+    if isinstance(left, _TyveraTask):
+        return left.identity == right.identity
+    if isinstance(left, (_TyveraTimer, _TyveraSupervisor)):
+        return left.identity == right.identity
+    if isinstance(left, (_TyveraReplySender, _TyveraReplyReceiver)):
+        return left.cell.identity == right.cell.identity
+    if isinstance(left, _TyveraTaskGroup):
+        return left.identity == right.identity
+    if isinstance(left, _TyveraSecret):
+        return left.identity == right.identity
+    if isinstance(left, _TyveraList):
+        if len(left.values) != len(right.values):
+            return False
+        pairs = set() if seen is None else seen
+        pair = (id(left), id(right))
+        if pair in pairs:
+            return True
+        pairs.add(pair)
+        try:
+            return all(_tyvera_equal(a, b, pairs) for a, b in zip(left.values, right.values))
+        finally:
+            pairs.remove(pair)
+    if isinstance(left, _TyveraTuple):
+        return (len(left.values) == len(right.values)
+                and all(_tyvera_equal(a, b, seen) for a, b in zip(left.values, right.values)))
+    if isinstance(left, _TyveraRecord):
+        return (left.type_name == right.type_name and left.fields.keys() == right.fields.keys()
+                and all(_tyvera_equal(left.fields[name], right.fields[name], seen) for name in left.fields))
+    if isinstance(left, _TyveraNewtype):
+        return left.type_name == right.type_name and _tyvera_equal(left.value, right.value, seen)
+    if isinstance(left, _TyveraMap):
+        if len(left.entries) != len(right.entries):
+            return False
+        pairs = set() if seen is None else seen
+        pair = (id(left), id(right))
+        if pair in pairs:
+            return True
+        pairs.add(pair)
+        try:
+            return all(
+                any(_tyvera_equal(key, other_key, pairs) and _tyvera_equal(value, other_value, pairs)
+                    for _, other_key, other_value in right.entries)
+                for _, key, value in left.entries
+            )
+        finally:
+            pairs.remove(pair)
+    if isinstance(left, _TyveraVariant):
+        return (left.enum_name == right.enum_name and left.variant == right.variant
+                and left.payload_arity == right.payload_arity
+                and _tyvera_equal(left.payload, right.payload, seen))
+    if isinstance(left, _TyveraJson):
+        if left.kind != right.kind:
+            return False
+        if left.kind == "array":
+            return len(left.value) == len(right.value) and all(
+                _tyvera_equal(a, b, seen) for a, b in zip(left.value, right.value)
+            )
+        if left.kind == "object":
+            return (left.value.keys() == right.value.keys()
+                    and all(_tyvera_equal(left.value[key], right.value[key], seen) for key in left.value))
+        return _tyvera_equal(left.value, right.value, seen)
+    return left is right
+
+
+def _tyvera_hash(value: object) -> int:
+    """Stable 64-bit hash for statically permitted Tyvera Map key values."""
+    if value is None:
+        return _hash_bytes(b"unit")
+    if type(value) is bool:
+        return _hash_bytes(b"bool\0true" if value else b"bool\0false")
+    if type(value) is int:
+        return _hash_number(value)
+    if type(value) is float:
+        numerator, denominator = value.as_integer_ratio()
+        return _hash_number(numerator, denominator)
+    if isinstance(value, str):
+        return _hash_bytes(b"string\0" + value.encode("utf-8"))
+    if isinstance(value, _TyveraDuration):
+        return _hash_parts(b"duration", value.milliseconds)
+    if isinstance(value, _TyveraTuple):
+        children = [_tyvera_hash(item) for item in value.values]
+        return _hash_parts(b"tuple", len(children), *children)
+    if isinstance(value, _TyveraRecord):
+        parts = [part for name, item in sorted(value.fields.items())
+                 for part in (_hash_bytes(name.encode("utf-8")), _tyvera_hash(item))]
+        return _hash_parts(b"record-" + value.type_name.encode("utf-8"), len(value.fields), *parts)
+    if isinstance(value, _TyveraNewtype):
+        return _hash_parts(b"newtype-" + value.type_name.encode("utf-8"), _tyvera_hash(value.value))
+    if isinstance(value, _TyveraInstance):
+        return _hash_parts(b"object-identity", value.identity)
+    if isinstance(value, _TyveraActorRef):
+        return _hash_parts(b"actor-identity", value.actor.identity)
+    if isinstance(value, _TyveraTask):
+        return _hash_parts(b"task-identity", value.identity)
+    if isinstance(value, _TyveraVariant):
+        return _hash_parts(b"variant", _hash_bytes((value.enum_name or "").encode("utf-8")),
+                           _hash_bytes(value.variant.encode("utf-8")),
+                           -1 if value.payload_arity is None else value.payload_arity,
+                           _tyvera_hash(value.payload))
+    if isinstance(value, _TyveraJson):
+        if value.kind == "array":
+            children = [_tyvera_hash(item) for item in value.value]
+            return _hash_parts(b"json-array", len(children), *children)
+        if value.kind == "object":
+            children = [(_hash_bytes(key.encode("utf-8")), _tyvera_hash(item))
+                        for key, item in value.value.items()]
+            children.sort()
+            return _hash_parts(b"json-object", len(children), *(part for pair in children for part in pair))
+        if value.kind == "float":
+            return _hash_parts(b"json-float", _tyvera_hash(value.value))
+        return _hash_parts(b"json-" + value.kind.encode("ascii"), _tyvera_hash(value.value))
+    raise TypeError("value is not a hashable Tyvera key")
+
+
 class Interpreter:
     def __init__(
         self, program: Program, output: TextIO, max_call_depth: int = 256, *,
@@ -253,6 +494,9 @@ class Interpreter:
     ) -> None:
         self.functions = {function.name: function for function in program.functions}
         self.classes: dict[str, ClassDeclaration] = {declaration.name: declaration for declaration in program.classes}
+        self.records = {declaration.name: declaration for declaration in program.records}
+        self.enums = {declaration.name: declaration for declaration in program.enums}
+        self.newtypes = {declaration.name: declaration for declaration in program.newtypes}
         self.actors: dict[str, ActorDeclaration] = {declaration.name: declaration for declaration in program.actors}
         self._ready_actors: deque[_TyveraActor] = deque()
         self._actors: list[_TyveraActor] = []
@@ -357,7 +601,7 @@ class Interpreter:
                 if isinstance(iterable, _TyveraList):
                     items = tuple(iterable.values)
                 elif isinstance(iterable, _TyveraMap):
-                    items = tuple(iterable.values.keys())
+                    items = tuple(iterable.keys())
                 else:
                     raise AssertionError("checked for-loop value is not iterable")
                 for item in items:
@@ -371,15 +615,11 @@ class Interpreter:
             elif isinstance(statement, MatchStatement):
                 value = self._evaluate(statement.value, variables, depth)
                 for arm in statement.arms:
-                    matched, binding = self._matches(arm.pattern, value)
+                    matched, pattern_bindings = self._matches(arm.pattern, value)
                     if not matched:
                         continue
                     arm_variables = variables.new_child()
-                    if binding is not _MISSING:
-                        pattern = arm.pattern
-                        name = pattern.name if isinstance(pattern, BindingPattern) else pattern.binding
-                        if name is not None:
-                            arm_variables[name] = binding
+                    arm_variables.update(pattern_bindings)
                     self._execute_block(arm.body, arm_variables, depth)
                     break
             elif isinstance(statement, LoopControl):
@@ -392,6 +632,8 @@ class Interpreter:
     def _evaluate(self, expression: Expression, variables: ChainMap[str, object], depth: int) -> object:
         if isinstance(expression, Literal):
             return expression.value
+        if isinstance(expression, TupleExpression):
+            return _TyveraTuple(tuple(self._evaluate(element, variables, depth) for element in expression.elements))
         if isinstance(expression, Name):
             return variables[expression.identifier]
         if isinstance(expression, Call):
@@ -493,11 +735,11 @@ class Interpreter:
             if expression.callee == "jsonArray":
                 return _TyveraJson("array", list(arguments[0].values))
             if expression.callee == "jsonObject":
-                return _TyveraJson("object", dict(arguments[0].values))
+                return _TyveraJson("object", {key: value for _, key, value in arguments[0].entries})
             if expression.callee == "List":
                 return _TyveraList([])
             if expression.callee == "Map":
-                return _TyveraMap({})
+                return _TyveraMap()
             if expression.callee == "Some":
                 return _TyveraVariant("Some", arguments[0])
             if expression.callee == "None":
@@ -506,8 +748,15 @@ class Interpreter:
                 return _TyveraVariant("Ok", arguments[0])
             if expression.callee == "Err":
                 return _TyveraVariant("Err", arguments[0])
+            if expression.callee in self.newtypes:
+                return _TyveraNewtype(expression.callee, arguments[0])
             if expression.callee in self.classes:
                 return self._construct(self.classes[expression.callee], arguments, expression.location, depth + 1)
+            if expression.callee in self.records:
+                declaration = self.records[expression.callee]
+                return _TyveraRecord(declaration.name, {
+                    field.name: value for field, value in zip(declaration.fields, arguments)
+                })
             function = self.functions[expression.callee]
             if function.is_async:
                 return self._create_async_task(function, arguments, expression.location, depth)
@@ -519,13 +768,32 @@ class Interpreter:
                 except SecretProviderError as error:
                     raise Diagnostic(expression.location, "runtime", str(error)) from error
                 return _TyveraVariant("None") if value is None else _TyveraVariant("Some", _TyveraSecret(value))
+            if isinstance(expression.receiver, Name) and expression.receiver.identifier in self.enums:
+                return _TyveraVariant(expression.member, None, expression.receiver.identifier, 0)
             receiver = self._evaluate(expression.receiver, variables, depth)
-            if expression.member == "length" and isinstance(receiver, (_TyveraList, _TyveraMap)):
+            if isinstance(receiver, _TyveraTuple) and expression.member.isdecimal():
+                return receiver.values[int(expression.member)]
+            if expression.member == "length" and isinstance(receiver, _TyveraList):
                 return len(receiver.values)
+            if expression.member == "length" and isinstance(receiver, _TyveraMap):
+                return len(receiver)
+            if isinstance(receiver, _TyveraRecord):
+                return receiver.fields[expression.member]
+            if isinstance(receiver, _TyveraNewtype) and expression.member == "value":
+                return receiver.value
             if not isinstance(receiver, _TyveraInstance):
                 raise AssertionError("checked field access receiver is not an instance")
             return receiver.fields[expression.member]
         if isinstance(expression, MemberCall):
+            if isinstance(expression.receiver, Name) and expression.receiver.identifier in self.enums:
+                payloads = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+                if not payloads:
+                    payload = None
+                elif len(payloads) == 1:
+                    payload = payloads[0]
+                else:
+                    payload = _TyveraTuple(tuple(payloads))
+                return _TyveraVariant(expression.method, payload, expression.receiver.identifier, len(payloads))
             receiver = self._evaluate(expression.receiver, variables, depth)
             if isinstance(receiver, _TyveraSupervisor):
                 if expression.method == "start":
@@ -861,19 +1129,72 @@ class Interpreter:
         raise AssertionError(f"checked Json method not implemented: {method}")
 
     @staticmethod
-    def _matches(pattern, value: object) -> tuple[bool, object]:
+    def _matches(pattern, value: object) -> tuple[bool, dict[str, object]]:
         if isinstance(pattern, WildcardPattern):
-            return True, _MISSING
+            return True, {}
         if isinstance(pattern, BindingPattern):
-            return True, value
+            return True, {pattern.name: value}
         if isinstance(pattern, LiteralPattern):
-            return type(value) is type(pattern.value) and value == pattern.value, _MISSING
+            return _tyvera_equal(value, pattern.value), {}
+        if isinstance(pattern, TuplePattern):
+            if not isinstance(value, _TyveraTuple) or len(value.values) != len(pattern.elements):
+                return False, {}
+            bindings: dict[str, object] = {}
+            for child, child_value in zip(pattern.elements, value.values):
+                matched, child_bindings = Interpreter._matches(child, child_value)
+                if not matched:
+                    return False, {}
+                bindings.update(child_bindings)
+            return True, bindings
+        if isinstance(pattern, RecordPattern):
+            if isinstance(value, _TyveraNewtype) and value.type_name == pattern.name:
+                if len(pattern.fields) != 1:
+                    return False, {}
+                return Interpreter._matches(pattern.fields[0], value.value)
+            if not isinstance(value, _TyveraRecord) or value.type_name != pattern.name:
+                return False, {}
+            if len(value.fields) != len(pattern.fields):
+                return False, {}
+            bindings: dict[str, object] = {}
+            for child, child_value in zip(pattern.fields, value.fields.values()):
+                matched, child_bindings = Interpreter._matches(child, child_value)
+                if not matched:
+                    return False, {}
+                bindings.update(child_bindings)
+            return True, bindings
+        if isinstance(pattern, EnumPattern):
+            if (not isinstance(value, _TyveraVariant) or value.enum_name != pattern.enum_name
+                    or value.variant != pattern.variant):
+                return False, {}
+            if value.payload_arity == 0:
+                payloads = ()
+            elif value.payload_arity == 1:
+                payloads = (value.payload,)
+            elif isinstance(value.payload, _TyveraTuple):
+                payloads = value.payload.values
+            elif pattern.payload_patterns:
+                payloads = (value.payload,)
+            else:
+                payloads = ()
+            if len(payloads) != len(pattern.payload_patterns):
+                return False, {}
+            bindings: dict[str, object] = {}
+            for child, child_value in zip(pattern.payload_patterns, payloads):
+                matched, child_bindings = Interpreter._matches(child, child_value)
+                if not matched:
+                    return False, {}
+                bindings.update(child_bindings)
+            return True, bindings
         if isinstance(pattern, VariantPattern):
             if not isinstance(value, _TyveraVariant) or value.variant != pattern.variant:
-                return False, _MISSING
+                return False, {}
             if pattern.variant == "None":
-                return True, _MISSING
-            return True, value.payload
+                return True, {}
+            if pattern.payload_pattern is not None:
+                return Interpreter._matches(pattern.payload_pattern, value.payload)
+            if pattern.binding is not None:
+                return True, {pattern.binding: value.payload}
+            return True, {}
         raise AssertionError(f"unhandled pattern node: {type(pattern).__name__}")
 
     @staticmethod
@@ -914,7 +1235,7 @@ class Interpreter:
                 return _TyveraVariant("None")
             return _TyveraVariant("Some", values.pop(index))
         if method == "contains":
-            return arguments[0] in values
+            return any(_tyvera_equal(arguments[0], item) for item in values)
         if method == "clear":
             values.clear()
             return None
@@ -924,30 +1245,27 @@ class Interpreter:
     def _call_map_method(
         receiver: _TyveraMap, method: str, arguments: list[object], location: Location,
     ) -> object:
-        values = receiver.values
         try:
             if method == "put":
-                values[arguments[0]] = arguments[1]
+                receiver.put(arguments[0], arguments[1])
                 return None
             if method == "get":
-                try:
-                    return _TyveraVariant("Some", values[arguments[0]])
-                except KeyError as error:
-                    return _TyveraVariant("None")
+                value = receiver.get(arguments[0])
+                return _TyveraVariant("None") if value is _MISSING else _TyveraVariant("Some", value)
             if method == "remove":
-                value = values.pop(arguments[0], _MISSING)
+                value = receiver.remove(arguments[0])
                 return _TyveraVariant("None") if value is _MISSING else _TyveraVariant("Some", value)
             if method == "containsKey":
-                return arguments[0] in values
+                return receiver.contains_key(arguments[0])
             if method == "keys":
-                return _TyveraList(list(values.keys()))
+                return _TyveraList(receiver.keys())
             if method == "values":
-                return _TyveraList(list(values.values()))
+                return _TyveraList(receiver.values())
             if method == "clear":
-                values.clear()
+                receiver.clear()
                 return None
         except TypeError as error:
-            raise Diagnostic(location, "runtime", "Map key is not hashable") from error
+            raise Diagnostic(location, "runtime", "Map key is not hashable under Tyvera's Map key rules") from error
         raise AssertionError(f"checked collection method not implemented: {method}")
 
     def _construct(
@@ -1015,7 +1333,8 @@ class Interpreter:
         if isinstance(value, _TyveraReplySender):
             return _TyveraReplySender(value.cell)
         if isinstance(value, _TyveraVariant):
-            return _TyveraVariant(value.variant, Interpreter._copy_actor_value(value.payload))
+            return _TyveraVariant(value.variant, Interpreter._copy_actor_value(value.payload),
+                                  value.enum_name, value.payload_arity)
         if value is None or type(value) in {bool, int, float, str}:
             return value
         raise AssertionError("checked actor constructor value is not transferable")
@@ -1297,7 +1616,7 @@ class Interpreter:
             if isinstance(iterable, _TyveraList):
                 items = tuple(iterable.values)
             elif isinstance(iterable, _TyveraMap):
-                items = tuple(iterable.values.keys())
+                    items = tuple(iterable.keys())
             else:
                 raise AssertionError("checked async for-loop value is not iterable")
             frame.index += 1
@@ -1311,11 +1630,7 @@ class Interpreter:
                 if not matched:
                     continue
                 scope = frame.variables.new_child()
-                if binding is not _MISSING:
-                    pattern = arm.pattern
-                    name = pattern.name if isinstance(pattern, BindingPattern) else pattern.binding
-                    if name is not None:
-                        scope[name] = binding
+                scope.update(binding)
                 task.frames.append(_AsyncBlockFrame(arm.body, scope))
                 break
             return
@@ -1711,9 +2026,9 @@ class Interpreter:
         if operator == "/":
             return left / right  # type: ignore[operator]
         if operator == "==":
-            return left == right
+            return _tyvera_equal(left, right)
         if operator == "!=":
-            return left != right
+            return not _tyvera_equal(left, right)
         if operator == "<":
             return left < right  # type: ignore[operator]
         if operator == "<=":

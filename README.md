@@ -14,12 +14,13 @@ Python 3.10 or newer. Native executables that run without Python remain a
 planned goal, and no native backend exists yet.
 
 The implemented language includes `Int`, `Float`, `Bool`, `String`, `Void`,
-generic functions and classes, typed `List<T>` and `Map<K,V>`, `Option<T>` and
-`Result<T,E>`, statement-level pattern matching, `for`, checked text I/O and
-path helpers, secrets, typed JSON, checked returns, lexical scopes, arithmetic,
-comparisons, conditionals, and loops. Classes, interfaces, and multi-file
-projects support checked initialization, dynamic dispatch, relative imports,
-and `pub` exports.
+generic functions, classes, records, enums and newtypes, transparent type
+aliases, typed tuples, `List<T>` and `Map<K,V>`, `Option<T>` and `Result<T,E>`,
+nested statement-level pattern matching, checked equality and map keyability,
+`for`, checked text I/O and path helpers, secrets, typed JSON, checked returns,
+lexical scopes, arithmetic, comparisons, conditionals, and loops. Classes,
+interfaces, and multi-file projects support checked initialization, dynamic
+dispatch, relative imports, and `pub` exports.
 
 The deterministic actor runtime supports typed messages, isolated state, FIFO
 mailboxes, crash isolation, bounded `one_for_one` supervision, request/reply,
@@ -91,6 +92,8 @@ tyvera check examples/runtime_foundations.tyv
 tyvera run examples/runtime_foundations.tyv
 tyvera check examples/async_tasks.tyv
 tyvera run examples/async_tasks.tyv
+tyvera check examples/type_system_v2.tyv
+tyvera run examples/type_system_v2.tyv
 ```
 
 Run the test suite from the repository root:
