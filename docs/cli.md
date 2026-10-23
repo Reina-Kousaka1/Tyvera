@@ -21,3 +21,13 @@ entry = "src/main.tyv"
 
 Without an explicit path, `run` and `check` use the current directory as a
 project. Package commands, `test`, and `fmt` are not implemented yet.
+
+## Planned native build
+
+`tyvera build` is not implemented. Its acceptance condition is a successful
+native executable for a selected target that runs without Python installed on
+the target system. A command that only validates a project, emits source, or
+launches the interpreter does not satisfy that contract. Target selection,
+toolchain diagnostics, output paths, and build profiles will be finalized with
+the first executable backend; see [Backend Architecture](backend-architecture.md).
+

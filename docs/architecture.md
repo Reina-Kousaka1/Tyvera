@@ -2,15 +2,17 @@
 
 ## Current pipeline
 
-A source file passes through four explicit stages:
+A source file passes through the frontend and selected backend:
 
 1. `lexer.py` converts characters into tokens with source locations.
 2. `parser.py` builds the Tyvera-specific AST in `ast.py`.
 3. `typesys.py` collects and validates declarations, expressions, calls,
    constructors, interface contracts and the entry point before execution.
-4. `interpreter.py` evaluates only a successfully checked AST, including
-   Tyvera-owned object instances, actor references, mailbox scheduling and
-   method dispatch.
+4. `compiler.py` returns a `CheckedProgram` after semantic analysis. The
+   current top-level function signature table is retained; inferred expression
+   types and most resolved semantic facts are not.
+5. `backend.py` defines the `ExecutionBackend` boundary. The CLI currently
+   selects `ReferenceInterpreterBackend`, which delegates to `interpreter.py`.
 
 `source.py` owns shared file/line/column locations and user-facing diagnostics.
 `modules.py` resolves relative imports, checks visibility and links source
@@ -33,9 +35,15 @@ and `--version`. The implementation uses Python's standard library only.
   without a native compiler, VM or external build tools. Lexer, AST, checker
   and CLI boundaries leave room for a future bytecode or native backend. This
   implementation makes no C++-level performance or native access claim.
-- **Host language is an implementation detail:** Python hosts the first
-  toolchain. Tyvera programs do not inherit Python syntax, libraries, dynamic
-  typing or object model.
+- **Python is the reference implementation:** Python is the bootstrap
+  implementation, current interpreter host, development tool, and conformance
+  reference for Tyvera behavior. It is not part of the language contract or
+  the planned native program runtime. Python-specific dependencies remain at
+  collection hashing, JSON conversion, object lifetime, exceptions, and host
+  I/O boundaries; see the [Memory Model](memory-model.md).
+- **Execution follows semantic analysis:** The lexer, parser, module loader,
+  and type checker have no execution-backend dependency. The CLI passes a
+  `CheckedProgram` to `ExecutionBackend`; no native implementation exists.
 - **No formatter yet:** Statement separation and indentation conventions are
   documented. A future formatter needs round-trip and idempotence tests.
 
@@ -62,7 +70,9 @@ and `--version`. The implementation uses Python's standard library only.
   bootstrap value records. The checker owns their method signatures and
   iteration element types. A `for` evaluates its collection once and the
   runtime iterates an immutable snapshot, so mutation during iteration is
-  deterministic.
+  deterministic. Map storage currently uses Python's dictionary/hash behavior;
+  keyability is not yet a complete static constraint. See the
+  [Memory Model](memory-model.md#implemented-reference-behavior).
 - `Option<T>` and `Result<T,E>` are tagged Tyvera values. `match` checks
   literal and variant pattern types, arm scopes, duplicate coverage, and
   exhaustiveness for `Bool`, `Option` and `Result`. These ordinary error values
@@ -124,57 +134,31 @@ Actors participate in that linker and can be exported and imported. The
 manifest currently has only `name` and `entry`; dependencies are not yet
 supported. Ordinary functions and I/O execute synchronously; actor handlers
 run only when the cooperative scheduler is explicitly pumped. The supervisor
-API currently supports only `one_for_one`. The task scheduler is cooperative,
-single-threaded and statement-stepped: an async function call creates a Task,
-and `await` statements suspend and resume explicit block and loop frames while
-other tasks run. Synchronous calls and individual expressions remain atomic.
-Tasks preserve their statically declared result type. Tasks created while an
-async task runs are owned children: owner cancellation or failure cancels
-descendants, child failure fails its owners, and normal owner return joins all
-unfinished children before completing. `TaskGroup` is an owner-local view over
-registered direct children and provides explicit subset joins and cancellation
-without changing parent ownership. Detach is owner-only: it removes the child
-from its parent and the parent's groups, then leaves it scheduled as root work.
-`Task<T>.withTimeout(Duration)` creates a typed wrapper with a monotonic
-deadline; expiry cancels the source and fails the wrapper, while cancelling the
-wrapper cancels the source. Both wrapper and source participate in their
-creator's ordinary child-join rules.
-`runTasks()` drives deadlines and may wait for timers, but async I/O, HTTP,
-WebSockets and external secret stores are not implemented. Request deadlines
-do not remove queued messages or interrupt handlers.
-These boundaries are reflected in the
-[language reference](language.md) and [roadmap](roadmap.md).
+API currently supports only `one_for_one`.
 
-## Task runtime boundary
-
-The task runtime stores explicit block and loop continuation frames; it does
-not depend on Python coroutine semantics. An `await` statement can suspend
-inside nested blocks, branches, loops and match arms, preserving lexical scopes
-and loop-control targets. The scheduler advances one frame action at a time,
-round-robin. Synchronous calls and expressions remain atomic, and `await` is
-still a statement rather than an expression. Parent-scoped cancellation,
-implicit child joining, owner-scoped task groups, explicit child detachment,
-and task deadlines are implemented. A group registers only direct children of
-its owner; it does not alter the implicit join rule. Detached failures remain
-visible to the task scheduler. `runTasks()` waits only when all
-active tasks are suspended on a monotonic deadline or actor reply. It can report
-deadlock when no runnable or timed work can make progress.
+The task scheduler uses explicit block and loop continuation frames rather
+than Python coroutines. It supports nested `await`, structured child ownership,
+owner-local task groups, explicit detachment, typed deadlines, and detached
+failure reporting. The runtime is cooperative and single-threaded. Actors own
+tasks created by their constructors and handlers; stop, crash, restart, and
+runtime shutdown cancel that actor-owned work. Runtime shutdown closes actors,
+supervisors, timers, and all unfinished tasks. When a task awaits an actor
+reply, the scheduler interleaves a bounded actor turn with task steps to avoid
+starving that reply. Synchronous calls and individual expressions remain
+atomic. Full lifecycle rules are in the [Runtime documentation](runtime.md).
 
 ## Native backend direction
 
-The C++ influence is an architectural goal, not a current performance or
-interop claim. A separate compiler pipeline should retain the lexer, parser,
-AST, semantic analysis and diagnostics, then lower checked programs to a
-Tyvera IR shared by the interpreter and a future native backend. No IR is
-introduced yet: the current interpreter consumes the checked AST directly,
-and there is no second backend that would justify maintaining another
-representation. At the native milestone, define explicit value layouts,
-checked integer/float semantics, deterministic resource handles and a narrow,
-typed FFI boundary before selecting an ABI. Evaluate LLVM or a comparable
-backend against these requirements without making it a bootstrap dependency.
-Safe Tyvera should not expose raw pointers; any future unsafe/native boundary
-must be explicit and isolate ownership and foreign error mapping. Keep the
-interpreter as a conformance reference while native output is introduced.
+No native backend or Tyvera IR exists. The CLI now hands a `CheckedProgram` to
+`ExecutionBackend`, with `ReferenceInterpreterBackend` as the only
+implementation. The current representation retains the checked AST and
+top-level function signatures, not the expression-level type and ownership
+facts that a native backend will need. A shared IR is deferred until a second
+consumer or a real lowering step establishes its purpose. The runtime ABI,
+initial target plan, native backend comparison, and `tyvera build` acceptance
+criteria are in [Backend Architecture](backend-architecture.md). Tyvera's
+proposed value and resource ownership rules are in the
+[Memory Model](memory-model.md).
 
 ## Local bootstrap benchmarks
 
@@ -190,3 +174,4 @@ python benchmarks/benchmark_bootstrap.py --iterations 10
 It reports median wall-clock time and Python version. Results are exploratory
 and environment-dependent; they are not correctness tests or CI thresholds.
 Keep benchmark workloads stable when comparing revisions.
+

@@ -573,6 +573,8 @@ class TypeChecker:
                                       f"{construction.callee} actor constructor")
                 return f"ActorRef<{construction.callee}>"
             if expression.callee in {"runActors", "runTasks"}:
+                if owner is not None and isinstance(owner.declaration, ActorDeclaration):
+                    raise Diagnostic(expression.location, "type", "scheduler pumps cannot be called inside actor handlers")
                 if expression.type_arguments or expression.arguments:
                     raise Diagnostic(expression.location, "type", f"'{expression.callee}' expects no arguments")
                 return "Result<Int,String>"
@@ -1300,3 +1302,4 @@ class TypeChecker:
                 if missing:
                     name = sorted(missing)[0]
                     raise Diagnostic(constructor.location, "type", f"constructor does not initialize field '{name}' on all paths")
+

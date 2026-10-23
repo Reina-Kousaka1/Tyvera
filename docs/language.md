@@ -2,7 +2,9 @@
 
 Tyvera is an independent, statically typed language. Java, Elixir and C++ inform
 its design; they are not compatibility targets. TypeScript is not part of the
-design. Python hosts the bootstrap implementation only.
+design. Python hosts the bootstrap and reference interpreter only; Python
+runtime behavior is not part of Tyvera's language contract. The current value,
+resource, and host-dependency limits are recorded in the [Memory Model](memory-model.md).
 
 ## Files, declarations and statements
 
@@ -100,8 +102,8 @@ the constructor.
 | --- | --- |
 | `Int` | Signed 64-bit integers, −9223372036854775808 through 9223372036854775807. Out-of-range literals are static errors; arithmetic overflow is a located runtime error. |
 | `Float` | Finite IEEE binary64 values. Decimal literals round to binary64. Non-finite literals and arithmetic overflow are errors; ordinary binary64 rounding and underflow apply. |
-| `Bool` | Exactly `true` or `false`; no truthiness conversion. |
-| `String` | Text, concatenation and equality. No indexing or implicit string conversion. |
+| `Bool` | Exactly `true` or `false`, printed in lowercase; no truthiness conversion. |
+| `String` | UTF-8 source and text-file input; string values compare exact Unicode text and concatenate. No indexing or implicit string conversion. Length, normalization, and indexing rules remain unspecified because no such operations exist yet. |
 | `Void` | No return value; not allowed for bindings or parameters. No literal. |
 
 `Unit` remains an exact compatibility alias for `Void`; signatures and
@@ -264,6 +266,12 @@ iterates a snapshot, so mutations during the loop do not alter its current
 iteration. Loop bindings are immutable and scoped to the loop body; `break`
 and `continue` target the innermost loop. A `for` loop may execute zero times
 and cannot by itself satisfy a non-`Void` function's return-path requirement.
+
+The bootstrap currently stores map entries in a Python dictionary. Tyvera's
+portable key equality and hashing contract is not complete, and some key types
+accepted by the checker can fail at runtime. Do not rely on Python hash values
+or cross-type key equivalence; this limitation is tracked in the
+[Memory Model](memory-model.md).
 
 These core types are available without an import. A separately packaged
 `tyvera.collections` module is not implemented yet.
@@ -489,6 +497,14 @@ ready tasks round-robin, drives actor messages needed by awaited replies, and
 waits until a deadline when no task can otherwise run. A deadlock with pending
 work but no runnable task or deadline is returned as `Err`.
 
+An interpreter runtime is one-shot: `main` starts it and runtime shutdown runs
+when `main` returns or raises. `runTasks()` may be called repeatedly while
+`main` is active; it is idle between calls and cannot be pumped recursively or
+from an actor constructor/handler. Shutdown cancels every unfinished task,
+including detached and never-started root tasks, stops live actors and
+supervisors, clears mailboxes and timers, and fails outstanding replies. No
+work survives that interpreter instance.
+
 The scheduler preserves block scopes and loop state across suspension, so
 `await` is supported inside nested blocks, `if` branches, `while` and `for`
 bodies, and `match` arms. Each continuation step is scheduled round-robin;
@@ -520,10 +536,19 @@ returns `false`. Detaching also removes that task from groups owned by the
 parent, so group joins do not wait for it. The detached task continues as
 scheduler-root work, and its failure remains visible as an error from
 `runTasks()`. Cancellation does not interrupt a running statement. Task and
-TaskGroup values cannot be sent between actors.
+TaskGroup values cannot be sent between actors. A detached task can outlive its
+former parent task; runtime shutdown remains the final cancellation boundary.
+A task started directly by an actor constructor or message handler belongs to
+that actor and is cancelled on actor stop, crash, or supervised restart. Actor
+handlers cannot detach their direct tasks because they run synchronously.
 The task scheduler is single-threaded; it provides cooperative concurrency,
-not parallel execution. The interpreter's clock and sleeper can both be
-injected for deterministic tests. Async I/O and networking are not implemented.
+not parallel execution. When tasks await actor replies, the scheduler delivers
+at most one queued actor message between task turns, so a continuously runnable
+task cannot starve the reply. Synchronous calls, expressions, and actor
+handlers are atomic and can still delay other work. `runTasks()` waits against
+the injected monotonic clock for task or awaited-reply deadlines; `runActors()`
+never sleeps for a future message. Both schedulers have bounded safety limits.
+Async I/O and networking are not implemented.
 
 ## JSON values
 
@@ -643,7 +668,10 @@ operands and function arguments evaluate left to right.
 Mixed numeric equality/order compare numeric values without first rounding an
 `Int` to binary64; e.g. an integer beyond binary64's exact range is not equal
 to a different rounded Float. Strings compare exact text; Bool is never a
-number. No other operator combinations or conversions are permitted.
+number. `==` on mutable class instances, lists, maps, actors, tasks, and other
+identity handles compares object identity. Scalars compare by value. `Option`,
+`Result`, and `Json` equality details are not all specified yet and must not be
+used as a portability guarantee. No other operator combinations or conversions are permitted.
 Both sides of a short-circuit expression are still statically checked.
 
 ## Conditions, loops and returns
@@ -695,3 +723,4 @@ termination checking or loop execution budget is provided;
 users can write infinite loops. Parsing and execution use
 the host stack, so extremely deeply nested source is not supported. The
 interpreter is replaceable bootstrap technology, not part of Tyvera semantics.
+

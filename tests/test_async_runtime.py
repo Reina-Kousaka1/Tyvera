@@ -642,6 +642,108 @@ fn main() {
 }''', clock=lambda: now[0], sleeper=advance)
         self.assertEqual(output, "detached failure reported\ntrue\n")
 
+    def test_nested_task_groups_join_at_each_owner_boundary(self) -> None:
+        output = self.run_source('''async fn leaf() {
+    await sleepFor(milliseconds(1))
+    println("leaf")
+}
+async fn middle() {
+    let group = taskGroup()
+    group.add(leaf())
+    await group
+    println("middle")
+}
+async fn outer() {
+    let group = taskGroup()
+    group.add(middle())
+    await group
+    println("outer")
+}
+fn main() {
+    let task = outer()
+    match runTasks() {
+        Ok(_) => println(task.isDone())
+        Err(reason) => println(reason)
+    }
+}''')
+        self.assertEqual(output, "leaf\nmiddle\nouter\ntrue\n")
+
+    def test_actor_reply_waiter_is_not_starved_by_ready_tasks(self) -> None:
+        output = self.run_source('''async fn spin() {
+    var index: Int = 0
+    while index < 20 {
+        println(index)
+        index = index + 1
+    }
+}
+actor Worker {
+    on ping(reply: ReplySender<Int>) {
+        println("handled")
+        reply.send(7)
+    }
+}
+async fn query(worker: ActorRef<Worker>) {
+    let answer: Int = await worker.request(ping)
+    println(answer)
+}
+fn main() {
+    let worker = spawn(Worker())
+    let spinner = spin()
+    let request = query(worker)
+    match runTasks() {
+        Ok(_) => println("complete")
+        Err(reason) => println(reason)
+    }
+}''')
+        self.assertEqual(output.splitlines()[0], "handled")
+        self.assertLess(output.index("handled\n"), output.index("19\n"))
+        self.assertIn("7\n", output)
+
+    def test_actor_stop_cancels_tasks_started_by_its_handler(self) -> None:
+        output = self.run_source('''async fn background() {
+    await sleepFor(milliseconds(1))
+    println("must not run")
+}
+actor Worker {
+    on start() { let pending = background() }
+}
+fn main() {
+    let worker = spawn(Worker())
+    worker.start()
+    runActors()
+    worker.stop()
+    runTasks()
+    println(worker.isAlive())
+}''')
+        self.assertEqual(output, "false\n")
+
+    def test_interpreter_shutdown_cancels_open_work_and_is_one_shot(self) -> None:
+        program, _ = compile_source('''async fn pending() {
+    await sleepFor(milliseconds(10))
+    println("must not run")
+}
+actor Worker {
+    on ping(reply: ReplySender<Int>) { }
+}
+fn main() {
+    let task = pending()
+    let worker = spawn(Worker())
+    worker.request(ping)
+}''', "shutdown.tyv")
+        output = io.StringIO()
+        interpreter = Interpreter(program, output)
+        interpreter.run()
+
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(interpreter._runtime_state, "closed")
+        self.assertEqual(interpreter._scheduler_state, "closed")
+        self.assertTrue(all(task.state in {"completed", "failed", "cancelled"} for task in interpreter._tasks))
+        self.assertTrue(all(actor.status == "stopped" and not actor.mailbox for actor in interpreter._actors))
+        self.assertFalse(interpreter._ready_tasks)
+        self.assertFalse(interpreter._ready_actors)
+        with self.assertRaisesRegex(Diagnostic, "can only run once"):
+            interpreter.run()
+
     def test_task_group_cannot_be_used_by_a_different_task(self) -> None:
         output = self.run_source('''async fn useGroup(group: TaskGroup) {
     await group
@@ -773,6 +875,10 @@ fn main() { let worker = spawn(Worker()); runActors() }''', "actor message canno
     on receive() { let group = taskGroup() }
 }
 fn main() { let worker = spawn(Worker()); runActors() }''', "inside actor handlers")
+        self.reject('''actor Worker {
+    on receive() { runTasks() }
+}
+fn main() { let worker = spawn(Worker()); runActors() }''', "scheduler pumps cannot be called inside actor handlers")
         self.reject('''async fn work() { }
 fn main() {
     let task = work()
@@ -782,3 +888,4 @@ fn main() {
 
 if __name__ == "__main__":
     unittest.main()
+

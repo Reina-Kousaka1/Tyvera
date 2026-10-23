@@ -162,6 +162,7 @@ class _TyveraTask:
     error: str | None = None
     result: object = None
     parent: _TyveraTask | None = None
+    owner_actor: _TyveraActor | None = None
     children: list[_TyveraTask] = dataclass_field(default_factory=list)
 
     def __repr__(self) -> str:
@@ -254,6 +255,8 @@ class Interpreter:
         self.classes: dict[str, ClassDeclaration] = {declaration.name: declaration for declaration in program.classes}
         self.actors: dict[str, ActorDeclaration] = {declaration.name: declaration for declaration in program.actors}
         self._ready_actors: deque[_TyveraActor] = deque()
+        self._actors: list[_TyveraActor] = []
+        self._supervisors: list[_TyveraSupervisor] = []
         self._scheduled_timers: list[_TyveraTimer] = []
         self._ready_tasks: deque[_TyveraTask] = deque()
         self._tasks: list[_TyveraTask] = []
@@ -261,6 +264,8 @@ class Interpreter:
         self._current_actor: _TyveraActor | None = None
         self._current_task: _TyveraTask | None = None
         self._running_tasks = False
+        self._runtime_state = "ready"
+        self._scheduler_state = "idle"
         self.output = output
         self.error_output = error_output if error_output is not None else sys.stderr
         self.max_call_depth = max_call_depth
@@ -271,7 +276,33 @@ class Interpreter:
 
     def run(self) -> None:
         main = self.functions["main"]
-        self._call(main, [], main.location, 0)
+        if self._runtime_state != "ready":
+            raise Diagnostic(main.location, "runtime", "interpreter runtime can only run once")
+        self._runtime_state = "running"
+        try:
+            self._call(main, [], main.location, 0)
+        finally:
+            self._shutdown_runtime()
+
+    def _shutdown_runtime(self) -> None:
+        if self._runtime_state == "closed":
+            return
+        self._runtime_state = "shutting_down"
+        for task in self._tasks:
+            self._cancel_task(task)
+        for actor in self._actors:
+            self._stop_actor(actor, "runtime shut down before actor replied")
+        for supervisor in self._supervisors:
+            if supervisor.status == "alive":
+                supervisor.status = "stopped"
+        self._ready_tasks.clear()
+        self._ready_actors.clear()
+        for timer in self._scheduled_timers:
+            timer.cancelled = True
+        self._scheduled_timers.clear()
+        self._task_groups.clear()
+        self._scheduler_state = "closed"
+        self._runtime_state = "closed"
 
     def _call(self, function: Function, arguments: list[object], call_location: Location, depth: int) -> object:
         if depth >= self.max_call_depth:
@@ -386,7 +417,9 @@ class Interpreter:
                     raise Diagnostic(expression.location, "runtime", f"oneForOne maxRestarts cannot exceed {_MAX_SUPERVISOR_RESTARTS}")
                 if window_milliseconds <= 0:
                     raise Diagnostic(expression.location, "runtime", "oneForOne windowMilliseconds must be greater than zero")
-                return _TyveraSupervisor(max_restarts, window_milliseconds, self._clock)
+                supervisor = _TyveraSupervisor(max_restarts, window_milliseconds, self._clock)
+                self._supervisors.append(supervisor)
+                return supervisor
             if expression.callee == "runActors":
                 return self._run_actors(expression.location, depth)
             if expression.callee == "runTasks":
@@ -937,6 +970,7 @@ class Interpreter:
             declaration=declaration,
             constructor_arguments=[self._copy_actor_value(value) for value in arguments],
         )
+        self._actors.append(actor)
         instance.actor = actor
         if supervisor is not None:
             supervisor.children.append(actor)
@@ -960,10 +994,16 @@ class Interpreter:
         declaration = actor.declaration
         if declaration is None:
             raise AssertionError("actor has no declaration")
+        actor.status = "starting"
         actor.instance = _TyveraInstance(declaration.name, {}, actor)
         constructor = next((method for method in declaration.handlers if method.name == "init"), None)
-        if constructor is not None:
-            self._call_method(constructor, actor.instance, arguments, call_location, depth)
+        previous_actor = self._current_actor
+        self._current_actor = actor
+        try:
+            if constructor is not None:
+                self._call_method(constructor, actor.instance, arguments, call_location, depth)
+        finally:
+            self._current_actor = previous_actor
         actor.status = "alive"
 
     @staticmethod
@@ -988,6 +1028,7 @@ class Interpreter:
         )
 
     def _fail_pending_replies(self, actor: _TyveraActor, error: str) -> None:
+        self._cancel_actor_tasks(actor)
         self._cancel_actor_timers(actor)
         for cell in actor.pending_replies:
             self._refresh_reply(cell)
@@ -996,17 +1037,23 @@ class Interpreter:
                 cell.error = error
         actor.pending_replies.clear()
 
-    def _stop_actor(self, actor: _TyveraActor) -> None:
+    def _stop_actor(self, actor: _TyveraActor, reply_error: str = "actor stopped before replying") -> None:
         self._cancel_actor_timers(actor)
-        if actor.status == "alive":
+        self._cancel_actor_tasks(actor)
+        if actor.status in {"alive", "starting"}:
             actor.status = "stopped"
         for cell in actor.pending_replies:
             self._refresh_reply(cell)
             if cell.state == "pending":
                 cell.state = "failed"
-                cell.error = "actor stopped before replying"
+                cell.error = reply_error
         actor.pending_replies.clear()
         actor.mailbox.clear()
+
+    def _cancel_actor_tasks(self, actor: _TyveraActor) -> None:
+        for task in self._tasks:
+            if task.owner_actor is actor:
+                self._cancel_task(task)
 
     def _cancel_actor_timers(self, actor: _TyveraActor) -> None:
         for timer in self._scheduled_timers:
@@ -1034,6 +1081,7 @@ class Interpreter:
         variables = ChainMap({parameter.name: value for parameter, value in zip(function.parameters, arguments)})
         task = _TyveraTask(function, variables, location, depth + 1, canonical_type(function.return_type))
         task.parent = self._current_task
+        task.owner_actor = self._current_actor
         if task.parent is not None:
             task.parent.children.append(task)
         task.frames.append(_AsyncBlockFrame(function.body, variables))
@@ -1045,7 +1093,7 @@ class Interpreter:
         now = self._clock()
         task = _TyveraTask(None, None, location, state="sleeping",
                            due_at=now + max(0, duration.milliseconds) / 1000.0,
-                           parent=self._current_task)
+                           parent=self._current_task, owner_actor=self._current_actor)
         if task.parent is not None:
             task.parent.children.append(task)
         self._tasks.append(task)
@@ -1057,7 +1105,7 @@ class Interpreter:
         task = _TyveraTask(
             None, None, location, state="timed_wait", result_type=target.result_type,
             due_at=self._clock() + duration.milliseconds / 1000.0,
-            timeout_target=target, parent=self._current_task,
+            timeout_target=target, parent=self._current_task, owner_actor=self._current_actor,
         )
         if task.parent is not None:
             task.parent.children.append(task)
@@ -1065,13 +1113,17 @@ class Interpreter:
         return task
 
     def _run_tasks(self, location: Location, depth: int) -> _TyveraVariant:
+        if self._runtime_state != "running":
+            raise Diagnostic(location, "runtime", "runTasks requires an active interpreter runtime")
         if self._current_actor is not None:
             raise Diagnostic(location, "runtime", "runTasks cannot be called from an actor message handler")
         if self._running_tasks:
             raise Diagnostic(location, "runtime", "runTasks cannot be called recursively")
 
         self._running_tasks = True
+        self._scheduler_state = "running"
         steps = 0
+        scheduler_steps = 0
         failure: str | None = None
         try:
             while True:
@@ -1080,10 +1132,10 @@ class Interpreter:
                 self._wake_waiting_tasks()
                 self._settle_joining_tasks()
                 if self._ready_tasks:
-                    if steps >= _MAX_TASK_STEPS:
+                    if scheduler_steps >= _MAX_TASK_STEPS:
                         failure = (
                             f"task scheduler reached the {_MAX_TASK_STEPS}-step safety limit; "
-                            "tasks remain queued"
+                            "cooperative work remains queued"
                         )
                         break
                     task = self._ready_tasks.popleft()
@@ -1110,9 +1162,20 @@ class Interpreter:
                         else:
                             self._complete_task(task)
                     steps += 1
+                    scheduler_steps += 1
                     self._settle_timed_tasks()
                     self._wake_waiting_tasks()
                     self._settle_joining_tasks()
+                    if self._has_waiting_actor_reply() and self._ready_actors:
+                        actor_result = self._run_actors(
+                            location, depth + 1, delivery_limit=1, fail_on_limit=False,
+                        )
+                        if actor_result.variant == "Err" and failure is None:
+                            failure = str(actor_result.payload)
+                        scheduler_steps += int(actor_result.payload) if actor_result.variant == "Ok" else 1
+                        self._promote_due_timers()
+                        self._wake_waiting_tasks()
+                        self._settle_joining_tasks()
                     continue
 
                 active = [task for task in self._tasks
@@ -1120,18 +1183,25 @@ class Interpreter:
                 if not active:
                     break
 
-                if any(
-                    task.state == "waiting" and isinstance(task.wait_target, _TyveraReplyReceiver)
-                    and self._await_state(task.wait_target)[0] == "pending"
-                    for task in active
-                ):
-                    actor_result = self._run_actors(location, depth + 1)
-                    if actor_result.variant == "Err" and failure is None:
-                        failure = str(actor_result.payload)
+                if self._has_waiting_actor_reply(active) and self._ready_actors:
+                    if scheduler_steps >= _MAX_TASK_STEPS:
+                        failure = (
+                            f"task scheduler reached the {_MAX_TASK_STEPS}-step safety limit; "
+                            "cooperative work remains queued"
+                        )
+                        break
+                    actor_result = self._run_actors(
+                        location, depth + 1, delivery_limit=1, fail_on_limit=False,
+                    )
+                    if actor_result.variant == "Err":
+                        failure = failure or str(actor_result.payload)
+                        scheduler_steps += 1
+                    else:
+                        scheduler_steps += int(actor_result.payload)
                     self._promote_due_timers()
                     self._wake_waiting_tasks()
                     self._settle_joining_tasks()
-                    if self._ready_tasks:
+                    if self._ready_tasks or (self._ready_actors and self._has_waiting_actor_reply()):
                         continue
 
                 deadline = self._next_task_deadline()
@@ -1141,11 +1211,7 @@ class Interpreter:
                         self._sleep(delay)
                     continue
 
-                waiting_on_reply = any(
-                    task.state == "waiting" and isinstance(task.wait_target, _TyveraReplyReceiver)
-                    and self._await_state(task.wait_target)[0] == "pending"
-                    for task in active
-                )
+                waiting_on_reply = self._has_waiting_actor_reply(active)
                 if waiting_on_reply:
                     failure = failure or "task scheduler has an unresolved actor reply with no runnable work or deadline"
                 else:
@@ -1160,6 +1226,15 @@ class Interpreter:
             return _TyveraVariant("Ok", steps)
         finally:
             self._running_tasks = False
+            self._scheduler_state = "idle" if self._runtime_state == "running" else "closed"
+
+    def _has_waiting_actor_reply(self, tasks: list[_TyveraTask] | None = None) -> bool:
+        candidates = self._tasks if tasks is None else tasks
+        return any(
+            task.state == "waiting" and isinstance(task.wait_target, _TyveraReplyReceiver)
+            and self._await_state(task.wait_target)[0] == "pending"
+            for task in candidates
+        )
 
     def _advance_async_task(self, task: _TyveraTask) -> None:
         if not task.frames:
@@ -1500,13 +1575,16 @@ class Interpreter:
             actor.queued = True
             self._ready_actors.append(actor)
 
-    def _run_actors(self, location: Location, depth: int) -> _TyveraVariant:
+    def _run_actors(
+        self, location: Location, depth: int, *, delivery_limit: int = _MAX_ACTOR_DELIVERIES,
+        fail_on_limit: bool = True,
+    ) -> _TyveraVariant:
         if self._current_actor is not None:
             raise Diagnostic(location, "runtime", "runActors cannot be called from an actor message handler")
         processed = 0
         first_crash: str | None = None
         self._promote_due_timers()
-        while self._ready_actors and processed < _MAX_ACTOR_DELIVERIES:
+        while self._ready_actors and processed < delivery_limit:
             actor = self._ready_actors.popleft()
             actor.queued = False
             if actor.status != "alive" or not actor.mailbox:
@@ -1540,9 +1618,9 @@ class Interpreter:
             if actor.status == "alive" and actor.mailbox and not actor.queued:
                 actor.queued = True
                 self._ready_actors.append(actor)
-        if self._ready_actors and processed >= _MAX_ACTOR_DELIVERIES:
+        if fail_on_limit and self._ready_actors and processed >= delivery_limit:
             if first_crash is None:
-                first_crash = f"actor scheduler reached the {_MAX_ACTOR_DELIVERIES}-message safety limit; messages remain queued"
+                first_crash = f"actor scheduler reached the {delivery_limit}-message safety limit; messages remain queued"
         if first_crash is not None:
             return _TyveraVariant("Err", first_crash)
         return _TyveraVariant("Ok", processed)
@@ -1651,3 +1729,4 @@ class Interpreter:
         if isinstance(value, bool):
             return "true" if value else "false"
         return str(value)
+
