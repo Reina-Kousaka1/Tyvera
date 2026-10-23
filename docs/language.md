@@ -692,6 +692,33 @@ contents and operating-system error details are not copied into the error
 message. Path joining follows the host platform's path rules. The text-file
 API cannot read or overwrite the project `.tyvera.secrets` file.
 
+`using` gives one text-file handle a deterministic lexical owner:
+
+```tyv
+using file = openText("notes.txt", "write") {
+    file.write("saved")
+}
+```
+
+`openText(path, mode)` supports `"read"`, `"write"` (truncate or create), and
+`"append"` (create if missing). It opens UTF-8 text and reports an open failure
+as `Err(String)`. `using` unwraps that acquisition result; its optional
+`else error { ... }` block handles failures, and without that block an `Err`
+becomes a source-located runtime diagnostic. `TextFile.readAll()` returns
+`Result<String,String>` in read mode; `TextFile.write(contents)` returns
+`Result<Bool,String>` in write or append mode. `isOpen()` observes the handle,
+and `close()` releases it once, returning `false` if it was already closed or
+could not be closed. Reading or writing with the wrong mode returns `Err`; using
+a closed handle is a runtime error. Scope exit closes the handle, including on `return`, runtime/task
+failure, loop control, and task cancellation while suspended at `await`.
+
+`TextFile` is a restricted move-only resource: it can only be acquired by a
+direct `using ... = openText(...)` statement, and the type checker rejects
+copying, passing, returning, storing, or sending its handle. It cannot cross
+actor boundaries. These file operations are synchronous and can block the
+cooperative scheduler; async I/O is not implemented. The scope mechanism can
+be extended to more resource types, but currently owns only text files.
+
 The built-in namespace `secrets.NAME` returns `Option<Secret<String>>`. The
 local provider reads `.tyvera.secrets` first, then checks the process
 environment. The local file uses one `NAME = "JSON-escaped string"` entry per

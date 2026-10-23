@@ -26,9 +26,11 @@ features.
 - Tasks share references captured in their arguments. Tasks are serial and
   cooperative, so they do not race in parallel, but their interleaving can
   make shared mutation order observable.
-- The interpreter's Python garbage collector manages its own implementation
-  objects. That allocation strategy is not a Tyvera guarantee. Tyvera has no
-  deterministic file, stream, socket, or native-handle cleanup yet.
+- `TextFile` is an identity resource that can only be acquired inside a
+  `using` scope. The interpreter's Python garbage collector manages its own
+  implementation objects; that allocation strategy is not a Tyvera guarantee.
+  Deterministic ownership is implemented for text files only. Streams,
+  sockets, native handles, and general move transfer remain planned.
 
 The bootstrap's internal 64-bit hash algorithm is not exposed as a language
 value. Backends may choose different hash bytes as long as equality, key
@@ -50,7 +52,7 @@ mutable state. It does not require a general borrow checker.
 | Records | Immutable nominal value records; fields compare structurally. Nested mutable references remain shared. | Implemented, including generic types, destructuring, and safe derived map keys. |
 | Class instances, lists, maps | Classes use stable identity; lists and maps compare by contents. Assignment copies references; collection contents remain shared. | Implemented in the bootstrap. |
 | Actor references, tasks, reply handles, timers, supervisors | Opaque identity handles. Copying a handle does not copy the actor, task, or operation it names. | Implemented in the interpreter; public runtime ABI is planned. |
-| Resource handles | Affine owners: one live owner, explicit transfer, deterministic release. | Planned; no resource type or syntax exists. |
+| Resource handles | One live owner, explicit transfer, deterministic release. | First slice implemented for scoped `TextFile`; general moves, transfer, and other resource types remain planned. |
 
 For mutable ordinary references, `==` compares identity. Value equality
 compares scalar and immutable tagged values structurally, recursively applying
@@ -81,10 +83,12 @@ class values cannot be transferred into actor state.
 
 ### Move and resource ownership
 
-Resource handles should be move-only. A move transfers the sole close
+Resource handles are move-only. A move transfers the sole close
 responsibility and makes the prior binding unusable. Ordinary values and
 ordinary references keep their current copy/reference behavior; Tyvera will
-not make the whole language affine.
+not make the whole language affine. The current `TextFile` slice enforces a
+single owner by restricting acquisition to `using` and rejecting handle use
+as a value, so general-purpose move expressions are not part of this slice.
 
 The resource-scope contract is:
 
@@ -92,19 +96,22 @@ The resource-scope contract is:
 2. Scope exit closes still-owned handles in reverse acquisition order.
 3. Cleanup also runs on return, runtime failure, task failure, cancellation,
    and unwinding from a nested block.
-4. Explicit `close()`/`dispose()` releases the handle once; scope cleanup then
-   observes that it is already closed.
+4. Explicit `close()` releases the handle once; it returns `false` on a second
+   close, and scope cleanup observes that it is already closed.
 5. Cleanup does not suspend. If cleanup fails during an existing failure, the
    original failure remains primary and cleanup failures are retained as
    secondary diagnostics.
 6. A resource cannot cross actor boundaries unless its type defines a safe,
    explicit transfer operation.
 
-The surface syntax for scoped acquisition is not chosen. An owner scope should
-work for files, streams, sockets, native handles, and memory regions without
-introducing general-purpose raw `malloc`/`free` operations. Borrowing is
-limited to temporary non-owning access within the owner's lifetime; no Rust-
-style lifetime parameter system is part of V1's current plan.
+`using name = openText(path, mode) { ... }` is the first implemented owner
+scope. It works across synchronous and cooperative async code; cancellation
+closes active scopes while discarding task continuations. Text operations do
+not suspend. The same ownership boundary should extend to streams, sockets,
+native handles, and memory regions without introducing general-purpose raw
+`malloc`/`free` operations. Borrowing remains limited to temporary non-owning
+access within the owner's lifetime; no Rust-style lifetime parameter system
+is part of V1's current plan.
 
 ### Lifetimes and runtime ownership
 
@@ -112,5 +119,6 @@ Ordinary heap values remain reachable while Tyvera references them; the
 collector or allocator is a runtime implementation choice. Task, actor, and
 resource lifetimes instead have explicit owners and shutdown rules. The
 implemented task and actor ownership rules are in the
-[runtime document](runtime.md). Resource lifetimes and deterministic cleanup
-are planned and must be added to that ownership tree before I/O expands.
+[runtime document](runtime.md). `TextFile` follows the scope rules above;
+other resource lifetimes must be added to that ownership tree before async I/O
+expands.

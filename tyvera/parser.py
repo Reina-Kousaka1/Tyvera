@@ -42,6 +42,7 @@ from .ast import (
     TupleExpression,
     TuplePattern,
     Unary,
+    UsingStatement,
     VariantPattern,
     WildcardPattern,
     WhileStatement,
@@ -403,6 +404,23 @@ class Parser:
         return statements
 
     def _statement(self) -> Statement:
+        if self._match("USING"):
+            token = self._previous()
+            name = self._expect("IDENTIFIER", "expected a resource name after 'using'")
+            self._expect("EQUAL", "expected '=' after the resource name")
+            resource = self._expression()
+            body = self._block()
+            saved = self.index
+            while self._match("NEWLINE"):
+                pass
+            error_name = None
+            else_body: list[Statement] = []
+            if self._match("ELSE"):
+                error_name = self._expect("IDENTIFIER", "expected an error variable after 'else'").lexeme
+                else_body = self._block()
+            else:
+                self.index = saved
+            return UsingStatement(name.lexeme, resource, body, token.location, error_name, else_body)
         if self._match("AWAIT"):
             token = self._previous()
             return AwaitStatement(self._expression(), token.location)

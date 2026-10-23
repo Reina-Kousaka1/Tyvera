@@ -45,6 +45,7 @@ KEYWORDS = {
     "import": "IMPORT",
     "as": "AS",
     "pub": "PUB",
+    "using": "USING",
 }
 
 SINGLE_CHAR_TOKENS = {

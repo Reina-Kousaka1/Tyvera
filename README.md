@@ -17,10 +17,11 @@ The implemented language includes `Int`, `Float`, `Bool`, `String`, `Void`,
 interface-constrained generic functions, classes, records, enums and newtypes, transparent type
 aliases, typed tuples, `List<T>` and `Map<K,V>`, `Option<T>` and `Result<T,E>`,
 nested statement-level pattern matching, checked equality and map keyability,
-`for`, checked text I/O and path helpers, secrets, typed JSON, checked returns,
-lexical scopes, arithmetic, comparisons, conditionals, and loops. Classes,
-interfaces, and multi-file projects support checked initialization, dynamic
-dispatch, relative imports, and `pub` exports.
+`for`, checked text I/O and path helpers, move-only `TextFile` scopes with
+deterministic cleanup, secrets, typed JSON, checked returns, lexical scopes,
+arithmetic, comparisons, conditionals, and loops. Classes, interfaces, and
+multi-file projects support checked initialization, dynamic dispatch, relative
+imports, and `pub` exports.
 
 The deterministic actor runtime supports typed messages, isolated state, FIFO
 mailboxes, crash isolation, bounded `one_for_one` supervision, request/reply,
@@ -94,6 +95,8 @@ tyvera check examples/async_tasks.tyv
 tyvera run examples/async_tasks.tyv
 tyvera check examples/type_system_v2.tyv
 tyvera run examples/type_system_v2.tyv
+tyvera check examples/resource_scopes.tyv
+tyvera run examples/resource_scopes.tyv
 ```
 
 Run the test suite from the repository root:
@@ -115,7 +118,7 @@ are in the [architecture note](docs/architecture.md), and planned stages are in
 the [roadmap](docs/roadmap.md).
 
 The implemented scheduler lifecycle is specified in [Runtime semantics](docs/runtime.md).
-The proposed value and resource rules are in the [Memory Model](docs/memory-model.md).
+The value and resource rules are in the [Memory Model](docs/memory-model.md).
 The backend boundary, runtime contract, target plan, and native compiler options
 are in [Backend Architecture](docs/backend-architecture.md).
 
@@ -127,8 +130,9 @@ secrets, typed JSON, deterministic actor supervision, one-shot actor replies,
 and a cooperative task scheduler with nested `await`, scoped cancellation,
 implicit child joining, owner-local task groups, explicit child detachment,
 and task deadlines are implemented. True parallel execution, async/network
-I/O, separate standard-library modules, external secret stores, and native
-backends remain planned. See the [roadmap](docs/roadmap.md) for sequence and
+I/O, general resource types, separate standard-library modules, external
+secret stores, and native backends remain planned. See the
+[roadmap](docs/roadmap.md) for sequence and
 scope, and [release/versioning notes](docs/release-process.md) for the
 pre-1.0 release approach.
 

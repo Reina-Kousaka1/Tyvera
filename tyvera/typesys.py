@@ -43,6 +43,7 @@ from .ast import (
     TupleExpression,
     TuplePattern,
     VariantPattern,
+    UsingStatement,
     WildcardPattern,
     WhileStatement,
 )
@@ -52,10 +53,10 @@ from .type_names import make_type, split_type, substitute_type
 
 _BUILTIN_TYPES = {
     "Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result",
-    "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup",
+    "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile",
 }
 _BUILTIN_FUNCTIONS = {
-    "println", "eprintln", "readText", "writeText", "pathJoin", "pathExists",
+    "println", "eprintln", "readText", "writeText", "openText", "pathJoin", "pathExists",
     "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool",
     "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors", "oneForOne",
     "milliseconds", "seconds", "timerAfter", "sleepFor", "runTasks", "taskGroup",
@@ -143,6 +144,7 @@ class TypeChecker:
             "ReplySender": 1, "ReplyReceiver": 1, "Task": 1,
         }
         self.active_type_variables: set[str] = set()
+        self._checking_using_resource = False
 
     def check(self) -> dict[str, Signature]:
         self._collect_types()
@@ -448,6 +450,8 @@ class TypeChecker:
             return
         if base not in self.type_names:
             raise Diagnostic(location, "type", f"unknown type '{base}'")
+        if base == "TextFile":
+            raise Diagnostic(location, "type", "TextFile is a scoped resource and cannot appear in declared types")
         if base in self.actor_names and not allow_actor:
             raise Diagnostic(location, "type", f"actor type '{base}' can only be used inside ActorRef<{base}>")
         expected_arity = self.generic_arities.get(base, 0)
@@ -662,6 +666,32 @@ class TypeChecker:
             elif isinstance(statement, Block):
                 exits = self._check_block(statement.body, variables.new_child(), return_type, loop_depth,
                                           owner, method_name, async_allowed)
+            elif isinstance(statement, UsingStatement):
+                if statement.name in {"self", "secrets", *_BUILTIN_FUNCTIONS}:
+                    raise Diagnostic(statement.location, "type", f"'{statement.name}' is reserved and cannot name a resource")
+                if statement.name in variables.maps[0]:
+                    raise Diagnostic(statement.location, "type", f"variable '{statement.name}' is already declared")
+                if not isinstance(statement.resource, Call) or statement.resource.callee != "openText":
+                    raise Diagnostic(statement.location, "type", "using currently requires a direct openText(path, mode) acquisition")
+                previous_resource_context = self._checking_using_resource
+                self._checking_using_resource = True
+                try:
+                    resource_type = self._expression_type(statement.resource, variables, owner)
+                finally:
+                    self._checking_using_resource = previous_resource_context
+                if resource_type != "Result<TextFile,String>":
+                    raise Diagnostic(statement.resource.location, "type", "using requires a TextFile acquisition result")
+                using_variables = variables.new_child()
+                using_variables[statement.name] = Binding("TextFile")
+                exits = self._check_block(statement.body, using_variables, return_type, loop_depth,
+                                          owner, method_name, async_allowed)
+                if statement.error_name is not None:
+                    if statement.error_name in {"self", "secrets", *_BUILTIN_FUNCTIONS}:
+                        raise Diagnostic(statement.location, "type", f"'{statement.error_name}' is reserved and cannot name an error")
+                    error_variables = variables.new_child()
+                    error_variables[statement.error_name] = Binding("String")
+                    exits |= self._check_block(statement.else_body, error_variables, return_type, loop_depth,
+                                               owner, method_name, async_allowed)
             elif isinstance(statement, IfStatement):
                 self._require_same_type("Bool", self._expression_type(statement.condition, variables, owner), statement.condition.location)
                 then_exits = self._check_block(statement.then_body, variables.new_child(), return_type, loop_depth,
@@ -769,8 +799,19 @@ class TypeChecker:
             binding = variables.get(expression.identifier)
             if binding is None:
                 raise Diagnostic(expression.location, "type", f"unknown variable '{expression.identifier}'")
+            if binding.type_name == "TextFile":
+                raise Diagnostic(expression.location, "type", "a TextFile handle can only be used as the receiver of a scoped file operation")
             return binding.type_name
         if isinstance(expression, Call):
+            if expression.callee == "openText":
+                if not self._checking_using_resource:
+                    raise Diagnostic(expression.location, "type", "openText resources must be acquired by a 'using' scope")
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'openText' does not accept type arguments")
+                argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
+                self._check_arguments(expression.arguments, argument_types, ("String", "String"),
+                                      expression.location, "openText")
+                return "Result<TextFile,String>"
             if expression.callee == "spawn":
                 if expression.type_arguments:
                     raise Diagnostic(expression.location, "type", "'spawn' does not accept type arguments")
@@ -973,10 +1014,31 @@ class TypeChecker:
                 return make_type(enum.declaration.name, [substitutions[name] for name in enum.type_parameters])
             if expression.type_arguments:
                 raise Diagnostic(expression.location, "type", "generic methods are not supported yet")
-            receiver_type = self._expression_type(expression.receiver, variables, owner)
+            resource_binding = (variables.get(expression.receiver.identifier)
+                                if isinstance(expression.receiver, Name) else None)
+            if resource_binding is not None and resource_binding.type_name == "TextFile":
+                receiver_type = "TextFile"
+            else:
+                receiver_type = self._expression_type(expression.receiver, variables, owner)
             if expression.method == "init":
                 raise Diagnostic(expression.location, "type", "constructors can only run when creating an instance")
             receiver_base, receiver_arguments = split_type(receiver_type)
+            if receiver_base == "TextFile":
+                argument_types = [self._expression_type(argument, variables, owner)
+                                  for argument in expression.arguments]
+                methods = {
+                    "readAll": ((), "Result<String,String>"),
+                    "write": (("String",), "Result<Bool,String>"),
+                    "close": ((), "Bool"),
+                    "isOpen": ((), "Bool"),
+                }
+                method_signature = methods.get(expression.method)
+                if method_signature is None:
+                    raise Diagnostic(expression.location, "type", f"TextFile has no method '{expression.method}'")
+                expected_types, result_type = method_signature
+                self._check_arguments(expression.arguments, argument_types, expected_types,
+                                      expression.location, f"TextFile.{expression.method}")
+                return result_type
             if receiver_base == "Supervisor":
                 if receiver_arguments:
                     raise Diagnostic(expression.location, "type", "Supervisor does not accept type arguments")
@@ -1859,6 +1921,11 @@ class TypeChecker:
                         following.append((initialized, "return"))
                     elif isinstance(statement, Block):
                         following.extend(flow(statement.body, [(initialized, "next")], loop_depth))
+                    elif isinstance(statement, UsingStatement):
+                        reads(statement.resource, initialized)
+                        following.extend(flow(statement.body, [(initialized, "next")], loop_depth))
+                        if statement.error_name is not None:
+                            following.extend(flow(statement.else_body, [(initialized, "next")], loop_depth))
                     elif isinstance(statement, IfStatement):
                         reads(statement.condition, initialized)
                         branches = [statement.then_body, statement.else_body]

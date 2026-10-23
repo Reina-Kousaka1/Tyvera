@@ -1,0 +1,11 @@
+fn main() {
+    using file = openText("resource_sample.txt", "read") {
+        match file.readAll() {
+            Ok(contents) => println(contents)
+            Err(_) => println("could not read sample")
+        }
+        println(file.isOpen())
+    } else error {
+        println(error)
+    }
+}

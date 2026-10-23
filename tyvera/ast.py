@@ -173,6 +173,16 @@ class Block(Statement):
 
 
 @dataclass(slots=True)
+class UsingStatement(Statement):
+    name: str
+    resource: Expression
+    body: list[Statement]
+    location: Location
+    error_name: str | None = None
+    else_body: list[Statement] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class IfStatement(Statement):
     condition: Expression
     then_body: list[Statement]

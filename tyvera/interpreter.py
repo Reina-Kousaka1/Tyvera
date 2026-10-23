@@ -42,6 +42,7 @@ from .ast import (
     TupleExpression,
     TuplePattern,
     Unary,
+    UsingStatement,
     VariantPattern,
     WildcardPattern,
     WhileStatement,
@@ -140,6 +141,17 @@ class _TyveraTimer:
         return "<Timer>"
 
 
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraTextFile:
+    stream: TextIO
+    mode: str
+    closed: bool = False
+    identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
+
+    def __repr__(self) -> str:
+        return "<TextFile>"
+
+
 @dataclass(slots=True, eq=False)
 class _AsyncBlockFrame:
     body: list[Statement]
@@ -156,6 +168,12 @@ class _AsyncLoopFrame:
     index: int = 0
 
 
+@dataclass(slots=True, eq=False)
+class _AsyncResourceFrame:
+    resource: _TyveraTextFile
+    location: Location
+
+
 @dataclass(slots=True, eq=False, repr=False)
 class _TyveraTask:
     function: Function | None
@@ -164,7 +182,7 @@ class _TyveraTask:
     depth: int = 0
     result_type: str = "Void"
     state: str = "runnable"
-    frames: list[_AsyncBlockFrame | _AsyncLoopFrame] = dataclass_field(default_factory=list)
+    frames: list[_AsyncBlockFrame | _AsyncLoopFrame | _AsyncResourceFrame] = dataclass_field(default_factory=list)
     wait_target: object | None = None
     wait_frame: _AsyncBlockFrame | None = None
     wait_statement: AwaitStatement | None = None
@@ -379,6 +397,8 @@ def _tyvera_equal(left: object, right: object, seen: set[tuple[int, int]] | None
         return left.cell.identity == right.cell.identity
     if isinstance(left, _TyveraTaskGroup):
         return left.identity == right.identity
+    if isinstance(left, _TyveraTextFile):
+        return left.identity == right.identity
     if isinstance(left, _TyveraSecret):
         return left.identity == right.identity
     if isinstance(left, _TyveraList):
@@ -465,6 +485,8 @@ def _tyvera_hash(value: object) -> int:
         return _hash_parts(b"actor-identity", value.actor.identity)
     if isinstance(value, _TyveraTask):
         return _hash_parts(b"task-identity", value.identity)
+    if isinstance(value, _TyveraTextFile):
+        return _hash_parts(b"resource-identity", value.identity)
     if isinstance(value, _TyveraVariant):
         return _hash_parts(b"variant", _hash_bytes((value.enum_name or "").encode("utf-8")),
                            _hash_bytes(value.variant.encode("utf-8")),
@@ -586,6 +608,38 @@ class Interpreter:
                 raise AssertionError("await statements are dispatched by the cooperative task scheduler")
             elif isinstance(statement, Block):
                 self._execute_block(statement.body, variables.new_child(), depth)
+            elif isinstance(statement, UsingStatement):
+                acquisition = self._evaluate(statement.resource, variables, depth)
+                if not isinstance(acquisition, _TyveraVariant):
+                    raise AssertionError("checked using acquisition did not return Result")
+                if acquisition.variant == "Err":
+                    if statement.error_name is None:
+                        raise Diagnostic(statement.location, "runtime", str(acquisition.payload))
+                    error_scope = variables.new_child()
+                    error_scope[statement.error_name] = acquisition.payload
+                    self._execute_block(statement.else_body, error_scope, depth)
+                elif acquisition.variant == "Ok":
+                    resource = acquisition.payload
+                    if not isinstance(resource, _TyveraTextFile):
+                        raise AssertionError("checked using acquisition is not a TextFile")
+                    scope = variables.new_child()
+                    scope[statement.name] = resource
+                    try:
+                        self._execute_block(statement.body, scope, depth)
+                    except Exception as primary:
+                        cleanup_error = self._close_text_file(resource)
+                        if cleanup_error is None:
+                            raise
+                        if isinstance(primary, Diagnostic):
+                            raise Diagnostic(primary.location, primary.stage,
+                                             f"{primary.message}; resource cleanup also failed: {cleanup_error}") from primary
+                        raise Diagnostic(statement.location, "runtime",
+                                         f"resource cleanup failed: {cleanup_error}") from primary
+                    cleanup_error = self._close_text_file(resource)
+                    if cleanup_error is not None:
+                        raise Diagnostic(statement.location, "runtime", f"resource cleanup failed: {cleanup_error}")
+                else:
+                    raise AssertionError("checked using acquisition returned neither Ok nor Err")
             elif isinstance(statement, IfStatement):
                 body = statement.then_body if self._evaluate(statement.condition, variables, depth) else statement.else_body
                 self._execute_block(body, variables.new_child(), depth)
@@ -677,6 +731,19 @@ class Interpreter:
                 if not isinstance(duration, _TyveraDuration):
                     raise AssertionError("checked timerAfter argument is not Duration")
                 return _TyveraTimer(self._clock(), duration.milliseconds, self._clock)
+            if expression.callee == "openText":
+                path = self._project_path(arguments[0])
+                mode = arguments[1]
+                if mode not in {"read", "write", "append"}:
+                    return _TyveraVariant("Err", "openText mode must be 'read', 'write', or 'append'", "Result", 1)
+                if self._is_secret_storage_path(path):
+                    return _TyveraVariant("Err", "secret file can only be accessed through the secrets provider", "Result", 1)
+                python_mode = {"read": "r", "write": "w", "append": "a"}[mode]
+                try:
+                    stream = path.open(python_mode, encoding="utf-8", newline="")
+                except OSError:
+                    return _TyveraVariant("Err", "cannot open text file", "Result", 1)
+                return _TyveraVariant("Ok", _TyveraTextFile(stream, mode), "Result", 1)
             if expression.callee == "sleepFor":
                 duration = arguments[0]
                 if not isinstance(duration, _TyveraDuration):
@@ -795,6 +862,31 @@ class Interpreter:
                     payload = _TyveraTuple(tuple(payloads))
                 return _TyveraVariant(expression.method, payload, expression.receiver.identifier, len(payloads))
             receiver = self._evaluate(expression.receiver, variables, depth)
+            if isinstance(receiver, _TyveraTextFile):
+                if expression.method == "isOpen":
+                    return not receiver.closed
+                if expression.method == "close":
+                    was_open = not receiver.closed
+                    return was_open and self._close_text_file(receiver) is None
+                if receiver.closed:
+                    raise Diagnostic(expression.location, "runtime", "TextFile is closed")
+                arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+                if expression.method == "readAll":
+                    if receiver.mode != "read":
+                        return _TyveraVariant("Err", "text file is not open for reading")
+                    try:
+                        return _TyveraVariant("Ok", receiver.stream.read())
+                    except (OSError, UnicodeDecodeError):
+                        return _TyveraVariant("Err", "cannot read text file")
+                if expression.method == "write":
+                    if receiver.mode == "read":
+                        return _TyveraVariant("Err", "text file is not open for writing")
+                    try:
+                        receiver.stream.write(arguments[0])
+                        return _TyveraVariant("Ok", True)
+                    except OSError:
+                        return _TyveraVariant("Err", "cannot write text file")
+                raise AssertionError(f"unhandled checked TextFile method: {expression.method}")
             if isinstance(receiver, _TyveraSupervisor):
                 if expression.method == "start":
                     if receiver.status != "alive":
@@ -938,7 +1030,7 @@ class Interpreter:
                     if receiver.state == "failed":
                         return _TyveraVariant("Err", receiver.error or "task failed")
                     if receiver.state == "cancelled":
-                        return _TyveraVariant("Err", "task was cancelled")
+                        return _TyveraVariant("Err", receiver.error or "task was cancelled")
                     if receiver.result_type == "Void":
                         return _TyveraVariant("Ok", receiver.state == "completed")
                     if receiver.state == "completed":
@@ -1008,6 +1100,37 @@ class Interpreter:
             self._check_numeric_result(result, expression.location)
             return result
         raise AssertionError(f"unhandled expression node: {type(expression).__name__}")
+
+    @staticmethod
+    def _close_text_file(resource: _TyveraTextFile) -> str | None:
+        if resource.closed:
+            return None
+        resource.closed = True
+        try:
+            resource.stream.close()
+        except OSError:
+            return "cannot close text file"
+        return None
+
+    @staticmethod
+    def _resource_cleanup_diagnostic(location: Location, message: str) -> str:
+        return f"{location.filename}:{location.line}:{location.column}: runtime error: {message}"
+
+    def _cleanup_resource_frames(
+        self, frames: list[_AsyncBlockFrame | _AsyncLoopFrame | _AsyncResourceFrame],
+    ) -> list[str]:
+        errors: list[str] = []
+        for frame in reversed(frames):
+            if isinstance(frame, _AsyncResourceFrame):
+                cleanup_error = self._close_text_file(frame.resource)
+                if cleanup_error is not None:
+                    errors.append(self._resource_cleanup_diagnostic(frame.location, cleanup_error))
+        return errors
+
+    def _release_task_frames(self, task: _TyveraTask) -> list[str]:
+        frames = task.frames
+        task.frames = []
+        return self._cleanup_resource_frames(frames)
 
     def _project_path(self, value: object) -> Path:
         if not isinstance(value, str):
@@ -1559,6 +1682,12 @@ class Interpreter:
         if not task.frames:
             return
         frame = task.frames[-1]
+        if isinstance(frame, _AsyncResourceFrame):
+            task.frames.pop()
+            cleanup_error = self._close_text_file(frame.resource)
+            if cleanup_error is not None:
+                self._fail_task(task, self._resource_cleanup_diagnostic(frame.location, cleanup_error))
+            return
         if isinstance(frame, _AsyncLoopFrame):
             statement = frame.statement
             if isinstance(statement, WhileStatement):
@@ -1601,6 +1730,28 @@ class Interpreter:
         if isinstance(statement, Block):
             frame.index += 1
             task.frames.append(_AsyncBlockFrame(statement.body, frame.variables.new_child()))
+            return
+        if isinstance(statement, UsingStatement):
+            acquisition = self._evaluate(statement.resource, frame.variables, task.depth)
+            if not isinstance(acquisition, _TyveraVariant):
+                raise AssertionError("checked using acquisition did not return Result")
+            frame.index += 1
+            if acquisition.variant == "Err":
+                if statement.error_name is None:
+                    raise Diagnostic(statement.location, "runtime", str(acquisition.payload))
+                scope = frame.variables.new_child()
+                scope[statement.error_name] = acquisition.payload
+                task.frames.append(_AsyncBlockFrame(statement.else_body, scope))
+            elif acquisition.variant == "Ok":
+                resource = acquisition.payload
+                if not isinstance(resource, _TyveraTextFile):
+                    raise AssertionError("checked using acquisition is not a TextFile")
+                scope = frame.variables.new_child()
+                scope[statement.name] = resource
+                task.frames.append(_AsyncResourceFrame(resource, statement.location))
+                task.frames.append(_AsyncBlockFrame(statement.body, scope))
+            else:
+                raise AssertionError("checked using acquisition returned neither Ok nor Err")
             return
         if isinstance(statement, IfStatement):
             body = statement.then_body if self._evaluate(statement.condition, frame.variables, task.depth) else statement.else_body
@@ -1647,7 +1798,12 @@ class Interpreter:
         if loop_index is None:
             self._fail_task(task, f"'{signal.kind}' escaped its loop in async task")
             return
-        del task.frames[loop_index + (1 if signal.kind == "continue" else 0):]
+        start = loop_index + (1 if signal.kind == "continue" else 0)
+        discarded = task.frames[start:]
+        del task.frames[start:]
+        cleanup_errors = self._cleanup_resource_frames(discarded)
+        if cleanup_errors:
+            self._fail_task(task, "; ".join(cleanup_errors))
 
     def _promote_sleeping_tasks(self) -> None:
         now = self._clock()
@@ -1755,7 +1911,10 @@ class Interpreter:
         variables[statement.binding_name] = value
 
     def _complete_task(self, task: _TyveraTask) -> None:
-        task.frames.clear()
+        cleanup_errors = self._release_task_frames(task)
+        if cleanup_errors:
+            self._fail_task(task, "; ".join(cleanup_errors))
+            return
         task.wait_target = None
         task.wait_frame = None
         task.wait_statement = None
@@ -1783,7 +1942,9 @@ class Interpreter:
         task.wait_target = None
         task.wait_frame = None
         task.wait_statement = None
-        task.frames.clear()
+        cleanup_errors = self._release_task_frames(task)
+        if cleanup_errors:
+            task.error = "; ".join(cleanup_errors)
         if task.timeout_target is not None:
             self._cancel_task(task.timeout_target)
             task.timeout_target = None
@@ -1794,11 +1955,13 @@ class Interpreter:
         if task.state in {"completed", "failed", "cancelled"}:
             return
         task.state = "failed"
-        task.error = error
         task.wait_target = None
         task.wait_frame = None
         task.wait_statement = None
-        task.frames.clear()
+        cleanup_errors = self._release_task_frames(task)
+        if cleanup_errors:
+            error = f"{error}; resource cleanup also failed: {'; '.join(cleanup_errors)}"
+        task.error = error
         for child in task.children:
             self._cancel_task(child)
         if task.parent is not None:

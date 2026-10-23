@@ -13,7 +13,7 @@ implemented.
 | 1. Core language | Implemented | Primitive types, functions, checked returns, lexical scopes, mutable/immutable bindings, operators, conditionals, `while`, `break` and `continue`, covered by tests. |
 | 2. Object and value types | First slice implemented | Classes, fields, `self`, constructors, methods, interfaces and dispatch, plus generic immutable records, enums, tuples, newtypes, transparent aliases, interface-constrained generic functions, recursive exhaustiveness for finite sum/product patterns, portable value equality, and statically hashable Map keys. Generic methods/interfaces, bounds on generic type declarations, match guards and inheritance remain open. |
 | 3. Modules | First slice implemented | Relative `.tyv` imports, aliases, `pub` exports, module graph linking, visibility/missing/duplicate diagnostics, cycle detection and project-root containment. Local package dependencies are still planned. |
-| 4. Standard library | Core slice implemented | Generic collections, `for`, `Option<T>`, `Result<T,E>`, core matching, text I/O/path helpers, local/environment secret providers, typed JSON, signed `Duration`, monotonic one-shot timers, timer-backed sleep tasks, cooperative parent-scoped lifecycle, owner-local `TaskGroup` joins/cancellation, explicit child detachment, actor-owned task cancellation, one-shot runtime shutdown and typed task deadlines. Separate stdlib modules remain planned. |
+| 4. Standard library | Core slice implemented | Generic collections, `for`, `Option<T>`, `Result<T,E>`, core matching, text I/O/path helpers, scoped move-only `TextFile` ownership and deterministic cleanup, local/environment secret providers, typed JSON, signed `Duration`, monotonic one-shot timers, timer-backed sleep tasks, cooperative parent-scoped lifecycle, owner-local `TaskGroup` joins/cancellation, explicit child detachment, actor-owned task cancellation, one-shot runtime shutdown and typed task deadlines. Separate stdlib modules remain planned. |
 | 5. Actor runtime | First slice implemented | Actor declarations, typed immutable message transfer, isolated state, FIFO mailboxes, deterministic round-robin cooperative scheduling, typed one-shot request/reply, cancellation, request deadlines, delayed typed messages, stop/alive lifecycle, and isolated crash reporting. Parallel scheduling and backpressure remain open. |
 | 6. Supervisors | First slice implemented | Child lifecycle, crash detection, bounded restart intensity and deterministic `one_for_one` restarts. `one_for_all` and `rest_for_one` remain planned. |
 | 7. Networking | Planned | Async I/O integration with the cooperative task runtime, then HTTP and WebSocket clients and event dispatch without Promise-specific language semantics. |
@@ -26,8 +26,8 @@ implemented.
 1. Extend generic constraints to type declarations; keep adding conformance
    cases for recursive patterns, structural types and backend-independent
    equality.
-2. Design deterministic resource ownership and cleanup before async I/O, native
-   handles, or a foreign-function interface.
+2. Extend the implemented `TextFile` scope into reusable resource traits and
+   explicit move transfer before async I/O, native handles, or an FFI.
 3. Move or wrap collection, I/O, JSON, and secret operations behind normal
    `tyvera.*` modules as the module model stabilizes; continue generic interface
    and constraint work with conformance tests.
@@ -57,11 +57,13 @@ cooperative async tasks with typed return values, parent-scoped cancellation,
 deadlines, delayed actor messages, explicit task groups, detached child tasks
 and typed task timeouts are usable. Await resumes inside nested blocks,
 branches, loops and match arms. True parallelism, structured async I/O,
-resource ownership, standard library modules, networking and a native backend
-are still missing. Runtime ownership, shutdown, detached task failures, timed
+general resource types beyond `TextFile`, standard library modules, networking
+and a native backend are still missing. Text-file scopes close on normal exit,
+return, errors, task cancellation and loop control. Runtime ownership,
+shutdown, detached task failures, timed
 wrappers, and actor reply fairness now have explicit semantics and tests. The
-portable value and equality contract is now implemented in the bootstrap. The
-next runtime/compiler dependency is deterministic resource ownership, followed
-by stable standard-library module boundaries and cross-backend conformance
+portable value and equality contract is now implemented in the bootstrap.
+Further resource ownership generalization is next, followed by stable
+standard-library module boundaries and cross-backend conformance
 programs.
 

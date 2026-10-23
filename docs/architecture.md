@@ -164,8 +164,8 @@ facts that a native backend will need. A shared IR is deferred until a second
 consumer or a real lowering step establishes its purpose. The runtime ABI,
 initial target plan, native backend comparison, and `tyvera build` acceptance
 criteria are in [Backend Architecture](backend-architecture.md). Tyvera's
-proposed value and resource ownership rules are in the
-[Memory Model](memory-model.md).
+value and resource ownership rules, including the current `TextFile` slice,
+are documented in the [Memory Model](memory-model.md).
 
 ## Local bootstrap benchmarks
 
