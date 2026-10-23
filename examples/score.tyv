@@ -1,0 +1,28 @@
+fn max(a: Int, b: Int) -> Int {
+    if a > b {
+        return a
+    } else {
+        return b
+    }
+}
+
+fn main() -> Void {
+    var score: Int = 10
+    score = score + 5
+    let highest: Int = max(score, 12)
+
+    if highest >= 15 && highest != 0 {
+        let message: String = "Tyvera works!"
+        println(message)
+    }
+
+    var round: Int = 0
+    while round < 3 {
+        round = round + 1
+        if round == 2 {
+            continue
+        }
+        println(round)
+    }
+    println(highest)
+}

@@ -37,6 +37,41 @@ class LetStatement(Statement):
     annotation: str | None
     value: Expression
     location: Location
+    mutable: bool = False
+
+
+@dataclass(slots=True)
+class Assignment(Statement):
+    name: str
+    value: Expression
+    location: Location
+
+
+@dataclass(slots=True)
+class Block(Statement):
+    body: list[Statement]
+    location: Location
+
+
+@dataclass(slots=True)
+class IfStatement(Statement):
+    condition: Expression
+    then_body: list[Statement]
+    else_body: list[Statement]
+    location: Location
+
+
+@dataclass(slots=True)
+class WhileStatement(Statement):
+    condition: Expression
+    body: list[Statement]
+    location: Location
+
+
+@dataclass(slots=True)
+class LoopControl(Statement):
+    kind: str
+    location: Location
 
 
 @dataclass(slots=True)

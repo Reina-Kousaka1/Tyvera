@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 from .ast import (
+    Assignment,
     Binary,
+    Block,
     Call,
     Expression,
     ExpressionStatement,
     Function,
+    IfStatement,
     LetStatement,
     Literal,
+    LoopControl,
     Name,
     Parameter,
     Program,
     ReturnStatement,
     Statement,
     Unary,
+    WhileStatement,
 )
 from .source import Diagnostic
 from .tokens import Token
@@ -82,14 +87,14 @@ class Parser:
                 if self._check("RPAREN"):
                     break
         self._expect("RPAREN", "expected ')' after parameters")
-        return_type = "Unit"
+        return_type = "Void"
         if self._match("ARROW"):
             return_type = self._expect("IDENTIFIER", "expected a return type after '->'").lexeme
         body = self._block()
         return Function(name_token.lexeme, parameters, return_type, body, fn_token.location)
 
     def _block(self) -> list[Statement]:
-        self._expect("LBRACE", "expected '{' to start the function body")
+        self._expect("LBRACE", "expected '{' to start the block")
         statements: list[Statement] = []
         self._skip_separators()
         while not self._check_any("RBRACE", "EOF"):
@@ -97,12 +102,27 @@ class Parser:
             if not self._check_any("NEWLINE", "SEMICOLON", "RBRACE", "EOF"):
                 self._error(self._current(), "expected a line break or ';' after the statement")
             self._skip_separators()
-        self._expect("RBRACE", "expected '}' to close the function body")
+        self._expect("RBRACE", "expected '}' to close the block")
         return statements
 
     def _statement(self) -> Statement:
-        if self._match("LET"):
+        if self._match("LET", "VAR"):
             return self._let_statement(self._previous())
+        if self._match("IF"):
+            return self._if_statement(self._previous())
+        if self._match("WHILE"):
+            token = self._previous()
+            condition = self._expression()
+            return WhileStatement(condition, self._block(), token.location)
+        if self._match("BREAK", "CONTINUE"):
+            return LoopControl(self._previous().lexeme, self._previous().location)
+        if self._check("LBRACE"):
+            location = self._current().location
+            return Block(self._block(), location)
+        if self._check("IDENTIFIER") and self.tokens[self.index + 1].kind == "EQUAL":
+            name = self._advance()
+            self._advance()
+            return Assignment(name.lexeme, self._expression(), name.location)
         if self._match("RETURN"):
             return self._return_statement(self._previous())
         token = self._current()
@@ -112,13 +132,31 @@ class Parser:
         return ExpressionStatement(expression, token.location)
 
     def _let_statement(self, let_token: Token) -> LetStatement:
-        name = self._expect("IDENTIFIER", "expected a variable name after 'let'")
+        name = self._expect("IDENTIFIER", f"expected a variable name after '{let_token.lexeme}'")
         annotation: str | None = None
         if self._match("COLON"):
             annotation = self._expect("IDENTIFIER", "expected a type name after ':'").lexeme
         self._expect("EQUAL", "expected '=' in variable declaration")
         value = self._expression()
-        return LetStatement(name.lexeme, annotation, value, let_token.location)
+        return LetStatement(name.lexeme, annotation, value, let_token.location, let_token.kind == "VAR")
+
+    def _if_statement(self, token: Token) -> IfStatement:
+        condition = self._expression()
+        then_body = self._block()
+        # Only consume intervening newlines if an else follows. Otherwise they
+        # still separate this compound statement from the next statement.
+        saved = self.index
+        while self._match("NEWLINE"):
+            pass
+        else_body: list[Statement] = []
+        if self._match("ELSE"):
+            if self._match("IF"):
+                else_body = [self._if_statement(self._previous())]
+            else:
+                else_body = self._block()
+        else:
+            self.index = saved
+        return IfStatement(condition, then_body, else_body, token.location)
 
     def _return_statement(self, return_token: Token) -> ReturnStatement:
         if self._check_any("NEWLINE", "SEMICOLON", "RBRACE", "EOF"):

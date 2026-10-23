@@ -8,3 +8,4 @@ hello:
 
 check:
 	python -m tyvera check hello.tyv
+	python -m tyvera check examples/score.tyv

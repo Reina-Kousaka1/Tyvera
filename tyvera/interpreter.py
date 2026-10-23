@@ -1,10 +1,29 @@
 from __future__ import annotations
 
 import math
+from collections import ChainMap
 from dataclasses import dataclass
 from typing import TextIO
 
-from .ast import Binary, Call, Expression, Function, LetStatement, Literal, Name, Program, ReturnStatement, Unary
+from .ast import (
+    Assignment,
+    Binary,
+    Block,
+    Call,
+    Expression,
+    ExpressionStatement,
+    Function,
+    IfStatement,
+    LetStatement,
+    Literal,
+    LoopControl,
+    Name,
+    Program,
+    ReturnStatement,
+    Statement,
+    Unary,
+    WhileStatement,
+)
 from .source import Diagnostic, Location
 from .typesys import INT_MAX, INT_MIN
 
@@ -12,6 +31,11 @@ from .typesys import INT_MAX, INT_MIN
 @dataclass(slots=True)
 class _ReturnSignal(Exception):
     value: object
+
+
+@dataclass(slots=True)
+class _LoopSignal(Exception):
+    kind: str
 
 
 class Interpreter:
@@ -27,21 +51,50 @@ class Interpreter:
     def _call(self, function: Function, arguments: list[object], call_location: Location, depth: int) -> object:
         if depth >= self.max_call_depth:
             raise Diagnostic(call_location, "runtime", f"maximum call depth ({self.max_call_depth}) exceeded")
-        variables = {parameter.name: value for parameter, value in zip(function.parameters, arguments)}
+        variables = ChainMap({parameter.name: value for parameter, value in zip(function.parameters, arguments)})
         try:
-            for statement in function.body:
-                if isinstance(statement, LetStatement):
-                    variables[statement.name] = self._evaluate(statement.value, variables, depth)
-                elif isinstance(statement, ReturnStatement):
-                    value = None if statement.value is None else self._evaluate(statement.value, variables, depth)
-                    raise _ReturnSignal(value)
-                else:
-                    self._evaluate(statement.expression, variables, depth)
+            self._execute_block(function.body, variables, depth)
         except _ReturnSignal as signal:
             return signal.value
+        except RecursionError as error:
+            raise Diagnostic(call_location, "runtime", "bootstrap runtime stack limit exceeded") from error
         return None
 
-    def _evaluate(self, expression: Expression, variables: dict[str, object], depth: int) -> object:
+    def _execute_block(self, body: list[Statement], variables: ChainMap[str, object], depth: int) -> None:
+        for statement in body:
+            if isinstance(statement, LetStatement):
+                variables[statement.name] = self._evaluate(statement.value, variables, depth)
+            elif isinstance(statement, Assignment):
+                value = self._evaluate(statement.value, variables, depth)
+                for scope in variables.maps:
+                    if statement.name in scope:
+                        scope[statement.name] = value
+                        break
+                else:
+                    raise AssertionError("checked assignment has no binding")
+            elif isinstance(statement, ReturnStatement):
+                value = None if statement.value is None else self._evaluate(statement.value, variables, depth)
+                raise _ReturnSignal(value)
+            elif isinstance(statement, Block):
+                self._execute_block(statement.body, variables.new_child(), depth)
+            elif isinstance(statement, IfStatement):
+                body = statement.then_body if self._evaluate(statement.condition, variables, depth) else statement.else_body
+                self._execute_block(body, variables.new_child(), depth)
+            elif isinstance(statement, WhileStatement):
+                while self._evaluate(statement.condition, variables, depth):
+                    try:
+                        self._execute_block(statement.body, variables.new_child(), depth)
+                    except _LoopSignal as signal:
+                        if signal.kind == "break":
+                            break
+            elif isinstance(statement, LoopControl):
+                raise _LoopSignal(statement.kind)
+            elif isinstance(statement, ExpressionStatement):
+                self._evaluate(statement.expression, variables, depth)
+            else:
+                raise AssertionError(f"unhandled statement node: {type(statement).__name__}")
+
+    def _evaluate(self, expression: Expression, variables: ChainMap[str, object], depth: int) -> object:
         if isinstance(expression, Literal):
             return expression.value
         if isinstance(expression, Name):

@@ -17,6 +17,12 @@ class Token:
 KEYWORDS = {
     "fn": "FN",
     "let": "LET",
+    "var": "VAR",
+    "if": "IF",
+    "else": "ELSE",
+    "while": "WHILE",
+    "break": "BREAK",
+    "continue": "CONTINUE",
     "return": "RETURN",
     "true": "TRUE",
     "false": "FALSE",
@@ -43,6 +49,8 @@ SINGLE_CHAR_TOKENS = {
 }
 
 TWO_CHAR_TOKENS = {
+    "&&": "AND",
+    "||": "OR",
     "->": "ARROW",
     "==": "EQUAL_EQUAL",
     "!=": "BANG_EQUAL",
