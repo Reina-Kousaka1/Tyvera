@@ -493,9 +493,9 @@ is a statement and cannot be embedded in an expression.
 Tasks created while an async task is running are owned by that task. A task
 created by synchronous `main` is a root task. Cancelling or failing an owner
 cancels its unfinished descendants; a child failure fails its owners and
-cancels sibling work. When an async function returns normally, unfinished
-children are cancelled so they cannot outlive the function. There is no
-detached-task operation or explicit task-group/join API yet. Cancellation does
+cancels sibling work. When an async function returns normally, it joins its
+unfinished children and does not complete until they do. There is no
+detached-task operation or explicit task-group syntax yet. Cancellation does
 not interrupt a running statement. Task values cannot be sent between actors.
 The task scheduler is single-threaded; it provides cooperative concurrency,
 not parallel execution. The interpreter's clock and sleeper can both be
@@ -664,8 +664,8 @@ inheritance, generic methods/interfaces/constraints, collection literals,
 `try`/`catch`, parallel process scheduling, async I/O, networking API,
 importable standard-library modules, external secret-store provider, native
 interop, garbage collector implementation, package manager or compiler
-backend. Explicit task groups, child joining, and detached-task ownership are
-not implemented. `await` remains statement-only; synchronous calls are atomic.
+backend. Explicit task groups and detached-task ownership are not implemented.
+`await` remains statement-only; synchronous calls are atomic.
 `runActors()` remains non-blocking; `runTasks()` waits for task deadlines.
 Actor request timeouts do not interrupt work. No performance claim is made. No
 termination checking or loop execution budget is provided;

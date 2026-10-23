@@ -130,11 +130,11 @@ and `await` statements suspend and resume explicit block and loop frames while
 other tasks run. Synchronous calls and individual expressions remain atomic.
 Tasks preserve their statically declared result type. Tasks created while an
 async task runs are owned children: owner cancellation or failure cancels
-descendants, child failure fails its owners, and normal owner return cancels
-unfinished children. There is no detached-task operation. `runTasks()` drives
-deadlines and may wait for timers, but async I/O, HTTP, WebSockets and
-external secret stores are not implemented. Request deadlines do not remove
-queued messages or interrupt handlers.
+descendants, child failure fails its owners, and normal owner return joins all
+unfinished children before completing. There is no detached-task operation.
+`runTasks()` drives deadlines and may wait for timers, but async I/O, HTTP,
+WebSockets and external secret stores are not implemented. Request deadlines
+do not remove queued messages or interrupt handlers.
 These boundaries are reflected in the
 [language reference](language.md) and [roadmap](roadmap.md).
 
@@ -145,11 +145,11 @@ not depend on Python coroutine semantics. An `await` statement can suspend
 inside nested blocks, branches, loops and match arms, preserving lexical scopes
 and loop-control targets. The scheduler advances one frame action at a time,
 round-robin. Synchronous calls and expressions remain atomic, and `await` is
-still a statement rather than an expression. Parent-scoped cancellation is
-implemented, but explicit task groups, child joining, and detached-task
-ownership are not. `runTasks()` waits only when all active tasks are suspended
-on a monotonic deadline or actor reply. It can report deadlock when no runnable
-or timed work can make progress.
+still a statement rather than an expression. Parent-scoped cancellation and
+implicit child joining at async function return are implemented. Explicit task
+groups and detached-task ownership are not. `runTasks()` waits only when all
+active tasks are suspended on a monotonic deadline or actor reply. It can report
+deadlock when no runnable or timed work can make progress.
 
 ## Native backend direction
 

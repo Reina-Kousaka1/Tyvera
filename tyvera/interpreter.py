@@ -1011,6 +1011,7 @@ class Interpreter:
             while True:
                 self._promote_sleeping_tasks()
                 self._wake_waiting_tasks()
+                self._settle_joining_tasks()
                 if self._ready_tasks:
                     if steps >= _MAX_TASK_STEPS:
                         failure = (
@@ -1043,10 +1044,11 @@ class Interpreter:
                             self._complete_task(task)
                     steps += 1
                     self._wake_waiting_tasks()
+                    self._settle_joining_tasks()
                     continue
 
                 active = [task for task in self._tasks
-                          if task.state in {"runnable", "running", "waiting", "sleeping"}]
+                          if task.state in {"runnable", "running", "waiting", "sleeping", "joining"}]
                 if not active:
                     break
 
@@ -1060,6 +1062,7 @@ class Interpreter:
                         failure = str(actor_result.payload)
                     self._promote_due_timers()
                     self._wake_waiting_tasks()
+                    self._settle_joining_tasks()
                     if self._ready_tasks:
                         continue
 
@@ -1258,13 +1261,26 @@ class Interpreter:
         variables[statement.binding_name] = value
 
     def _complete_task(self, task: _TyveraTask) -> None:
-        for child in task.children:
-            self._cancel_task(child)
         task.frames.clear()
         task.wait_target = None
         task.wait_frame = None
         task.wait_statement = None
-        task.state = "completed"
+        if any(child.state in {"runnable", "running", "waiting", "sleeping", "joining"}
+               for child in task.children):
+            task.state = "joining"
+        else:
+            task.state = "completed"
+
+    def _settle_joining_tasks(self) -> None:
+        for task in self._tasks:
+            if task.state != "joining":
+                continue
+            failed_child = next((child for child in task.children if child.state == "failed"), None)
+            if failed_child is not None:
+                self._fail_task(task, f"owned child task failed: {failed_child.error or 'async task failed'}")
+            elif not any(child.state in {"runnable", "running", "waiting", "sleeping", "joining"}
+                         for child in task.children):
+                task.state = "completed"
 
     def _cancel_task(self, task: _TyveraTask) -> None:
         if task.state in {"completed", "failed", "cancelled"}:

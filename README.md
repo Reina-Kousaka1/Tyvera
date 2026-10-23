@@ -92,8 +92,8 @@ The detailed supported grammar and type rules are in [the language reference](do
 The object-system slice, multi-file modules, generics, collections, optional
 and result values, pattern matching, text I/O, local/environment-backed
 secrets, typed JSON, deterministic actor supervision, one-shot actor replies
-and a cooperative task scheduler with nested `await` and parent-scoped
-cancellation are implemented. True parallel scheduling, explicit task groups,
-async/network I/O, external secret stores and native backends remain planned
-and are not represented as working features. See the
+and a cooperative task scheduler with nested `await`, scoped cancellation and
+implicit child joining are implemented. True parallel scheduling, explicit
+task groups, detached tasks, async/network I/O, external secret stores and
+native backends remain planned and are not represented as working features. See the
 [roadmap](docs/roadmap.md) for sequence and scope.

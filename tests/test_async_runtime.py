@@ -214,10 +214,10 @@ fn main() {
 }
 async fn owner() {
     let child_task = child()
-    await child_task
-    println("owner escaped")
+    println("owner body complete")
 }
 async fn cancel(target: Task) {
+    await sleepFor(milliseconds(1))
     target.cancel()
 }
 fn main() {
@@ -227,12 +227,12 @@ fn main() {
     println(owner_task.isCancelled())
     println(canceller.isDone())
 }''')
-        self.assertEqual(output, "true\ntrue\n")
+        self.assertEqual(output, "owner body complete\ntrue\ntrue\n")
 
-    def test_normal_owner_exit_cancels_unfinished_children(self) -> None:
+    def test_normal_owner_exit_joins_unfinished_children(self) -> None:
         output = self.run_source('''async fn child() {
     await sleepFor(milliseconds(10))
-    println("child escaped")
+    println("child finished")
 }
 async fn owner() -> Task {
     let child_task = child()
@@ -243,13 +243,16 @@ fn main() {
     runTasks()
     match owner_task.tryResult() {
         Ok(result) => match result {
-            Some(child_task) => println(child_task.isCancelled())
+            Some(child_task) => {
+                println(child_task.isDone())
+                println(child_task.isCancelled())
+            }
             None => println("missing child")
         }
         Err(reason) => println(reason)
     }
 }''')
-        self.assertEqual(output, "true\n")
+        self.assertEqual(output, "child finished\ntrue\nfalse\n")
 
     def test_owned_child_failure_fails_owner_and_cancels_siblings(self) -> None:
         now = [0.0]
