@@ -1,0 +1,40 @@
+actor Counter {
+    var value: Int
+
+    init(start: Int) {
+        self.value = start
+    }
+
+    on add(amount: Int) {
+        self.value = self.value + amount
+    }
+
+    on read(reply: ReplySender<Int>) {
+        reply.send(self.value)
+    }
+}
+
+fn main() {
+    let counter = spawn(Counter(10))
+    counter.add(5)
+    let delayed = counter.sendAfter(milliseconds(0), add, 2)
+    runActors()
+    let response = counter.request(read)
+    let deadline = timerAfter(milliseconds(0))
+
+    match runActors() {
+        Ok(_) => println("messages processed")
+        Err(reason) => eprintln(reason)
+    }
+
+    println(deadline.isReady())
+    match response.tryReceive() {
+        Ok(value) => {
+            match value {
+                Some(score) => println(score)
+                None => println("response pending")
+            }
+        }
+        Err(reason) => eprintln(reason)
+    }
+}

@@ -75,6 +75,59 @@ class _ActorMessage:
 
 
 @dataclass(slots=True, eq=False, repr=False)
+class _TyveraReplyCell:
+    state: str = "pending"
+    value: object = None
+    error: str | None = None
+    started_at: float | None = None
+    timeout_milliseconds: int | None = None
+    clock: Callable[[], float] | None = None
+
+    def __repr__(self) -> str:
+        return "<ReplyChannel>"
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraReplySender:
+    cell: _TyveraReplyCell
+
+    def __repr__(self) -> str:
+        return "<ReplySender>"
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraReplyReceiver:
+    cell: _TyveraReplyCell
+
+    def __repr__(self) -> str:
+        return "<ReplyReceiver>"
+
+
+@dataclass(slots=True, frozen=True, order=True, repr=False)
+class _TyveraDuration:
+    milliseconds: int
+
+    def __repr__(self) -> str:
+        return "<Duration>"
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraTimer:
+    started_at: float
+    duration_milliseconds: int
+    clock: Callable[[], float]
+    cancelled: bool = False
+    scheduled_actor: _TyveraActor | None = None
+    scheduled_method: str | None = None
+    scheduled_arguments: list[object] = dataclass_field(default_factory=list)
+    scheduled_location: Location | None = None
+    delivered: bool = False
+
+    def __repr__(self) -> str:
+        return "<Timer>"
+
+
+@dataclass(slots=True, eq=False, repr=False)
 class _TyveraSupervisor:
     max_restarts: int
     window_milliseconds: int
@@ -96,6 +149,7 @@ class _TyveraActor:
     supervisor: _TyveraSupervisor | None = None
     declaration: ActorDeclaration | None = None
     constructor_arguments: list[object] = dataclass_field(default_factory=list)
+    pending_replies: set[_TyveraReplyCell] = dataclass_field(default_factory=set)
 
 
 @dataclass(slots=True, eq=False, repr=False)
@@ -149,6 +203,7 @@ class Interpreter:
         self.classes: dict[str, ClassDeclaration] = {declaration.name: declaration for declaration in program.classes}
         self.actors: dict[str, ActorDeclaration] = {declaration.name: declaration for declaration in program.actors}
         self._ready_actors: deque[_TyveraActor] = deque()
+        self._scheduled_timers: list[_TyveraTimer] = []
         self._current_actor: _TyveraActor | None = None
         self.output = output
         self.error_output = error_output if error_output is not None else sys.stderr
@@ -270,6 +325,16 @@ class Interpreter:
             if expression.callee == "runActors":
                 return self._run_actors(expression.location, depth)
             arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+            if expression.callee == "milliseconds":
+                return self._make_duration(arguments[0], expression.location)
+            if expression.callee == "seconds":
+                seconds = arguments[0]
+                return self._make_duration(seconds * 1000, expression.location)
+            if expression.callee == "timerAfter":
+                duration = arguments[0]
+                if not isinstance(duration, _TyveraDuration):
+                    raise AssertionError("checked timerAfter argument is not Duration")
+                return _TyveraTimer(self._clock(), duration.milliseconds, self._clock)
             if expression.callee == "println":
                 self.output.write(self._display(arguments[0]) + "\n")
                 return None
@@ -372,6 +437,45 @@ class Interpreter:
                         for child in receiver.children:
                             self._stop_actor(child)
                     return None
+            if isinstance(receiver, _TyveraActorRef) and expression.method in {"request", "requestWithin", "sendAfter"}:
+                actor = receiver.actor
+                scheduled = expression.method == "sendAfter"
+                timed = expression.method in {"requestWithin", "sendAfter"}
+                prefix = 1 if timed else 0
+                duration = self._evaluate(expression.arguments[0], variables, depth) if timed else None
+                selector = expression.arguments[prefix]
+                if not isinstance(selector, Name):
+                    raise AssertionError("checked actor request selector is not a name")
+                request_arguments = [
+                    self._evaluate(argument, variables, depth)
+                    for argument in expression.arguments[prefix + 1:]
+                ]
+                if scheduled:
+                    if not isinstance(duration, _TyveraDuration):
+                        raise AssertionError("checked sendAfter duration is not Duration")
+                    if actor.status != "alive":
+                        raise Diagnostic(expression.location, "runtime", f"cannot schedule a message for a {actor.status} actor")
+                    timer = _TyveraTimer(
+                        self._clock(), duration.milliseconds, self._clock,
+                        scheduled_actor=actor,
+                        scheduled_method=selector.identifier,
+                        scheduled_arguments=request_arguments,
+                        scheduled_location=expression.location,
+                    )
+                    self._scheduled_timers.append(timer)
+                    return timer
+                cell = _TyveraReplyCell()
+                if duration is not None:
+                    if not isinstance(duration, _TyveraDuration):
+                        raise AssertionError("checked requestWithin timeout is not Duration")
+                    cell.started_at = self._clock()
+                    cell.timeout_milliseconds = duration.milliseconds
+                    cell.clock = self._clock
+                receiver_value = _TyveraReplyReceiver(cell)
+                self._enqueue_actor_message(
+                    actor, selector.identifier, [*request_arguments, _TyveraReplySender(cell)], expression.location,
+                )
+                return receiver_value
             arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
             if isinstance(receiver, _TyveraActorRef):
                 actor = receiver.actor
@@ -382,6 +486,58 @@ class Interpreter:
                     return None
                 self._enqueue_actor_message(actor, expression.method, arguments, expression.location)
                 return None
+            if isinstance(receiver, _TyveraReplySender) and expression.method == "send":
+                return self._send_reply(receiver.cell, arguments[0])
+            if isinstance(receiver, _TyveraReplyReceiver):
+                self._refresh_reply(receiver.cell)
+                cell = receiver.cell
+                if expression.method == "isReady":
+                    return cell.state != "pending"
+                if expression.method == "isCancelled":
+                    return cell.state == "cancelled"
+                if expression.method == "isTimedOut":
+                    return cell.state == "timed_out"
+                if expression.method == "cancel":
+                    if cell.state != "pending":
+                        return False
+                    cell.state = "cancelled"
+                    return True
+                if expression.method == "tryReceive":
+                    if cell.state == "sent":
+                        value = cell.value
+                        cell.value = None
+                        cell.state = "consumed"
+                        return _TyveraVariant("Ok", _TyveraVariant("Some", value))
+                    if cell.state in {"failed", "timed_out"}:
+                        return _TyveraVariant("Err", cell.error or "request failed")
+                    return _TyveraVariant("Ok", _TyveraVariant("None"))
+            if isinstance(receiver, _TyveraDuration) and expression.method == "inMilliseconds":
+                return receiver.milliseconds
+            if isinstance(receiver, _TyveraTimer):
+                if expression.method == "isCancelled":
+                    return receiver.cancelled
+                if receiver.cancelled:
+                    if expression.method == "isReady":
+                        return False
+                    if expression.method == "remaining":
+                        return _TyveraDuration(0)
+                    if expression.method == "cancel":
+                        return False
+                elapsed = (receiver.clock() - receiver.started_at) * 1000.0
+                ready = elapsed >= receiver.duration_milliseconds
+                if expression.method == "isReady":
+                    return ready
+                if expression.method == "cancel":
+                    if ready:
+                        return False
+                    receiver.cancelled = True
+                    self._prune_scheduled_timers()
+                    return True
+                if expression.method == "remaining":
+                    if ready:
+                        return _TyveraDuration(0)
+                    remaining = math.ceil(receiver.duration_milliseconds - elapsed)
+                    return _TyveraDuration(max(0, min(remaining, INT_MAX)))
             if isinstance(receiver, _TyveraSecret) and expression.method == "reveal":
                 return receiver.value
             if isinstance(receiver, _TyveraJson):
@@ -682,6 +838,10 @@ class Interpreter:
     def _copy_actor_value(value: object) -> object:
         if isinstance(value, _TyveraActorRef):
             return _TyveraActorRef(value.actor)
+        if isinstance(value, _TyveraDuration):
+            return value
+        if isinstance(value, _TyveraReplySender):
+            return _TyveraReplySender(value.cell)
         if isinstance(value, _TyveraVariant):
             return _TyveraVariant(value.variant, Interpreter._copy_actor_value(value.payload))
         if value is None or type(value) in {bool, int, float, str}:
@@ -695,21 +855,48 @@ class Interpreter:
             f"{error.location.line}:{error.location.column}: {error.message}"
         )
 
-    @staticmethod
-    def _stop_actor(actor: _TyveraActor) -> None:
+    def _fail_pending_replies(self, actor: _TyveraActor, error: str) -> None:
+        self._cancel_actor_timers(actor)
+        for cell in actor.pending_replies:
+            self._refresh_reply(cell)
+            if cell.state == "pending":
+                cell.state = "failed"
+                cell.error = error
+        actor.pending_replies.clear()
+
+    def _stop_actor(self, actor: _TyveraActor) -> None:
+        self._cancel_actor_timers(actor)
         if actor.status == "alive":
             actor.status = "stopped"
+        for cell in actor.pending_replies:
+            self._refresh_reply(cell)
+            if cell.state == "pending":
+                cell.state = "failed"
+                cell.error = "actor stopped before replying"
+        actor.pending_replies.clear()
         actor.mailbox.clear()
+
+    def _cancel_actor_timers(self, actor: _TyveraActor) -> None:
+        for timer in self._scheduled_timers:
+            if timer.scheduled_actor is actor and not timer.delivered:
+                timer.cancelled = True
+        self._prune_scheduled_timers()
+
+    def _prune_scheduled_timers(self) -> None:
+        self._scheduled_timers = [
+            timer for timer in self._scheduled_timers if not timer.cancelled and not timer.delivered
+        ]
 
     def _fail_supervisor(self, supervisor: _TyveraSupervisor) -> None:
         supervisor.status = "failed"
         for child in supervisor.children:
-            child.status = "stopped"
-            child.mailbox.clear()
+            self._stop_actor(child)
 
     def _restart_supervised_actor(
         self, actor: _TyveraActor, failure: str, call_location: Location, depth: int,
     ) -> str | None:
+        self._fail_pending_replies(actor, failure)
+        actor.mailbox.clear()
         supervisor = actor.supervisor
         if supervisor is None:
             return failure
@@ -758,6 +945,9 @@ class Interpreter:
             raise Diagnostic(location, "runtime", f"cannot send a message to a {actor.status} actor")
         if len(actor.mailbox) >= _MAX_ACTOR_MAILBOX:
             raise Diagnostic(location, "runtime", f"actor mailbox capacity ({_MAX_ACTOR_MAILBOX}) exceeded")
+        for argument in arguments:
+            if isinstance(argument, _TyveraReplySender):
+                actor.pending_replies.add(argument.cell)
         actor.mailbox.append(_ActorMessage(method, arguments, location))
         if not actor.queued:
             actor.queued = True
@@ -768,6 +958,7 @@ class Interpreter:
             raise Diagnostic(location, "runtime", "runActors cannot be called from an actor message handler")
         processed = 0
         first_crash: str | None = None
+        self._promote_due_timers()
         while self._ready_actors and processed < _MAX_ACTOR_DELIVERIES:
             actor = self._ready_actors.popleft()
             actor.queued = False
@@ -782,7 +973,6 @@ class Interpreter:
                 self._call_method(method, actor.instance, message.arguments, message.location, depth + 1)
             except Diagnostic as error:
                 actor.status = "crashed"
-                actor.mailbox.clear()
                 failure = self._restart_supervised_actor(
                     actor, self._format_actor_failure(declaration, error), message.location, depth + 1,
                 )
@@ -790,7 +980,6 @@ class Interpreter:
                     first_crash = failure
             except _LoopSignal as signal:
                 actor.status = "crashed"
-                actor.mailbox.clear()
                 failure = self._restart_supervised_actor(
                     actor, f"actor '{declaration.name}' crashed: '{signal.kind}' escaped its loop",
                     message.location, depth + 1,
@@ -799,6 +988,8 @@ class Interpreter:
                     first_crash = failure
             finally:
                 self._current_actor = None
+            actor.pending_replies = {cell for cell in actor.pending_replies if cell.state == "pending"}
+            self._promote_due_timers()
             if actor.status == "alive" and actor.mailbox and not actor.queued:
                 actor.queued = True
                 self._ready_actors.append(actor)
@@ -808,6 +999,23 @@ class Interpreter:
         if first_crash is not None:
             return _TyveraVariant("Err", first_crash)
         return _TyveraVariant("Ok", processed)
+
+    def _promote_due_timers(self) -> None:
+        for timer in self._scheduled_timers:
+            if timer.cancelled or timer.delivered or timer.scheduled_actor is None:
+                continue
+            elapsed = (timer.clock() - timer.started_at) * 1000.0
+            if elapsed < timer.duration_milliseconds:
+                continue
+            timer.delivered = True
+            method = timer.scheduled_method
+            location = timer.scheduled_location
+            if method is None or location is None:
+                raise AssertionError("scheduled actor timer is missing its message")
+            self._enqueue_actor_message(
+                timer.scheduled_actor, method, timer.scheduled_arguments, location,
+            )
+        self._prune_scheduled_timers()
 
     def _call_method(
         self, method: Method, receiver: _TyveraInstance, arguments: list[object],
@@ -830,8 +1038,35 @@ class Interpreter:
     def _check_numeric_result(value: object, location: Location) -> None:
         if type(value) is int and not INT_MIN <= value <= INT_MAX:
             raise Diagnostic(location, "runtime", "Int overflow: result is outside the signed 64-bit range")
+        if isinstance(value, _TyveraDuration) and not INT_MIN <= value.milliseconds <= INT_MAX:
+            raise Diagnostic(location, "runtime", "Duration overflow: result is outside signed 64-bit milliseconds")
         if isinstance(value, float) and not math.isfinite(value):
             raise Diagnostic(location, "runtime", "Float overflow: result is outside the supported range")
+
+    @staticmethod
+    def _make_duration(milliseconds: object, location: Location) -> _TyveraDuration:
+        if type(milliseconds) is not int:
+            raise AssertionError("checked Duration input is not Int")
+        if not INT_MIN <= milliseconds <= INT_MAX:
+            raise Diagnostic(location, "runtime", "Duration overflow: value is outside signed 64-bit milliseconds")
+        return _TyveraDuration(milliseconds)
+
+    @staticmethod
+    def _refresh_reply(cell: _TyveraReplyCell) -> None:
+        if (cell.state == "pending" and cell.started_at is not None
+                and cell.timeout_milliseconds is not None and cell.clock is not None
+                and (cell.clock() - cell.started_at) * 1000.0 >= cell.timeout_milliseconds):
+            cell.state = "timed_out"
+            cell.error = "request timed out"
+
+    @classmethod
+    def _send_reply(cls, cell: _TyveraReplyCell, value: object) -> bool:
+        cls._refresh_reply(cell)
+        if cell.state != "pending":
+            return False
+        cell.state = "sent"
+        cell.value = value
+        return True
 
     @staticmethod
     def _apply_binary(operator: str, left: object, right: object) -> object:
@@ -840,8 +1075,12 @@ class Interpreter:
         if operator == "or":
             return bool(left or right)
         if operator == "+":
+            if isinstance(left, _TyveraDuration) and isinstance(right, _TyveraDuration):
+                return _TyveraDuration(left.milliseconds + right.milliseconds)
             return left + right  # type: ignore[operator]
         if operator == "-":
+            if isinstance(left, _TyveraDuration) and isinstance(right, _TyveraDuration):
+                return _TyveraDuration(left.milliseconds - right.milliseconds)
             return left - right  # type: ignore[operator]
         if operator == "*":
             return left * right  # type: ignore[operator]

@@ -8,7 +8,7 @@ Tyvera is an independent, statically typed programming language with a design di
 
 The repository contains a working bootstrap toolchain: a lexer, parser and AST, static type checker, source-located diagnostics, and interpreter. It uses Python only as the current implementation host; Tyvera syntax and semantics are defined separately.
 
-Supported and tested: `Int`, `Float`, `Bool`, `String`, `Void`; generic functions/classes; typed `List<T>` and `Map<K,V>`; `Option<T>`/`Result<T,E>` and statement-level pattern matching; `for` iteration; checked text-file I/O and path helpers; local/environment-backed `Secret<String>` access with explicit reveal; typed JSON parsing, access and encoding; checked returns and lexical scopes; `let`/`var`; arithmetic, comparisons, `if`/`else`, and `while` with `break`/`continue`. Classes support constructors, fields, `self`, methods and checked initialization. Interfaces support exact contracts, multiple implementation and dynamic dispatch. Multi-file projects support explicit relative imports and `pub` exports. The deterministic cooperative actor runtime supports typed messages, isolated actor state, FIFO mailboxes, crash isolation and bounded `one_for_one` supervision. `Unit`, `and`, and `or` remain compatibility spellings.
+Supported and tested: `Int`, `Float`, `Bool`, `String`, `Void`; generic functions/classes; typed `List<T>` and `Map<K,V>`; `Option<T>`/`Result<T,E>` and statement-level pattern matching; `for` iteration; checked text-file I/O and path helpers; local/environment-backed `Secret<String>` access with explicit reveal; typed JSON parsing, access and encoding; checked returns and lexical scopes; `let`/`var`; arithmetic, comparisons, `if`/`else`, and `while` with `break`/`continue`. Classes support constructors, fields, `self`, methods and checked initialization. Interfaces support exact contracts, multiple implementation and dynamic dispatch. Multi-file projects support explicit relative imports and `pub` exports. The deterministic cooperative actor runtime supports typed messages, isolated actor state, FIFO mailboxes, crash isolation, bounded `one_for_one` supervision, typed one-shot request/reply, cancellation and delayed message delivery. The time core provides checked `Duration` values and monotonic one-shot timers. `Unit`, `and`, and `or` remain compatibility spellings.
 
 Requirements: Python 3.10 or newer. The toolchain has no third-party runtime dependencies.
 
@@ -68,6 +68,8 @@ tyvera check examples/actors.tyv
 tyvera run examples/actors.tyv
 tyvera check examples/supervision.tyv
 tyvera run examples/supervision.tyv
+tyvera check examples/runtime_foundations.tyv
+tyvera run examples/runtime_foundations.tyv
 ```
 
 Run the test suite from the repository root:
@@ -87,7 +89,8 @@ The detailed supported grammar and type rules are in [the language reference](do
 
 The object-system slice, multi-file modules, generics, collections, optional
 and result values, pattern matching, text I/O, local/environment-backed
-secrets, typed JSON and deterministic actor supervision are implemented. True
-parallel scheduling, request/reply, async/network I/O, external secret stores
-and native backends remain planned and are not represented as working features. See the
+secrets, typed JSON, deterministic actor supervision and one-shot actor replies
+are implemented. True parallel scheduling, resumable async tasks, timer-driven
+wakeups, async/network I/O, external secret stores and native backends remain
+planned and are not represented as working features. See the
 [roadmap](docs/roadmap.md) for sequence and scope.

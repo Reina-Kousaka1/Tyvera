@@ -68,6 +68,10 @@ type        = identifier {"." identifier} ["<" type {"," type} ">"] ;
 pattern     = literal | "_" | identifier | ("Some" | "Ok" | "Err") "(" [identifier | "_"] ")" | "None" ;
 ```
 
+Actor references additionally support `request`, `requestWithin`, and
+`sendAfter`. Their handler selector is a bare identifier naming a declared
+handler.
+
 Assignments are statements, not expressions. Function and method calls can be
 used as expression statements. Local declarations require an initializer;
 class fields declare their type without an initializer and are initialized by
@@ -330,12 +334,14 @@ per actor per round, while preserving FIFO order within each actor. It is not
 parallel and does not preempt a running handler. Handlers cannot recursively
 drive `runActors()`.
 
-Message and constructor arguments are transferable Tyvera values of type `Int`,
-`Float`, `Bool`, `String`, `Option<T>`, `Result<T,E>`, or `ActorRef<A>` when the
-nested types are also transferable. Mutable collections, ordinary class
-instances and secrets cannot cross a mailbox. A runtime diagnostic in a
-handler marks that actor crashed, discards its queued messages, and lets other
-actors continue; an unsupervised crash is returned as `Err`. Ordinary `Result`
+Constructor arguments and ordinary message arguments are transferable Tyvera
+values of type `Int`, `Float`, `Bool`, `String`, `Duration`, `Option<T>`,
+`Result<T,E>`, or `ActorRef<A>` when the nested types are also transferable.
+Mutable collections, ordinary class instances and secrets cannot cross a
+mailbox. Request messages additionally carry a `ReplySender<T>` as their final
+parameter; `T` must itself be transferable. A runtime diagnostic in a handler
+marks that actor crashed, discards its queued messages, and lets other actors
+continue; an unsupervised crash is returned as `Err`. Ordinary `Result`
 failures remain application values, separate from actor crashes.
 
 `oneForOne(maxRestarts, windowMilliseconds) -> Supervisor` creates a
@@ -362,6 +368,77 @@ the crash. A mailbox holds at most 100,000 pending messages and one
 `runActors()` call delivers at most 100,000. The round-robin scheduler is
 cooperative rather than parallel or preemptive; a handler that does not return
 can block every actor and the runtime.
+
+### Typed requests and replies
+
+An actor handler can accept `ReplySender<T>` as its final parameter. Calling
+`actor.request(handlerName, arguments...)` creates a one-shot reply channel,
+enqueues the handler with its typed sender, and returns `ReplyReceiver<T>`.
+`requestWithin(duration, handlerName, arguments...)` adds a monotonic deadline.
+
+```tyv
+actor Counter {
+    var value: Int
+    init(start: Int) { self.value = start }
+    on read(reply: ReplySender<Int>) { reply.send(self.value) }
+}
+
+fn main() {
+    let counter = spawn(Counter(15))
+    let response = counter.request(read)
+    runActors()
+    match response.tryReceive() {
+        Ok(value) => {
+            match value {
+                Some(number) => println(number)
+                None => println("not available yet")
+            }
+        }
+        Err(reason) => eprintln(reason)
+    }
+}
+```
+
+`ReplySender.send(value) -> Bool` succeeds only while the request is pending;
+later sends return `false`. `ReplyReceiver.tryReceive() ->
+Result<Option<T>,String>` is non-blocking and consumes a successful response at
+most once. `Ok(None)` means no value is available (including after
+cancellation); check `isReady()` and `isCancelled()` to distinguish those
+states, and `isTimedOut()` identifies deadline expiry. Actor crashes and stops
+complete outstanding requests with `Err`, and timeouts return
+`Err("request timed out")` when the receiver is next polled or a sender next
+tries to reply. `cancel()` returns `true` only
+when it changes a pending request. Cancellation and timeout stop the caller
+from receiving a reply; they do not remove the queued message or interrupt a
+running handler. A handler may inspect the `Bool` returned by `send` before
+performing follow-up work. Reply senders are only accepted as a handler's final
+parameter and cannot be forwarded through ordinary actor messages.
+
+Requests never block or implicitly run the scheduler. Call `runActors()` to
+deliver queued messages, then poll the receiver or poll again from a later
+actor message. Reply channels are single-assignment capabilities; they do not
+grant access to actor state.
+
+### Durations and timers
+
+`milliseconds(Int)` and `seconds(Int)` construct signed, 64-bit `Duration`
+values in millisecond resolution. `Duration` supports addition, subtraction,
+comparisons, and `inMilliseconds()`. Arithmetic and unit conversion are
+checked for overflow. `timerAfter(Duration)` creates a one-shot `Timer` using
+the runtime's monotonic clock. Timers expose `isReady()`, `remaining()`,
+`cancel()`, and `isCancelled()`; cancelling an elapsed timer returns `false`.
+`ActorRef.sendAfter(duration, handlerName, arguments...) -> Timer` schedules a
+typed actor message for one-shot delivery after the duration. The selected
+handler must not require a reply sender. Cancelling before delivery prevents
+the message; stopping or crashing the target actor cancels its scheduled
+messages. Negative durations are already elapsed when used for a timer or
+request deadline.
+
+Timers never block or sleep. Due actor messages are promoted when
+`runActors()` is called; the runtime does not wait for a future deadline or
+wake itself. The interpreter accepts an injected clock for deterministic
+tests. No async functions, `await`, general task scheduling, or non-blocking
+I/O are implemented yet.
 
 ## JSON values
 
@@ -523,11 +600,11 @@ limit (or the bootstrap host stack limit, if reached sooner).
 Current limits: classes, interfaces and the deterministic cooperative actor
 runtime with bounded `one_for_one` supervision are supported, but there is no
 inheritance, generic methods/interfaces/constraints, collection literals,
-`try`/`catch`, reply channels, parallel process scheduling, async runtime,
-networking API, importable standard-library modules, external secret-store
-provider, native interop, garbage collector implementation, package manager or
-compiler backend. No performance claim is made. No termination checking or
-loop execution budget is provided; users can write infinite loops. Parsing and
-execution use the host stack, so extremely deeply nested source is not
-supported. The interpreter is replaceable bootstrap technology, not part of
-Tyvera semantics.
+`try`/`catch`, parallel process scheduling, async runtime, networking API,
+importable standard-library modules, external secret-store provider, native
+interop, garbage collector implementation, package manager or compiler
+backend. Timers do not wake the runtime, and actor request timeouts do not
+interrupt work. No performance claim is made. No termination checking or loop execution
+budget is provided; users can write infinite loops. Parsing and execution use
+the host stack, so extremely deeply nested source is not supported. The
+interpreter is replaceable bootstrap technology, not part of Tyvera semantics.

@@ -71,7 +71,11 @@ and `--version`. The implementation uses Python's standard library only.
   bootstrap scheduler owns FIFO mailboxes and schedules one message per actor
   per round. It is cooperative and deterministic, not parallel. Messages are
   restricted to transferable immutable primitives, nested `Option`/`Result`
-  values, and actor references; ordinary mutable objects cannot be shared.
+  values, durations and actor references; ordinary mutable objects cannot be
+  shared. A final `ReplySender<T>` handler parameter is the one controlled
+  single-assignment capability exception. `ActorRef.request` creates its
+  receiver and enqueues the typed request. Receivers poll without blocking,
+  support cancellation and deadlines, and are failed on actor crash or stop.
   Handler diagnostics crash only their actor and clear its mailbox. An
   unsupervised crash is reported with source location by `runActors()` as
   `Result<Int,String>` while other actors continue. A `one_for_one` Supervisor
@@ -82,6 +86,11 @@ and `--version`. The implementation uses Python's standard library only.
   queued messages are discarded. Mailboxes and each scheduler drain have a
   100,000 message limit; a nonterminating handler can still block the
   cooperative loop.
+- **Time is observable and injectable:** `Duration` uses checked signed 64-bit
+  milliseconds. `Timer` stores a monotonic deadline and can be queried or
+  cancelled. `ActorRef.sendAfter` uses it to schedule one typed actor message;
+  `runActors()` promotes due messages but never sleeps or wakes itself. The
+  interpreter's clock injection keeps time-dependent tests deterministic.
 - JSON uses a Tyvera-owned opaque `Json` value and checked constructors,
   accessors and `Result`-returning parse/encode intrinsics. The bootstrap uses
   Python's standard JSON codec internally, but rejects duplicate keys,
@@ -115,10 +124,32 @@ Actors participate in that linker and can be exported and imported. The
 manifest currently has only `name` and `entry`; dependencies are not yet
 supported. Ordinary functions and I/O execute synchronously; actor handlers
 run only when the cooperative scheduler is explicitly pumped. The supervisor
-API currently supports only `one_for_one`; request/reply, parallel scheduling,
-async I/O, HTTP, WebSockets and external secret stores are not implemented.
+API currently supports only `one_for_one`; parallel scheduling, resumable
+tasks, `async`/`await`, interruptible work, async I/O, HTTP, WebSockets and
+external secret stores are not implemented. Request deadlines do not remove
+queued messages or interrupt handlers.
 These boundaries are reflected in the
 [language reference](language.md) and [roadmap](roadmap.md).
+
+## Next async-runtime architecture decision
+
+The current interpreter executes a function body recursively to completion;
+it has no continuation object that can preserve local scopes and resume at an
+`await`. Actor `ReplyReceiver<T>` values and monotonic timers are non-blocking
+primitives, not general tasks. Adding `async` syntax on top of ordinary
+function calls would therefore run work synchronously and misstate the
+semantics.
+
+Before implementing async functions, define a Tyvera-owned `Task<T>` state
+machine with pending/completed/failed/cancelled outcomes and explicit
+continuation frames. An async function call should create a task; `await`
+should suspend only that task, leaving actor turns and other ready tasks
+runnable. The deterministic bootstrap scheduler should advance tasks only at
+defined suspension points, integrate timers as wake events, and make
+cancellation cooperative at those same points. This model must not inherit
+Python `asyncio` or Promise semantics. Task failure mapping to `Result` and
+scope/lifetime rules are still open design decisions; no `Task<T>` or `async`
+syntax is implemented.
 
 ## Native backend direction
 
