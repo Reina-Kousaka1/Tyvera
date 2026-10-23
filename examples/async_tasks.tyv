@@ -1,7 +1,17 @@
-async fn announce(label: String) -> String {
-    println(label + " started")
+async fn resume(label: String) -> String {
     await sleepFor(milliseconds(2))
     return label + " resumed"
+}
+
+async fn announce(label: String) -> String {
+    println(label + " started")
+    if label == "first" {
+        let message: String = await resume(label)
+        return message
+    } else {
+        await sleepFor(milliseconds(2))
+        return label + " resumed"
+    }
 }
 
 fn main() {

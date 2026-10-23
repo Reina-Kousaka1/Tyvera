@@ -16,7 +16,7 @@ These core types and functions are currently available without an import:
 | `Duration` | `milliseconds(Int)`, `seconds(Int)`, checked `+`/`-`, comparisons, and `inMilliseconds()`. Signed millisecond values use checked 64-bit arithmetic. |
 | `Timer` | `timerAfter(Duration)`, `isReady`, `remaining`, `cancel`, and `isCancelled`, backed by a monotonic clock. `ActorRef.sendAfter(Duration, handler, ...)` schedules a typed one-shot actor message. Timers never sleep or wake the runtime. |
 | Actor replies | `ActorRef.request(handler, ...)` and `requestWithin(Duration, handler, ...)` return `ReplyReceiver<T>` for handlers ending in `ReplySender<T>`. Receivers poll with `tryReceive`, can be cancelled, and receive errors on actor crash/stop or deadline. |
-| `Task<T>` | Calls to `async fn` create deferred typed tasks; bare `Task` means `Task<Void>`. `isDone()`, `isCancelled()`, `cancel()`, and `tryResult()` expose lifecycle and values. `sleepFor(Duration)` returns `Task<Void>`; `runTasks()` drives ready work and returns `Result<Int,String>`. `await` suspends on `Task<T>` or `ReplyReceiver<T>`. |
+| `Task<T>` | Calls to `async fn` create deferred typed tasks; bare `Task` means `Task<Void>`. `isDone()`, `isCancelled()`, `cancel()`, and `tryResult()` expose lifecycle and values. `sleepFor(Duration)` returns `Task<Void>`; `runTasks()` drives ready work and returns `Result<Int,String>`. `await` suspends on `Task<T>` or `ReplyReceiver<T>` from nested blocks, branches, loops and match arms. Tasks created within an async task are owned children: owner cancellation/failure cascades, child failure fails owners, and normal owner return cancels unfinished children. |
 | Text I/O | `readText`, `writeText`, `pathJoin`, `pathExists`, `println`, and `eprintln`; file errors use `Result`. |
 | Secrets | `secrets.NAME` reads `.tyvera.secrets` before the process environment and returns `Option<Secret<String>>`; `Secret.reveal()` is explicit. |
 | `Json` | `parseJson(String) -> Result<Json,String>`, `jsonStringify(Json) -> Result<String,String>`, typed constructors, and optional accessors for JSON values. |
@@ -64,11 +64,13 @@ are suspended, then resumes them. It does not create background threads.
 
 Async functions can return statically checked values. `await task` waits without
 binding a value; `let value: T = await task` binds a `Task<T>` or typed reply
-payload. `await` is supported only directly in an async function body, outside
-`if`, loop, match and nested block bodies. Each scheduler turn executes one
-top-level statement; nested control flow and synchronous calls execute
-atomically and cannot be preempted. Task cancellation is cooperative, not
-structured or parent-propagated. `Task<T>.tryResult()` reports pending as
+payload. `await` is supported in nested blocks, branches, loops and match arms
+inside an async function. Each scheduler turn advances one statement or
+continuation action; synchronous calls and expressions execute atomically and
+cannot be preempted. Tasks created while an async task runs are owned children.
+Owner cancellation or failure cancels descendants, child failure fails owners,
+and normal owner return cancels unfinished children. Task values still cannot
+be detached or sent through actor messages. `Task<T>.tryResult()` reports pending as
 `Ok(None)`, completion as `Ok(Some(value))`, and failure or cancellation as
 `Err`; for `Task<Void>` it returns `Result<Bool,String>` (`Ok(false)` pending,
 `Ok(true)` completed). Task arguments use ordinary function-call capture and

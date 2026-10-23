@@ -23,8 +23,8 @@ implemented.
 
 ## Near-term sequence
 
-1. Extend task continuations to nested control flow; define structured
-   cancellation and child-task ownership before networking.
+1. Define explicit task-group/join and detached-task semantics on top of the
+   implemented parent-scoped cancellation before networking.
 2. Move or wrap collection, I/O, JSON and secret operations behind normal
    `tyvera.*` modules as that library module model stabilizes.
 3. Continue improving generic interfaces, constraints and type inference with
@@ -47,9 +47,11 @@ Tyvera errors.
 
 The object system, relative file modules, generic collections, file I/O,
 provider-backed secrets, typed JSON core, supervised actors, typed replies,
-cooperative async tasks with typed return values, cancellation, deadlines and
-delayed actor messages are usable. True parallelism and structured cancellation,
-resource ownership, async networking and a native backend are still missing.
-The next deliverable is continuation support inside nested control flow and a
-structured task-lifetime model, followed by standard-library module boundaries
-and networking only after those runtime contracts are testable.
+cooperative async tasks with typed return values, parent-scoped cancellation,
+deadlines and delayed actor messages are usable. Await now resumes inside
+nested blocks, branches, loops and match arms. True parallelism, explicit
+task-group/join and detached-task semantics, resource ownership, async
+networking and a native backend are still missing. The next deliverable is to
+specify whether child tasks can be joined or detached, followed by
+standard-library module boundaries and networking only after those runtime
+contracts are testable.

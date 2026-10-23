@@ -432,7 +432,7 @@ class TypeChecker:
                 exits = {"return"}
             elif isinstance(statement, AwaitStatement):
                 if not async_allowed:
-                    raise Diagnostic(statement.location, "type", "'await' is only valid as a top-level statement in an async function")
+                    raise Diagnostic(statement.location, "type", "'await' is only valid inside an async function")
                 awaited_type = self._expression_type(statement.value, variables, owner)
                 base, arguments = split_type(awaited_type)
                 if base == "Task" and len(arguments) == 1:
@@ -457,18 +457,22 @@ class TypeChecker:
                         result_type = canonical_type(statement.annotation)
                     variables[name] = Binding(result_type, statement.mutable)
             elif isinstance(statement, Block):
-                exits = self._check_block(statement.body, variables.new_child(), return_type, loop_depth, owner, method_name)
+                exits = self._check_block(statement.body, variables.new_child(), return_type, loop_depth,
+                                          owner, method_name, async_allowed)
             elif isinstance(statement, IfStatement):
                 self._require_same_type("Bool", self._expression_type(statement.condition, variables, owner), statement.condition.location)
-                then_exits = self._check_block(statement.then_body, variables.new_child(), return_type, loop_depth, owner, method_name)
-                else_exits = self._check_block(statement.else_body, variables.new_child(), return_type, loop_depth, owner, method_name)
+                then_exits = self._check_block(statement.then_body, variables.new_child(), return_type, loop_depth,
+                                               owner, method_name, async_allowed)
+                else_exits = self._check_block(statement.else_body, variables.new_child(), return_type, loop_depth,
+                                               owner, method_name, async_allowed)
                 if isinstance(statement.condition, Literal):
                     exits = then_exits if statement.condition.value else else_exits
                 else:
                     exits = then_exits | else_exits
             elif isinstance(statement, WhileStatement):
                 self._require_same_type("Bool", self._expression_type(statement.condition, variables, owner), statement.condition.location)
-                body_exits = self._check_block(statement.body, variables.new_child(), return_type, loop_depth + 1, owner, method_name)
+                body_exits = self._check_block(statement.body, variables.new_child(), return_type, loop_depth + 1,
+                                               owner, method_name, async_allowed)
                 literal = isinstance(statement.condition, Literal)
                 exits = set()
                 if not literal or statement.condition.value:
@@ -488,7 +492,8 @@ class TypeChecker:
                     raise Diagnostic(statement.iterable.location, "type", f"for-loop value must be a List or Map, found {iterable_type}")
                 loop_variables = variables.new_child()
                 loop_variables[statement.name] = Binding(element_type)
-                body_exits = self._check_block(statement.body, loop_variables, return_type, loop_depth + 1, owner, method_name)
+                body_exits = self._check_block(statement.body, loop_variables, return_type, loop_depth + 1,
+                                               owner, method_name, async_allowed)
                 exits = {"next"} | (body_exits & {"return"})
             elif isinstance(statement, MatchStatement):
                 subject_type = self._expression_type(statement.value, variables, owner)
@@ -517,7 +522,8 @@ class TypeChecker:
                         arm_variables[pattern.name] = Binding(subject_type)
                     elif isinstance(pattern, VariantPattern) and pattern.binding is not None:
                         arm_variables[pattern.binding] = Binding(self._variant_payload_type(pattern, subject_type))
-                    exits |= self._check_block(arm.body, arm_variables, return_type, loop_depth, owner, method_name)
+                    exits |= self._check_block(arm.body, arm_variables, return_type, loop_depth,
+                                               owner, method_name, async_allowed)
                 if not self._match_is_exhaustive(subject_type, coverage, has_catchall):
                     exits.add("next")
             elif isinstance(statement, LoopControl):

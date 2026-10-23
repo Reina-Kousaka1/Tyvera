@@ -126,11 +126,13 @@ supported. Ordinary functions and I/O execute synchronously; actor handlers
 run only when the cooperative scheduler is explicitly pumped. The supervisor
 API currently supports only `one_for_one`. The task scheduler is cooperative,
 single-threaded and statement-stepped: an async function call creates a Task,
-and direct top-level `await` statements suspend it while other tasks run. Nested
-control-flow blocks and synchronous calls are atomic. Tasks preserve their
-statically declared result type; cancellation is not propagated through
-parent/child ownership. `runTasks()` drives deadlines and may wait for timers,
-but async I/O, HTTP, WebSockets and
+and `await` statements suspend and resume explicit block and loop frames while
+other tasks run. Synchronous calls and individual expressions remain atomic.
+Tasks preserve their statically declared result type. Tasks created while an
+async task runs are owned children: owner cancellation or failure cancels
+descendants, child failure fails its owners, and normal owner return cancels
+unfinished children. There is no detached-task operation. `runTasks()` drives
+deadlines and may wait for timers, but async I/O, HTTP, WebSockets and
 external secret stores are not implemented. Request deadlines do not remove
 queued messages or interrupt handlers.
 These boundaries are reflected in the
@@ -138,16 +140,16 @@ These boundaries are reflected in the
 
 ## Task runtime boundary
 
-The first task slice uses explicit statement continuations: each Task stores
-its function frame and top-level statement index. This keeps the bootstrap
-interpreter independent of Python coroutine semantics. `await` is restricted
-to direct function-body statements because nested branches and loops currently
-execute recursively and do not expose resumable frames. Typed task results work
-at supported await points; nested awaits, structured cancellation, child-task
-ownership, cancellation propagation, and non-blocking I/O remain design work.
-`runTasks()` advances tasks round-robin and waits only when every active task is suspended on a
-monotonic deadline or actor reply. It can report deadlock when no runnable or
-timed work can make progress.
+The task runtime stores explicit block and loop continuation frames; it does
+not depend on Python coroutine semantics. An `await` statement can suspend
+inside nested blocks, branches, loops and match arms, preserving lexical scopes
+and loop-control targets. The scheduler advances one frame action at a time,
+round-robin. Synchronous calls and expressions remain atomic, and `await` is
+still a statement rather than an expression. Parent-scoped cancellation is
+implemented, but explicit task groups, child joining, and detached-task
+ownership are not. `runTasks()` waits only when all active tasks are suspended
+on a monotonic deadline or actor reply. It can report deadlock when no runnable
+or timed work can make progress.
 
 ## Native backend direction
 

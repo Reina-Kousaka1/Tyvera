@@ -190,8 +190,10 @@ fn main() {
             now[0] += seconds
 
         output = self.run_source('''async fn delayed() {
-    await sleepFor(milliseconds(10))
-    println("must not run")
+    if true {
+        await sleepFor(milliseconds(10))
+        println("must not run")
+    }
 }
 async fn cancel(target: Task) {
     println(target.cancel())
@@ -204,6 +206,84 @@ fn main() {
     println(canceller.isDone())
 }''', clock=lambda: now[0], sleeper=advance)
         self.assertEqual(output, "true\ntrue\ntrue\n")
+
+    def test_task_cancellation_cascades_to_owned_children(self) -> None:
+        output = self.run_source('''async fn child() {
+    await sleepFor(milliseconds(10))
+    println("child escaped")
+}
+async fn owner() {
+    let child_task = child()
+    await child_task
+    println("owner escaped")
+}
+async fn cancel(target: Task) {
+    target.cancel()
+}
+fn main() {
+    let owner_task = owner()
+    let canceller = cancel(owner_task)
+    runTasks()
+    println(owner_task.isCancelled())
+    println(canceller.isDone())
+}''')
+        self.assertEqual(output, "true\ntrue\n")
+
+    def test_normal_owner_exit_cancels_unfinished_children(self) -> None:
+        output = self.run_source('''async fn child() {
+    await sleepFor(milliseconds(10))
+    println("child escaped")
+}
+async fn owner() -> Task {
+    let child_task = child()
+    return child_task
+}
+fn main() {
+    let owner_task = owner()
+    runTasks()
+    match owner_task.tryResult() {
+        Ok(result) => match result {
+            Some(child_task) => println(child_task.isCancelled())
+            None => println("missing child")
+        }
+        Err(reason) => println(reason)
+    }
+}''')
+        self.assertEqual(output, "true\n")
+
+    def test_owned_child_failure_fails_owner_and_cancels_siblings(self) -> None:
+        now = [0.0]
+
+        def advance(seconds: float) -> None:
+            now[0] += seconds
+
+        output = self.run_source('''async fn failingChild() {
+    await sleepFor(milliseconds(1))
+    println(1 / 0)
+}
+async fn slowSibling() {
+    await sleepFor(milliseconds(20))
+    println("sibling escaped")
+}
+async fn owner() {
+    let failing = failingChild()
+    let sibling = slowSibling()
+    await sleepFor(milliseconds(50))
+    println("owner escaped")
+}
+fn main() {
+    let task = owner()
+    match runTasks() {
+        Ok(_) => println("unexpected success")
+        Err(_) => println("child failure propagated")
+    }
+    match task.tryResult() {
+        Ok(_) => println("unexpected owner result")
+        Err(_) => println("owner failed")
+    }
+}''', clock=lambda: now[0], sleeper=advance)
+        self.assertEqual(output, "child failure propagated\nowner failed\n")
+        self.assertGreaterEqual(now[0], 0.001)
 
     def test_task_sleep_does_not_consume_unrelated_actor_timer(self) -> None:
         now = [2.0]
@@ -313,16 +393,111 @@ fn main() {
 }''')
         self.assertEqual(output, "await diagnostic contained\ntask failed\n")
 
-    def test_await_is_restricted_to_top_level_async_body_statements(self) -> None:
-        self.reject('''fn main() {
+    def test_await_is_supported_inside_nested_if_and_lexical_scope(self) -> None:
+        output = self.run_source('''async fn value() -> Int {
     await sleepFor(milliseconds(1))
-}''', "only valid as a top-level statement")
-        self.reject('''async fn work() {
+    return 40
+}
+async fn choose(flag: Bool) -> Int {
+    if flag {
+        let answer: Int = await value()
+        return answer + 2
+    } else {
+        let fallback: Int = await value()
+        return fallback + 1
+    }
+}
+fn main() {
+    let task = choose(true)
+    match runTasks() {
+        Ok(_) => match task.tryResult() {
+            Ok(result) => match result {
+                Some(answer) => println(answer)
+                None => println("pending")
+            }
+            Err(reason) => println(reason)
+        }
+        Err(reason) => println(reason)
+    }
+}''')
+        self.assertEqual(output, "42\n")
+
+    def test_await_in_while_resumes_and_continue_targets_the_async_loop(self) -> None:
+        now = [0.0]
+
+        def advance(seconds: float) -> None:
+            now[0] += seconds
+
+        output = self.run_source('''async fn loopWork() {
+    var index: Int = 0
+    while index < 3 {
+        index = index + 1
+        if index == 2 {
+            await sleepFor(milliseconds(1))
+            continue
+        }
+        let value: Int = await delayed(index)
+        println(value)
+    }
+}
+async fn delayed(value: Int) -> Int {
+    await sleepFor(milliseconds(1))
+    return value
+}
+fn main() {
+    let task = loopWork()
+    match runTasks() {
+        Ok(_) => println(task.isDone())
+        Err(reason) => println(reason)
+    }
+}''', clock=lambda: now[0], sleeper=advance)
+        self.assertEqual(output, "1\n3\ntrue\n")
+        self.assertGreaterEqual(now[0], 0.003)
+
+    def test_await_in_match_and_for_supports_break_from_nested_arm(self) -> None:
+        output = self.run_source('''async fn twice(value: Int) -> Int {
+    await sleepFor(milliseconds(1))
+    return value * 2
+}
+async fn visit() {
+    let values = List<Int>()
+    values.append(1)
+    values.append(2)
+    values.append(3)
+    for value in values {
+        match value {
+            1 => {
+                let doubled: Int = await twice(value)
+                println(doubled)
+            }
+            2 => {
+                await sleepFor(milliseconds(1))
+                break
+            }
+            _ => println("unreachable")
+        }
+    }
+    println("after loop")
+}
+fn main() {
+    let task = visit()
+    runTasks()
+    println(task.isDone())
+}''')
+        self.assertEqual(output, "2\nafter loop\ntrue\n")
+
+    def test_await_remains_invalid_in_synchronous_nested_control_flow(self) -> None:
+        self.reject('''fn main() {
+    if true {
+        await sleepFor(milliseconds(1))
+    }
+}''', "only valid inside an async function")
+        self.reject('''fn work() {
     if true {
         await sleepFor(milliseconds(1))
     }
 }
-fn main() { work() }''', "only valid as a top-level statement")
+fn main() { work() }''', "only valid inside an async function")
 
     def test_async_entry_point_is_rejected(self) -> None:
         self.reject('''async fn main() { }

@@ -129,6 +129,22 @@ class _TyveraTimer:
         return "<Timer>"
 
 
+@dataclass(slots=True, eq=False)
+class _AsyncBlockFrame:
+    body: list[Statement]
+    variables: ChainMap[str, object]
+    index: int = 0
+
+
+@dataclass(slots=True, eq=False)
+class _AsyncLoopFrame:
+    statement: WhileStatement | ForStatement
+    variables: ChainMap[str, object]
+    depth: int
+    items: tuple[object, ...] | None = None
+    index: int = 0
+
+
 @dataclass(slots=True, eq=False, repr=False)
 class _TyveraTask:
     function: Function | None
@@ -137,11 +153,15 @@ class _TyveraTask:
     depth: int = 0
     result_type: str = "Void"
     state: str = "runnable"
-    program_counter: int = 0
+    frames: list[_AsyncBlockFrame | _AsyncLoopFrame] = dataclass_field(default_factory=list)
     wait_target: object | None = None
+    wait_frame: _AsyncBlockFrame | None = None
+    wait_statement: AwaitStatement | None = None
     due_at: float | None = None
     error: str | None = None
     result: object = None
+    parent: _TyveraTask | None = None
+    children: list[_TyveraTask] = dataclass_field(default_factory=list)
 
     def __repr__(self) -> str:
         return "<Task>"
@@ -228,6 +248,7 @@ class Interpreter:
         self._ready_tasks: deque[_TyveraTask] = deque()
         self._tasks: list[_TyveraTask] = []
         self._current_actor: _TyveraActor | None = None
+        self._current_task: _TyveraTask | None = None
         self._running_tasks = False
         self.output = output
         self.error_output = error_output if error_output is not None else sys.stderr
@@ -556,8 +577,7 @@ class Interpreter:
                 if expression.method == "cancel":
                     if receiver.state in {"completed", "failed", "cancelled"}:
                         return False
-                    receiver.state = "cancelled"
-                    receiver.wait_target = None
+                    self._cancel_task(receiver)
                     self._wake_waiting_tasks()
                     return True
                 if expression.method == "tryResult":
@@ -960,6 +980,10 @@ class Interpreter:
             raise Diagnostic(location, "runtime", f"maximum call depth ({self.max_call_depth}) exceeded")
         variables = ChainMap({parameter.name: value for parameter, value in zip(function.parameters, arguments)})
         task = _TyveraTask(function, variables, location, depth + 1, canonical_type(function.return_type))
+        task.parent = self._current_task
+        if task.parent is not None:
+            task.parent.children.append(task)
+        task.frames.append(_AsyncBlockFrame(function.body, variables))
         self._tasks.append(task)
         self._ready_tasks.append(task)
         return task
@@ -967,7 +991,10 @@ class Interpreter:
     def _create_sleep_task(self, duration: _TyveraDuration, location: Location) -> _TyveraTask:
         now = self._clock()
         task = _TyveraTask(None, None, location, state="sleeping",
-                           due_at=now + max(0, duration.milliseconds) / 1000.0)
+                           due_at=now + max(0, duration.milliseconds) / 1000.0,
+                           parent=self._current_task)
+        if task.parent is not None:
+            task.parent.children.append(task)
         self._tasks.append(task)
         return task
 
@@ -994,50 +1021,26 @@ class Interpreter:
                     task = self._ready_tasks.popleft()
                     if task.state != "runnable":
                         continue
-                    if task.function is None or task.variables is None:
-                        raise AssertionError("runnable task has no async function frame")
                     task.state = "running"
-                    statement = (
-                        task.function.body[task.program_counter]
-                        if task.program_counter < len(task.function.body) else None
-                    )
-                    if statement is None:
-                        task.state = "completed"
-                    elif isinstance(statement, AwaitStatement):
-                        try:
-                            target = self._evaluate(statement.value, task.variables, task.depth)
-                            state, error = self._await_state(target)
-                        except Diagnostic as error:
-                            self._fail_task(task, error.render())
+                    previous_task = self._current_task
+                    self._current_task = task
+                    try:
+                        self._advance_async_task(task)
+                    except _ReturnSignal as signal:
+                        task.result = signal.value
+                        self._complete_task(task)
+                    except Diagnostic as error:
+                        self._fail_task(task, error.render())
+                    except _LoopSignal as signal:
+                        self._handle_async_loop_control(task, signal)
+                    finally:
+                        self._current_task = previous_task
+                    if task.state == "running":
+                        if task.frames:
+                            task.state = "runnable"
+                            self._ready_tasks.append(task)
                         else:
-                            if state == "ready":
-                                self._complete_task_await(task, statement, target)
-                                task.program_counter += 1
-                                task.state = "runnable"
-                                self._ready_tasks.append(task)
-                            elif state == "failed":
-                                self._fail_task(task, error or "awaited operation failed")
-                            else:
-                                task.state = "waiting"
-                                task.wait_target = target
-                    else:
-                        try:
-                            self._execute_block([statement], task.variables, task.depth)
-                        except _ReturnSignal as signal:
-                            task.result = signal.value
-                            task.state = "completed"
-                        except Diagnostic as error:
-                            self._fail_task(task, error.render())
-                        except _LoopSignal as signal:
-                            self._fail_task(task, f"'{signal.kind}' escaped its loop in async task")
-                        else:
-                            if task.state == "running":
-                                task.program_counter += 1
-                                if task.program_counter >= len(task.function.body):
-                                    task.state = "completed"
-                                else:
-                                    task.state = "runnable"
-                                    self._ready_tasks.append(task)
+                            self._complete_task(task)
                     steps += 1
                     self._wake_waiting_tasks()
                     continue
@@ -1087,6 +1090,102 @@ class Interpreter:
         finally:
             self._running_tasks = False
 
+    def _advance_async_task(self, task: _TyveraTask) -> None:
+        if not task.frames:
+            return
+        frame = task.frames[-1]
+        if isinstance(frame, _AsyncLoopFrame):
+            statement = frame.statement
+            if isinstance(statement, WhileStatement):
+                if self._evaluate(statement.condition, frame.variables, task.depth):
+                    task.frames.append(_AsyncBlockFrame(statement.body, frame.variables.new_child()))
+                else:
+                    task.frames.pop()
+                return
+            if frame.items is None:
+                raise AssertionError("for-loop continuation has no snapshotted iterable")
+            if frame.index >= len(frame.items):
+                task.frames.pop()
+                return
+            scope = frame.variables.new_child()
+            scope[statement.name] = frame.items[frame.index]
+            frame.index += 1
+            task.frames.append(_AsyncBlockFrame(statement.body, scope))
+            return
+
+        if frame.index >= len(frame.body):
+            task.frames.pop()
+            return
+        statement = frame.body[frame.index]
+        if isinstance(statement, AwaitStatement):
+            target = self._evaluate(statement.value, frame.variables, task.depth)
+            state, error = self._await_state(target)
+            if state == "ready":
+                self._complete_task_await(task, statement, target, frame.variables)
+                frame.index += 1
+            elif state == "failed":
+                self._fail_task(task, error or "awaited operation failed")
+            else:
+                task.state = "waiting"
+                task.wait_target = target
+                task.wait_frame = frame
+                task.wait_statement = statement
+            return
+        if isinstance(statement, Block):
+            frame.index += 1
+            task.frames.append(_AsyncBlockFrame(statement.body, frame.variables.new_child()))
+            return
+        if isinstance(statement, IfStatement):
+            body = statement.then_body if self._evaluate(statement.condition, frame.variables, task.depth) else statement.else_body
+            frame.index += 1
+            task.frames.append(_AsyncBlockFrame(body, frame.variables.new_child()))
+            return
+        if isinstance(statement, WhileStatement):
+            frame.index += 1
+            task.frames.append(_AsyncLoopFrame(statement, frame.variables, task.depth))
+            return
+        if isinstance(statement, ForStatement):
+            iterable = self._evaluate(statement.iterable, frame.variables, task.depth)
+            if isinstance(iterable, _TyveraList):
+                items = tuple(iterable.values)
+            elif isinstance(iterable, _TyveraMap):
+                items = tuple(iterable.values.keys())
+            else:
+                raise AssertionError("checked async for-loop value is not iterable")
+            frame.index += 1
+            task.frames.append(_AsyncLoopFrame(statement, frame.variables, task.depth, items))
+            return
+        if isinstance(statement, MatchStatement):
+            value = self._evaluate(statement.value, frame.variables, task.depth)
+            frame.index += 1
+            for arm in statement.arms:
+                matched, binding = self._matches(arm.pattern, value)
+                if not matched:
+                    continue
+                scope = frame.variables.new_child()
+                if binding is not _MISSING:
+                    pattern = arm.pattern
+                    name = pattern.name if isinstance(pattern, BindingPattern) else pattern.binding
+                    if name is not None:
+                        scope[name] = binding
+                task.frames.append(_AsyncBlockFrame(arm.body, scope))
+                break
+            return
+
+        self._execute_block([statement], frame.variables, task.depth)
+        frame.index += 1
+
+    def _handle_async_loop_control(self, task: _TyveraTask, signal: _LoopSignal) -> None:
+        loop_index = next(
+            (index for index in range(len(task.frames) - 1, -1, -1)
+             if isinstance(task.frames[index], _AsyncLoopFrame)),
+            None,
+        )
+        if loop_index is None:
+            self._fail_task(task, f"'{signal.kind}' escaped its loop in async task")
+            return
+        del task.frames[loop_index + (1 if signal.kind == "continue" else 0):]
+
     def _promote_sleeping_tasks(self) -> None:
         now = self._clock()
         for task in self._tasks:
@@ -1124,25 +1223,27 @@ class Interpreter:
             if state == "pending":
                 continue
             task.wait_target = None
+            frame = task.wait_frame
+            statement = task.wait_statement
+            task.wait_frame = None
+            task.wait_statement = None
             if state == "failed":
                 self._fail_task(task, error or "awaited operation failed")
             else:
-                if task.function is None or task.variables is None:
-                    raise AssertionError("waiting task has no async function frame")
-                statement = task.function.body[task.program_counter]
-                if not isinstance(statement, AwaitStatement):
-                    raise AssertionError("waiting task program counter is not at await")
-                self._complete_task_await(task, statement, target)
-                task.program_counter += 1
+                if frame is None or statement is None:
+                    raise AssertionError("waiting task has no suspended await continuation")
+                self._complete_task_await(task, statement, target, frame.variables)
+                frame.index += 1
                 task.state = "runnable"
                 self._ready_tasks.append(task)
 
     @staticmethod
-    def _complete_task_await(task: _TyveraTask, statement: AwaitStatement, target: object) -> None:
+    def _complete_task_await(
+        task: _TyveraTask, statement: AwaitStatement, target: object,
+        variables: ChainMap[str, object],
+    ) -> None:
         if statement.binding_name is None:
             return
-        if task.variables is None:
-            raise AssertionError("async task frame has no variable environment")
         if isinstance(target, _TyveraTask):
             value = target.result
         elif isinstance(target, _TyveraReplyReceiver):
@@ -1154,13 +1255,41 @@ class Interpreter:
             cell.state = "consumed"
         else:
             raise AssertionError("type-checked await target is not awaitable")
-        task.variables[statement.binding_name] = value
+        variables[statement.binding_name] = value
 
-    @staticmethod
-    def _fail_task(task: _TyveraTask, error: str) -> None:
+    def _complete_task(self, task: _TyveraTask) -> None:
+        for child in task.children:
+            self._cancel_task(child)
+        task.frames.clear()
+        task.wait_target = None
+        task.wait_frame = None
+        task.wait_statement = None
+        task.state = "completed"
+
+    def _cancel_task(self, task: _TyveraTask) -> None:
+        if task.state in {"completed", "failed", "cancelled"}:
+            return
+        task.state = "cancelled"
+        task.wait_target = None
+        task.wait_frame = None
+        task.wait_statement = None
+        task.frames.clear()
+        for child in task.children:
+            self._cancel_task(child)
+
+    def _fail_task(self, task: _TyveraTask, error: str) -> None:
+        if task.state in {"completed", "failed", "cancelled"}:
+            return
         task.state = "failed"
         task.error = error
         task.wait_target = None
+        task.wait_frame = None
+        task.wait_statement = None
+        task.frames.clear()
+        for child in task.children:
+            self._cancel_task(child)
+        if task.parent is not None:
+            self._fail_task(task.parent, f"owned child task failed: {error}")
 
     def _next_task_deadline(self) -> float | None:
         deadlines = [

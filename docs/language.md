@@ -471,8 +471,8 @@ fn main() {
 }
 ```
 
-`sleepFor(Duration) -> Task<Void>` creates a timer-backed task. A top-level
-`await task` suspends the current async function until that task completes.
+`sleepFor(Duration) -> Task<Void>` creates a timer-backed task. An `await`
+statement suspends the current async function until that task completes.
 `let value: T = await task` also binds a typed task result; the same form can
 bind a typed actor reply. An unbound `await replyReceiver` leaves its reply
 available for `tryReceive()`. Failure, cancellation, or timeout of an awaited
@@ -484,16 +484,22 @@ ready tasks round-robin, drives actor messages needed by awaited replies, and
 waits until a deadline when no task can otherwise run. A deadlock with pending
 work but no runnable task or deadline is returned as `Err`.
 
-Task turns occur between direct statements in the async function body. A
-statement containing nested control flow or a synchronous function call runs
-atomically. For that reason `await` is currently allowed only as a direct
-statement or awaited binding in an async function body, outside `if`, `while`,
-`for`, `match` and nested blocks. Task cancellation does not interrupt a
-running statement and is not yet propagated between parent and child tasks. Task values cannot be sent
-between actors. The task scheduler is single-threaded; it provides cooperative
-concurrency, not parallel execution. The interpreter's clock and sleeper can
-both be injected for deterministic tests. Async I/O and networking are not
-implemented.
+The scheduler preserves block scopes and loop state across suspension, so
+`await` is supported inside nested blocks, `if` branches, `while` and `for`
+bodies, and `match` arms. Each continuation step is scheduled round-robin;
+synchronous function calls and individual expressions remain atomic. `await`
+is a statement and cannot be embedded in an expression.
+
+Tasks created while an async task is running are owned by that task. A task
+created by synchronous `main` is a root task. Cancelling or failing an owner
+cancels its unfinished descendants; a child failure fails its owners and
+cancels sibling work. When an async function returns normally, unfinished
+children are cancelled so they cannot outlive the function. There is no
+detached-task operation or explicit task-group/join API yet. Cancellation does
+not interrupt a running statement. Task values cannot be sent between actors.
+The task scheduler is single-threaded; it provides cooperative concurrency,
+not parallel execution. The interpreter's clock and sleeper can both be
+injected for deterministic tests. Async I/O and networking are not implemented.
 
 ## JSON values
 
@@ -658,10 +664,11 @@ inheritance, generic methods/interfaces/constraints, collection literals,
 `try`/`catch`, parallel process scheduling, async I/O, networking API,
 importable standard-library modules, external secret-store provider, native
 interop, garbage collector implementation, package manager or compiler
-backend. Await cannot appear inside nested control-flow bodies and cancellation
-is not structured. `runActors()` remains non-blocking; `runTasks()` waits for
-task deadlines. Actor request timeouts do not interrupt work. No performance
-claim is made. No termination checking or loop execution budget is provided;
+backend. Explicit task groups, child joining, and detached-task ownership are
+not implemented. `await` remains statement-only; synchronous calls are atomic.
+`runActors()` remains non-blocking; `runTasks()` waits for task deadlines.
+Actor request timeouts do not interrupt work. No performance claim is made. No
+termination checking or loop execution budget is provided;
 users can write infinite loops. Parsing and execution use
 the host stack, so extremely deeply nested source is not supported. The
 interpreter is replaceable bootstrap technology, not part of Tyvera semantics.
