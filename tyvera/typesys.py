@@ -13,6 +13,7 @@ from .ast import (
     Expression,
     ExpressionStatement,
     Field,
+    ForStatement,
     Function,
     IfStatement,
     InterfaceDeclaration,
@@ -31,9 +32,10 @@ from .ast import (
     WhileStatement,
 )
 from .source import Diagnostic, Location
+from .type_names import make_type, split_type, substitute_type
 
 
-_BUILTIN_TYPES = {"Int", "Float", "Bool", "String", "Void", "Unit"}
+_BUILTIN_TYPES = {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map"}
 _DISPLAYABLE_TYPES = {"Int", "Float", "Bool", "String"}
 _NUMERIC_TYPES = {"Int", "Float"}
 INT_MIN = -(1 << 63)
@@ -55,6 +57,7 @@ class Signature:
     parameter_types: tuple[str, ...]
     return_type: str
     location: Location
+    type_parameters: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -62,6 +65,7 @@ class ClassInfo:
     declaration: ClassDeclaration
     fields: dict[str, Field]
     methods: dict[str, Signature]
+    type_parameters: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -78,6 +82,8 @@ class TypeChecker:
         self.classes: dict[str, ClassInfo] = {}
         self.interfaces: dict[str, InterfaceInfo] = {}
         self.type_names: set[str] = set(_BUILTIN_TYPES)
+        self.generic_arities: dict[str, int] = {"List": 1, "Map": 2}
+        self.active_type_variables: set[str] = set()
 
     def check(self) -> dict[str, Signature]:
         self._collect_types()
@@ -111,7 +117,9 @@ class TypeChecker:
                 raise Diagnostic(declaration.location, "type", f"type '{declaration.name}' is already declared")
             names[declaration.name] = declaration.location
         self.type_names.update(names)
-
+        for declaration in self.program.classes:
+            self._validate_type_parameters(declaration.type_parameters, declaration.location)
+            self.generic_arities[declaration.name] = len(declaration.type_parameters)
         for declaration in self.program.interfaces:
             methods: dict[str, Signature] = {}
             for method in declaration.methods:
@@ -123,11 +131,12 @@ class TypeChecker:
             self.interfaces[declaration.name] = InterfaceInfo(declaration, methods)
 
         for declaration in self.program.classes:
+            class_type_variables = set(declaration.type_parameters)
             fields: dict[str, Field] = {}
             for member in declaration.fields:
                 if member.name in fields:
                     raise Diagnostic(member.location, "type", f"field '{member.name}' is already declared")
-                self._require_known_type(member.type_name, member.location)
+                self._require_known_type(member.type_name, member.location, class_type_variables)
                 if canonical_type(member.type_name) == "Void":
                     raise Diagnostic(member.location, "type", "fields cannot have type Void")
                 fields[member.name] = member
@@ -137,11 +146,11 @@ class TypeChecker:
                     raise Diagnostic(method.location, "type", f"method '{method.name}' is already declared")
                 if method.name in fields:
                     raise Diagnostic(method.location, "type", f"method '{method.name}' conflicts with a field")
-                methods[method.name] = self._method_signature(method)
+                methods[method.name] = self._method_signature(method, class_type_variables)
             constructor = methods.get("init")
             if declaration.fields and constructor is None:
                 raise Diagnostic(declaration.location, "type", f"class '{declaration.name}' declares fields and requires an 'init' constructor")
-            self.classes[declaration.name] = ClassInfo(declaration, fields, methods)
+            self.classes[declaration.name] = ClassInfo(declaration, fields, methods, tuple(declaration.type_parameters))
 
     def _collect_signatures(self) -> None:
         all_names = set(self.classes) | set(self.interfaces)
@@ -152,7 +161,22 @@ class TypeChecker:
                 raise Diagnostic(function.location, "type", f"function or type '{function.name}' is already declared")
             self.signatures[function.name] = self._method_signature(function)
 
-    def _method_signature(self, function: Function | Method | MethodSignature) -> Signature:
+    def _validate_type_parameters(self, parameters: list[str], location: Location) -> None:
+        seen: set[str] = set()
+        for name in parameters:
+            if name in seen:
+                raise Diagnostic(location, "type", f"generic type parameter '{name}' is declared more than once")
+            if name in self.type_names:
+                raise Diagnostic(location, "type", f"generic type parameter '{name}' conflicts with a known type")
+            seen.add(name)
+
+    def _method_signature(
+        self, function: Function | Method | MethodSignature,
+        type_variables: set[str] | None = None,
+    ) -> Signature:
+        declared_parameters = list(getattr(function, "type_parameters", []))
+        self._validate_type_parameters(declared_parameters, function.location)
+        known_variables = set(type_variables or ()) | set(declared_parameters)
         parameter_names: set[str] = set()
         parameter_types: list[str] = []
         for parameter in function.parameters:
@@ -163,16 +187,42 @@ class TypeChecker:
             if parameter.name in parameter_names:
                 raise Diagnostic(parameter.location, "type", f"parameter '{parameter.name}' is declared more than once")
             parameter_names.add(parameter.name)
-            self._require_known_type(parameter.type_name, parameter.location)
+            self._require_known_type(parameter.type_name, parameter.location, known_variables)
             if canonical_type(parameter.type_name) == "Void":
                 raise Diagnostic(parameter.location, "type", "parameters cannot have type Void")
             parameter_types.append(canonical_type(parameter.type_name))
-        self._require_known_type(function.return_type, function.location)
-        return Signature(tuple(parameter_types), canonical_type(function.return_type), function.location)
+        self._require_known_type(function.return_type, function.location, known_variables)
+        return Signature(tuple(parameter_types), canonical_type(function.return_type), function.location,
+                         tuple(declared_parameters))
 
-    def _require_known_type(self, type_name: str, location: Location) -> None:
-        if type_name not in self.type_names:
-            raise Diagnostic(location, "type", f"unknown type '{type_name}'")
+    def _require_known_type(
+        self, type_name: str, location: Location, type_variables: set[str] | None = None,
+    ) -> None:
+        known_variables = self.active_type_variables if type_variables is None else type_variables
+        if type_name in known_variables:
+            return
+        base, arguments = split_type(type_name)
+        if base in known_variables:
+            if arguments:
+                raise Diagnostic(location, "type", f"type parameter '{base}' cannot take type arguments")
+            return
+        if base not in self.type_names:
+            raise Diagnostic(location, "type", f"unknown type '{base}'")
+        expected_arity = self.generic_arities.get(base, 0)
+        if len(arguments) != expected_arity:
+            if expected_arity:
+                raise Diagnostic(location, "type", f"type '{base}' expects {expected_arity} type argument(s), got {len(arguments)}")
+            if arguments:
+                raise Diagnostic(location, "type", f"type '{base}' does not accept type arguments")
+        for argument in arguments:
+            self._require_known_type(argument, location, known_variables)
+            if canonical_type(argument) == "Void":
+                raise Diagnostic(location, "type", "type arguments cannot be Void")
+        if base == "Map" and arguments:
+            key_base, _ = split_type(arguments[0])
+            allowed_keys = _DISPLAYABLE_TYPES | set(self.classes) | set(self.interfaces)
+            if key_base not in allowed_keys:
+                raise Diagnostic(location, "type", f"Map key type '{arguments[0]}' is not a supported primitive or object-reference type")
 
     def _check_interface_implementations(self) -> None:
         for class_info in self.classes.values():
@@ -195,17 +245,27 @@ class TypeChecker:
                         raise Diagnostic(actual.location, "type", f"method '{method_name}' does not match '{interface_name}': expected return type {required.return_type}, found {actual.return_type}")
 
     def _check_function(self, function: Function, signature: Signature) -> None:
+        previous = self.active_type_variables
+        self.active_type_variables = set(signature.type_parameters)
         variables = ChainMap({p.name: Binding(canonical_type(p.type_name)) for p in function.parameters})
-        outcomes = self._check_block(function.body, variables, signature.return_type, 0)
-        self._require_return_paths(function.name, signature.return_type, outcomes, function.location)
+        try:
+            outcomes = self._check_block(function.body, variables, signature.return_type, 0)
+            self._require_return_paths(function.name, signature.return_type, outcomes, function.location)
+        finally:
+            self.active_type_variables = previous
 
     def _check_method(self, method: Method, signature: Signature, owner: ClassInfo) -> None:
         if method.name == "init" and signature.return_type != "Void":
             raise Diagnostic(method.location, "type", "constructors must return Void")
+        previous = self.active_type_variables
+        self.active_type_variables = set(owner.type_parameters)
         variables = ChainMap({p.name: Binding(canonical_type(p.type_name)) for p in method.parameters})
         variables["self"] = Binding(owner.declaration.name)
-        outcomes = self._check_block(method.body, variables, signature.return_type, 0, owner, method.name)
-        self._require_return_paths(f"{owner.declaration.name}.{method.name}", signature.return_type, outcomes, method.location)
+        try:
+            outcomes = self._check_block(method.body, variables, signature.return_type, 0, owner, method.name)
+            self._require_return_paths(f"{owner.declaration.name}.{method.name}", signature.return_type, outcomes, method.location)
+        finally:
+            self.active_type_variables = previous
 
     @staticmethod
     def _require_return_paths(name: str, return_type: str, outcomes: set[str], location: Location) -> None:
@@ -279,6 +339,21 @@ class TypeChecker:
                     exits |= body_exits & {"return"}
                 if not literal or not statement.condition.value or "break" in body_exits:
                     exits.add("next")
+            elif isinstance(statement, ForStatement):
+                if statement.name in {"self", "println"}:
+                    raise Diagnostic(statement.location, "type", f"'{statement.name}' is reserved and cannot be a loop variable")
+                iterable_type = self._expression_type(statement.iterable, variables, owner)
+                iterable_base, iterable_arguments = split_type(iterable_type)
+                if iterable_base == "List" and len(iterable_arguments) == 1:
+                    element_type = iterable_arguments[0]
+                elif iterable_base == "Map" and len(iterable_arguments) == 2:
+                    element_type = iterable_arguments[0]
+                else:
+                    raise Diagnostic(statement.iterable.location, "type", f"for-loop value must be a List or Map, found {iterable_type}")
+                loop_variables = variables.new_child()
+                loop_variables[statement.name] = Binding(element_type)
+                body_exits = self._check_block(statement.body, loop_variables, return_type, loop_depth + 1, owner, method_name)
+                exits = {"next"} | (body_exits & {"return"})
             elif isinstance(statement, LoopControl):
                 if not loop_depth:
                     raise Diagnostic(statement.location, "type", f"'{statement.kind}' is only valid inside a loop")
@@ -308,43 +383,76 @@ class TypeChecker:
         if isinstance(expression, Call):
             argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
             if expression.callee == "println":
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'println' does not accept type arguments")
                 if len(argument_types) != 1:
                     raise Diagnostic(expression.location, "type", "'println' expects exactly one argument")
                 if argument_types[0] not in _DISPLAYABLE_TYPES:
                     raise Diagnostic(expression.arguments[0].location, "type", "'println' cannot display a Void value")
                 return "Void"
+            if expression.callee in {"List", "Map"}:
+                arity = self.generic_arities[expression.callee]
+                if len(expression.type_arguments) != arity:
+                    raise Diagnostic(expression.location, "type", f"'{expression.callee}' expects {arity} type argument(s), got {len(expression.type_arguments)}")
+                collection_type = make_type(expression.callee, [canonical_type(item) for item in expression.type_arguments])
+                self._require_known_type(collection_type, expression.location)
+                if expression.arguments:
+                    raise Diagnostic(expression.location, "type", f"'{expression.callee}' currently constructs an empty collection and takes no value arguments")
+                return collection_type
             class_info = self.classes.get(expression.callee)
             if class_info is not None:
                 constructor = class_info.methods.get("init")
                 expected = () if constructor is None else constructor.parameter_types
-                self._check_arguments(expression.arguments, argument_types, expected, expression.location, expression.callee)
-                return expression.callee
+                substitutions = self._resolve_type_arguments(
+                    class_info.type_parameters, expression.type_arguments, expected, argument_types,
+                    expression.arguments, expression.location, expression.callee,
+                )
+                return make_type(expression.callee, [substitutions[name] for name in class_info.type_parameters])
             signature = self.signatures.get(expression.callee)
             if signature is None:
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", f"unknown generic function '{expression.callee}'")
                 if expression.callee in self.interfaces:
                     raise Diagnostic(expression.location, "type", "interfaces cannot be constructed")
                 raise Diagnostic(expression.location, "type", f"unknown function '{expression.callee}'")
-            self._check_arguments(expression.arguments, argument_types, signature.parameter_types, expression.location, expression.callee)
-            return signature.return_type
+            substitutions = self._resolve_type_arguments(
+                signature.type_parameters, expression.type_arguments, signature.parameter_types, argument_types,
+                expression.arguments, expression.location, expression.callee,
+            )
+            return substitute_type(signature.return_type, substitutions)
         if isinstance(expression, MemberAccess):
             field_type, _ = self._member_field(expression, variables, owner)
             return field_type
         if isinstance(expression, MemberCall):
+            if expression.type_arguments:
+                raise Diagnostic(expression.location, "type", "generic methods are not supported yet")
             receiver_type = self._expression_type(expression.receiver, variables, owner)
             argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
             if expression.method == "init":
                 raise Diagnostic(expression.location, "type", "constructors can only run when creating an instance")
-            if receiver_type in self.classes:
-                signature = self.classes[receiver_type].methods.get(expression.method)
-            elif receiver_type in self.interfaces:
-                signature = self.interfaces[receiver_type].methods.get(expression.method)
+            receiver_base, receiver_arguments = split_type(receiver_type)
+            if receiver_base in {"List", "Map"}:
+                signature = self._collection_method(receiver_base, receiver_arguments, expression.method, expression.location)
+                substitutions = {}
+            elif receiver_base in self.classes:
+                class_info = self.classes[receiver_base]
+                signature = class_info.methods.get(expression.method)
+                if receiver_arguments:
+                    substitutions = dict(zip(class_info.type_parameters, receiver_arguments))
+                else:
+                    substitutions = {name: name for name in class_info.type_parameters}
+            elif receiver_base in self.interfaces:
+                signature = self.interfaces[receiver_base].methods.get(expression.method)
+                substitutions = {}
             else:
                 signature = None
+                substitutions = {}
             if signature is None:
                 raise Diagnostic(expression.location, "type", f"type '{receiver_type}' has no method '{expression.method}'")
-            self._check_arguments(expression.arguments, argument_types, signature.parameter_types, expression.location,
+            parameter_types = tuple(substitute_type(item, substitutions) for item in signature.parameter_types)
+            self._check_arguments(expression.arguments, argument_types, parameter_types, expression.location,
                                   f"{receiver_type}.{expression.method}")
-            return signature.return_type
+            return substitute_type(signature.return_type, substitutions)
         if isinstance(expression, Unary):
             if (
                 expression.operator == "-"
@@ -371,11 +479,113 @@ class TypeChecker:
         self, expression: MemberAccess, variables: ChainMap[str, Binding], owner: ClassInfo | None,
     ) -> tuple[str, Field]:
         receiver_type = self._expression_type(expression.receiver, variables, owner)
-        class_info = self.classes.get(receiver_type)
+        receiver_base, receiver_arguments = split_type(receiver_type)
+        if receiver_base in {"List", "Map"} and expression.member == "length":
+            return "Int", Field("length", "Int", False, expression.location)
+        class_info = self.classes.get(receiver_base)
         field = None if class_info is None else class_info.fields.get(expression.member)
         if field is None:
             raise Diagnostic(expression.location, "type", f"type '{receiver_type}' has no field '{expression.member}'")
-        return canonical_type(field.type_name), field
+        if receiver_arguments:
+            substitutions = dict(zip(class_info.type_parameters, receiver_arguments))
+        elif class_info is not None:
+            substitutions = {name: name for name in class_info.type_parameters}
+        else:
+            substitutions = {}
+        return canonical_type(substitute_type(field.type_name, substitutions)), field
+
+    def _resolve_type_arguments(
+        self, type_parameters: tuple[str, ...], explicit: list[str], formal_types: tuple[str, ...],
+        actual_types: list[str], arguments: list[Expression], location: Location, callee: str,
+    ) -> dict[str, str]:
+        if len(actual_types) != len(formal_types):
+            raise Diagnostic(location, "type", f"'{callee}' expects {len(formal_types)} argument(s), got {len(actual_types)}")
+        if not type_parameters:
+            if explicit:
+                raise Diagnostic(location, "type", f"'{callee}' does not accept type arguments")
+            self._check_arguments(arguments, actual_types, formal_types, location, callee)
+            return {}
+
+        substitutions: dict[str, str] = {}
+        if explicit:
+            if len(explicit) != len(type_parameters):
+                raise Diagnostic(location, "type", f"'{callee}' expects {len(type_parameters)} type argument(s), got {len(explicit)}")
+            for parameter, type_name in zip(type_parameters, explicit):
+                self._require_known_type(type_name, location)
+                if canonical_type(type_name) == "Void":
+                    raise Diagnostic(location, "type", "type arguments cannot be Void")
+                substitutions[parameter] = canonical_type(type_name)
+        else:
+            allowed = set(type_parameters)
+            for formal, actual in zip(formal_types, actual_types):
+                self._infer_type_arguments(formal, actual, allowed, substitutions, location, callee)
+            missing = [name for name in type_parameters if name not in substitutions]
+            if missing:
+                raise Diagnostic(location, "type", f"cannot infer type argument '{missing[0]}' for '{callee}'; provide it explicitly")
+
+        resolved_parameters = tuple(substitute_type(item, substitutions) for item in formal_types)
+        self._check_arguments(arguments, actual_types, resolved_parameters, location, callee)
+        return substitutions
+
+    def _collection_method(
+        self, collection: str, type_arguments: tuple[str, ...], method: str, location: Location,
+    ) -> Signature:
+        expected_arity = self.generic_arities[collection]
+        if len(type_arguments) != expected_arity:
+            raise Diagnostic(location, "type", f"type '{collection}' expects {expected_arity} type argument(s)")
+        if collection == "List":
+            element = type_arguments[0]
+            signatures = {
+                "append": (("T",), "Void"),
+                "insert": (("Int", "T"), "Void"),
+                "get": (("Int",), "T"),
+                "set": (("Int", "T"), "Void"),
+                "removeAt": (("Int",), "T"),
+                "contains": (("T",), "Bool"),
+                "clear": ((), "Void"),
+            }
+            signature = signatures.get(method)
+            if signature is None:
+                raise Diagnostic(location, "type", f"type '{make_type(collection, list(type_arguments))}' has no method '{method}'")
+            params, result = signature
+            substitutions = {"T": element}
+        else:
+            key_type, value_type = type_arguments
+            signatures = {
+                "put": (("K", "V"), "Void"),
+                "get": (("K",), "V"),
+                "remove": (("K",), "Bool"),
+                "containsKey": (("K",), "Bool"),
+                "keys": ((), "List<K>"),
+                "values": ((), "List<V>"),
+                "clear": ((), "Void"),
+            }
+            signature = signatures.get(method)
+            if signature is None:
+                raise Diagnostic(location, "type", f"type '{make_type(collection, list(type_arguments))}' has no method '{method}'")
+            params, result = signature
+            substitutions = {"K": key_type, "V": value_type}
+        return Signature(tuple(substitute_type(item, substitutions) for item in params),
+                         substitute_type(result, substitutions), location)
+
+    def _infer_type_arguments(
+        self, formal: str, actual: str, parameters: set[str], substitutions: dict[str, str],
+        location: Location, callee: str,
+    ) -> None:
+        if formal in parameters:
+            previous = substitutions.get(formal)
+            if previous is None:
+                if canonical_type(actual) == "Void":
+                    raise Diagnostic(location, "type", "type arguments cannot be inferred as Void")
+                substitutions[formal] = canonical_type(actual)
+            elif previous != canonical_type(actual):
+                raise Diagnostic(location, "type", f"cannot infer one type for '{formal}' in call to '{callee}': found {previous} and {actual}")
+            return
+        formal_base, formal_arguments = split_type(formal)
+        actual_base, actual_arguments = split_type(actual)
+        if formal_arguments and formal_base == actual_base and len(formal_arguments) == len(actual_arguments):
+            for formal_arg, actual_arg in zip(formal_arguments, actual_arguments):
+                self._infer_type_arguments(formal_arg, actual_arg, parameters, substitutions, location, callee)
 
     def _check_arguments(
         self, arguments: list[Expression], actual_types: list[str], expected_types: tuple[str, ...],
@@ -390,8 +600,12 @@ class TypeChecker:
     def _is_assignable(self, expected: str, actual: str) -> bool:
         if expected == actual:
             return True
-        class_info = self.classes.get(actual)
-        return class_info is not None and expected in class_info.declaration.interfaces
+        actual_base, _ = split_type(actual)
+        expected_base, expected_arguments = split_type(expected)
+        if expected_arguments:
+            return False
+        class_info = self.classes.get(actual_base)
+        return class_info is not None and expected_base in class_info.declaration.interfaces
 
     def _binary_type(self, expression: Binary, left: str, right: str) -> str:
         operator = expression.operator
@@ -506,6 +720,12 @@ class TypeChecker:
                         following.extend((state, "return") for state, kind in body_states if kind == "return")
                         if not isinstance(statement.condition, Literal) or not statement.condition.value:
                             following.append((initialized, "next"))
+                        following.extend((state, "next") for state, kind in body_states if kind == "break")
+                    elif isinstance(statement, ForStatement):
+                        reads(statement.iterable, initialized)
+                        body_states = flow(statement.body, [(initialized, "next")], loop_depth + 1)
+                        following.append((initialized, "next"))
+                        following.extend((state, "return") for state, kind in body_states if kind == "return")
                         following.extend((state, "next") for state, kind in body_states if kind == "break")
                     elif isinstance(statement, ExpressionStatement):
                         reads(statement.expression, initialized)

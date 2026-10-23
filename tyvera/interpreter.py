@@ -14,6 +14,7 @@ from .ast import (
     Expression,
     ExpressionStatement,
     Function,
+    ForStatement,
     IfStatement,
     LetStatement,
     Literal,
@@ -32,6 +33,9 @@ from .source import Diagnostic, Location
 from .typesys import INT_MAX, INT_MIN
 
 
+_MISSING = object()
+
+
 @dataclass(slots=True)
 class _ReturnSignal(Exception):
     value: object
@@ -46,6 +50,16 @@ class _LoopSignal(Exception):
 class _TyveraInstance:
     class_name: str
     fields: dict[str, object]
+
+
+@dataclass(slots=True, eq=False)
+class _TyveraList:
+    values: list[object]
+
+
+@dataclass(slots=True, eq=False)
+class _TyveraMap:
+    values: dict[object, object]
 
 
 class Interpreter:
@@ -105,6 +119,22 @@ class Interpreter:
                     except _LoopSignal as signal:
                         if signal.kind == "break":
                             break
+            elif isinstance(statement, ForStatement):
+                iterable = self._evaluate(statement.iterable, variables, depth)
+                if isinstance(iterable, _TyveraList):
+                    items = tuple(iterable.values)
+                elif isinstance(iterable, _TyveraMap):
+                    items = tuple(iterable.values.keys())
+                else:
+                    raise AssertionError("checked for-loop value is not iterable")
+                for item in items:
+                    iteration_scope = variables.new_child()
+                    iteration_scope[statement.name] = item
+                    try:
+                        self._execute_block(statement.body, iteration_scope, depth)
+                    except _LoopSignal as signal:
+                        if signal.kind == "break":
+                            break
             elif isinstance(statement, LoopControl):
                 raise _LoopSignal(statement.kind)
             elif isinstance(statement, ExpressionStatement):
@@ -122,17 +152,27 @@ class Interpreter:
             if expression.callee == "println":
                 self.output.write(self._display(arguments[0]) + "\n")
                 return None
+            if expression.callee == "List":
+                return _TyveraList([])
+            if expression.callee == "Map":
+                return _TyveraMap({})
             if expression.callee in self.classes:
                 return self._construct(self.classes[expression.callee], arguments, expression.location, depth + 1)
             return self._call(self.functions[expression.callee], arguments, expression.location, depth + 1)
         if isinstance(expression, MemberAccess):
             receiver = self._evaluate(expression.receiver, variables, depth)
+            if expression.member == "length" and isinstance(receiver, (_TyveraList, _TyveraMap)):
+                return len(receiver.values)
             if not isinstance(receiver, _TyveraInstance):
                 raise AssertionError("checked field access receiver is not an instance")
             return receiver.fields[expression.member]
         if isinstance(expression, MemberCall):
             receiver = self._evaluate(expression.receiver, variables, depth)
             arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+            if isinstance(receiver, _TyveraList):
+                return self._call_list_method(receiver, expression.method, arguments, expression.location)
+            if isinstance(receiver, _TyveraMap):
+                return self._call_map_method(receiver, expression.method, arguments, expression.location)
             if not isinstance(receiver, _TyveraInstance):
                 raise AssertionError("checked method receiver is not an instance")
             declaration = self.classes[receiver.class_name]
@@ -159,6 +199,69 @@ class Interpreter:
             self._check_numeric_result(result, expression.location)
             return result
         raise AssertionError(f"unhandled expression node: {type(expression).__name__}")
+
+    @staticmethod
+    def _list_index(values: list[object], index: object, location: Location, insertion: bool = False) -> int:
+        if type(index) is not int:
+            raise AssertionError("checked collection index is not Int")
+        upper = len(values) if insertion else len(values) - 1
+        if index < 0 or index > upper:
+            raise Diagnostic(location, "runtime", f"List index {index} is out of range")
+        return index
+
+    def _call_list_method(
+        self, receiver: _TyveraList, method: str, arguments: list[object], location: Location,
+    ) -> object:
+        values = receiver.values
+        if method == "append":
+            values.append(arguments[0])
+            return None
+        if method == "insert":
+            index = self._list_index(values, arguments[0], location, insertion=True)
+            values.insert(index, arguments[1])
+            return None
+        if method == "get":
+            return values[self._list_index(values, arguments[0], location)]
+        if method == "set":
+            values[self._list_index(values, arguments[0], location)] = arguments[1]
+            return None
+        if method == "removeAt":
+            return values.pop(self._list_index(values, arguments[0], location))
+        if method == "contains":
+            return arguments[0] in values
+        if method == "clear":
+            values.clear()
+            return None
+        raise AssertionError(f"checked collection method not implemented: {method}")
+
+    @staticmethod
+    def _call_map_method(
+        receiver: _TyveraMap, method: str, arguments: list[object], location: Location,
+    ) -> object:
+        values = receiver.values
+        try:
+            if method == "put":
+                values[arguments[0]] = arguments[1]
+                return None
+            if method == "get":
+                try:
+                    return values[arguments[0]]
+                except KeyError as error:
+                    raise Diagnostic(location, "runtime", "Map.get could not find the requested key") from error
+            if method == "remove":
+                return values.pop(arguments[0], _MISSING) is not _MISSING
+            if method == "containsKey":
+                return arguments[0] in values
+            if method == "keys":
+                return _TyveraList(list(values.keys()))
+            if method == "values":
+                return _TyveraList(list(values.values()))
+            if method == "clear":
+                values.clear()
+                return None
+        except TypeError as error:
+            raise Diagnostic(location, "runtime", "Map key is not hashable") from error
+        raise AssertionError(f"checked collection method not implemented: {method}")
 
     def _construct(
         self, declaration: ClassDeclaration, arguments: list[object], call_location: Location, depth: int,

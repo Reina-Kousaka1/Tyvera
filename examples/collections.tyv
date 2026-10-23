@@ -1,0 +1,18 @@
+fn identity<T>(value: T) -> T {
+    return value
+}
+
+fn main() {
+    let names: List<String> = identity(List<String>())
+    names.append("Mira")
+    names.append("Kai")
+
+    for name in names {
+        println(name)
+    }
+
+    let scores: Map<String, Int> = Map<String, Int>()
+    scores.put("Mira", 12)
+    scores.put("Kai", 9)
+    println(scores.get("Mira"))
+}

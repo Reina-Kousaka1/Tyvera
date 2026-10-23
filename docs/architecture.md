@@ -51,6 +51,17 @@ and `--version`. The implementation uses Python's standard library only.
   and required method names, parameter types and return types must match
   exactly. A conforming class is assignable to its interface. There is no
   class inheritance or structural duck typing.
+- Generic function and class signatures retain type parameters in the checked
+  type representation. Calls infer parameters from actual arguments or accept
+  explicit type arguments; recursive substitution validates nested
+  applications before execution. Generic methods, interfaces and constraints
+  are not supported. The interpreter erases type arguments in object records;
+  runtime dispatch still uses the statically selected nominal class methods.
+- `List<T>` and `Map<K,V>` expose Tyvera-specific typed APIs through private
+  bootstrap value records. The checker owns their method signatures and
+  iteration element types. A `for` evaluates its collection once and the
+  runtime iterates an immutable snapshot, so mutation during iteration is
+  deterministic.
 - Constructors are named `init` and return `Void`. Classes with fields must
   define one. A path-sensitive constructor analysis ensures fields have been
   initialized before a successful return; it checks immutable assignment,
@@ -70,9 +81,9 @@ module-qualified names before the existing semantic checker sees the linked
 program. Imports are relative `.tyv` files, aliases are explicit, `pub` is
 required for cross-module access, and paths cannot escape the project root.
 The manifest currently has only `name` and `entry`; dependencies are not yet
-supported. Calls still execute synchronously in one process. Collections,
-generics, error handling, pattern matching, actors, supervisors, async I/O,
-JSON and environment/secret access are not implemented. These boundaries are reflected in the
+supported. Calls still execute synchronously in one process. Option/Result,
+pattern matching, error handling, actors, supervisors, async I/O, JSON and
+environment/secret access are not implemented. These boundaries are reflected in the
 [language reference](language.md) and [roadmap](roadmap.md).
 
 ## Native backend direction

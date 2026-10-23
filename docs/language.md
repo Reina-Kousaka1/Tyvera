@@ -46,19 +46,20 @@ declaration = ("let" | "var") identifier [":" type] "=" expression ;
 assignment  = identifier "=" expression ;
 field-set   = expression "." identifier "=" expression ;
 conditional = "if" expression block ["else" (block | conditional)] ;
-loop        = "while" expression block ;
+loop        = "while" expression block | for-loop ;
 return      = "return" [expression] ;
 statement   = declaration | assignment | field-set | conditional | loop | return
             | "break" | "continue" | block | function-call ;
-function    = "fn" identifier "(" [parameters] ")" ["->" type] block ;
-class       = "class" identifier ["implements" type-list] "{" {field | method} "}" ;
+for-loop    = "for" identifier "in" expression block ;
+function    = "fn" identifier ["<" identifier {"," identifier} ">"] "(" [parameters] ")" ["->" type] block ;
+class       = "class" identifier ["<" identifier {"," identifier} ">"] ["implements" type-list] "{" {field | method} "}" ;
 field       = ("let" | "var") identifier ":" type ;
 method      = function ;
 interface   = "interface" identifier "{" {method-signature} "}" ;
 method-signature = "fn" identifier "(" [parameters] ")" ["->" type] ;
 type-list   = identifier {"," identifier} ;
 parameters  = identifier ":" type {"," identifier ":" type} ;
-type        = identifier {"." identifier} ;
+type        = identifier {"." identifier} ["<" type {"," type} ">"] ;
 ```
 
 Assignments are statements, not expressions. Function and method calls can be
@@ -189,6 +190,70 @@ declarations are private by default; `pub fn`, `pub class` and `pub interface`
 make a declaration importable. Class fields and methods remain public once the
 class itself is imported.
 
+## Generics
+
+Generic functions and classes use named type parameters. Calls infer parameters
+from value arguments when possible; explicit type arguments are available when
+inference has no input:
+
+```tyv
+fn identity<T>(value: T) -> T { return value }
+
+class Box<T> {
+    let value: T
+    fn init(value: T) { self.value = value }
+    fn get() -> T { return self.value }
+}
+
+fn main() {
+    let number: Int = identity(42)
+    let box: Box<Int> = Box(number)
+    println(box.get())
+}
+```
+
+Type arguments are checked recursively and cannot be `Void`. Generic types are
+invariant. Generic methods, generic interfaces and type-parameter constraints
+are not supported. The checker substitutes concrete types at each call; the
+bootstrap interpreter erases type arguments in runtime object records, and no
+runtime cast or dynamic generic dispatch is exposed.
+
+## Core collections and iteration
+
+`List<T>` and `Map<K,V>` are built-in, statically typed mutable reference
+collections. Construct them with explicit type arguments; an empty collection
+cannot infer its element types:
+
+```tyv
+fn main() {
+    let names: List<String> = List<String>()
+    names.append("Mira")
+    names.append("Kai")
+    for name in names {
+        println(name)
+    }
+}
+```
+
+`List<T>` supports `append(T)`, `insert(Int,T)`, `get(Int) -> T`,
+`set(Int,T)`, `removeAt(Int) -> T`, `contains(T) -> Bool`, `clear()` and the
+read-only `.length` property. Indexes are zero-based; invalid reads, writes,
+insertions and removals produce runtime diagnostics.
+
+`Map<K,V>` supports `put(K,V)`, `get(K) -> V`, `remove(K) -> Bool`,
+`containsKey(K) -> Bool`, `keys() -> List<K>`, `values() -> List<V>`,
+`clear()` and read-only `.length`. Keys must be primitive values or class/
+interface references. `get` on a missing key is a runtime diagnostic for now;
+the planned `Option<V>` model will make that outcome explicit. Iterating a map
+visits keys in insertion order. A `for` loop evaluates its collection once and
+iterates a snapshot, so mutations during the loop do not alter its current
+iteration. Loop bindings are immutable and scoped to the loop body; `break`
+and `continue` target the innermost loop. A `for` loop may execute zero times
+and cannot by itself satisfy a non-`Void` function's return-path requirement.
+
+These core types are available without an import. A separately packaged
+`tyvera.collections` module is not implemented yet.
+
 ## Modules and projects
 
 Each file is one module. Imports name a `.tyv` file relative to the importing
@@ -284,9 +349,10 @@ limit (or the bootstrap host stack limit, if reached sooner).
 `tyvera run file.tyv` checks and interprets the AST.
 
 Current limits: classes and interfaces are supported, but there is no
-inheritance, generic type, collection, `for` loop, pattern matching, `try`/`catch`,
-actor/process model, messaging, supervisor, async/I/O or networking API, JSON
-library, environment-variable API, native interop, garbage collector
+inheritance, generic methods/interfaces/constraints, collection literals,
+Option/Result, pattern matching, `try`/`catch`, actor/process model, messaging,
+supervisor, async/I/O or networking API, JSON library, environment-variable
+or secret API, native interop, garbage collector
 implementation, package manager or Discord SDK. No compiler backend or
 performance claim. No termination checking or loop execution budget; users can
 write infinite loops. Parsing and execution use the host stack, so extremely

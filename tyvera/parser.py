@@ -9,6 +9,7 @@ from .ast import (
     Expression,
     ExpressionStatement,
     Field,
+    ForStatement,
     Function,
     IfStatement,
     ImportDeclaration,
@@ -108,12 +109,15 @@ class Parser:
 
     def _function(self, public: bool = False) -> Function:
         fn_token = self._expect("FN", "expected 'fn'")
-        name, parameters, return_type = self._function_header()
-        body = self._block()
-        return Function(name, parameters, return_type, body, fn_token.location, public)
-
-    def _function_header(self) -> tuple[str, list[Parameter], str]:
         name_token = self._expect("IDENTIFIER", "expected a function name after 'fn'")
+        type_parameters = self._type_parameters()
+        name, parameters, return_type = self._function_header(name_token)
+        body = self._block()
+        return Function(name, parameters, return_type, body, fn_token.location, public, type_parameters)
+
+    def _function_header(self, name_token: Token | None = None) -> tuple[str, list[Parameter], str]:
+        if name_token is None:
+            name_token = self._expect("IDENTIFIER", "expected a function name after 'fn'")
         self._expect("LPAREN", "expected '(' after function name")
         parameters: list[Parameter] = []
         if not self._check("RPAREN"):
@@ -136,11 +140,38 @@ class Parser:
         parts = [self._expect("IDENTIFIER", message).lexeme]
         while self._match("DOT"):
             parts.append(self._expect("IDENTIFIER", "expected a type name after '.'").lexeme)
-        return ".".join(parts)
+        name = ".".join(parts)
+        if self._match("LESS"):
+            arguments = [self._type_name("expected a type argument after '<'")]
+            while self._match("COMMA"):
+                arguments.append(self._type_name("expected a type argument after ','"))
+            self._expect("GREATER", "expected '>' after type arguments")
+            name += "<" + ",".join(arguments) + ">"
+        return name
+
+    def _type_arguments(self) -> list[str]:
+        self._expect("LESS", "expected '<' before type arguments")
+        arguments = [self._type_name("expected a type argument after '<'")]
+        while self._match("COMMA"):
+            arguments.append(self._type_name("expected a type argument after ','"))
+        self._expect("GREATER", "expected '>' after type arguments")
+        return arguments
+
+    def _type_parameters(self) -> list[str]:
+        if not self._match("LESS"):
+            return []
+        parameters = [self._expect("IDENTIFIER", "expected a type parameter after '<'").lexeme]
+        while self._match("COMMA"):
+            parameters.append(self._expect("IDENTIFIER", "expected a type parameter after ','").lexeme)
+        self._expect("GREATER", "expected '>' after type parameters")
+        if len(set(parameters)) != len(parameters):
+            self._error(self._previous(), "generic type parameters must be unique")
+        return parameters
 
     def _class_declaration(self, public: bool = False) -> ClassDeclaration:
         class_token = self._expect("CLASS", "expected 'class'")
         name = self._expect("IDENTIFIER", "expected a class name after 'class'")
+        type_parameters = self._type_parameters()
         interfaces: list[str] = []
         if self._match("IMPLEMENTS"):
             while True:
@@ -169,7 +200,7 @@ class Parser:
                 self._error(self._current(), "expected a line break or ';' after class member")
             self._skip_separators()
         self._expect("RBRACE", "expected '}' to close class body")
-        return ClassDeclaration(name.lexeme, interfaces, fields, methods, class_token.location, public)
+        return ClassDeclaration(name.lexeme, interfaces, fields, methods, class_token.location, public, type_parameters)
 
     def _interface_declaration(self, public: bool = False) -> InterfaceDeclaration:
         interface_token = self._expect("INTERFACE", "expected 'interface'")
@@ -210,6 +241,12 @@ class Parser:
             token = self._previous()
             condition = self._expression()
             return WhileStatement(condition, self._block(), token.location)
+        if self._match("FOR"):
+            token = self._previous()
+            name = self._expect("IDENTIFIER", "expected a loop variable after 'for'")
+            self._expect("IN", "expected 'in' after the loop variable")
+            iterable = self._expression()
+            return ForStatement(name.lexeme, iterable, self._block(), token.location)
         if self._match("BREAK", "CONTINUE"):
             return LoopControl(self._previous().lexeme, self._previous().location)
         if self._check("LBRACE"):
@@ -263,14 +300,37 @@ class Parser:
     def _expression(self, minimum_precedence: int = 0) -> Expression:
         expression = self._prefix()
         while True:
+            if isinstance(expression, Name) and self._check("LESS"):
+                saved = self.index
+                try:
+                    type_arguments = self._type_arguments()
+                except Diagnostic:
+                    self.index = saved
+                else:
+                    if self._check("LPAREN"):
+                        expression = self._call(expression, type_arguments)
+                        continue
+                    self.index = saved
             if self._check("LPAREN") and isinstance(expression, Name):
                 expression = self._call(expression)
                 continue
             if self._check("DOT"):
                 dot = self._advance()
                 member = self._expect("IDENTIFIER", "expected a field or method name after '.'")
+                type_arguments: list[str] = []
+                if self._check("LESS"):
+                    saved = self.index
+                    try:
+                        parsed_arguments = self._type_arguments()
+                    except Diagnostic:
+                        self.index = saved
+                    else:
+                        if self._check("LPAREN"):
+                            type_arguments = parsed_arguments
+                        else:
+                            self.index = saved
                 if self._check("LPAREN"):
-                    expression = self._member_call(expression, member.lexeme, dot.location)
+                    expression = self._member_call(expression, member.lexeme, dot.location, type_arguments)
                 else:
                     expression = MemberAccess(expression, member.lexeme, dot.location)
                 continue
@@ -308,17 +368,19 @@ class Parser:
             return expression
         self._error(token, "expected an expression")
 
-    def _call(self, callee: Name) -> Call:
+    def _call(self, callee: Name, type_arguments: list[str] | None = None) -> Call:
         self._expect("LPAREN", "expected '(' after function name")
         arguments = self._arguments()
         self._expect("RPAREN", "expected ')' after function arguments")
-        return Call(callee.identifier, arguments, callee.location)
+        return Call(callee.identifier, arguments, callee.location, type_arguments or [])
 
-    def _member_call(self, receiver: Expression, method: str, location) -> MemberCall:
+    def _member_call(
+        self, receiver: Expression, method: str, location, type_arguments: list[str] | None = None,
+    ) -> MemberCall:
         self._expect("LPAREN", "expected '(' after method name")
         arguments = self._arguments()
         self._expect("RPAREN", "expected ')' after method arguments")
-        return MemberCall(receiver, method, arguments, location)
+        return MemberCall(receiver, method, arguments, location, type_arguments or [])
 
     def _arguments(self) -> list[Expression]:
         arguments: list[Expression] = []

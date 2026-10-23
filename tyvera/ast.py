@@ -54,6 +54,7 @@ class ClassDeclaration:
     methods: list[Method]
     location: Location
     public: bool = False
+    type_parameters: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -79,6 +80,7 @@ class Function:
     body: list[Statement]
     location: Location
     public: bool = False
+    type_parameters: list[str] = field(default_factory=list)
 
 
 class Statement:
@@ -123,6 +125,14 @@ class WhileStatement(Statement):
 
 
 @dataclass(slots=True)
+class ForStatement(Statement):
+    name: str
+    iterable: Expression
+    body: list[Statement]
+    location: Location
+
+
+@dataclass(slots=True)
 class LoopControl(Statement):
     kind: str
     location: Location
@@ -162,6 +172,7 @@ class Call(Expression):
     callee: str
     arguments: list[Expression]
     location: Location
+    type_arguments: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -177,6 +188,7 @@ class MemberCall(Expression):
     method: str
     arguments: list[Expression]
     location: Location
+    type_arguments: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

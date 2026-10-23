@@ -9,9 +9,9 @@ Roadmap items below are plans unless marked implemented.
 | Stage | Status | Scope and exit condition |
 | --- | --- | --- |
 | 1. Core language | Implemented | Primitive types, functions, checked returns, lexical scopes, mutable/immutable bindings, operators, conditionals, `while`, `break` and `continue`, covered by tests. |
-| 2. Object system | First slice implemented | Classes, fields, `self`, constructors, methods, interfaces, multiple interface implementation and interface dispatch. Next: generics, then review visibility and inheritance requirements before adding them. |
+| 2. Object system | First slice implemented | Classes, fields, `self`, constructors, methods, interfaces, multiple interface implementation, interface dispatch, generic classes and generic functions. Generic methods/interfaces/constraints and inheritance remain open. |
 | 3. Modules | First slice implemented | Relative `.tyv` imports, aliases, `pub` exports, module graph linking, visibility/missing/duplicate diagnostics, cycle detection and project-root containment. Local package dependencies are still planned. |
-| 4. Standard library | Planned | Typed `List<T>` and `Map<K,V>`, `for` iteration, environment access, and JSON parse/encode APIs with explicit error results. |
+| 4. Standard library | Core slice implemented | Generic `List<T>`/`Map<K,V>`, typed operations and `for` iteration. Separate stdlib modules, `Option`/`Result`, environment/secret access and JSON parse/encode remain planned. |
 | 5. Actor runtime | Planned | Isolated process state, typed messages, mailboxes, sequenced message handling and lifecycle, with deterministic runtime tests. |
 | 6. Supervisors | Planned | Child lifecycle, crash detection, restart and an initial `one_for_one` policy, separate from ordinary recoverable errors. |
 | 7. Networking | Planned | Async runtime abstraction, timers, HTTP and WebSocket client support, and event dispatch without Promise-specific language semantics. |
@@ -21,8 +21,9 @@ Roadmap items below are plans unless marked implemented.
 
 ## Near-term sequence
 
-1. Implement generic classes and functions, then typed collections and `for`.
-2. Add an explicit error-result model and JSON/environment APIs before
+1. Add `Option`/`Result` and pattern matching, then move or wrap collection
+   operations behind a normal `tyvera.collections` module.
+2. Add JSON and environment/secret APIs before
    networking, so missing configuration and parse failures remain ordinary,
    testable program outcomes.
 3. Define async operations and actor message semantics before any Discord
@@ -44,9 +45,9 @@ Tyvera errors.
 
 ## Current Discord-readiness gap
 
-The object system and relative file modules are usable for domain models, but
-Tyvera cannot yet use generic collections, read a token from the environment,
+The object system, relative file modules and generic collections are usable for
+domain models, but Tyvera cannot yet read a token from the environment,
 parse JSON, perform asynchronous I/O, or connect over HTTP/WebSocket. It
 therefore cannot yet implement or run a real Discord bot. The next deliverable
-is generics and typed collection foundations; an SDK should come only after
+is safe optional/error types and JSON/environment foundations; an SDK should come only after
 networking and error semantics work as ordinary libraries.

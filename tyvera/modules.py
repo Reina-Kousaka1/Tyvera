@@ -12,6 +12,7 @@ from .ast import (
     Expression,
     ExpressionStatement,
     Function,
+    ForStatement,
     IfStatement,
     InterfaceDeclaration,
     LetStatement,
@@ -27,6 +28,7 @@ from .ast import (
 from .lexer import Lexer
 from .parser import Parser
 from .source import Diagnostic, Location
+from .type_names import make_type, split_type
 
 
 @dataclass(slots=True)
@@ -195,15 +197,18 @@ class ModuleLoader:
         self, type_name: str, module: _Module, local: dict[str, str],
         imports: dict[str, _Module], known: dict[str, tuple[str, object]], location: Location,
     ) -> str:
-        if "." in type_name:
-            qualifier, symbol = type_name.split(".", 1)
+        base, arguments = split_type(type_name)
+        if "." in base:
+            qualifier, symbol = base.split(".", 1)
             if qualifier in imports:
-                return self._resolve_imported(qualifier, symbol, module, imports, location, {"class", "interface"})
-            return type_name
-        target = known.get(type_name)
+                base = self._resolve_imported(qualifier, symbol, module, imports, location, {"class", "interface"})
+            return make_type(base, [self._resolve_type(argument, module, local, imports, known, location)
+                                   for argument in arguments])
+        target = known.get(base)
         if target is not None and target[0] in {"class", "interface"}:
-            return local[type_name]
-        return type_name
+            base = local[base]
+        return make_type(base, [self._resolve_type(argument, module, local, imports, known, location)
+                                for argument in arguments])
 
     def _rewrite_function(self, function, module, local, imports, known) -> None:
         for parameter in function.parameters:
@@ -249,6 +254,9 @@ class ModuleLoader:
             elif isinstance(statement, WhileStatement):
                 statement.condition = self._rewrite_expression(statement.condition, module, local, imports, known)
                 self._rewrite_block(statement.body, module, local, imports, known)
+            elif isinstance(statement, ForStatement):
+                statement.iterable = self._rewrite_expression(statement.iterable, module, local, imports, known)
+                self._rewrite_block(statement.body, module, local, imports, known)
             elif isinstance(statement, ReturnStatement) and statement.value is not None:
                 statement.value = self._rewrite_expression(statement.value, module, local, imports, known)
             elif isinstance(statement, ExpressionStatement):
@@ -260,6 +268,8 @@ class ModuleLoader:
                 target = known.get(expression.callee)
                 if target is not None:
                     expression.callee = local[expression.callee]
+            expression.type_arguments = [self._resolve_type(argument, module, local, imports, known, expression.location)
+                                         for argument in expression.type_arguments]
             expression.arguments = [self._rewrite_expression(arg, module, local, imports, known) for arg in expression.arguments]
             return expression
         if isinstance(expression, MemberCall):
@@ -267,8 +277,12 @@ class ModuleLoader:
                 callee = self._resolve_imported(expression.receiver.identifier, expression.method, module, imports,
                                                 expression.location, {"function", "class", "interface"})
                 return Call(callee, [self._rewrite_expression(arg, module, local, imports, known)
-                                     for arg in expression.arguments], expression.location)
+                                     for arg in expression.arguments], expression.location,
+                            [self._resolve_type(argument, module, local, imports, known, expression.location)
+                             for argument in expression.type_arguments])
             expression.receiver = self._rewrite_expression(expression.receiver, module, local, imports, known)
+            expression.type_arguments = [self._resolve_type(argument, module, local, imports, known, expression.location)
+                                         for argument in expression.type_arguments]
             expression.arguments = [self._rewrite_expression(arg, module, local, imports, known) for arg in expression.arguments]
             return expression
         if isinstance(expression, MemberAccess):
@@ -289,12 +303,16 @@ class ModuleLoader:
             for statement in body:
                 if isinstance(statement, LetStatement) and statement.name in aliases:
                     raise Diagnostic(statement.location, "module", f"'{statement.name}' is reserved as an import alias in this module")
+                if isinstance(statement, ForStatement) and statement.name in aliases:
+                    raise Diagnostic(statement.location, "module", f"'{statement.name}' is reserved as an import alias in this module")
                 if isinstance(statement, Block):
                     block(statement.body)
                 elif isinstance(statement, IfStatement):
                     block(statement.then_body)
                     block(statement.else_body)
                 elif isinstance(statement, WhileStatement):
+                    block(statement.body)
+                elif isinstance(statement, ForStatement):
                     block(statement.body)
 
         for function in module.program.functions:

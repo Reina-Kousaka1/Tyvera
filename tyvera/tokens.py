@@ -21,6 +21,8 @@ KEYWORDS = {
     "if": "IF",
     "else": "ELSE",
     "while": "WHILE",
+    "for": "FOR",
+    "in": "IN",
     "break": "BREAK",
     "continue": "CONTINUE",
     "return": "RETURN",
