@@ -66,16 +66,22 @@ and `--version`. The implementation uses Python's standard library only.
 - `Option<T>` and `Result<T,E>` are tagged Tyvera values. `match` checks
   literal and variant pattern types, arm scopes, duplicate coverage, and
   exhaustiveness for `Bool`, `Option` and `Result`. These ordinary error values
-  remain separate from runtime diagnostics and future actor crashes.
+  remain separate from runtime diagnostics and actor crashes.
 - Actor declarations have a checked message protocol and private state. The
   bootstrap scheduler owns FIFO mailboxes and schedules one message per actor
   per round. It is cooperative and deterministic, not parallel. Messages are
   restricted to transferable immutable primitives, nested `Option`/`Result`
   values, and actor references; ordinary mutable objects cannot be shared.
-  Handler diagnostics crash only their actor, clear its mailbox, and are
-  reported with source location by `runActors()` as `Result<Int,String>` while
-  other actors continue. Mailboxes and each scheduler drain have a 100,000
-  message limit; a nonterminating handler can still block the cooperative loop.
+  Handler diagnostics crash only their actor and clear its mailbox. An
+  unsupervised crash is reported with source location by `runActors()` as
+  `Result<Int,String>` while other actors continue. A `one_for_one` Supervisor
+  can restart only the failed child from its initial constructor arguments;
+  restart intensity is bounded by a monotonic time window and a maximum of
+  1,000 attempts. Exhaustion stops the supervisor's children and is reported as
+  `Err`. Successful recovery is returned as `Ok`; the child's old state and
+  queued messages are discarded. Mailboxes and each scheduler drain have a
+  100,000 message limit; a nonterminating handler can still block the
+  cooperative loop.
 - JSON uses a Tyvera-owned opaque `Json` value and checked constructors,
   accessors and `Result`-returning parse/encode intrinsics. The bootstrap uses
   Python's standard JSON codec internally, but rejects duplicate keys,
@@ -108,9 +114,10 @@ required for cross-module access, and paths cannot escape the project root.
 Actors participate in that linker and can be exported and imported. The
 manifest currently has only `name` and `entry`; dependencies are not yet
 supported. Ordinary functions and I/O execute synchronously; actor handlers
-run only when the cooperative scheduler is explicitly pumped. `try`/`catch`,
-supervisors, parallel scheduling, async I/O, HTTP, WebSockets and external
-secret stores are not implemented. These boundaries are reflected in the
+run only when the cooperative scheduler is explicitly pumped. The supervisor
+API currently supports only `one_for_one`; request/reply, parallel scheduling,
+async I/O, HTTP, WebSockets and external secret stores are not implemented.
+These boundaries are reflected in the
 [language reference](language.md) and [roadmap](roadmap.md).
 
 ## Native backend direction
@@ -128,3 +135,18 @@ backend against these requirements without making it a bootstrap dependency.
 Safe Tyvera should not expose raw pointers; any future unsafe/native boundary
 must be explicit and isolate ownership and foreign error mapping. Keep the
 interpreter as a conformance reference while native output is introduced.
+
+## Local bootstrap benchmarks
+
+`benchmarks/benchmark_bootstrap.py` provides non-gating measurements for
+lexing, parsing, type checking, the full check pipeline, interpretation, a
+500-element list workload and a 500-message actor scheduler workload. Run it
+after installing the editable package:
+
+```sh
+python benchmarks/benchmark_bootstrap.py --iterations 10
+```
+
+It reports median wall-clock time and Python version. Results are exploratory
+and environment-dependent; they are not correctness tests or CI thresholds.
+Keep benchmark workloads stable when comparing revisions.

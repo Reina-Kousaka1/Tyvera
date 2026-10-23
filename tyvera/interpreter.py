@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import math
 import sys
+import time
 from collections import ChainMap, deque
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
-from typing import TextIO
+from typing import Callable, TextIO
 
 from .ast import (
     ActorDeclaration,
@@ -46,6 +47,7 @@ from .typesys import INT_MAX, INT_MIN
 _MISSING = object()
 _MAX_ACTOR_MAILBOX = 100_000
 _MAX_ACTOR_DELIVERIES = 100_000
+_MAX_SUPERVISOR_RESTARTS = 1_000
 
 
 @dataclass(slots=True)
@@ -72,12 +74,28 @@ class _ActorMessage:
     location: Location
 
 
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraSupervisor:
+    max_restarts: int
+    window_milliseconds: int
+    clock: Callable[[], float]
+    restart_times: deque[float] = dataclass_field(default_factory=deque)
+    children: list[_TyveraActor] = dataclass_field(default_factory=list)
+    status: str = "alive"
+
+    def __repr__(self) -> str:
+        return "<Supervisor>"
+
+
 @dataclass(slots=True, eq=False)
 class _TyveraActor:
     instance: _TyveraInstance
     status: str = "alive"
     mailbox: deque[_ActorMessage] = dataclass_field(default_factory=deque)
     queued: bool = False
+    supervisor: _TyveraSupervisor | None = None
+    declaration: ActorDeclaration | None = None
+    constructor_arguments: list[object] = dataclass_field(default_factory=list)
 
 
 @dataclass(slots=True, eq=False, repr=False)
@@ -125,6 +143,7 @@ class Interpreter:
     def __init__(
         self, program: Program, output: TextIO, max_call_depth: int = 256, *,
         project_root: str | Path | None = None, error_output: TextIO | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.functions = {function.name: function for function in program.functions}
         self.classes: dict[str, ClassDeclaration] = {declaration.name: declaration for declaration in program.classes}
@@ -136,6 +155,7 @@ class Interpreter:
         self.max_call_depth = max_call_depth
         self.project_root = Path.cwd() if project_root is None else Path(project_root)
         self.secret_provider = SecretProvider(self.project_root)
+        self._clock = time.monotonic if clock is None else clock
 
     def run(self) -> None:
         main = self.functions["main"]
@@ -237,6 +257,16 @@ class Interpreter:
                 declaration = self.actors[construction.callee]
                 arguments = [self._evaluate(argument, variables, depth) for argument in construction.arguments]
                 return self._spawn_actor(declaration, arguments, expression.location, depth + 1)
+            if expression.callee == "oneForOne":
+                arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+                max_restarts, window_milliseconds = arguments
+                if max_restarts < 0:
+                    raise Diagnostic(expression.location, "runtime", "oneForOne maxRestarts must be zero or greater")
+                if max_restarts > _MAX_SUPERVISOR_RESTARTS:
+                    raise Diagnostic(expression.location, "runtime", f"oneForOne maxRestarts cannot exceed {_MAX_SUPERVISOR_RESTARTS}")
+                if window_milliseconds <= 0:
+                    raise Diagnostic(expression.location, "runtime", "oneForOne windowMilliseconds must be greater than zero")
+                return _TyveraSupervisor(max_restarts, window_milliseconds, self._clock)
             if expression.callee == "runActors":
                 return self._run_actors(expression.location, depth)
             arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
@@ -324,14 +354,31 @@ class Interpreter:
             return receiver.fields[expression.member]
         if isinstance(expression, MemberCall):
             receiver = self._evaluate(expression.receiver, variables, depth)
+            if isinstance(receiver, _TyveraSupervisor):
+                if expression.method == "start":
+                    if receiver.status != "alive":
+                        raise Diagnostic(expression.location, "runtime", f"cannot start a child on a {receiver.status} supervisor")
+                    construction = expression.arguments[0]
+                    if not isinstance(construction, Call):
+                        raise AssertionError("checked supervisor.start argument is not an actor construction")
+                    declaration = self.actors[construction.callee]
+                    arguments = [self._evaluate(argument, variables, depth) for argument in construction.arguments]
+                    return self._spawn_actor(declaration, arguments, expression.location, depth + 1, receiver)
+                if expression.method == "isAlive":
+                    return receiver.status == "alive"
+                if expression.method == "stop":
+                    if receiver.status == "alive":
+                        receiver.status = "stopped"
+                        for child in receiver.children:
+                            self._stop_actor(child)
+                    return None
             arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
             if isinstance(receiver, _TyveraActorRef):
                 actor = receiver.actor
                 if expression.method == "isAlive":
                     return actor.status == "alive"
                 if expression.method == "stop":
-                    actor.status = "stopped"
-                    actor.mailbox.clear()
+                    self._stop_actor(actor)
                     return None
                 self._enqueue_actor_message(actor, expression.method, arguments, expression.location)
                 return None
@@ -593,19 +640,116 @@ class Interpreter:
 
     def _spawn_actor(
         self, declaration: ActorDeclaration, arguments: list[object], call_location: Location, depth: int,
+        supervisor: _TyveraSupervisor | None = None,
     ) -> _TyveraActorRef:
         instance = _TyveraInstance(declaration.name, {})
-        actor = _TyveraActor(instance)
+        actor = _TyveraActor(
+            instance,
+            supervisor=supervisor,
+            declaration=declaration,
+            constructor_arguments=[self._copy_actor_value(value) for value in arguments],
+        )
         instance.actor = actor
+        if supervisor is not None:
+            supervisor.children.append(actor)
+        try:
+            self._initialize_actor(actor, arguments, call_location, depth)
+        except Diagnostic as error:
+            actor.status = "crashed"
+            actor.mailbox.clear()
+            if supervisor is None:
+                raise
+            failure = self._restart_supervised_actor(
+                actor, self._format_actor_failure(declaration, error), call_location, depth,
+            )
+            if failure is not None:
+                raise Diagnostic(call_location, "runtime", failure) from error
+        return _TyveraActorRef(actor)
+
+    def _initialize_actor(
+        self, actor: _TyveraActor, arguments: list[object], call_location: Location, depth: int,
+    ) -> None:
+        declaration = actor.declaration
+        if declaration is None:
+            raise AssertionError("actor has no declaration")
+        actor.instance = _TyveraInstance(declaration.name, {}, actor)
         constructor = next((method for method in declaration.handlers if method.name == "init"), None)
         if constructor is not None:
+            self._call_method(constructor, actor.instance, arguments, call_location, depth)
+        actor.status = "alive"
+
+    @staticmethod
+    def _copy_actor_value(value: object) -> object:
+        if isinstance(value, _TyveraActorRef):
+            return _TyveraActorRef(value.actor)
+        if isinstance(value, _TyveraVariant):
+            return _TyveraVariant(value.variant, Interpreter._copy_actor_value(value.payload))
+        if value is None or type(value) in {bool, int, float, str}:
+            return value
+        raise AssertionError("checked actor constructor value is not transferable")
+
+    @staticmethod
+    def _format_actor_failure(declaration: ActorDeclaration, error: Diagnostic) -> str:
+        return (
+            f"actor '{declaration.name}' crashed at {error.location.filename}:"
+            f"{error.location.line}:{error.location.column}: {error.message}"
+        )
+
+    @staticmethod
+    def _stop_actor(actor: _TyveraActor) -> None:
+        if actor.status == "alive":
+            actor.status = "stopped"
+        actor.mailbox.clear()
+
+    def _fail_supervisor(self, supervisor: _TyveraSupervisor) -> None:
+        supervisor.status = "failed"
+        for child in supervisor.children:
+            child.status = "stopped"
+            child.mailbox.clear()
+
+    def _restart_supervised_actor(
+        self, actor: _TyveraActor, failure: str, call_location: Location, depth: int,
+    ) -> str | None:
+        supervisor = actor.supervisor
+        if supervisor is None:
+            return failure
+        if supervisor.status != "alive":
+            actor.status = "stopped"
+            return failure
+
+        declaration = actor.declaration
+        if declaration is None:
+            raise AssertionError("supervised actor has no declaration")
+        window_seconds = supervisor.window_milliseconds / 1000.0
+        while True:
+            now = self._clock()
+            while supervisor.restart_times and now - supervisor.restart_times[0] > window_seconds:
+                supervisor.restart_times.popleft()
+            if len(supervisor.restart_times) >= supervisor.max_restarts:
+                self._fail_supervisor(supervisor)
+                return (
+                    f"supervisor restart limit exceeded for actor '{declaration.name}' "
+                    f"within {supervisor.window_milliseconds}ms: {failure}"
+                )
+
+            supervisor.restart_times.append(now)
+            actor.mailbox.clear()
             try:
-                self._call_method(constructor, instance, arguments, call_location, depth)
-            except Diagnostic:
+                self._initialize_actor(
+                    actor,
+                    [self._copy_actor_value(value) for value in actor.constructor_arguments],
+                    call_location,
+                    depth + 1,
+                )
+            except Diagnostic as error:
                 actor.status = "crashed"
-                actor.mailbox.clear()
-                raise
-        return _TyveraActorRef(actor)
+                failure = self._format_actor_failure(declaration, error)
+                continue
+            except _LoopSignal as signal:
+                actor.status = "crashed"
+                failure = f"actor '{declaration.name}' crashed: '{signal.kind}' escaped its constructor"
+                continue
+            return None
 
     def _enqueue_actor_message(
         self, actor: _TyveraActor, method: str, arguments: list[object], location: Location,
@@ -639,16 +783,20 @@ class Interpreter:
             except Diagnostic as error:
                 actor.status = "crashed"
                 actor.mailbox.clear()
-                if first_crash is None:
-                    first_crash = (
-                        f"actor '{declaration.name}' crashed at {error.location.filename}:"
-                        f"{error.location.line}:{error.location.column}: {error.message}"
-                    )
+                failure = self._restart_supervised_actor(
+                    actor, self._format_actor_failure(declaration, error), message.location, depth + 1,
+                )
+                if failure is not None and first_crash is None:
+                    first_crash = failure
             except _LoopSignal as signal:
                 actor.status = "crashed"
                 actor.mailbox.clear()
-                if first_crash is None:
-                    first_crash = f"actor '{declaration.name}' crashed: '{signal.kind}' escaped its loop"
+                failure = self._restart_supervised_actor(
+                    actor, f"actor '{declaration.name}' crashed: '{signal.kind}' escaped its loop",
+                    message.location, depth + 1,
+                )
+                if failure is not None and first_crash is None:
+                    first_crash = failure
             finally:
                 self._current_actor = None
             if actor.status == "alive" and actor.mailbox and not actor.queued:

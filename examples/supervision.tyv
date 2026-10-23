@@ -1,0 +1,30 @@
+actor Counter {
+    var value: Int
+
+    init(start: Int) {
+        self.value = start
+    }
+
+    on fail() {
+        let failure: Float = 1 / 0
+    }
+
+    on report() {
+        println(self.value)
+    }
+}
+
+fn main() {
+    let supervisor = oneForOne(2, 1000)
+    let counter = supervisor.start(Counter(7))
+
+    counter.fail()
+    match runActors() {
+        Ok(delivered) => println(delivered)
+        Err(reason) => eprintln(reason)
+    }
+
+    println(counter.isAlive())
+    counter.report()
+    runActors()
+}

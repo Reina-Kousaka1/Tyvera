@@ -3,8 +3,10 @@
 Tyvera is an independent, statically typed programming language with
 Java-inspired structure, Elixir-inspired concurrency and fault tolerance, and
 a C++-inspired focus on performance and controlled system-level access.
-Discord is a future library/SDK use case, not a compiler or language feature.
-Roadmap items below are plans unless marked implemented.
+Tyvera's core is being developed independently of any one application domain;
+larger real applications will be useful stress tests after the language and
+runtime foundations are stable. Roadmap items below are plans unless marked
+implemented.
 
 | Stage | Status | Scope and exit condition |
 | --- | --- | --- |
@@ -13,20 +15,20 @@ Roadmap items below are plans unless marked implemented.
 | 3. Modules | First slice implemented | Relative `.tyv` imports, aliases, `pub` exports, module graph linking, visibility/missing/duplicate diagnostics, cycle detection and project-root containment. Local package dependencies are still planned. |
 | 4. Standard library | Core slice implemented | Generic collections, `for`, `Option<T>`, `Result<T,E>`, core matching, text I/O/path helpers, local/environment secret providers and typed JSON parse/access/encode. Separate stdlib modules, timers and networking remain planned. |
 | 5. Actor runtime | First slice implemented | Actor declarations, typed immutable message transfer, isolated state, FIFO mailboxes, deterministic round-robin cooperative scheduling, stop/alive lifecycle, and isolated crash reporting. True parallel scheduling, replies, cancellation, configurable capacity and backpressure remain open. |
-| 6. Supervisors | Planned | Child lifecycle, crash detection, restart and an initial `one_for_one` policy, separate from ordinary recoverable errors. |
+| 6. Supervisors | First slice implemented | Child lifecycle, crash detection, bounded restart intensity and deterministic `one_for_one` restarts. `one_for_all` and `rest_for_one` remain planned. |
 | 7. Networking | Planned | Async runtime abstraction, timers, HTTP and WebSocket client support, and event dispatch without Promise-specific language semantics. |
 | 8. Native backend | Planned | Separate compiler backend, documented value/resource model, efficient value types and a narrow typed FFI. No unsafe native surface before its ownership and ABI rules are testable. |
 | 9. Package system | Planned | Reproducible package metadata, dependency resolution and versioning after modules and the standard library stabilize. |
-| 10. Discord SDK | Planned | A normal Tyvera library over modules, JSON, environment access, async I/O, WebSockets and actor lifecycle. No Discord-specific compiler behavior. |
+| 10. Application library ecosystem | Planned | Build general-purpose libraries and use larger applications as later conformance and load tests; application protocols stay outside compiler semantics. |
 
 ## Near-term sequence
 
-1. Add an actor supervisor with deterministic `one_for_one` restarts and
-   restart limits, preserving the current explicit cooperative scheduling.
-2. Define reply channels and cancellation on top of typed messages, then
-   introduce timer-backed async tasks before HTTP/WebSocket support.
-3. Move or wrap collection, I/O, JSON and secret operations behind normal
+1. Define typed request/reply and cancellation on top of supervised messages,
+   then add time primitives and a structured async task model.
+2. Move or wrap collection, I/O, JSON and secret operations behind normal
    `tyvera.*` modules as that library module model stabilizes.
+3. Continue improving generic interfaces, constraints and type inference with
+   conformance tests before expanding the object model.
 4. Keep backend work independent from the Python interpreter. Establish
    language-level conformance programs before implementing native codegen.
 
@@ -41,11 +43,12 @@ and conformance tests match the interpreter. Avoid untyped pointers,
 unbounded foreign object ownership and direct exposure of C++ exceptions as
 Tyvera errors.
 
-## Current Discord-readiness gap
+## General application readiness gap
 
 The object system, relative file modules, generic collections, file I/O,
-provider-backed secrets, typed JSON core and cooperative actor/mailbox slice
-are usable. Tyvera cannot yet perform asynchronous I/O or connect over
-HTTP/WebSocket, so it cannot yet implement or run a real Discord bot. The next
-deliverable is deterministic actor supervision, followed by reply channels,
-timers and an async I/O model before HTTP/WebSocket and a Discord SDK.
+provider-backed secrets, typed JSON core and cooperative actor runtime with
+bounded supervision are usable. Async I/O, cancellation, timers, resource
+ownership, networking and a native backend are still missing. The next
+deliverable is typed request/reply and a general time/task model, followed by
+standard-library module boundaries and networking only after those runtime
+contracts are testable.

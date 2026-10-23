@@ -335,13 +335,33 @@ Message and constructor arguments are transferable Tyvera values of type `Int`,
 nested types are also transferable. Mutable collections, ordinary class
 instances and secrets cannot cross a mailbox. A runtime diagnostic in a
 handler marks that actor crashed, discards its queued messages, and lets other
-actors continue; `runActors()` reports the first crash as `Err`. `stop()` stops
-an actor immediately and drops its pending mailbox; `isAlive()` reports whether
-it can receive more messages. Ordinary `Result` failures remain application
-values, separate from actor crashes. Supervisors, restarts, reply channels,
-parallel execution and async I/O are not implemented. A mailbox holds at most
-100,000 pending messages and one `runActors()` call delivers at most 100,000;
-an endless handler still blocks this cooperative scheduler.
+actors continue; an unsupervised crash is returned as `Err`. Ordinary `Result`
+failures remain application values, separate from actor crashes.
+
+`oneForOne(maxRestarts, windowMilliseconds) -> Supervisor` creates a
+supervisor. `maxRestarts` must be from 0 through 1,000 and the time window must
+be positive. `supervisor.start(Actor(...))` starts a child and returns its
+`ActorRef`; the constructor arguments are retained as transferable values so a
+restart can rebuild fresh actor state. After a handler crash, the supervisor
+drops the failed actor's pending mailbox and restarts only that child. The
+reference remains valid and `isAlive()` becomes true after a successful
+restart. Restart attempts across all children share the configured limit and
+use a monotonic clock; events exactly on the window boundary still count.
+Exceeding the limit fails the supervisor, stops its children and makes
+`runActors()` return `Err`. A child's explicit `stop()` is graceful and does not
+trigger a restart. `supervisor.stop()` stops all children and
+`supervisor.isAlive()` reports the supervisor lifecycle. A stopped or failed
+supervisor cannot start new children. The current strategy is only
+`one_for_one`; `one_for_all` and `rest_for_one` are not implemented.
+
+Supervised restarts are recoveries: `runActors()` returns `Ok` when a crashing
+child was successfully restarted. An exhausted restart limit is a runtime
+failure reported as `Err`. Restarting reconstructs the child's state from its
+initial constructor arguments; it does not restore the state at the moment of
+the crash. A mailbox holds at most 100,000 pending messages and one
+`runActors()` call delivers at most 100,000. The round-robin scheduler is
+cooperative rather than parallel or preemptive; a handler that does not return
+can block every actor and the runtime.
 
 ## JSON values
 
@@ -501,13 +521,13 @@ limit (or the bootstrap host stack limit, if reached sooner).
 `tyvera run file.tyv` checks and interprets the AST.
 
 Current limits: classes, interfaces and the deterministic cooperative actor
-slice are supported, but there is no
+runtime with bounded `one_for_one` supervision are supported, but there is no
 inheritance, generic methods/interfaces/constraints, collection literals,
-`try`/`catch`, actor supervisors/restarts, parallel process scheduling, async runtime,
+`try`/`catch`, reply channels, parallel process scheduling, async runtime,
 networking API, importable standard-library modules, external secret-store
-provider, native interop, garbage collector
-implementation, package manager or Discord SDK. No compiler backend or
-performance claim. No termination checking or loop execution budget; users can
-write infinite loops. Parsing and execution use the host stack, so extremely
-deeply nested source is not supported. The interpreter is replaceable bootstrap
-technology, not part of Tyvera semantics.
+provider, native interop, garbage collector implementation, package manager or
+compiler backend. No performance claim is made. No termination checking or
+loop execution budget is provided; users can write infinite loops. Parsing and
+execution use the host stack, so extremely deeply nested source is not
+supported. The interpreter is replaceable bootstrap technology, not part of
+Tyvera semantics.

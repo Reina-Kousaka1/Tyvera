@@ -16,7 +16,7 @@ These core types and functions are currently available without an import:
 | Text I/O | `readText`, `writeText`, `pathJoin`, `pathExists`, `println`, and `eprintln`; file errors use `Result`. |
 | Secrets | `secrets.NAME` reads `.tyvera.secrets` before the process environment and returns `Option<Secret<String>>`; `Secret.reveal()` is explicit. |
 | `Json` | `parseJson(String) -> Result<Json,String>`, `jsonStringify(Json) -> Result<String,String>`, typed constructors, and optional accessors for JSON values. |
-| Actor runtime | `spawn(Actor(...)) -> ActorRef<Actor>`, handler calls that enqueue typed messages, `runActors() -> Result<Int,String>`, `ActorRef.isAlive()` and `ActorRef.stop()`. The scheduler is cooperative and deterministic. |
+| Actor runtime | `spawn(Actor(...)) -> ActorRef<Actor>`, `oneForOne(maxRestarts, windowMilliseconds) -> Supervisor`, `Supervisor.start(Actor(...))`, `Supervisor.stop()`/`isAlive()`, handler calls that enqueue typed messages, `runActors() -> Result<Int,String>`, and `ActorRef.isAlive()`/`stop()`. Scheduling is cooperative and deterministic; supervised restarts rebuild child state from constructor arguments. |
 
 See [the language reference](language.md#core-collections-and-iteration) for
 collection signatures, key restrictions, ordering, mutation and runtime error

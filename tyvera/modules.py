@@ -113,7 +113,7 @@ class ModuleLoader:
 
     @staticmethod
     def _declarations(module: _Module) -> dict[str, tuple[str, object]]:
-        builtin_functions = {"println", "eprintln", "readText", "writeText", "pathJoin", "pathExists", "spawn", "runActors"}
+        builtin_functions = {"println", "eprintln", "readText", "writeText", "pathJoin", "pathExists", "spawn", "runActors", "oneForOne"}
         declarations: dict[str, tuple[str, object]] = {}
         all_declarations = [
             *(('function', declaration) for declaration in module.program.functions),
@@ -122,7 +122,7 @@ class ModuleLoader:
             *(('actor', declaration) for declaration in module.program.actors),
         ]
         for kind, declaration in all_declarations:
-            if declaration.name in {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json", "ActorRef"}:
+            if declaration.name in {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json", "ActorRef", "Supervisor"}:
                 raise Diagnostic(declaration.location, "type", f"type name '{declaration.name}' is reserved")
             if declaration.name == "secrets":
                 raise Diagnostic(declaration.location, "type", "'secrets' is a reserved namespace")
@@ -154,7 +154,7 @@ class ModuleLoader:
             for declaration in module.program.imports:
                 path = (module.path.parent / declaration.path).resolve()
                 imported = self.modules[path]
-                if declaration.alias in {"secrets", "println", "eprintln", "readText", "writeText", "pathJoin", "pathExists", "spawn", "runActors"}:
+                if declaration.alias in {"secrets", "println", "eprintln", "readText", "writeText", "pathJoin", "pathExists", "spawn", "runActors", "oneForOne", "Supervisor"}:
                     raise Diagnostic(declaration.location, "module", f"'{declaration.alias}' is a reserved name")
                 if declaration.alias in imports:
                     raise Diagnostic(declaration.location, "module", f"import alias '{declaration.alias}' is already declared")

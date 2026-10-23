@@ -41,11 +41,11 @@ from .source import Diagnostic, Location
 from .type_names import make_type, split_type, substitute_type
 
 
-_BUILTIN_TYPES = {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json", "ActorRef"}
+_BUILTIN_TYPES = {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json", "ActorRef", "Supervisor"}
 _BUILTIN_FUNCTIONS = {
     "println", "eprintln", "readText", "writeText", "pathJoin", "pathExists",
     "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool",
-    "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors",
+    "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors", "oneForOne",
 }
 _DISPLAYABLE_TYPES = {"Int", "Float", "Bool", "String"}
 _NUMERIC_TYPES = {"Int", "Float"}
@@ -509,6 +509,12 @@ class TypeChecker:
                     raise Diagnostic(expression.location, "type", "'runActors' expects no arguments")
                 return "Result<Int,String>"
             argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
+            if expression.callee == "oneForOne":
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'oneForOne' does not accept type arguments")
+                self._check_arguments(expression.arguments, argument_types, ("Int", "Int"),
+                                      expression.location, "oneForOne")
+                return "Supervisor"
             if expression.callee == "println":
                 if expression.type_arguments:
                     raise Diagnostic(expression.location, "type", "'println' does not accept type arguments")
@@ -604,10 +610,36 @@ class TypeChecker:
             if expression.type_arguments:
                 raise Diagnostic(expression.location, "type", "generic methods are not supported yet")
             receiver_type = self._expression_type(expression.receiver, variables, owner)
-            argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
             if expression.method == "init":
                 raise Diagnostic(expression.location, "type", "constructors can only run when creating an instance")
             receiver_base, receiver_arguments = split_type(receiver_type)
+            if receiver_base == "Supervisor":
+                if receiver_arguments:
+                    raise Diagnostic(expression.location, "type", "Supervisor does not accept type arguments")
+                if expression.method == "start":
+                    if len(expression.arguments) != 1 or not isinstance(expression.arguments[0], Call):
+                        raise Diagnostic(expression.location, "type", "Supervisor.start expects one actor construction, for example supervisor.start(Counter(0))")
+                    construction = expression.arguments[0]
+                    actor = self.actors.get(construction.callee)
+                    if actor is None:
+                        raise Diagnostic(construction.location, "type", f"'{construction.callee}' is not an actor type")
+                    if construction.type_arguments:
+                        raise Diagnostic(construction.location, "type", "actor types do not accept type arguments")
+                    constructor = actor.methods.get("init")
+                    expected = () if constructor is None else constructor.parameter_types
+                    argument_types = [self._expression_type(argument, variables, owner)
+                                      for argument in construction.arguments]
+                    self._check_arguments(construction.arguments, argument_types, expected,
+                                          construction.location, f"{construction.callee} actor constructor")
+                    return f"ActorRef<{construction.callee}>"
+                if expression.method in {"stop", "isAlive"}:
+                    argument_types = [self._expression_type(argument, variables, owner)
+                                      for argument in expression.arguments]
+                    self._check_arguments(expression.arguments, argument_types, (), expression.location,
+                                          f"Supervisor.{expression.method}")
+                    return "Void" if expression.method == "stop" else "Bool"
+                raise Diagnostic(expression.location, "type", f"Supervisor has no method '{expression.method}'")
+            argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
             if receiver_base == "Secret" and expression.method == "reveal":
                 if expression.arguments:
                     raise Diagnostic(expression.location, "type", "Secret.reveal() expects no arguments")
