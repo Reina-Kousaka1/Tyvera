@@ -3,6 +3,7 @@ from __future__ import annotations
 from .ast import (
     Assignment,
     Binary,
+    BindingPattern,
     Block,
     ClassDeclaration,
     Call,
@@ -17,6 +18,9 @@ from .ast import (
     LetStatement,
     Literal,
     LoopControl,
+    LiteralPattern,
+    MatchArm,
+    MatchStatement,
     MemberAccess,
     MemberCall,
     Method,
@@ -27,6 +31,8 @@ from .ast import (
     ReturnStatement,
     Statement,
     Unary,
+    VariantPattern,
+    WildcardPattern,
     WhileStatement,
 )
 from .source import Diagnostic
@@ -247,6 +253,8 @@ class Parser:
             self._expect("IN", "expected 'in' after the loop variable")
             iterable = self._expression()
             return ForStatement(name.lexeme, iterable, self._block(), token.location)
+        if self._match("MATCH"):
+            return self._match_statement(self._previous())
         if self._match("BREAK", "CONTINUE"):
             return LoopControl(self._previous().lexeme, self._previous().location)
         if self._check("LBRACE"):
@@ -367,6 +375,56 @@ class Parser:
             self._expect("RPAREN", "expected ')' after expression")
             return expression
         self._error(token, "expected an expression")
+
+    def _match_statement(self, token: Token) -> MatchStatement:
+        value = self._expression()
+        self._expect("LBRACE", "expected '{' after match value")
+        arms: list[MatchArm] = []
+        self._skip_separators()
+        while not self._check_any("RBRACE", "EOF"):
+            pattern = self._pattern()
+            self._expect("FAT_ARROW", "expected '=>' after match pattern")
+            if self._check("LBRACE"):
+                body = self._block()
+            else:
+                body = [self._statement()]
+            arms.append(MatchArm(pattern, body, pattern.location))
+            if not self._check_any("NEWLINE", "SEMICOLON", "RBRACE", "EOF"):
+                self._error(self._current(), "expected a line break after match arm")
+            self._skip_separators()
+        self._expect("RBRACE", "expected '}' after match arms")
+        if not arms:
+            self._error(token, "match must contain at least one arm")
+        return MatchStatement(value, arms, token.location)
+
+    def _pattern(self):
+        token = self._current()
+        if token.kind == "MINUS":
+            self._advance()
+            number = self._advance()
+            if number.kind not in {"INTEGER", "FLOAT"}:
+                self._error(number, "expected a numeric literal after '-' in pattern")
+            type_name = "Int" if number.kind == "INTEGER" else "Float"
+            return LiteralPattern(-number.value, type_name, token.location)
+        if token.kind in {"INTEGER", "FLOAT", "STRING", "TRUE", "FALSE"}:
+            self._advance()
+            value = token.value if token.kind in {"INTEGER", "FLOAT", "STRING"} else token.kind == "TRUE"
+            type_name = {"INTEGER": "Int", "FLOAT": "Float", "STRING": "String",
+                         "TRUE": "Bool", "FALSE": "Bool"}[token.kind]
+            return LiteralPattern(value, type_name, token.location)
+        if token.kind == "IDENTIFIER":
+            self._advance()
+            if token.lexeme == "_":
+                return WildcardPattern(token.location)
+            if self._match("LPAREN"):
+                if token.lexeme == "None":
+                    self._error(token, "None pattern does not take a payload")
+                binding_token = self._expect("IDENTIFIER", "expected a binding or '_' inside variant pattern")
+                binding = None if binding_token.lexeme == "_" else binding_token.lexeme
+                self._expect("RPAREN", "expected ')' after variant pattern")
+                return VariantPattern(token.lexeme, binding, token.location)
+            return BindingPattern(token.lexeme, token.location)
+        self._error(token, "expected a literal, wildcard, binding, or variant pattern")
 
     def _call(self, callee: Name, type_arguments: list[str] | None = None) -> Call:
         self._expect("LPAREN", "expected '(' after function name")

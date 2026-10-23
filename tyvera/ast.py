@@ -133,6 +133,49 @@ class ForStatement(Statement):
 
 
 @dataclass(slots=True)
+class MatchStatement(Statement):
+    value: Expression
+    arms: list[MatchArm]
+    location: Location
+
+
+class Pattern:
+    location: Location
+
+
+@dataclass(slots=True)
+class LiteralPattern(Pattern):
+    value: Any
+    type_name: str
+    location: Location
+
+
+@dataclass(slots=True)
+class WildcardPattern(Pattern):
+    location: Location
+
+
+@dataclass(slots=True)
+class BindingPattern(Pattern):
+    name: str
+    location: Location
+
+
+@dataclass(slots=True)
+class VariantPattern(Pattern):
+    variant: str
+    binding: str | None
+    location: Location
+
+
+@dataclass(slots=True)
+class MatchArm:
+    pattern: Pattern
+    body: list[Statement]
+    location: Location
+
+
+@dataclass(slots=True)
 class LoopControl(Statement):
     kind: str
     location: Location

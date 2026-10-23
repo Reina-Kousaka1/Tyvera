@@ -73,7 +73,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         entry, root, label = _entry_and_root(arguments.path)
         program, _ = compile_project(entry, root)
         if arguments.command == "run":
-            Interpreter(program, sys.stdout).run()
+            Interpreter(program, sys.stdout, project_root=root, error_output=sys.stderr).run()
         else:
             print(f"checked {label}")
     except Diagnostic as error:

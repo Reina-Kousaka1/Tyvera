@@ -47,8 +47,9 @@ assignment  = identifier "=" expression ;
 field-set   = expression "." identifier "=" expression ;
 conditional = "if" expression block ["else" (block | conditional)] ;
 loop        = "while" expression block | for-loop ;
+match       = "match" expression "{" {pattern "=>" (block | statement)} "}" ;
 return      = "return" [expression] ;
-statement   = declaration | assignment | field-set | conditional | loop | return
+statement   = declaration | assignment | field-set | conditional | loop | match | return
             | "break" | "continue" | block | function-call ;
 for-loop    = "for" identifier "in" expression block ;
 function    = "fn" identifier ["<" identifier {"," identifier} ">"] "(" [parameters] ")" ["->" type] block ;
@@ -60,6 +61,7 @@ method-signature = "fn" identifier "(" [parameters] ")" ["->" type] ;
 type-list   = identifier {"," identifier} ;
 parameters  = identifier ":" type {"," identifier ":" type} ;
 type        = identifier {"." identifier} ["<" type {"," type} ">"] ;
+pattern     = literal | "_" | identifier | ("Some" | "Ok" | "Err") "(" [identifier | "_"] ")" | "None" ;
 ```
 
 Assignments are statements, not expressions. Function and method calls can be
@@ -235,16 +237,15 @@ fn main() {
 }
 ```
 
-`List<T>` supports `append(T)`, `insert(Int,T)`, `get(Int) -> T`,
-`set(Int,T)`, `removeAt(Int) -> T`, `contains(T) -> Bool`, `clear()` and the
-read-only `.length` property. Indexes are zero-based; invalid reads, writes,
-insertions and removals produce runtime diagnostics.
+`List<T>` supports `append(T)`, `insert(Int,T)`, `get(Int) -> Option<T>`,
+`set(Int,T)`, `removeAt(Int) -> Option<T>`, `contains(T) -> Bool`, `clear()`
+and the read-only `.length` property. Indexes are zero-based; missing reads and
+removals return `None`; invalid writes or insertions produce runtime diagnostics.
 
-`Map<K,V>` supports `put(K,V)`, `get(K) -> V`, `remove(K) -> Bool`,
+`Map<K,V>` supports `put(K,V)`, `get(K) -> Option<V>`, `remove(K) -> Option<V>`,
 `containsKey(K) -> Bool`, `keys() -> List<K>`, `values() -> List<V>`,
 `clear()` and read-only `.length`. Keys must be primitive values or class/
-interface references. `get` on a missing key is a runtime diagnostic for now;
-the planned `Option<V>` model will make that outcome explicit. Iterating a map
+interface references. Iterating a map
 visits keys in insertion order. A `for` loop evaluates its collection once and
 iterates a snapshot, so mutations during the loop do not alter its current
 iteration. Loop bindings are immutable and scoped to the loop body; `break`
@@ -253,6 +254,62 @@ and cannot by itself satisfy a non-`Void` function's return-path requirement.
 
 These core types are available without an import. A separately packaged
 `tyvera.collections` module is not implemented yet.
+
+## Optional and result values
+
+`Option<T>` represents either a present `Some(value)` or absent `None`; `Result<T,E>`
+represents success `Ok(value)` or expected failure `Err(error)`. Their payload
+types are statically checked. `Some(value)` infers `T`; `None<T>()` needs an
+explicit type argument. `Ok<T,E>(value)` and `Err<T,E>(error)` use explicit
+type arguments because the unused side cannot be inferred. `Void` is not a
+valid payload type.
+
+These are ordinary values. A failed `Result` is an expected application
+outcome, not a runtime failure or process crash. The interpreter does not
+automatically unwrap either type.
+
+## Pattern matching
+
+`match` is a statement; each arm has a pattern and a statement or block body.
+Supported patterns are primitive literals, `_`, a binding name, and the
+`Some(value)`, `None`, `Ok(value)`, `Err(error)` variants. A binding is immutable
+and visible only in its arm. Literal types must exactly match the subject type.
+Option/Result and Bool matches are checked for exhaustiveness; other types may
+use a wildcard/binding default. A non-exhaustive match simply executes no arm
+when no pattern matches. Duplicate cases and arms after exhaustive coverage
+are errors.
+
+```tyv
+match response {
+    Ok(value) => println(value)
+    Err(message) => println(message)
+}
+```
+
+This is a first sum-type slice; destructuring nested values, guards, and
+message-pattern matching are not implemented.
+
+## Text I/O, paths and secrets
+
+The bootstrap core provides `readText(path) -> Result<String,String>`,
+`writeText(path, contents) -> Result<Bool,String>`, `pathJoin(left,right) ->
+String`, `pathExists(path) -> Bool`, `println` and `eprintln`. Relative file
+paths resolve from the project root. I/O failures return `Err` values; file
+contents and operating-system error details are not copied into the error
+message. Path joining follows the host platform's path rules. The text-file
+API cannot read or overwrite the project `.tyvera.secrets` file.
+
+The built-in namespace `secrets.NAME` returns `Option<Secret<String>>`. The
+local provider reads `.tyvera.secrets` first, then checks the process
+environment. The local file uses one `NAME = "JSON-escaped string"` entry per
+line; malformed files produce a generic, value-redacted runtime diagnostic.
+The file is gitignored; `.tyvera.secrets.example` may be committed. `Secret<T>`
+cannot be passed to `println`/`eprintln`, concatenated with strings, or
+implicitly converted. The explicit `secret.reveal()` method returns the value
+as `T`; applications should pass the wrapper to trusted APIs and only reveal
+it when needed. Secret values are redacted from the wrapper's representation
+and are never included in provider diagnostics. External secret stores are not
+implemented; the provider boundary is the extension point.
 
 ## Modules and projects
 
@@ -350,9 +407,8 @@ limit (or the bootstrap host stack limit, if reached sooner).
 
 Current limits: classes and interfaces are supported, but there is no
 inheritance, generic methods/interfaces/constraints, collection literals,
-Option/Result, pattern matching, `try`/`catch`, actor/process model, messaging,
-supervisor, async/I/O or networking API, JSON library, environment-variable
-or secret API, native interop, garbage collector
+`try`/`catch`, actor/process model, messaging, supervisor, async runtime,
+networking API, JSON library, external secret-store provider, native interop, garbage collector
 implementation, package manager or Discord SDK. No compiler backend or
 performance claim. No termination checking or loop execution budget; users can
 write infinite loops. Parsing and execution use the host stack, so extremely

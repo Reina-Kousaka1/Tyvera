@@ -20,6 +20,9 @@ from .ast import (
     LetStatement,
     Literal,
     LoopControl,
+    BindingPattern,
+    LiteralPattern,
+    MatchStatement,
     MemberAccess,
     MemberCall,
     Method,
@@ -29,13 +32,16 @@ from .ast import (
     ReturnStatement,
     Statement,
     Unary,
+    VariantPattern,
+    WildcardPattern,
     WhileStatement,
 )
 from .source import Diagnostic, Location
 from .type_names import make_type, split_type, substitute_type
 
 
-_BUILTIN_TYPES = {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map"}
+_BUILTIN_TYPES = {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret"}
+_BUILTIN_FUNCTIONS = {"println", "eprintln", "readText", "writeText", "pathJoin", "pathExists"}
 _DISPLAYABLE_TYPES = {"Int", "Float", "Bool", "String"}
 _NUMERIC_TYPES = {"Int", "Float"}
 INT_MIN = -(1 << 63)
@@ -82,7 +88,7 @@ class TypeChecker:
         self.classes: dict[str, ClassInfo] = {}
         self.interfaces: dict[str, InterfaceInfo] = {}
         self.type_names: set[str] = set(_BUILTIN_TYPES)
-        self.generic_arities: dict[str, int] = {"List": 1, "Map": 2}
+        self.generic_arities: dict[str, int] = {"List": 1, "Map": 2, "Option": 1, "Result": 2, "Secret": 1}
         self.active_type_variables: set[str] = set()
 
     def check(self) -> dict[str, Signature]:
@@ -111,6 +117,8 @@ class TypeChecker:
     def _collect_types(self) -> None:
         names: dict[str, Location] = {}
         for declaration in [*self.program.classes, *self.program.interfaces]:
+            if declaration.name == "secrets":
+                raise Diagnostic(declaration.location, "type", "'secrets' is a reserved namespace")
             if declaration.name in _BUILTIN_TYPES:
                 raise Diagnostic(declaration.location, "type", f"type name '{declaration.name}' is reserved")
             if declaration.name in names:
@@ -155,8 +163,10 @@ class TypeChecker:
     def _collect_signatures(self) -> None:
         all_names = set(self.classes) | set(self.interfaces)
         for function in self.program.functions:
-            if function.name == "println":
-                raise Diagnostic(function.location, "type", "'println' is a built-in function name")
+            if function.name in _BUILTIN_FUNCTIONS:
+                raise Diagnostic(function.location, "type", f"'{function.name}' is a built-in function name")
+            if function.name == "secrets":
+                raise Diagnostic(function.location, "type", "'secrets' is a reserved namespace")
             if function.name in all_names or function.name in self.signatures:
                 raise Diagnostic(function.location, "type", f"function or type '{function.name}' is already declared")
             self.signatures[function.name] = self._method_signature(function)
@@ -182,8 +192,10 @@ class TypeChecker:
         for parameter in function.parameters:
             if parameter.name == "self":
                 raise Diagnostic(parameter.location, "type", "'self' is reserved for the current instance")
-            if parameter.name == "println":
-                raise Diagnostic(parameter.location, "type", "'println' is reserved for the built-in function")
+            if parameter.name in _BUILTIN_FUNCTIONS:
+                raise Diagnostic(parameter.location, "type", f"'{parameter.name}' is reserved for a built-in function")
+            if parameter.name == "secrets":
+                raise Diagnostic(parameter.location, "type", "'secrets' is a reserved namespace")
             if parameter.name in parameter_names:
                 raise Diagnostic(parameter.location, "type", f"parameter '{parameter.name}' is declared more than once")
             parameter_names.add(parameter.name)
@@ -283,6 +295,10 @@ class TypeChecker:
             if isinstance(statement, LetStatement):
                 if statement.name == "println":
                     raise Diagnostic(statement.location, "type", "'println' is reserved for the built-in function")
+                if statement.name in _BUILTIN_FUNCTIONS:
+                    raise Diagnostic(statement.location, "type", f"'{statement.name}' is reserved for a built-in function")
+                if statement.name == "secrets":
+                    raise Diagnostic(statement.location, "type", "'secrets' is a reserved namespace")
                 if statement.name == "self":
                     raise Diagnostic(statement.location, "type", "'self' is reserved for the current instance")
                 if statement.name in variables.maps[0]:
@@ -340,7 +356,7 @@ class TypeChecker:
                 if not literal or not statement.condition.value or "break" in body_exits:
                     exits.add("next")
             elif isinstance(statement, ForStatement):
-                if statement.name in {"self", "println"}:
+                if statement.name in {"self", "secrets", *_BUILTIN_FUNCTIONS}:
                     raise Diagnostic(statement.location, "type", f"'{statement.name}' is reserved and cannot be a loop variable")
                 iterable_type = self._expression_type(statement.iterable, variables, owner)
                 iterable_base, iterable_arguments = split_type(iterable_type)
@@ -354,6 +370,36 @@ class TypeChecker:
                 loop_variables[statement.name] = Binding(element_type)
                 body_exits = self._check_block(statement.body, loop_variables, return_type, loop_depth + 1, owner, method_name)
                 exits = {"next"} | (body_exits & {"return"})
+            elif isinstance(statement, MatchStatement):
+                subject_type = self._expression_type(statement.value, variables, owner)
+                exits = set()
+                seen: set[tuple[object, ...]] = set()
+                coverage: set[str] = set()
+                has_catchall = False
+                for arm in statement.arms:
+                    pattern = arm.pattern
+                    if has_catchall:
+                        raise Diagnostic(pattern.location, "type", "match arm is unreachable after a wildcard or binding pattern")
+                    if self._match_is_exhaustive(subject_type, coverage, has_catchall):
+                        raise Diagnostic(pattern.location, "type", "match arm is unreachable after exhaustive patterns")
+                    key = self._check_pattern(pattern, subject_type, variables)
+                    if key in seen:
+                        raise Diagnostic(pattern.location, "type", "duplicate match pattern")
+                    seen.add(key)
+                    if key and key[0] == "variant":
+                        coverage.add(str(key[1]))
+                    if key and key[0] == "literal" and key[1] == "Bool":
+                        coverage.add("true" if key[2] else "false")
+                    if key and key[0] == "catchall":
+                        has_catchall = True
+                    arm_variables = variables.new_child()
+                    if isinstance(pattern, BindingPattern):
+                        arm_variables[pattern.name] = Binding(subject_type)
+                    elif isinstance(pattern, VariantPattern) and pattern.binding is not None:
+                        arm_variables[pattern.binding] = Binding(self._variant_payload_type(pattern, subject_type))
+                    exits |= self._check_block(arm.body, arm_variables, return_type, loop_depth, owner, method_name)
+                if not self._match_is_exhaustive(subject_type, coverage, has_catchall):
+                    exits.add("next")
             elif isinstance(statement, LoopControl):
                 if not loop_depth:
                     raise Diagnostic(statement.location, "type", f"'{statement.kind}' is only valid inside a loop")
@@ -388,8 +434,24 @@ class TypeChecker:
                 if len(argument_types) != 1:
                     raise Diagnostic(expression.location, "type", "'println' expects exactly one argument")
                 if argument_types[0] not in _DISPLAYABLE_TYPES:
-                    raise Diagnostic(expression.arguments[0].location, "type", "'println' cannot display a Void value")
+                    raise Diagnostic(expression.arguments[0].location, "type", f"'println' accepts Int, Float, Bool, or String, found {argument_types[0]}")
                 return "Void"
+            if expression.callee == "eprintln":
+                self._check_output_call(expression, argument_types)
+                return "Void"
+            if expression.callee in {"readText", "writeText", "pathJoin", "pathExists"}:
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", f"'{expression.callee}' does not accept type arguments")
+                signatures = {
+                    "readText": (("String",), "Result<String,String>"),
+                    "writeText": (("String", "String"), "Result<Bool,String>"),
+                    "pathJoin": (("String", "String"), "String"),
+                    "pathExists": (("String",), "Bool"),
+                }
+                parameter_types, result_type = signatures[expression.callee]
+                self._check_arguments(expression.arguments, argument_types, parameter_types,
+                                      expression.location, expression.callee)
+                return result_type
             if expression.callee in {"List", "Map"}:
                 arity = self.generic_arities[expression.callee]
                 if len(expression.type_arguments) != arity:
@@ -399,6 +461,19 @@ class TypeChecker:
                 if expression.arguments:
                     raise Diagnostic(expression.location, "type", f"'{expression.callee}' currently constructs an empty collection and takes no value arguments")
                 return collection_type
+            if expression.callee in {"Some", "None", "Ok", "Err"}:
+                constructor_types = {
+                    "Some": (("T",), ("T",), "Option<T>"),
+                    "None": (("T",), (), "Option<T>"),
+                    "Ok": (("T", "E"), ("T",), "Result<T,E>"),
+                    "Err": (("T", "E"), ("E",), "Result<T,E>"),
+                }
+                type_parameters, formal_types, result_type = constructor_types[expression.callee]
+                substitutions = self._resolve_type_arguments(
+                    type_parameters, expression.type_arguments, formal_types, argument_types,
+                    expression.arguments, expression.location, expression.callee,
+                )
+                return substitute_type(result_type, substitutions)
             class_info = self.classes.get(expression.callee)
             if class_info is not None:
                 constructor = class_info.methods.get("init")
@@ -431,6 +506,12 @@ class TypeChecker:
             if expression.method == "init":
                 raise Diagnostic(expression.location, "type", "constructors can only run when creating an instance")
             receiver_base, receiver_arguments = split_type(receiver_type)
+            if receiver_base == "Secret" and expression.method == "reveal":
+                if expression.arguments:
+                    raise Diagnostic(expression.location, "type", "Secret.reveal() expects no arguments")
+                if len(receiver_arguments) != 1:
+                    raise Diagnostic(expression.location, "type", "Secret requires one type argument")
+                return receiver_arguments[0]
             if receiver_base in {"List", "Map"}:
                 signature = self._collection_method(receiver_base, receiver_arguments, expression.method, expression.location)
                 substitutions = {}
@@ -478,6 +559,10 @@ class TypeChecker:
     def _member_field(
         self, expression: MemberAccess, variables: ChainMap[str, Binding], owner: ClassInfo | None,
     ) -> tuple[str, Field]:
+        if isinstance(expression.receiver, Name) and expression.receiver.identifier == "secrets":
+            if not expression.member[0].isupper() or expression.member != expression.member.upper():
+                raise Diagnostic(expression.location, "type", "secret names must use uppercase letters, digits, and underscores")
+            return "Option<Secret<String>>", Field(expression.member, "Option<Secret<String>>", False, expression.location)
         receiver_type = self._expression_type(expression.receiver, variables, owner)
         receiver_base, receiver_arguments = split_type(receiver_type)
         if receiver_base in {"List", "Map"} and expression.member == "length":
@@ -493,6 +578,14 @@ class TypeChecker:
         else:
             substitutions = {}
         return canonical_type(substitute_type(field.type_name, substitutions)), field
+
+    def _check_output_call(self, expression: Call, argument_types: list[str]) -> None:
+        if expression.type_arguments:
+            raise Diagnostic(expression.location, "type", f"'{expression.callee}' does not accept type arguments")
+        if len(argument_types) != 1:
+            raise Diagnostic(expression.location, "type", f"'{expression.callee}' expects exactly one argument")
+        if argument_types[0] not in _DISPLAYABLE_TYPES:
+            raise Diagnostic(expression.arguments[0].location, "type", f"'{expression.callee}' accepts Int, Float, Bool, or String, found {argument_types[0]}")
 
     def _resolve_type_arguments(
         self, type_parameters: tuple[str, ...], explicit: list[str], formal_types: tuple[str, ...],
@@ -538,9 +631,9 @@ class TypeChecker:
             signatures = {
                 "append": (("T",), "Void"),
                 "insert": (("Int", "T"), "Void"),
-                "get": (("Int",), "T"),
+                "get": (("Int",), "Option<T>"),
                 "set": (("Int", "T"), "Void"),
-                "removeAt": (("Int",), "T"),
+                "removeAt": (("Int",), "Option<T>"),
                 "contains": (("T",), "Bool"),
                 "clear": ((), "Void"),
             }
@@ -553,8 +646,8 @@ class TypeChecker:
             key_type, value_type = type_arguments
             signatures = {
                 "put": (("K", "V"), "Void"),
-                "get": (("K",), "V"),
-                "remove": (("K",), "Bool"),
+                "get": (("K",), "Option<V>"),
+                "remove": (("K",), "Option<V>"),
                 "containsKey": (("K",), "Bool"),
                 "keys": ((), "List<K>"),
                 "values": ((), "List<V>"),
@@ -567,6 +660,56 @@ class TypeChecker:
             substitutions = {"K": key_type, "V": value_type}
         return Signature(tuple(substitute_type(item, substitutions) for item in params),
                          substitute_type(result, substitutions), location)
+
+    def _check_pattern(self, pattern, subject_type: str, variables: ChainMap[str, Binding]) -> tuple[object, ...]:
+        if isinstance(pattern, WildcardPattern):
+            return ("catchall",)
+        if isinstance(pattern, BindingPattern):
+            if pattern.name in {"self", "secrets", *_BUILTIN_FUNCTIONS}:
+                raise Diagnostic(pattern.location, "type", f"'{pattern.name}' is reserved and cannot be a pattern binding")
+            return ("catchall",)
+        if isinstance(pattern, LiteralPattern):
+            if pattern.type_name == "Int" and not INT_MIN <= pattern.value <= INT_MAX:
+                raise Diagnostic(pattern.location, "type", "Int pattern is outside the signed 64-bit range")
+            if pattern.type_name != subject_type:
+                raise Diagnostic(pattern.location, "type", f"pattern has type {pattern.type_name}, but match value has type {subject_type}")
+            return ("literal", pattern.type_name, pattern.value)
+        if isinstance(pattern, VariantPattern):
+            base, arguments = split_type(subject_type)
+            if base == "Option" and len(arguments) == 1:
+                if pattern.variant not in {"Some", "None"}:
+                    raise Diagnostic(pattern.location, "type", f"Option<{arguments[0]}> has no pattern '{pattern.variant}'")
+                if pattern.variant == "None" and pattern.binding is not None:
+                    raise Diagnostic(pattern.location, "type", "None pattern does not bind a value")
+            elif base == "Result" and len(arguments) == 2:
+                if pattern.variant not in {"Ok", "Err"}:
+                    raise Diagnostic(pattern.location, "type", f"Result<{arguments[0]},{arguments[1]}> has no pattern '{pattern.variant}'")
+            else:
+                raise Diagnostic(pattern.location, "type", f"variant patterns require Option or Result, found {subject_type}")
+            if pattern.binding in {"self", "secrets", *_BUILTIN_FUNCTIONS}:
+                raise Diagnostic(pattern.location, "type", f"'{pattern.binding}' is reserved and cannot be a pattern binding")
+            return ("variant", pattern.variant)
+        raise AssertionError(f"unhandled pattern node: {type(pattern).__name__}")
+
+    @staticmethod
+    def _variant_payload_type(pattern: VariantPattern, subject_type: str) -> str:
+        base, arguments = split_type(subject_type)
+        if base == "Option":
+            return arguments[0]
+        return arguments[0] if pattern.variant == "Ok" else arguments[1]
+
+    @staticmethod
+    def _match_is_exhaustive(subject_type: str, coverage: set[str], catchall: bool) -> bool:
+        if catchall:
+            return True
+        base, _ = split_type(subject_type)
+        if base == "Option":
+            return {"Some", "None"} <= coverage
+        if base == "Result":
+            return {"Ok", "Err"} <= coverage
+        if subject_type == "Bool":
+            return {"true", "false"} <= coverage
+        return False
 
     def _infer_type_arguments(
         self, formal: str, actual: str, parameters: set[str], substitutions: dict[str, str],
@@ -727,6 +870,18 @@ class TypeChecker:
                         following.append((initialized, "next"))
                         following.extend((state, "return") for state, kind in body_states if kind == "return")
                         following.extend((state, "next") for state, kind in body_states if kind == "break")
+                    elif isinstance(statement, MatchStatement):
+                        reads(statement.value, initialized)
+                        for arm in statement.arms:
+                            following.extend(flow(arm.body, [(initialized, "next")], loop_depth))
+                        patterns = [arm.pattern for arm in statement.arms]
+                        exhaustive = any(isinstance(item, (WildcardPattern, BindingPattern)) for item in patterns)
+                        variants = {item.variant for item in patterns if isinstance(item, VariantPattern)}
+                        literals = {(item.type_name, item.value) for item in patterns if isinstance(item, LiteralPattern)}
+                        exhaustive |= {"Some", "None"} <= variants or {"Ok", "Err"} <= variants
+                        exhaustive |= {("Bool", True), ("Bool", False)} <= literals
+                        if not exhaustive:
+                            following.append((initialized, "next"))
                     elif isinstance(statement, ExpressionStatement):
                         reads(statement.expression, initialized)
                         following.append((initialized, "next"))

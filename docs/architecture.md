@@ -62,6 +62,16 @@ and `--version`. The implementation uses Python's standard library only.
   iteration element types. A `for` evaluates its collection once and the
   runtime iterates an immutable snapshot, so mutation during iteration is
   deterministic.
+- `Option<T>` and `Result<T,E>` are tagged Tyvera values. `match` checks
+  literal and variant pattern types, arm scopes, duplicate coverage, and
+  exhaustiveness for `Bool`, `Option` and `Result`. These ordinary error values
+  remain separate from runtime diagnostics and future actor crashes.
+- Text I/O returns `Result` values and path operations are explicit core
+  functions. `SecretProvider` reads project-local secrets first and falls back
+  to the process environment. The interpreter wraps loaded values in a
+  redacted `Secret<String>`; `println`/`eprintln` reject the wrapper, and only
+  `reveal()` removes it. Generic text I/O blocks the configured local secrets
+  file from reads and writes.
 - Constructors are named `init` and return `Void`. Classes with fields must
   define one. A path-sensitive constructor analysis ensures fields have been
   initialized before a successful return; it checks immutable assignment,
@@ -81,9 +91,9 @@ module-qualified names before the existing semantic checker sees the linked
 program. Imports are relative `.tyv` files, aliases are explicit, `pub` is
 required for cross-module access, and paths cannot escape the project root.
 The manifest currently has only `name` and `entry`; dependencies are not yet
-supported. Calls still execute synchronously in one process. Option/Result,
-pattern matching, error handling, actors, supervisors, async I/O, JSON and
-environment/secret access are not implemented. These boundaries are reflected in the
+supported. Calls still execute synchronously in one process. `try`/`catch`,
+actors, supervisors, async I/O, JSON and external secret stores are not
+implemented. These boundaries are reflected in the
 [language reference](language.md) and [roadmap](roadmap.md).
 
 ## Native backend direction

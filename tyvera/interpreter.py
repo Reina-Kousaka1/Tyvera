@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import math
+import sys
 from collections import ChainMap
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TextIO
 
 from .ast import (
@@ -19,6 +21,9 @@ from .ast import (
     LetStatement,
     Literal,
     LoopControl,
+    BindingPattern,
+    LiteralPattern,
+    MatchStatement,
     MemberAccess,
     MemberCall,
     Method,
@@ -27,9 +32,12 @@ from .ast import (
     ReturnStatement,
     Statement,
     Unary,
+    VariantPattern,
+    WildcardPattern,
     WhileStatement,
 )
 from .source import Diagnostic, Location
+from .secrets import SecretProvider, SecretProviderError
 from .typesys import INT_MAX, INT_MIN
 
 
@@ -62,12 +70,32 @@ class _TyveraMap:
     values: dict[object, object]
 
 
+@dataclass(slots=True, eq=False)
+class _TyveraVariant:
+    variant: str
+    payload: object = None
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraSecret:
+    value: str
+
+    def __repr__(self) -> str:
+        return "<Secret redacted>"
+
+
 class Interpreter:
-    def __init__(self, program: Program, output: TextIO, max_call_depth: int = 256) -> None:
+    def __init__(
+        self, program: Program, output: TextIO, max_call_depth: int = 256, *,
+        project_root: str | Path | None = None, error_output: TextIO | None = None,
+    ) -> None:
         self.functions = {function.name: function for function in program.functions}
         self.classes: dict[str, ClassDeclaration] = {declaration.name: declaration for declaration in program.classes}
         self.output = output
+        self.error_output = error_output if error_output is not None else sys.stderr
         self.max_call_depth = max_call_depth
+        self.project_root = Path.cwd() if project_root is None else Path(project_root)
+        self.secret_provider = SecretProvider(self.project_root)
 
     def run(self) -> None:
         main = self.functions["main"]
@@ -135,6 +163,20 @@ class Interpreter:
                     except _LoopSignal as signal:
                         if signal.kind == "break":
                             break
+            elif isinstance(statement, MatchStatement):
+                value = self._evaluate(statement.value, variables, depth)
+                for arm in statement.arms:
+                    matched, binding = self._matches(arm.pattern, value)
+                    if not matched:
+                        continue
+                    arm_variables = variables.new_child()
+                    if binding is not _MISSING:
+                        pattern = arm.pattern
+                        name = pattern.name if isinstance(pattern, BindingPattern) else pattern.binding
+                        if name is not None:
+                            arm_variables[name] = binding
+                    self._execute_block(arm.body, arm_variables, depth)
+                    break
             elif isinstance(statement, LoopControl):
                 raise _LoopSignal(statement.kind)
             elif isinstance(statement, ExpressionStatement):
@@ -152,14 +194,54 @@ class Interpreter:
             if expression.callee == "println":
                 self.output.write(self._display(arguments[0]) + "\n")
                 return None
+            if expression.callee == "eprintln":
+                self.error_output.write(self._display(arguments[0]) + "\n")
+                return None
+            if expression.callee == "readText":
+                path = self._project_path(arguments[0])
+                if self._is_secret_storage_path(path):
+                    return _TyveraVariant("Err", "secret file can only be read through the secrets provider")
+                try:
+                    return _TyveraVariant("Ok", path.read_text(encoding="utf-8"))
+                except UnicodeDecodeError:
+                    return _TyveraVariant("Err", "text file is not valid UTF-8")
+                except OSError:
+                    return _TyveraVariant("Err", "cannot read text file")
+            if expression.callee == "writeText":
+                path = self._project_path(arguments[0])
+                if self._is_secret_storage_path(path):
+                    return _TyveraVariant("Err", "secret file cannot be changed by the text-file API")
+                try:
+                    path.write_text(arguments[1], encoding="utf-8")
+                    return _TyveraVariant("Ok", True)
+                except OSError:
+                    return _TyveraVariant("Err", "cannot write text file")
+            if expression.callee == "pathJoin":
+                return (Path(arguments[0]) / arguments[1]).as_posix()
+            if expression.callee == "pathExists":
+                return self._project_path(arguments[0]).exists()
             if expression.callee == "List":
                 return _TyveraList([])
             if expression.callee == "Map":
                 return _TyveraMap({})
+            if expression.callee == "Some":
+                return _TyveraVariant("Some", arguments[0])
+            if expression.callee == "None":
+                return _TyveraVariant("None")
+            if expression.callee == "Ok":
+                return _TyveraVariant("Ok", arguments[0])
+            if expression.callee == "Err":
+                return _TyveraVariant("Err", arguments[0])
             if expression.callee in self.classes:
                 return self._construct(self.classes[expression.callee], arguments, expression.location, depth + 1)
             return self._call(self.functions[expression.callee], arguments, expression.location, depth + 1)
         if isinstance(expression, MemberAccess):
+            if isinstance(expression.receiver, Name) and expression.receiver.identifier == "secrets":
+                try:
+                    value = self.secret_provider.get(expression.member)
+                except SecretProviderError as error:
+                    raise Diagnostic(expression.location, "runtime", str(error)) from error
+                return _TyveraVariant("None") if value is None else _TyveraVariant("Some", _TyveraSecret(value))
             receiver = self._evaluate(expression.receiver, variables, depth)
             if expression.member == "length" and isinstance(receiver, (_TyveraList, _TyveraMap)):
                 return len(receiver.values)
@@ -169,6 +251,8 @@ class Interpreter:
         if isinstance(expression, MemberCall):
             receiver = self._evaluate(expression.receiver, variables, depth)
             arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+            if isinstance(receiver, _TyveraSecret) and expression.method == "reveal":
+                return receiver.value
             if isinstance(receiver, _TyveraList):
                 return self._call_list_method(receiver, expression.method, arguments, expression.location)
             if isinstance(receiver, _TyveraMap):
@@ -200,6 +284,34 @@ class Interpreter:
             return result
         raise AssertionError(f"unhandled expression node: {type(expression).__name__}")
 
+    def _project_path(self, value: object) -> Path:
+        if not isinstance(value, str):
+            raise AssertionError("checked path argument is not String")
+        path = Path(value)
+        return path if path.is_absolute() else self.project_root / path
+
+    def _is_secret_storage_path(self, path: Path) -> bool:
+        try:
+            return path.resolve() == (self.project_root / ".tyvera.secrets").resolve()
+        except (OSError, RuntimeError):
+            return False
+
+    @staticmethod
+    def _matches(pattern, value: object) -> tuple[bool, object]:
+        if isinstance(pattern, WildcardPattern):
+            return True, _MISSING
+        if isinstance(pattern, BindingPattern):
+            return True, value
+        if isinstance(pattern, LiteralPattern):
+            return type(value) is type(pattern.value) and value == pattern.value, _MISSING
+        if isinstance(pattern, VariantPattern):
+            if not isinstance(value, _TyveraVariant) or value.variant != pattern.variant:
+                return False, _MISSING
+            if pattern.variant == "None":
+                return True, _MISSING
+            return True, value.payload
+        raise AssertionError(f"unhandled pattern node: {type(pattern).__name__}")
+
     @staticmethod
     def _list_index(values: list[object], index: object, location: Location, insertion: bool = False) -> int:
         if type(index) is not int:
@@ -221,12 +333,22 @@ class Interpreter:
             values.insert(index, arguments[1])
             return None
         if method == "get":
-            return values[self._list_index(values, arguments[0], location)]
+            index = arguments[0]
+            if type(index) is not int:
+                raise AssertionError("checked collection index is not Int")
+            if index < 0 or index >= len(values):
+                return _TyveraVariant("None")
+            return _TyveraVariant("Some", values[index])
         if method == "set":
             values[self._list_index(values, arguments[0], location)] = arguments[1]
             return None
         if method == "removeAt":
-            return values.pop(self._list_index(values, arguments[0], location))
+            index = arguments[0]
+            if type(index) is not int:
+                raise AssertionError("checked collection index is not Int")
+            if index < 0 or index >= len(values):
+                return _TyveraVariant("None")
+            return _TyveraVariant("Some", values.pop(index))
         if method == "contains":
             return arguments[0] in values
         if method == "clear":
@@ -245,11 +367,12 @@ class Interpreter:
                 return None
             if method == "get":
                 try:
-                    return values[arguments[0]]
+                    return _TyveraVariant("Some", values[arguments[0]])
                 except KeyError as error:
-                    raise Diagnostic(location, "runtime", "Map.get could not find the requested key") from error
+                    return _TyveraVariant("None")
             if method == "remove":
-                return values.pop(arguments[0], _MISSING) is not _MISSING
+                value = values.pop(arguments[0], _MISSING)
+                return _TyveraVariant("None") if value is _MISSING else _TyveraVariant("Some", value)
             if method == "containsKey":
                 return arguments[0] in values
             if method == "keys":

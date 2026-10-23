@@ -24,7 +24,10 @@ fn main() {
     values.set(1, 2)
     values.append(3)
     println(values.length)
-    println(values.get(1))
+    match values.get(1) {
+        Some(value) => println(value)
+        None => println(-1)
+    }
     println(values.contains(3))
     var total: Int = 0
     for value in values {
@@ -37,7 +40,10 @@ fn main() {
         }
     }
     println(total)
-    println(values.removeAt(0))
+    match values.removeAt(0) {
+        Some(removed) => println(removed)
+        None => println(-1)
+    }
     println(values.length)
 }
 '''
@@ -51,7 +57,10 @@ fn main() {
     scores.put("Mira", 12)
     scores.put("Ada", 10)
     println(scores.length)
-    println(scores.get("Ada"))
+    match scores.get("Ada") {
+        Some(score) => println(score)
+        None => println(-1)
+    }
     println(scores.containsKey("Mira"))
     var names: Int = 0
     for key in scores {
@@ -60,12 +69,18 @@ fn main() {
     }
     println(names)
     println(scores.keys().length)
-    println(scores.values().get(1))
-    println(scores.remove("Mira"))
+    match scores.values().get(1) {
+        Some(score) => println(score)
+        None => println(-1)
+    }
+    match scores.remove("Mira") {
+        Some(score) => println(score)
+        None => println(-1)
+    }
     println(scores.length)
 }
 '''
-        self.assertEqual(self._run(source), "2\n10\ntrue\nAda\nMira\n2\n2\n12\ntrue\n1\n")
+        self.assertEqual(self._run(source), "2\n10\ntrue\nAda\nMira\n2\n2\n12\n12\n1\n")
 
     def test_for_variable_is_lexical_and_typed(self) -> None:
         with self.assertRaisesRegex(Diagnostic, "unknown variable 'value'"):
@@ -118,16 +133,22 @@ fn main() {
 fn main() {}
 ''')
 
-    def test_collection_bounds_and_missing_map_keys_are_runtime_diagnostics(self) -> None:
-        for body, message in [
-            ('''let values: List<Int> = List<Int>()
-println(values.get(0))''', "List index 0 is out of range"),
-            ('''let values: Map<String, Int> = Map<String, Int>()
-println(values.get("missing"))''', "Map.get could not find the requested key"),
-        ]:
-            program, _ = compile_source(f"fn main() {{\n{body}\n}}", "bounds.tyv")
-            with self.subTest(message=message), self.assertRaisesRegex(Diagnostic, message):
-                Interpreter(program, io.StringIO()).run()
+    def test_collection_gets_return_explicit_none_for_missing_values(self) -> None:
+        source = '''
+fn main() {
+    let values: List<Int> = List<Int>()
+    let scores: Map<String, Int> = Map<String, Int>()
+    match values.get(0) {
+        Some(value) => println(value)
+        None => println("list empty")
+    }
+    match scores.get("missing") {
+        Some(value) => println(value)
+        None => println("key absent")
+    }
+}
+'''
+        self.assertEqual(self._run(source), "list empty\nkey absent\n")
 
     def test_iteration_over_values_uses_a_stable_snapshot(self) -> None:
         source = '''
@@ -151,7 +172,10 @@ fn identity<T>(value: T) -> T { return value }
 fn main() {
     let values: List<Int> = identity(List<Int>())
     values.append(8)
-    println(values.get(0))
+    match values.get(0) {
+        Some(item) => println(item)
+        None => println(-1)
+    }
 }
 '''
         self.assertEqual(self._run(source), "8\n")

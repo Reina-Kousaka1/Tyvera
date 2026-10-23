@@ -6,7 +6,7 @@ Tyvera is an independent, statically typed programming language with a design di
 
 The repository contains a working bootstrap toolchain: a lexer, parser and AST, static type checker, source-located diagnostics, and interpreter. It uses Python only as the current implementation host; Tyvera syntax and semantics are defined separately.
 
-Supported and tested: `Int`, `Float`, `Bool`, `String`, `Void`; generic functions and classes with static inference/substitution; typed mutable `List<T>` and `Map<K,V>`; `for` iteration; functions and checked returns; lexical block scopes and nested shadowing; immutable `let` and mutable `var`; arithmetic, comparisons and short-circuit `&&`/`||`; `if`/`else if`/`else`; and `while` with `break`/`continue`. Classes support constructors, typed fields, `self`, instance methods, member access, and checked field initialization. Interfaces support exact method contracts, multiple implementation, interface-typed values, and dynamic method dispatch. Multi-file projects support explicit relative imports and `pub` exports. `Unit`, `and`, and `or` remain compatibility spellings.
+Supported and tested: `Int`, `Float`, `Bool`, `String`, `Void`; generic functions/classes; typed `List<T>` and `Map<K,V>`; `Option<T>`/`Result<T,E>` and statement-level pattern matching; `for` iteration; checked text-file I/O and path helpers; local/environment-backed `Secret<String>` access with explicit reveal; checked returns and lexical scopes; `let`/`var`; arithmetic, comparisons, `if`/`else`, and `while` with `break`/`continue`. Classes support constructors, fields, `self`, methods and checked initialization. Interfaces support exact contracts, multiple implementation and dynamic dispatch. Multi-file projects support explicit relative imports and `pub` exports. `Unit`, `and`, and `or` remain compatibility spellings.
 
 Requirements: Python 3.10 or newer. The toolchain has no third-party runtime dependencies.
 
@@ -38,8 +38,8 @@ fn main() {
 ```
 
 The loader checks public visibility, missing files/symbols, duplicate names,
-cyclic imports and project-root boundaries. `.tyvera.secrets` is gitignored,
-but secret loading is not implemented yet.
+cyclic imports and project-root boundaries. `.tyvera.secrets` is gitignored;
+`secrets.NAME` reads it before falling back to the process environment.
 
 ```sh
 tyvera new my_app
@@ -70,9 +70,9 @@ The detailed supported grammar and type rules are in [the language reference](do
 
 ## Direction
 
-The first object-system slice, explicit multi-file modules, generic functions
-and classes, and a core collection slice are implemented. Pattern matching,
-error handling, actors, supervision,
-async/network I/O, JSON, environment/secret access and native backends remain
+The object-system slice, multi-file modules, generics, collections, optional
+and result values, pattern matching, text I/O and local/environment-backed
+secrets are implemented. Actor runtime, supervision, async/network I/O, JSON,
+external secret stores and native backends remain
 planned and are not represented as working features. See the
 [roadmap](docs/roadmap.md) for sequence and scope.

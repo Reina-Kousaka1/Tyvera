@@ -16,6 +16,7 @@ from .ast import (
     IfStatement,
     InterfaceDeclaration,
     LetStatement,
+    MatchStatement,
     MemberAccess,
     MemberCall,
     Name,
@@ -111,6 +112,7 @@ class ModuleLoader:
 
     @staticmethod
     def _declarations(module: _Module) -> dict[str, tuple[str, object]]:
+        builtin_functions = {"println", "eprintln", "readText", "writeText", "pathJoin", "pathExists"}
         declarations: dict[str, tuple[str, object]] = {}
         all_declarations = [
             *(('function', declaration) for declaration in module.program.functions),
@@ -120,8 +122,10 @@ class ModuleLoader:
         for kind, declaration in all_declarations:
             if declaration.name in {"Int", "Float", "Bool", "String", "Void", "Unit"}:
                 raise Diagnostic(declaration.location, "type", f"type name '{declaration.name}' is reserved")
-            if kind == "function" and declaration.name == "println":
-                raise Diagnostic(declaration.location, "type", "'println' is a built-in function name")
+            if declaration.name == "secrets":
+                raise Diagnostic(declaration.location, "type", "'secrets' is a reserved namespace")
+            if kind == "function" and declaration.name in builtin_functions:
+                raise Diagnostic(declaration.location, "type", f"'{declaration.name}' is a built-in function name")
             if declaration.name in declarations:
                 raise Diagnostic(declaration.location, "module", f"symbol '{declaration.name}' is declared more than once in module '{module.name}'")
             declarations[declaration.name] = (kind, declaration)
@@ -146,6 +150,8 @@ class ModuleLoader:
             for declaration in module.program.imports:
                 path = (module.path.parent / declaration.path).resolve()
                 imported = self.modules[path]
+                if declaration.alias in {"secrets", "println", "eprintln", "readText", "writeText", "pathJoin", "pathExists"}:
+                    raise Diagnostic(declaration.location, "module", f"'{declaration.alias}' is a reserved name")
                 if declaration.alias in imports:
                     raise Diagnostic(declaration.location, "module", f"import alias '{declaration.alias}' is already declared")
                 if declaration.alias in local:
@@ -257,6 +263,10 @@ class ModuleLoader:
             elif isinstance(statement, ForStatement):
                 statement.iterable = self._rewrite_expression(statement.iterable, module, local, imports, known)
                 self._rewrite_block(statement.body, module, local, imports, known)
+            elif isinstance(statement, MatchStatement):
+                statement.value = self._rewrite_expression(statement.value, module, local, imports, known)
+                for arm in statement.arms:
+                    self._rewrite_block(arm.body, module, local, imports, known)
             elif isinstance(statement, ReturnStatement) and statement.value is not None:
                 statement.value = self._rewrite_expression(statement.value, module, local, imports, known)
             elif isinstance(statement, ExpressionStatement):
@@ -305,6 +315,12 @@ class ModuleLoader:
                     raise Diagnostic(statement.location, "module", f"'{statement.name}' is reserved as an import alias in this module")
                 if isinstance(statement, ForStatement) and statement.name in aliases:
                     raise Diagnostic(statement.location, "module", f"'{statement.name}' is reserved as an import alias in this module")
+                if isinstance(statement, MatchStatement):
+                    for arm in statement.arms:
+                        pattern = arm.pattern
+                        binding = getattr(pattern, "name", None) or getattr(pattern, "binding", None)
+                        if binding in aliases:
+                            raise Diagnostic(pattern.location, "module", f"'{binding}' is reserved as an import alias in this module")
                 if isinstance(statement, Block):
                     block(statement.body)
                 elif isinstance(statement, IfStatement):
@@ -314,6 +330,9 @@ class ModuleLoader:
                     block(statement.body)
                 elif isinstance(statement, ForStatement):
                     block(statement.body)
+                elif isinstance(statement, MatchStatement):
+                    for arm in statement.arms:
+                        block(arm.body)
 
         for function in module.program.functions:
             for parameter in function.parameters:
