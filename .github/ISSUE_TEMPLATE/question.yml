@@ -1,0 +1,22 @@
+name: Development question
+description: Ask a general question about using or contributing to this repository.
+title: "[Question]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep the question focused and share only public, non-sensitive information. Never post tokens, passwords, credentials, or `.tyvera.secrets` contents.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What are you trying to understand or do?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Relevant context
+      description: Include the documentation or repository area you checked and what remains unclear.
+    validations:
+      required: false

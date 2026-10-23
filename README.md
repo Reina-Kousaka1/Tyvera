@@ -80,10 +80,11 @@ Run the test suite from the repository root:
 python -m unittest discover -v
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the local quality checks and pull
-request workflow. Bug reports and language proposals use the repository's
-[issue forms](.github/ISSUE_TEMPLATE); vulnerability reports follow the
-[security policy](SECURITY.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local checks and the pull-request
+workflow. The [issue chooser](https://github.com/Reina-Kousaka1/Tyvera/issues/new/choose)
+routes bug, feature, language-proposal, documentation, and development-question
+reports. Also see the [support guide](SUPPORT.md), [Code of Conduct](CODE_OF_CONDUCT.md),
+[security policy](SECURITY.md), and [changelog](CHANGELOG.md).
 
 The detailed supported grammar and type rules are in [the language reference](docs/language.md). Current and planned library APIs are in [the standard library reference](docs/standard-library.md). CLI commands are listed in [the CLI reference](docs/cli.md). The staged toolchain and recorded architecture decisions are in [the architecture note](docs/architecture.md). Planned stages toward a stable general-purpose language and runtime are in [the roadmap](docs/roadmap.md).
 
@@ -91,9 +92,11 @@ The detailed supported grammar and type rules are in [the language reference](do
 
 The object-system slice, multi-file modules, generics, collections, optional
 and result values, pattern matching, text I/O, local/environment-backed
-secrets, typed JSON, deterministic actor supervision, one-shot actor replies
-and a cooperative task scheduler with nested `await`, scoped cancellation and
-implicit child joining are implemented. True parallel scheduling, explicit
-task groups, detached tasks, async/network I/O, external secret stores and
-native backends remain planned and are not represented as working features. See the
-[roadmap](docs/roadmap.md) for sequence and scope.
+secrets, typed JSON, deterministic actor supervision, one-shot actor replies,
+and a cooperative task scheduler with nested `await`, scoped cancellation,
+implicit child joining, owner-local task groups, explicit child detachment,
+and task deadlines are implemented. True parallel execution, async/network
+I/O, separate standard-library modules, external secret stores, and native
+backends remain planned. See the [roadmap](docs/roadmap.md) for sequence and
+scope, and [release/versioning notes](docs/release-process.md) for the
+pre-1.0 release approach.

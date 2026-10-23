@@ -17,8 +17,8 @@ cd Tyvera
 python -m pip install -e .
 ```
 
-The default and current development branch is `Dev`. Do not rename it or assume
-that a separate `main` branch exists.
+`Dev` is the current integration branch. Short-lived feature and fix branches
+are expected alongside it; do not assume a separate `main` branch exists.
 
 ## Run the local quality checks
 
@@ -45,21 +45,24 @@ The CI workflow also creates a project in a temporary directory with
 
 ## Branch and pull request workflow
 
-1. Start a short-lived feature or fix branch from `Dev`.
+1. Start a short-lived feature or fix branch from the latest `Dev`.
 2. Make a focused change and run the relevant checks above.
 3. Open a pull request targeting `Dev`; explain the problem, design choice,
    affected compiler/runtime stages, tests, documentation, and security impact.
 4. Let the `CI` checks pass and resolve review conversations.
-5. Merge through GitHub review. Avoid direct pushes to `Dev` for normal changes.
+5. A repository owner or maintainer merges after review. Avoid direct pushes to
+   `Dev` for normal changes; do not force-push protected branches.
 
-The repository currently has only the `Dev` branch. The CI workflow runs for
-pull requests targeting `Dev` and pushes to `Dev`. See
+The CI workflow runs for pull requests targeting `Dev` and pushes to `Dev`.
+Delete a topic branch only when its work is complete or intentionally abandoned.
+See
 [`docs/github-governance.md`](docs/github-governance.md) for recommended manual
-branch protection settings.
+branch protection settings and the repository's label recommendations.
 
 Commit prefixes are a recommendation, not a gate: `feat:`, `fix:`, `docs:`,
-`test:`, or `ci:` followed by a concise description. Releases and package
-publishing are not automated by this repository.
+`test:`, or `ci:` followed by a concise description. See
+[`docs/release-process.md`](docs/release-process.md) for the pre-1.0 versioning
+and release approach; releases and package publishing are not automated.
 
 ## Language and architecture changes
 
@@ -85,6 +88,12 @@ that helps reviewers follow the design. New language features should account
 for multi-file projects, static diagnostics, and the future native backend
 without introducing an unimplemented feature claim.
 
+Use the Feature Request form for small, focused ideas. A Language Proposal /
+RFC is useful before implementation when a change could affect syntax or
+semantics across programs, type-system rules, runtime/concurrency behavior, or
+the future compiler/backend boundary. An RFC is a design discussion, not an
+automatic acceptance or implementation commitment.
+
 ## Security, secrets, and license
 
 Never commit `.tyvera.secrets`, tokens, credentials, or other private values.
@@ -95,4 +104,7 @@ in issues, pull requests, tests, examples, diagnostics, or logs. See
 Tyvera is distributed under **GNU GPLv3**. Preserve the existing `LICENSE` file
 and notices. By submitting a contribution, you confirm it may be distributed
 under the repository's GPLv3 terms; do not add code or assets with incompatible
-license terms.
+license terms. See [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for community
+expectations and [`SUPPORT.md`](SUPPORT.md) for the right issue form. Report
+security vulnerabilities using the process in `SECURITY.md`, not a public
+issue.
