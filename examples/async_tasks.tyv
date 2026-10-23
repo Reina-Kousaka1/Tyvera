@@ -1,0 +1,24 @@
+async fn announce(label: String) -> String {
+    println(label + " started")
+    await sleepFor(milliseconds(2))
+    return label + " resumed"
+}
+
+fn main() {
+    let first = announce("first")
+    let second = announce("second")
+
+    match runTasks() {
+        Ok(steps) => println(steps > 0)
+        Err(reason) => println(reason)
+    }
+
+    match first.tryResult() {
+        Ok(result) => match result {
+            Some(message) => println(message)
+            None => println("first still pending")
+        }
+        Err(reason) => println(reason)
+    }
+    println(first.isDone() and second.isDone())
+}

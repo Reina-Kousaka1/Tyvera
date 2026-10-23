@@ -13,6 +13,10 @@ later in the same module. Functions can recurse. Parameters require types and
 are immutable. Return annotations use `-> Type`; an omitted annotation means
 `Void`.
 
+Top-level functions may be declared `async fn`; calling one returns a deferred
+`Task<T>` where `T` is its declared return type. Bare `Task` means
+`Task<Void>`. `main` remains synchronous.
+
 ```tyv
 fn max(a: Int, b: Int) -> Int {
     if a > b {
@@ -42,20 +46,21 @@ precedence below):
 block       = "{" [statements] "}" ;
 import      = "import" string "as" identifier ;
 top-level   = import | ["pub"] (function | class | interface | actor) ;
-declaration = ("let" | "var") identifier [":" type] "=" expression ;
+declaration = ("let" | "var") identifier [":" type] "=" (expression | await) ;
 assignment  = identifier "=" expression ;
 field-set   = expression "." identifier "=" expression ;
 conditional = "if" expression block ["else" (block | conditional)] ;
 loop        = "while" expression block | for-loop ;
 match       = "match" expression "{" {pattern "=>" (block | statement)} "}" ;
 return      = "return" [expression] ;
-statement   = declaration | assignment | field-set | conditional | loop | match | return
+statement   = declaration | assignment | field-set | conditional | loop | match | return | await
             | "break" | "continue" | block | function-call ;
+await       = "await" expression ;
 for-loop    = "for" identifier "in" expression block ;
-function    = "fn" identifier ["<" identifier {"," identifier} ">"] "(" [parameters] ")" ["->" type] block ;
+function    = ["async"] "fn" identifier ["<" identifier {"," identifier} ">"] "(" [parameters] ")" ["->" type] block ;
 class       = "class" identifier ["<" identifier {"," identifier} ">"] ["implements" type-list] "{" {field | method} "}" ;
 field       = ("let" | "var") identifier ":" type ;
-method      = function ;
+method      = "fn" identifier ["<" identifier {"," identifier} ">"] "(" [parameters] ")" ["->" type] block ;
 interface   = "interface" identifier "{" {method-signature} "}" ;
 actor       = "actor" identifier "{" {actor-field | actor-init | actor-handler} "}" ;
 actor-field = ("let" | "var") identifier ":" type ;
@@ -436,9 +441,59 @@ request deadline.
 
 Timers never block or sleep. Due actor messages are promoted when
 `runActors()` is called; the runtime does not wait for a future deadline or
-wake itself. The interpreter accepts an injected clock for deterministic
-tests. No async functions, `await`, general task scheduling, or non-blocking
-I/O are implemented yet.
+wake itself. The interpreter accepts an injected monotonic clock for
+deterministic tests.
+
+### Cooperative tasks
+
+An `async fn` declares a function that creates a deferred `Task<T>` when called.
+The function body does not start until `runTasks()` drives the task scheduler.
+Async functions use ordinary checked return annotations and return-path
+analysis; `main` remains synchronous. Calling one evaluates its arguments
+immediately and captures them for later execution. Primitive values follow
+ordinary Tyvera value behavior; mutable lists and class instances retain the
+same shared-reference behavior as synchronous function arguments. Tasks execute
+serially and cannot be sent through actor messages.
+
+```tyv
+async fn announce() {
+    println("started")
+    await sleepFor(milliseconds(5))
+    println("resumed")
+}
+
+fn main() {
+    let task = announce()
+    match runTasks() {
+        Ok(_) => println(task.isDone())
+        Err(reason) => println(reason)
+    }
+}
+```
+
+`sleepFor(Duration) -> Task<Void>` creates a timer-backed task. A top-level
+`await task` suspends the current async function until that task completes.
+`let value: T = await task` also binds a typed task result; the same form can
+bind a typed actor reply. An unbound `await replyReceiver` leaves its reply
+available for `tryReceive()`. Failure, cancellation, or timeout of an awaited
+operation fails the awaiting task. `Task<T>.isDone()`, `isCancelled()`,
+`cancel()`, and `tryResult()` expose lifecycle and value status. For non-`Void`
+tasks, `tryResult()` returns `Result<Option<T>,String>`; for `Task<Void>` it
+returns `Result<Bool,String>`. `runTasks() -> Result<Int,String>` advances
+ready tasks round-robin, drives actor messages needed by awaited replies, and
+waits until a deadline when no task can otherwise run. A deadlock with pending
+work but no runnable task or deadline is returned as `Err`.
+
+Task turns occur between direct statements in the async function body. A
+statement containing nested control flow or a synchronous function call runs
+atomically. For that reason `await` is currently allowed only as a direct
+statement or awaited binding in an async function body, outside `if`, `while`,
+`for`, `match` and nested blocks. Task cancellation does not interrupt a
+running statement and is not yet propagated between parent and child tasks. Task values cannot be sent
+between actors. The task scheduler is single-threaded; it provides cooperative
+concurrency, not parallel execution. The interpreter's clock and sleeper can
+both be injected for deterministic tests. Async I/O and networking are not
+implemented.
 
 ## JSON values
 
@@ -600,11 +655,13 @@ limit (or the bootstrap host stack limit, if reached sooner).
 Current limits: classes, interfaces and the deterministic cooperative actor
 runtime with bounded `one_for_one` supervision are supported, but there is no
 inheritance, generic methods/interfaces/constraints, collection literals,
-`try`/`catch`, parallel process scheduling, async runtime, networking API,
+`try`/`catch`, parallel process scheduling, async I/O, networking API,
 importable standard-library modules, external secret-store provider, native
 interop, garbage collector implementation, package manager or compiler
-backend. Timers do not wake the runtime, and actor request timeouts do not
-interrupt work. No performance claim is made. No termination checking or loop execution
-budget is provided; users can write infinite loops. Parsing and execution use
+backend. Await cannot appear inside nested control-flow bodies and cancellation
+is not structured. `runActors()` remains non-blocking; `runTasks()` waits for
+task deadlines. Actor request timeouts do not interrupt work. No performance
+claim is made. No termination checking or loop execution budget is provided;
+users can write infinite loops. Parsing and execution use
 the host stack, so extremely deeply nested source is not supported. The
 interpreter is replaceable bootstrap technology, not part of Tyvera semantics.

@@ -95,6 +95,7 @@ class Function:
     location: Location
     public: bool = False
     type_parameters: list[str] = field(default_factory=list)
+    is_async: bool = False
 
 
 class Statement:
@@ -199,6 +200,15 @@ class LoopControl(Statement):
 class ReturnStatement(Statement):
     value: Expression | None
     location: Location
+
+
+@dataclass(slots=True)
+class AwaitStatement(Statement):
+    value: Expression
+    location: Location
+    binding_name: str | None = None
+    annotation: str | None = None
+    mutable: bool = False
 
 
 @dataclass(slots=True)

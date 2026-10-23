@@ -124,32 +124,30 @@ Actors participate in that linker and can be exported and imported. The
 manifest currently has only `name` and `entry`; dependencies are not yet
 supported. Ordinary functions and I/O execute synchronously; actor handlers
 run only when the cooperative scheduler is explicitly pumped. The supervisor
-API currently supports only `one_for_one`; parallel scheduling, resumable
-tasks, `async`/`await`, interruptible work, async I/O, HTTP, WebSockets and
+API currently supports only `one_for_one`. The task scheduler is cooperative,
+single-threaded and statement-stepped: an async function call creates a Task,
+and direct top-level `await` statements suspend it while other tasks run. Nested
+control-flow blocks and synchronous calls are atomic. Tasks preserve their
+statically declared result type; cancellation is not propagated through
+parent/child ownership. `runTasks()` drives deadlines and may wait for timers,
+but async I/O, HTTP, WebSockets and
 external secret stores are not implemented. Request deadlines do not remove
 queued messages or interrupt handlers.
 These boundaries are reflected in the
 [language reference](language.md) and [roadmap](roadmap.md).
 
-## Next async-runtime architecture decision
+## Task runtime boundary
 
-The current interpreter executes a function body recursively to completion;
-it has no continuation object that can preserve local scopes and resume at an
-`await`. Actor `ReplyReceiver<T>` values and monotonic timers are non-blocking
-primitives, not general tasks. Adding `async` syntax on top of ordinary
-function calls would therefore run work synchronously and misstate the
-semantics.
-
-Before implementing async functions, define a Tyvera-owned `Task<T>` state
-machine with pending/completed/failed/cancelled outcomes and explicit
-continuation frames. An async function call should create a task; `await`
-should suspend only that task, leaving actor turns and other ready tasks
-runnable. The deterministic bootstrap scheduler should advance tasks only at
-defined suspension points, integrate timers as wake events, and make
-cancellation cooperative at those same points. This model must not inherit
-Python `asyncio` or Promise semantics. Task failure mapping to `Result` and
-scope/lifetime rules are still open design decisions; no `Task<T>` or `async`
-syntax is implemented.
+The first task slice uses explicit statement continuations: each Task stores
+its function frame and top-level statement index. This keeps the bootstrap
+interpreter independent of Python coroutine semantics. `await` is restricted
+to direct function-body statements because nested branches and loops currently
+execute recursively and do not expose resumable frames. Typed task results work
+at supported await points; nested awaits, structured cancellation, child-task
+ownership, cancellation propagation, and non-blocking I/O remain design work.
+`runTasks()` advances tasks round-robin and waits only when every active task is suspended on a
+monotonic deadline or actor reply. It can report deadlock when no runnable or
+timed work can make progress.
 
 ## Native backend direction
 
