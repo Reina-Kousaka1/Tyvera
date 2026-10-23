@@ -158,6 +158,7 @@ class _TyveraTask:
     wait_frame: _AsyncBlockFrame | None = None
     wait_statement: AwaitStatement | None = None
     due_at: float | None = None
+    timeout_target: _TyveraTask | None = None
     error: str | None = None
     result: object = None
     parent: _TyveraTask | None = None
@@ -165,6 +166,15 @@ class _TyveraTask:
 
     def __repr__(self) -> str:
         return "<Task>"
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraTaskGroup:
+    owner: _TyveraTask | None
+    tasks: list[_TyveraTask] = dataclass_field(default_factory=list)
+
+    def __repr__(self) -> str:
+        return "<TaskGroup>"
 
 
 @dataclass(slots=True, eq=False, repr=False)
@@ -247,6 +257,7 @@ class Interpreter:
         self._scheduled_timers: list[_TyveraTimer] = []
         self._ready_tasks: deque[_TyveraTask] = deque()
         self._tasks: list[_TyveraTask] = []
+        self._task_groups: list[_TyveraTaskGroup] = []
         self._current_actor: _TyveraActor | None = None
         self._current_task: _TyveraTask | None = None
         self._running_tasks = False
@@ -353,6 +364,12 @@ class Interpreter:
         if isinstance(expression, Name):
             return variables[expression.identifier]
         if isinstance(expression, Call):
+            if expression.callee == "taskGroup":
+                if self._current_actor is not None:
+                    raise Diagnostic(expression.location, "runtime", "task groups cannot be created inside actor message handlers")
+                group = _TyveraTaskGroup(self._current_task)
+                self._task_groups.append(group)
+                return group
             if expression.callee == "spawn":
                 construction = expression.arguments[0]
                 if not isinstance(construction, Call):
@@ -535,6 +552,26 @@ class Interpreter:
                 )
                 return receiver_value
             arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+            if isinstance(receiver, _TyveraTaskGroup):
+                if self._current_actor is not None or receiver.owner is not self._current_task:
+                    raise Diagnostic(expression.location, "runtime", "TaskGroup may only be used by its creating task")
+                if expression.method == "add":
+                    task = arguments[0]
+                    if not isinstance(task, _TyveraTask) or task not in self._tasks or task.parent is not receiver.owner:
+                        raise Diagnostic(expression.location, "runtime", "TaskGroup.add accepts only a task created by the group's owner")
+                    if task in receiver.tasks:
+                        return False
+                    receiver.tasks.append(task)
+                    return True
+                if expression.method == "isDone":
+                    return all(task.state in {"completed", "failed", "cancelled"} for task in receiver.tasks)
+                if expression.method == "cancel":
+                    active = [task for task in receiver.tasks
+                              if task.state not in {"completed", "failed", "cancelled"}]
+                    for task in active:
+                        self._cancel_task(task)
+                    self._wake_waiting_tasks()
+                    return len(active)
             if isinstance(receiver, _TyveraActorRef):
                 actor = receiver.actor
                 if expression.method == "isAlive":
@@ -580,6 +617,22 @@ class Interpreter:
                     self._cancel_task(receiver)
                     self._wake_waiting_tasks()
                     return True
+                if expression.method == "detach":
+                    parent = receiver.parent
+                    if (parent is None or parent is not self._current_task
+                            or receiver.state in {"completed", "failed", "cancelled"}):
+                        return False
+                    parent.children.remove(receiver)
+                    receiver.parent = None
+                    for group in self._task_groups:
+                        if group.owner is parent and receiver in group.tasks:
+                            group.tasks.remove(receiver)
+                    return True
+                if expression.method == "withTimeout":
+                    duration = arguments[0]
+                    if not isinstance(duration, _TyveraDuration):
+                        raise AssertionError("checked Task.withTimeout argument is not Duration")
+                    return self._create_timeout_task(receiver, duration, expression.location)
                 if expression.method == "tryResult":
                     if receiver.state == "failed":
                         return _TyveraVariant("Err", receiver.error or "task failed")
@@ -998,6 +1051,19 @@ class Interpreter:
         self._tasks.append(task)
         return task
 
+    def _create_timeout_task(
+        self, target: _TyveraTask, duration: _TyveraDuration, location: Location,
+    ) -> _TyveraTask:
+        task = _TyveraTask(
+            None, None, location, state="timed_wait", result_type=target.result_type,
+            due_at=self._clock() + duration.milliseconds / 1000.0,
+            timeout_target=target, parent=self._current_task,
+        )
+        if task.parent is not None:
+            task.parent.children.append(task)
+        self._tasks.append(task)
+        return task
+
     def _run_tasks(self, location: Location, depth: int) -> _TyveraVariant:
         if self._current_actor is not None:
             raise Diagnostic(location, "runtime", "runTasks cannot be called from an actor message handler")
@@ -1010,6 +1076,7 @@ class Interpreter:
         try:
             while True:
                 self._promote_sleeping_tasks()
+                self._settle_timed_tasks()
                 self._wake_waiting_tasks()
                 self._settle_joining_tasks()
                 if self._ready_tasks:
@@ -1043,12 +1110,13 @@ class Interpreter:
                         else:
                             self._complete_task(task)
                     steps += 1
+                    self._settle_timed_tasks()
                     self._wake_waiting_tasks()
                     self._settle_joining_tasks()
                     continue
 
                 active = [task for task in self._tasks
-                          if task.state in {"runnable", "running", "waiting", "sleeping", "joining"}]
+                          if task.state in {"runnable", "running", "waiting", "sleeping", "joining", "timed_wait"}]
                 if not active:
                     break
 
@@ -1122,6 +1190,8 @@ class Interpreter:
         statement = frame.body[frame.index]
         if isinstance(statement, AwaitStatement):
             target = self._evaluate(statement.value, frame.variables, task.depth)
+            if isinstance(target, _TyveraTaskGroup) and target.owner is not task:
+                raise Diagnostic(statement.location, "runtime", "TaskGroup may only be awaited by its creating task")
             state, error = self._await_state(target)
             if state == "ready":
                 self._complete_task_await(task, statement, target, frame.variables)
@@ -1196,6 +1266,31 @@ class Interpreter:
                 task.state = "completed"
         self._wake_waiting_tasks()
 
+    def _settle_timed_tasks(self) -> None:
+        now = self._clock()
+        for task in self._tasks:
+            if task.state != "timed_wait" or task.timeout_target is None:
+                continue
+            target = task.timeout_target
+            if target.state == "completed":
+                task.result = target.result
+                task.timeout_target = None
+                task.due_at = None
+                task.state = "completed"
+            elif target.state == "failed":
+                task.timeout_target = None
+                task.due_at = None
+                self._fail_task(task, target.error or "timed task failed")
+            elif target.state == "cancelled":
+                task.timeout_target = None
+                task.due_at = None
+                self._fail_task(task, "timed task was cancelled")
+            elif task.due_at is not None and now + 1e-12 >= task.due_at:
+                task.timeout_target = None
+                task.due_at = None
+                self._cancel_task(target)
+                self._fail_task(task, "task timed out")
+
     def _await_state(self, target: object) -> tuple[str, str | None]:
         if isinstance(target, _TyveraTask):
             if target.state == "completed":
@@ -1204,6 +1299,13 @@ class Interpreter:
                 return "failed", target.error or "awaited task failed"
             if target.state == "cancelled":
                 return "failed", "awaited task was cancelled"
+            return "pending", None
+        if isinstance(target, _TyveraTaskGroup):
+            failed_task = next((task for task in target.tasks if task.state == "failed"), None)
+            if failed_task is not None:
+                return "failed", failed_task.error or "task group member failed"
+            if all(task.state in {"completed", "failed", "cancelled"} for task in target.tasks):
+                return "ready", None
             return "pending", None
         if isinstance(target, _TyveraReplyReceiver):
             cell = target.cell
@@ -1249,6 +1351,8 @@ class Interpreter:
             return
         if isinstance(target, _TyveraTask):
             value = target.result
+        elif isinstance(target, _TyveraTaskGroup):
+            return
         elif isinstance(target, _TyveraReplyReceiver):
             cell = target.cell
             if cell.state != "sent":
@@ -1265,7 +1369,7 @@ class Interpreter:
         task.wait_target = None
         task.wait_frame = None
         task.wait_statement = None
-        if any(child.state in {"runnable", "running", "waiting", "sleeping", "joining"}
+        if any(child.state in {"runnable", "running", "waiting", "sleeping", "joining", "timed_wait"}
                for child in task.children):
             task.state = "joining"
         else:
@@ -1278,7 +1382,7 @@ class Interpreter:
             failed_child = next((child for child in task.children if child.state == "failed"), None)
             if failed_child is not None:
                 self._fail_task(task, f"owned child task failed: {failed_child.error or 'async task failed'}")
-            elif not any(child.state in {"runnable", "running", "waiting", "sleeping", "joining"}
+            elif not any(child.state in {"runnable", "running", "waiting", "sleeping", "joining", "timed_wait"}
                          for child in task.children):
                 task.state = "completed"
 
@@ -1290,6 +1394,9 @@ class Interpreter:
         task.wait_frame = None
         task.wait_statement = None
         task.frames.clear()
+        if task.timeout_target is not None:
+            self._cancel_task(task.timeout_target)
+            task.timeout_target = None
         for child in task.children:
             self._cancel_task(child)
 
@@ -1310,7 +1417,7 @@ class Interpreter:
     def _next_task_deadline(self) -> float | None:
         deadlines = [
             task.due_at for task in self._tasks
-            if task.state == "sleeping" and task.due_at is not None
+            if task.state in {"sleeping", "timed_wait"} and task.due_at is not None
         ]
         waiting_for_reply = any(
             task.state == "waiting" and isinstance(task.wait_target, _TyveraReplyReceiver)

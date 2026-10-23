@@ -472,13 +472,18 @@ fn main() {
 ```
 
 `sleepFor(Duration) -> Task<Void>` creates a timer-backed task. An `await`
-statement suspends the current async function until that task completes.
+statement suspends the current async function until a task or task group is
+ready. `Task<T>.withTimeout(Duration) -> Task<T>` creates a typed wrapper with
+a monotonic deadline that starts when the method is called. If the source task
+does not complete by the deadline, the wrapper cancels it and fails with
+`"task timed out"`; cancelling the wrapper also cancels its source. A negative
+duration is already expired. A source that is already complete succeeds.
 `let value: T = await task` also binds a typed task result; the same form can
 bind a typed actor reply. An unbound `await replyReceiver` leaves its reply
 available for `tryReceive()`. Failure, cancellation, or timeout of an awaited
 operation fails the awaiting task. `Task<T>.isDone()`, `isCancelled()`,
-`cancel()`, and `tryResult()` expose lifecycle and value status. For non-`Void`
-tasks, `tryResult()` returns `Result<Option<T>,String>`; for `Task<Void>` it
+`cancel()`, `detach()`, and `tryResult()` expose lifecycle and value status.
+For non-`Void` tasks, `tryResult()` returns `Result<Option<T>,String>`; for `Task<Void>` it
 returns `Result<Bool,String>`. `runTasks() -> Result<Int,String>` advances
 ready tasks round-robin, drives actor messages needed by awaited replies, and
 waits until a deadline when no task can otherwise run. A deadlock with pending
@@ -494,9 +499,28 @@ Tasks created while an async task is running are owned by that task. A task
 created by synchronous `main` is a root task. Cancelling or failing an owner
 cancels its unfinished descendants; a child failure fails its owners and
 cancels sibling work. When an async function returns normally, it joins its
-unfinished children and does not complete until they do. There is no
-detached-task operation or explicit task-group syntax yet. Cancellation does
-not interrupt a running statement. Task values cannot be sent between actors.
+unfinished children and does not complete until they do.
+
+`taskGroup()` creates a `TaskGroup` owned by the current async task, or by the
+synchronous root when called from `main`. `group.add(task)` registers a direct
+child task once and returns `true`; duplicate registration returns `false`.
+`group.isDone()` is true when every registered member is completed, failed or
+cancelled. `group.cancel()` cancels active members and returns how many it
+cancelled. `await group` suspends until every member is terminal; a failed
+member fails the await. Group membership is an explicit join/cancellation view,
+not ownership transfer: the owner still implicitly joins every child, including
+children never added to a group. Only the creating task can operate on or await
+its group, and a group cannot cross actor message boundaries. Actor handlers
+cannot create or operate on task groups; task scopes belong to the cooperative
+task runtime, not to actor message turns.
+
+`task.detach()` explicitly drops the parent ownership edge for an active direct
+child and returns `true`; calling it on a root, terminal task or non-child
+returns `false`. Detaching also removes that task from groups owned by the
+parent, so group joins do not wait for it. The detached task continues as
+scheduler-root work, and its failure remains visible as an error from
+`runTasks()`. Cancellation does not interrupt a running statement. Task and
+TaskGroup values cannot be sent between actors.
 The task scheduler is single-threaded; it provides cooperative concurrency,
 not parallel execution. The interpreter's clock and sleeper can both be
 injected for deterministic tests. Async I/O and networking are not implemented.
@@ -664,8 +688,7 @@ inheritance, generic methods/interfaces/constraints, collection literals,
 `try`/`catch`, parallel process scheduling, async I/O, networking API,
 importable standard-library modules, external secret-store provider, native
 interop, garbage collector implementation, package manager or compiler
-backend. Explicit task groups and detached-task ownership are not implemented.
-`await` remains statement-only; synchronous calls are atomic.
+backend. `await` remains statement-only; synchronous calls are atomic.
 `runActors()` remains non-blocking; `runTasks()` waits for task deadlines.
 Actor request timeouts do not interrupt work. No performance claim is made. No
 termination checking or loop execution budget is provided;

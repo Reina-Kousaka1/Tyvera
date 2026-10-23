@@ -510,7 +510,274 @@ fn main() { work() }''', "only valid inside an async function")
         self.reject('''async fn invalid() {
     await milliseconds(1)
 }
-fn main() { invalid() }''', "expects Task or ReplyReceiver")
+fn main() { invalid() }''', "expects Task<T>, TaskGroup, or ReplyReceiver<T>")
+
+    def test_task_group_joins_only_registered_direct_children(self) -> None:
+        now = [0.0]
+
+        def advance(seconds: float) -> None:
+            now[0] += seconds
+
+        output = self.run_source('''async fn work(label: String) {
+    await sleepFor(milliseconds(2))
+    println(label)
+}
+async fn owner() {
+    let group = taskGroup()
+    let first = work("first")
+    let second = work("second")
+    println(group.add(first))
+    println(group.add(first))
+    group.add(second)
+    println(group.isDone())
+    await group
+    println(group.isDone())
+}
+fn main() {
+    let owner_task = owner()
+    runTasks()
+    println(owner_task.isDone())
+}''', clock=lambda: now[0], sleeper=advance)
+        self.assertEqual(output, "true\nfalse\nfalse\nfirst\nsecond\ntrue\ntrue\n")
+        self.assertGreaterEqual(now[0], 0.002)
+
+    def test_task_group_cancellation_cancels_active_members_and_descendants(self) -> None:
+        output = self.run_source('''async fn slow() {
+    await sleepFor(milliseconds(100))
+    println("must not run")
+}
+async fn owner() {
+    let group = taskGroup()
+    let task = slow()
+    group.add(task)
+    println(group.cancel())
+    println(task.isCancelled())
+    await group
+}
+fn main() {
+    let task = owner()
+    runTasks()
+    println(task.isDone())
+}''')
+        self.assertEqual(output, "1\ntrue\ntrue\n")
+
+    def test_detached_child_outlives_its_owner(self) -> None:
+        now = [0.0]
+
+        def advance(seconds: float) -> None:
+            now[0] += seconds
+
+        output = self.run_source('''async fn survivor() {
+    await sleepFor(milliseconds(1))
+    println("survivor ran")
+}
+async fn owner() {
+    let task = survivor()
+    println(task.detach())
+}
+fn main() {
+    let task = owner()
+    runTasks()
+    println(task.isDone())
+}''', clock=lambda: now[0], sleeper=advance)
+        self.assertEqual(output, "true\nsurvivor ran\ntrue\n")
+
+    def test_detach_removes_task_from_group_and_is_owner_only(self) -> None:
+        now = [0.0]
+
+        def advance(seconds: float) -> None:
+            now[0] += seconds
+
+        output = self.run_source('''async fn child() {
+    await sleepFor(milliseconds(1))
+    println("child")
+}
+async fn owner() {
+    let group = taskGroup()
+    let task = child()
+    group.add(task)
+    println(task.detach())
+    println(group.isDone())
+    await group
+}
+fn main() {
+    let task = owner()
+    runTasks()
+    println(task.isDone())
+}''', clock=lambda: now[0], sleeper=advance)
+        self.assertEqual(output, "true\ntrue\nchild\ntrue\n")
+
+    def test_root_or_terminal_task_cannot_be_detached(self) -> None:
+        output = self.run_source('''async fn empty() { }
+fn main() {
+    let task = empty()
+    println(task.detach())
+    runTasks()
+    println(task.detach())
+}''')
+        self.assertEqual(output, "false\nfalse\n")
+
+    def test_detached_task_failure_is_reported_by_scheduler(self) -> None:
+        now = [0.0]
+
+        def advance(seconds: float) -> None:
+            now[0] += seconds
+
+        output = self.run_source('''async fn broken() {
+    await sleepFor(milliseconds(1))
+    var value: Int = 9223372036854775807
+    value = value + 1
+}
+async fn owner() {
+    let task = broken()
+    task.detach()
+}
+fn main() {
+    let task = owner()
+    match runTasks() {
+        Ok(_) => println("missed failure")
+        Err(_) => println("detached failure reported")
+    }
+    println(task.isDone())
+}''', clock=lambda: now[0], sleeper=advance)
+        self.assertEqual(output, "detached failure reported\ntrue\n")
+
+    def test_task_group_cannot_be_used_by_a_different_task(self) -> None:
+        output = self.run_source('''async fn useGroup(group: TaskGroup) {
+    await group
+}
+async fn owner() {
+    let group = taskGroup()
+    let child = useGroup(group)
+    await child
+}
+fn main() {
+    let task = owner()
+    match runTasks() {
+        Ok(_) => println("ownership not enforced")
+        Err(_) => println("foreign group rejected")
+    }
+    println(task.isDone())
+}''')
+        self.assertEqual(output, "foreign group rejected\ntrue\n")
+
+    def test_task_timeout_returns_result_when_task_completes_first(self) -> None:
+        now = [0.0]
+
+        def advance(seconds: float) -> None:
+            now[0] += seconds
+
+        output = self.run_source('''async fn answer() -> Int {
+    await sleepFor(milliseconds(2))
+    return 42
+}
+fn main() {
+    let timed = answer().withTimeout(milliseconds(5))
+    runTasks()
+    match timed.tryResult() {
+        Ok(value) => match value {
+            Some(number) => println(number)
+            None => println("pending")
+        }
+        Err(_) => println("failed")
+    }
+}''', clock=lambda: now[0], sleeper=advance)
+        self.assertEqual(output, "42\n")
+        self.assertGreaterEqual(now[0], 0.002)
+
+    def test_task_timeout_cancels_source_and_reports_timeout(self) -> None:
+        now = [0.0]
+
+        def advance(seconds: float) -> None:
+            now[0] += seconds
+
+        output = self.run_source('''async fn slow() -> Int {
+    await sleepFor(milliseconds(20))
+    return 42
+}
+fn main() {
+    let source = slow()
+    let timed = source.withTimeout(milliseconds(2))
+    match runTasks() {
+        Ok(_) => println("missed timeout")
+        Err(_) => println("timeout reported")
+    }
+    println(source.isCancelled())
+    match timed.tryResult() {
+        Err(reason) => println(reason)
+        Ok(_) => println("unexpected result")
+    }
+}''', clock=lambda: now[0], sleeper=advance)
+        self.assertEqual(output, "timeout reported\ntrue\ntask timed out\n")
+        self.assertGreaterEqual(now[0], 0.002)
+
+    def test_cancelling_timeout_task_cancels_source(self) -> None:
+        output = self.run_source('''async fn slow() {
+    await sleepFor(milliseconds(20))
+}
+fn main() {
+    let source = slow()
+    let timed = source.withTimeout(milliseconds(10))
+    println(timed.cancel())
+    println(source.isCancelled())
+    runTasks()
+}''')
+        self.assertEqual(output, "true\ntrue\n")
+
+    def test_timeout_wrapper_preserves_an_already_completed_result(self) -> None:
+        output = self.run_source('''async fn answer() -> Int { return 42 }
+async fn owner() {
+    let source = answer()
+    let first: Int = await source
+    let timed = source.withTimeout(milliseconds(-1))
+    let second: Int = await timed
+    println(first + second)
+}
+fn main() {
+    let task = owner()
+    runTasks()
+}''')
+        self.assertEqual(output, "84\n")
+
+    def test_negative_task_timeout_expires_before_source_starts(self) -> None:
+        output = self.run_source('''async fn slow() {
+    println("must not start")
+}
+fn main() {
+    let source = slow()
+    let timed = source.withTimeout(milliseconds(-1))
+    match runTasks() {
+        Ok(_) => println("missed timeout")
+        Err(_) => println("expired")
+    }
+    println(source.isCancelled())
+    println(timed.isDone())
+}''')
+        self.assertEqual(output, "expired\ntrue\ntrue\n")
+
+    def test_task_group_and_detach_have_checked_types_and_actor_isolation(self) -> None:
+        self.reject('''fn main() {
+    let group = taskGroup()
+    group.add(42)
+}''', "expects Task<T>")
+        self.reject('''async fn invalid() {
+    let group = taskGroup()
+    let value: Void = await group
+}
+fn main() { invalid() }''', "Void task cannot initialize")
+        self.reject('''actor Worker {
+    on receive(group: TaskGroup) { }
+}
+fn main() { let worker = spawn(Worker()); runActors() }''', "actor message cannot carry")
+        self.reject('''actor Worker {
+    on receive() { let group = taskGroup() }
+}
+fn main() { let worker = spawn(Worker()); runActors() }''', "inside actor handlers")
+        self.reject('''async fn work() { }
+fn main() {
+    let task = work()
+    task.withTimeout(10)
+}''', "expects Duration, found Int")
 
 
 if __name__ == "__main__":

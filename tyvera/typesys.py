@@ -44,13 +44,13 @@ from .type_names import make_type, split_type, substitute_type
 
 _BUILTIN_TYPES = {
     "Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result",
-    "Secret", "Json", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task",
+    "Secret", "Json", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup",
 }
 _BUILTIN_FUNCTIONS = {
     "println", "eprintln", "readText", "writeText", "pathJoin", "pathExists",
     "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool",
     "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors", "oneForOne",
-    "milliseconds", "seconds", "timerAfter", "sleepFor", "runTasks",
+    "milliseconds", "seconds", "timerAfter", "sleepFor", "runTasks", "taskGroup",
 }
 _DISPLAYABLE_TYPES = {"Int", "Float", "Bool", "String"}
 _NUMERIC_TYPES = {"Int", "Float"}
@@ -439,8 +439,10 @@ class TypeChecker:
                     result_type = arguments[0]
                 elif base == "ReplyReceiver" and len(arguments) == 1:
                     result_type = arguments[0]
+                elif base == "TaskGroup" and not arguments:
+                    result_type = "Void"
                 else:
-                    raise Diagnostic(statement.value.location, "type", f"'await' expects Task or ReplyReceiver<T>, found {awaited_type}")
+                    raise Diagnostic(statement.value.location, "type", f"'await' expects Task<T>, TaskGroup, or ReplyReceiver<T>, found {awaited_type}")
                 if statement.binding_name is not None:
                     name = statement.binding_name
                     if name in {"self", "secrets", *_BUILTIN_FUNCTIONS}:
@@ -574,6 +576,12 @@ class TypeChecker:
                 if expression.type_arguments or expression.arguments:
                     raise Diagnostic(expression.location, "type", f"'{expression.callee}' expects no arguments")
                 return "Result<Int,String>"
+            if expression.callee == "taskGroup":
+                if owner is not None and isinstance(owner.declaration, ActorDeclaration):
+                    raise Diagnostic(expression.location, "type", "task groups cannot be created inside actor handlers")
+                if expression.type_arguments or expression.arguments:
+                    raise Diagnostic(expression.location, "type", "'taskGroup' expects no arguments")
+                return "TaskGroup"
             argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
             if expression.callee == "oneForOne":
                 if expression.type_arguments:
@@ -805,6 +813,8 @@ class TypeChecker:
                     "isDone": ((), "Bool"),
                     "isCancelled": ((), "Bool"),
                     "cancel": ((), "Bool"),
+                    "detach": ((), "Bool"),
+                    "withTimeout": (("Duration",), make_type("Task", [task_value_type])),
                 }
                 methods["tryResult"] = (
                     (), "Result<Bool,String>" if task_value_type == "Void"
@@ -816,6 +826,24 @@ class TypeChecker:
                 expected_types, result_type = method_signature
                 self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
                                       f"Task.{expression.method}")
+                return result_type
+            if receiver_base == "TaskGroup":
+                if receiver_arguments:
+                    raise Diagnostic(expression.location, "type", "TaskGroup does not accept type arguments")
+                if expression.method == "add":
+                    if len(argument_types) != 1:
+                        raise Diagnostic(expression.location, "type", "TaskGroup.add expects one Task argument")
+                    task_base, task_arguments = split_type(argument_types[0])
+                    if task_base != "Task" or len(task_arguments) != 1:
+                        raise Diagnostic(expression.arguments[0].location, "type", f"TaskGroup.add expects Task<T>, found {argument_types[0]}")
+                    return "Bool"
+                methods = {"isDone": ((), "Bool"), "cancel": ((), "Int")}
+                method_signature = methods.get(expression.method)
+                if method_signature is None:
+                    raise Diagnostic(expression.location, "type", f"TaskGroup has no method '{expression.method}'")
+                expected_types, result_type = method_signature
+                self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
+                                      f"TaskGroup.{expression.method}")
                 return result_type
             if receiver_base == "Duration" and expression.method == "inMilliseconds":
                 self._check_arguments(expression.arguments, argument_types, (), expression.location,

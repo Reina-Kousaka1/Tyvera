@@ -51,6 +51,23 @@ fn main() {
 }'''
 
 
+TASK_SOURCE = '''async fn identity(value: Int) -> Int { return value }
+async fn workload() {
+    let group = taskGroup()
+    var next = 0
+    while next < 500 {
+        let task = identity(next)
+        group.add(task)
+        next = next + 1
+    }
+    await group
+}
+fn main() {
+    let task = workload()
+    runTasks()
+}'''
+
+
 def _measure(label: str, action, iterations: int) -> None:
     action()  # warm up imports and one-time interpreter paths
     samples: list[float] = []
@@ -73,6 +90,7 @@ def main() -> int:
     program = Parser(tokens).parse()
     collection_program, _ = compile_source(COLLECTION_SOURCE, "collections-benchmark.tyv")
     actor_program, _ = compile_source(ACTOR_SOURCE, "actors-benchmark.tyv")
+    task_program, _ = compile_source(TASK_SOURCE, "tasks-benchmark.tyv")
 
     print(f"Python {platform.python_version()} | {arguments.iterations} measured run(s) per workload")
     _measure("lexer", lambda: Lexer(source, "benchmark.tyv").tokenize(), arguments.iterations)
@@ -92,6 +110,11 @@ def main() -> int:
     _measure(
         "actor scheduler (500 msgs)",
         lambda: Interpreter(actor_program, io.StringIO()).run(),
+        arguments.iterations,
+    )
+    _measure(
+        "task scheduler (500 children)",
+        lambda: Interpreter(task_program, io.StringIO()).run(),
         arguments.iterations,
     )
     return 0

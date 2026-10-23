@@ -131,7 +131,14 @@ other tasks run. Synchronous calls and individual expressions remain atomic.
 Tasks preserve their statically declared result type. Tasks created while an
 async task runs are owned children: owner cancellation or failure cancels
 descendants, child failure fails its owners, and normal owner return joins all
-unfinished children before completing. There is no detached-task operation.
+unfinished children before completing. `TaskGroup` is an owner-local view over
+registered direct children and provides explicit subset joins and cancellation
+without changing parent ownership. Detach is owner-only: it removes the child
+from its parent and the parent's groups, then leaves it scheduled as root work.
+`Task<T>.withTimeout(Duration)` creates a typed wrapper with a monotonic
+deadline; expiry cancels the source and fails the wrapper, while cancelling the
+wrapper cancels the source. Both wrapper and source participate in their
+creator's ordinary child-join rules.
 `runTasks()` drives deadlines and may wait for timers, but async I/O, HTTP,
 WebSockets and external secret stores are not implemented. Request deadlines
 do not remove queued messages or interrupt handlers.
@@ -145,9 +152,11 @@ not depend on Python coroutine semantics. An `await` statement can suspend
 inside nested blocks, branches, loops and match arms, preserving lexical scopes
 and loop-control targets. The scheduler advances one frame action at a time,
 round-robin. Synchronous calls and expressions remain atomic, and `await` is
-still a statement rather than an expression. Parent-scoped cancellation and
-implicit child joining at async function return are implemented. Explicit task
-groups and detached-task ownership are not. `runTasks()` waits only when all
+still a statement rather than an expression. Parent-scoped cancellation,
+implicit child joining, owner-scoped task groups, explicit child detachment,
+and task deadlines are implemented. A group registers only direct children of
+its owner; it does not alter the implicit join rule. Detached failures remain
+visible to the task scheduler. `runTasks()` waits only when all
 active tasks are suspended on a monotonic deadline or actor reply. It can report
 deadlock when no runnable or timed work can make progress.
 
@@ -171,8 +180,8 @@ interpreter as a conformance reference while native output is introduced.
 
 `benchmarks/benchmark_bootstrap.py` provides non-gating measurements for
 lexing, parsing, type checking, the full check pipeline, interpretation, a
-500-element list workload and a 500-message actor scheduler workload. Run it
-after installing the editable package:
+500-element list workload, a 500-message actor scheduler workload, and a
+500-child task-group workload. Run it after installing the editable package:
 
 ```sh
 python benchmarks/benchmark_bootstrap.py --iterations 10

@@ -13,7 +13,7 @@ implemented.
 | 1. Core language | Implemented | Primitive types, functions, checked returns, lexical scopes, mutable/immutable bindings, operators, conditionals, `while`, `break` and `continue`, covered by tests. |
 | 2. Object system | First slice implemented | Classes, fields, `self`, constructors, methods, interfaces, multiple interface implementation, interface dispatch, generic classes and generic functions. Generic methods/interfaces/constraints and inheritance remain open. |
 | 3. Modules | First slice implemented | Relative `.tyv` imports, aliases, `pub` exports, module graph linking, visibility/missing/duplicate diagnostics, cycle detection and project-root containment. Local package dependencies are still planned. |
-| 4. Standard library | Core slice implemented | Generic collections, `for`, `Option<T>`, `Result<T,E>`, core matching, text I/O/path helpers, local/environment secret providers, typed JSON, signed `Duration`, monotonic one-shot timers, timer-backed sleep tasks and cooperative parent-scoped task lifecycle. Separate stdlib modules remain planned. |
+| 4. Standard library | Core slice implemented | Generic collections, `for`, `Option<T>`, `Result<T,E>`, core matching, text I/O/path helpers, local/environment secret providers, typed JSON, signed `Duration`, monotonic one-shot timers, timer-backed sleep tasks, cooperative parent-scoped lifecycle, owner-local `TaskGroup` joins/cancellation, explicit child detachment and typed task deadlines. Separate stdlib modules remain planned. |
 | 5. Actor runtime | First slice implemented | Actor declarations, typed immutable message transfer, isolated state, FIFO mailboxes, deterministic round-robin cooperative scheduling, typed one-shot request/reply, cancellation, request deadlines, delayed typed messages, stop/alive lifecycle, and isolated crash reporting. Parallel scheduling and backpressure remain open. |
 | 6. Supervisors | First slice implemented | Child lifecycle, crash detection, bounded restart intensity and deterministic `one_for_one` restarts. `one_for_all` and `rest_for_one` remain planned. |
 | 7. Networking | Planned | Async I/O integration with the cooperative task runtime, then HTTP and WebSocket clients and event dispatch without Promise-specific language semantics. |
@@ -23,8 +23,8 @@ implemented.
 
 ## Near-term sequence
 
-1. Define explicit task-group composition and detached-task semantics on top of
-   the implemented parent-scoped cancellation and implicit child joining.
+1. Specify and test task failure handling, scheduler shutdown, and cancellation
+   behavior for detached roots, nested groups, and timed wrappers.
 2. Move or wrap collection, I/O, JSON and secret operations behind normal
    `tyvera.*` modules as that library module model stabilizes.
 3. Continue improving generic interfaces, constraints and type inference with
@@ -48,10 +48,11 @@ Tyvera errors.
 The object system, relative file modules, generic collections, file I/O,
 provider-backed secrets, typed JSON core, supervised actors, typed replies,
 cooperative async tasks with typed return values, parent-scoped cancellation,
-deadlines and delayed actor messages are usable. Await now resumes inside
-nested blocks, branches, loops and match arms. True parallelism, explicit
-task-group composition and detached-task semantics, resource ownership, async
-networking and a native backend are still missing. The next deliverable is to
-specify task-group composition and whether tasks can be detached, followed by
-standard-library module boundaries and networking only after those runtime
-contracts are testable.
+deadlines, delayed actor messages, explicit task groups, detached child tasks
+and typed task timeouts are usable. Await resumes inside nested blocks,
+branches, loops and match arms. True parallelism, structured async I/O,
+resource ownership, standard library modules, networking and a native backend
+are still missing. The next
+runtime deliverable is scheduler lifecycle and failure/cancellation semantics
+for detached roots and timed wrappers, followed by stable standard-library
+module boundaries.

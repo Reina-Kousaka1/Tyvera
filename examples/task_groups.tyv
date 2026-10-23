@@ -1,0 +1,23 @@
+async fn announceLater(label: String) {
+    await sleepFor(milliseconds(1))
+    println(label)
+}
+
+async fn coordinate() {
+    let group = taskGroup()
+    let first = announceLater("joined child")
+    group.add(first)
+    await group
+    println(group.isDone())
+
+    let detached = announceLater("detached child")
+    println(detached.detach())
+}
+
+fn main() {
+    let task = coordinate()
+    match runTasks() {
+        Ok(_) => println(task.isDone())
+        Err(reason) => println(reason)
+    }
+}
