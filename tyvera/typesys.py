@@ -40,8 +40,12 @@ from .source import Diagnostic, Location
 from .type_names import make_type, split_type, substitute_type
 
 
-_BUILTIN_TYPES = {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret"}
-_BUILTIN_FUNCTIONS = {"println", "eprintln", "readText", "writeText", "pathJoin", "pathExists"}
+_BUILTIN_TYPES = {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json"}
+_BUILTIN_FUNCTIONS = {
+    "println", "eprintln", "readText", "writeText", "pathJoin", "pathExists",
+    "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool",
+    "jsonNull", "jsonArray", "jsonObject",
+}
 _DISPLAYABLE_TYPES = {"Int", "Float", "Bool", "String"}
 _NUMERIC_TYPES = {"Int", "Float"}
 INT_MIN = -(1 << 63)
@@ -452,6 +456,25 @@ class TypeChecker:
                 self._check_arguments(expression.arguments, argument_types, parameter_types,
                                       expression.location, expression.callee)
                 return result_type
+            if expression.callee in {"parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat",
+                                     "jsonBool", "jsonNull", "jsonArray", "jsonObject"}:
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", f"'{expression.callee}' does not accept type arguments")
+                signatures = {
+                    "parseJson": (("String",), "Result<Json,String>"),
+                    "jsonStringify": (("Json",), "Result<String,String>"),
+                    "jsonString": (("String",), "Json"),
+                    "jsonInt": (("Int",), "Json"),
+                    "jsonFloat": (("Float",), "Json"),
+                    "jsonBool": (("Bool",), "Json"),
+                    "jsonNull": ((), "Json"),
+                    "jsonArray": (("List<Json>",), "Json"),
+                    "jsonObject": (("Map<String,Json>",), "Json"),
+                }
+                parameter_types, result_type = signatures[expression.callee]
+                self._check_arguments(expression.arguments, argument_types, parameter_types,
+                                      expression.location, expression.callee)
+                return result_type
             if expression.callee in {"List", "Map"}:
                 arity = self.generic_arities[expression.callee]
                 if len(expression.type_arguments) != arity:
@@ -512,6 +535,27 @@ class TypeChecker:
                 if len(receiver_arguments) != 1:
                     raise Diagnostic(expression.location, "type", "Secret requires one type argument")
                 return receiver_arguments[0]
+            if receiver_base == "Json":
+                methods = {
+                    "kind": ((), "String"),
+                    "isNull": ((), "Bool"),
+                    "asString": ((), "Option<String>"),
+                    "asInt": ((), "Option<Int>"),
+                    "asFloat": ((), "Option<Float>"),
+                    "asBool": ((), "Option<Bool>"),
+                    "arrayLength": ((), "Option<Int>"),
+                    "objectLength": ((), "Option<Int>"),
+                    "arrayAt": (("Int",), "Option<Json>"),
+                    "objectGet": (("String",), "Option<Json>"),
+                    "objectKeys": ((), "Option<List<String>>"),
+                }
+                method_signature = methods.get(expression.method)
+                if method_signature is None:
+                    raise Diagnostic(expression.location, "type", f"Json has no method '{expression.method}'")
+                expected_types, result_type = method_signature
+                self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
+                                      f"Json.{expression.method}")
+                return result_type
             if receiver_base in {"List", "Map"}:
                 signature = self._collection_method(receiver_base, receiver_arguments, expression.method, expression.location)
                 substitutions = {}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import sys
 from collections import ChainMap
@@ -82,6 +83,15 @@ class _TyveraSecret:
 
     def __repr__(self) -> str:
         return "<Secret redacted>"
+
+
+@dataclass(slots=True, frozen=True, repr=False)
+class _TyveraJson:
+    kind: str
+    value: object
+
+    def __repr__(self) -> str:
+        return "<Json value redacted>"
 
 
 class Interpreter:
@@ -220,6 +230,31 @@ class Interpreter:
                 return (Path(arguments[0]) / arguments[1]).as_posix()
             if expression.callee == "pathExists":
                 return self._project_path(arguments[0]).exists()
+            if expression.callee == "parseJson":
+                return self._parse_json(arguments[0])
+            if expression.callee == "jsonStringify":
+                try:
+                    serialized = json.dumps(
+                        self._json_to_python(arguments[0]), ensure_ascii=False,
+                        separators=(",", ":"), allow_nan=False,
+                    )
+                    return _TyveraVariant("Ok", serialized)
+                except (TypeError, ValueError, RecursionError):
+                    return _TyveraVariant("Err", "JSON encoding failed")
+            if expression.callee == "jsonString":
+                return _TyveraJson("string", arguments[0])
+            if expression.callee == "jsonInt":
+                return _TyveraJson("int", arguments[0])
+            if expression.callee == "jsonFloat":
+                return _TyveraJson("float", arguments[0])
+            if expression.callee == "jsonBool":
+                return _TyveraJson("bool", arguments[0])
+            if expression.callee == "jsonNull":
+                return _TyveraJson("null", None)
+            if expression.callee == "jsonArray":
+                return _TyveraJson("array", list(arguments[0].values))
+            if expression.callee == "jsonObject":
+                return _TyveraJson("object", dict(arguments[0].values))
             if expression.callee == "List":
                 return _TyveraList([])
             if expression.callee == "Map":
@@ -253,6 +288,8 @@ class Interpreter:
             arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
             if isinstance(receiver, _TyveraSecret) and expression.method == "reveal":
                 return receiver.value
+            if isinstance(receiver, _TyveraJson):
+                return self._call_json_method(receiver, expression.method, arguments)
             if isinstance(receiver, _TyveraList):
                 return self._call_list_method(receiver, expression.method, arguments, expression.location)
             if isinstance(receiver, _TyveraMap):
@@ -295,6 +332,113 @@ class Interpreter:
             return path.resolve() == (self.project_root / ".tyvera.secrets").resolve()
         except (OSError, RuntimeError):
             return False
+
+    @staticmethod
+    def _parse_json(text: str) -> _TyveraVariant:
+        def parse_integer(raw: str) -> int:
+            value = int(raw)
+            if not INT_MIN <= value <= INT_MAX:
+                raise ValueError("number outside Tyvera Int range")
+            return value
+
+        def parse_float(raw: str) -> float:
+            value = float(raw)
+            if not math.isfinite(value):
+                raise ValueError("non-finite number")
+            return value
+
+        def reject_constant(_raw: str):
+            raise ValueError("non-standard JSON constant")
+
+        def object_pairs(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate object key")
+                result[key] = value
+            return result
+
+        try:
+            value = json.loads(
+                text, parse_int=parse_integer, parse_float=parse_float,
+                parse_constant=reject_constant, object_pairs_hook=object_pairs,
+            )
+            return _TyveraVariant("Ok", Interpreter._json_from_python(value))
+        except (json.JSONDecodeError, ValueError, RecursionError, TypeError):
+            return _TyveraVariant("Err", "invalid JSON document")
+
+    @staticmethod
+    def _json_from_python(value: object) -> _TyveraJson:
+        if value is None:
+            return _TyveraJson("null", None)
+        if type(value) is bool:
+            return _TyveraJson("bool", value)
+        if type(value) is int:
+            if not INT_MIN <= value <= INT_MAX:
+                raise ValueError("number outside Tyvera Int range")
+            return _TyveraJson("int", value)
+        if type(value) is float:
+            if not math.isfinite(value):
+                raise ValueError("non-finite number")
+            return _TyveraJson("float", value)
+        if isinstance(value, str):
+            if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+                raise ValueError("JSON string contains an invalid Unicode surrogate")
+            return _TyveraJson("string", value)
+        if isinstance(value, list):
+            return _TyveraJson("array", [Interpreter._json_from_python(item) for item in value])
+        if isinstance(value, dict):
+            if any(any(0xD800 <= ord(character) <= 0xDFFF for character in key) for key in value):
+                raise ValueError("JSON object key contains an invalid Unicode surrogate")
+            return _TyveraJson("object", {key: Interpreter._json_from_python(item) for key, item in value.items()})
+        raise ValueError("unsupported JSON value")
+
+    @staticmethod
+    def _json_to_python(value: object) -> object:
+        if not isinstance(value, _TyveraJson):
+            raise TypeError("jsonStringify expects a Json value")
+        if value.kind == "array":
+            return [Interpreter._json_to_python(item) for item in value.value]  # type: ignore[union-attr]
+        if value.kind == "object":
+            return {key: Interpreter._json_to_python(item) for key, item in value.value.items()}  # type: ignore[union-attr]
+        return value.value
+
+    @staticmethod
+    def _call_json_method(
+        receiver: _TyveraJson, method: str, arguments: list[object],
+    ) -> object:
+        value = receiver.value
+        if method == "kind":
+            return receiver.kind
+        if method == "isNull":
+            return receiver.kind == "null"
+        if method == "asString":
+            return _TyveraVariant("Some", value) if receiver.kind == "string" else _TyveraVariant("None")
+        if method == "asInt":
+            return _TyveraVariant("Some", value) if receiver.kind == "int" else _TyveraVariant("None")
+        if method == "asFloat":
+            return _TyveraVariant("Some", value) if receiver.kind == "float" else _TyveraVariant("None")
+        if method == "asBool":
+            return _TyveraVariant("Some", value) if receiver.kind == "bool" else _TyveraVariant("None")
+        if method == "arrayLength":
+            return _TyveraVariant("Some", len(value)) if receiver.kind == "array" else _TyveraVariant("None")
+        if method == "objectLength":
+            return _TyveraVariant("Some", len(value)) if receiver.kind == "object" else _TyveraVariant("None")
+        if method == "arrayAt":
+            index = arguments[0]
+            if receiver.kind != "array" or type(index) is not int or index < 0 or index >= len(value):
+                return _TyveraVariant("None")
+            return _TyveraVariant("Some", value[index])
+        if method == "objectGet":
+            if receiver.kind != "object":
+                return _TyveraVariant("None")
+            found = value.get(arguments[0], _MISSING)
+            return _TyveraVariant("None") if found is _MISSING else _TyveraVariant("Some", found)
+        if method == "objectKeys":
+            if receiver.kind == "object":
+                return _TyveraVariant("Some", _TyveraList(list(value.keys())))
+            return _TyveraVariant("None")
+        raise AssertionError(f"checked Json method not implemented: {method}")
 
     @staticmethod
     def _matches(pattern, value: object) -> tuple[bool, object]:

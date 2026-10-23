@@ -1,0 +1,21 @@
+fn main() {
+    let payload: String = "{\"service\":\"Tyvera\",\"ready\":true}"
+
+    match parseJson(payload) {
+        Ok(document) => {
+            match document.objectGet("service") {
+                Some(service) => match service.asString() {
+                    Some(name) => println(name)
+                    None => println("service field is not text")
+                }
+                None => println("service field is missing")
+            }
+
+            match jsonStringify(document) {
+                Ok(encoded) => println(encoded)
+                Err(_) => println("JSON encoding failed")
+            }
+        }
+        Err(_) => println("JSON parsing failed")
+    }
+}

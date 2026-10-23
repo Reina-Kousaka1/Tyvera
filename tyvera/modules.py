@@ -120,7 +120,7 @@ class ModuleLoader:
             *(('interface', declaration) for declaration in module.program.interfaces),
         ]
         for kind, declaration in all_declarations:
-            if declaration.name in {"Int", "Float", "Bool", "String", "Void", "Unit"}:
+            if declaration.name in {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json"}:
                 raise Diagnostic(declaration.location, "type", f"type name '{declaration.name}' is reserved")
             if declaration.name == "secrets":
                 raise Diagnostic(declaration.location, "type", "'secrets' is a reserved namespace")

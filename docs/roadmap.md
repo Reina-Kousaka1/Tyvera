@@ -11,7 +11,7 @@ Roadmap items below are plans unless marked implemented.
 | 1. Core language | Implemented | Primitive types, functions, checked returns, lexical scopes, mutable/immutable bindings, operators, conditionals, `while`, `break` and `continue`, covered by tests. |
 | 2. Object system | First slice implemented | Classes, fields, `self`, constructors, methods, interfaces, multiple interface implementation, interface dispatch, generic classes and generic functions. Generic methods/interfaces/constraints and inheritance remain open. |
 | 3. Modules | First slice implemented | Relative `.tyv` imports, aliases, `pub` exports, module graph linking, visibility/missing/duplicate diagnostics, cycle detection and project-root containment. Local package dependencies are still planned. |
-| 4. Standard library | Core slice implemented | Generic collections, `for`, `Option<T>`, `Result<T,E>`, core matching, text I/O/path helpers and local/environment secret providers. Separate stdlib modules and JSON parse/encode remain planned. |
+| 4. Standard library | Core slice implemented | Generic collections, `for`, `Option<T>`, `Result<T,E>`, core matching, text I/O/path helpers, local/environment secret providers and typed JSON parse/access/encode. Separate stdlib modules, timers and networking remain planned. |
 | 5. Actor runtime | Planned | Isolated process state, typed messages, mailboxes, sequenced message handling and lifecycle, with deterministic runtime tests. |
 | 6. Supervisors | Planned | Child lifecycle, crash detection, restart and an initial `one_for_one` policy, separate from ordinary recoverable errors. |
 | 7. Networking | Planned | Async runtime abstraction, timers, HTTP and WebSocket client support, and event dispatch without Promise-specific language semantics. |
@@ -21,12 +21,11 @@ Roadmap items below are plans unless marked implemented.
 
 ## Near-term sequence
 
-1. Move or wrap collection, I/O and secret operations behind normal `tyvera.*`
-   modules, then add JSON parse/encode before networking, so configuration
-   and parse failures remain ordinary, testable program outcomes.
-2. Define async operations and actor message semantics before any Discord
-   gateway client. Add supervisors only after actor lifecycle and failure
-   behavior have deterministic tests.
+1. Move or wrap collection, I/O, JSON and secret operations behind normal
+   `tyvera.*` modules, then define typed message and actor lifecycle semantics
+   before implementing concurrency.
+2. Add deterministic actor/mailbox tests, then supervisors; only after those
+   lifecycle and failure rules stabilize should async I/O and networking begin.
 3. Keep backend work independent from the Python interpreter. Establish
    language-level conformance programs before implementing native codegen.
 
@@ -43,9 +42,9 @@ Tyvera errors.
 
 ## Current Discord-readiness gap
 
-The object system, relative file modules, generic collections, file I/O and
-secret access are usable, but Tyvera cannot yet parse JSON, perform
-asynchronous I/O, or connect over HTTP/WebSocket. It
-therefore cannot yet implement or run a real Discord bot. The next deliverable
-is JSON plus the async/actor foundations; an SDK should come only after
-networking and error semantics work as ordinary libraries.
+The object system, relative file modules, generic collections, file I/O,
+provider-backed secrets and typed JSON core are usable. Tyvera cannot yet
+perform asynchronous I/O or connect over HTTP/WebSocket, so it cannot yet
+implement or run a real Discord bot. The next deliverable is a specified
+actor/mailbox lifecycle with deterministic tests; networking and a Discord
+SDK follow after async operations and WebSocket behavior exist.

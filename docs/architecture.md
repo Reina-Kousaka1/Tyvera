@@ -66,6 +66,11 @@ and `--version`. The implementation uses Python's standard library only.
   literal and variant pattern types, arm scopes, duplicate coverage, and
   exhaustiveness for `Bool`, `Option` and `Result`. These ordinary error values
   remain separate from runtime diagnostics and future actor crashes.
+- JSON uses a Tyvera-owned opaque `Json` value and checked constructors,
+  accessors and `Result`-returning parse/encode intrinsics. The bootstrap uses
+  Python's standard JSON codec internally, but rejects duplicate keys,
+  non-finite values, out-of-range integers and invalid surrogate values; host
+  dictionaries and arbitrary Tyvera instances never cross the language API.
 - Text I/O returns `Result` values and path operations are explicit core
   functions. `SecretProvider` reads project-local secrets first and falls back
   to the process environment. The interpreter wraps loaded values in a
@@ -99,13 +104,15 @@ implemented. These boundaries are reflected in the
 ## Native backend direction
 
 The C++ influence is an architectural goal, not a current performance or
-interop claim. Keep a future compiler backend separate from the interpreter
-and define Tyvera's value, integer-overflow, floating-point and resource
-semantics before selecting a target ABI. The module linker keeps the AST/type
-checker independent from loading so a later IR can consume the same resolved
-program graph. A native layer should use explicit
-ownership or resource handles, value types with documented layout rules and a
-narrow, typed FFI boundary. Avoid exposing raw C++ object layouts or host
-exceptions as Tyvera semantics. Prototype a backend and ABI after generics and
-the core library stabilize; retain the interpreter as the
-executable reference implementation during that transition.
+interop claim. A separate compiler pipeline should retain the lexer, parser,
+AST, semantic analysis and diagnostics, then lower checked programs to a
+Tyvera IR shared by the interpreter and a future native backend. No IR is
+introduced yet: the current interpreter consumes the checked AST directly,
+and there is no second backend that would justify maintaining another
+representation. At the native milestone, define explicit value layouts,
+checked integer/float semantics, deterministic resource handles and a narrow,
+typed FFI boundary before selecting an ABI. Evaluate LLVM or a comparable
+backend against these requirements without making it a bootstrap dependency.
+Safe Tyvera should not expose raw pointers; any future unsafe/native boundary
+must be explicit and isolate ownership and foreign error mapping. Keep the
+interpreter as a conformance reference while native output is introduced.

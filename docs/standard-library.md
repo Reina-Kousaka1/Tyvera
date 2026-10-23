@@ -15,9 +15,12 @@ These core types and functions are currently available without an import:
 | `Result<T,E>` | `Ok<T,E>(value)`, `Err<T,E>(error)`, and pattern matching with `Ok(value)`/`Err(error)`. |
 | Text I/O | `readText`, `writeText`, `pathJoin`, `pathExists`, `println`, and `eprintln`; file errors use `Result`. |
 | Secrets | `secrets.NAME` reads `.tyvera.secrets` before the process environment and returns `Option<Secret<String>>`; `Secret.reveal()` is explicit. |
+| `Json` | `parseJson(String) -> Result<Json,String>`, `jsonStringify(Json) -> Result<String,String>`, typed constructors, and optional accessors for JSON values. |
 
 See [the language reference](language.md#core-collections-and-iteration) for
-signatures, key restrictions, ordering, mutation and runtime error behavior.
+collection signatures, key restrictions, ordering, mutation and runtime error
+behavior, and [JSON values](language.md#json-values) for JSON signatures and
+number handling.
 Collections are mutable references even when held by a `let` binding. `Option`
 and `Result` are implemented core sum types. `readText`/`writeText` resolve
 relative paths from the project root and refuse direct access to
@@ -30,11 +33,10 @@ The module paths below are design targets, not current imports:
 
 | Namespace | Planned APIs |
 | --- | --- |
-| `tyvera.json` | Typed JSON values, parsing and encoding. |
 | `tyvera.time` | Duration, monotonic time and timers. |
 | `tyvera.net` | Async HTTP and WebSocket clients. |
 | `tyvera.secrets` | A separately importable provider-backed secret library. |
 
-JSON, timers and networking are not implemented. Collection, I/O and secret
-operations are bootstrap intrinsics and have not yet been moved into source
-`.tyv` library modules.
+Timers and networking are not implemented. JSON, collection, I/O and secret
+operations are bootstrap intrinsics rather than source `.tyv` modules, so
+they are not yet imported through `tyvera.*` namespaces.

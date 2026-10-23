@@ -289,6 +289,47 @@ match response {
 This is a first sum-type slice; destructuring nested values, guards, and
 message-pattern matching are not implemented.
 
+## JSON values
+
+`Json` is an opaque, typed value. `parseJson(text) -> Result<Json,String>`
+parses JSON and returns a generic `Err("invalid JSON document")` for malformed
+input, duplicate object keys, non-standard constants, non-finite numbers,
+numbers outside the signed 64-bit `Int` range, excessive nesting, or invalid
+Unicode surrogate values. JSON integers use `Int`; decimal or exponent-form
+numbers use finite binary64 `Float`. No conversion to arbitrary Tyvera classes
+is performed.
+
+`jsonStringify(value) -> Result<String,String>` encodes a `Json` value as
+compact JSON. Constructors preserve Tyvera's static types:
+`jsonString(String)`, `jsonInt(Int)`, `jsonFloat(Float)`, `jsonBool(Bool)`,
+`jsonNull()`, `jsonArray(List<Json>)`, and
+`jsonObject(Map<String,Json>)`. JSON object key order follows the input order
+or the map's insertion order.
+
+The methods `kind() -> String` and `isNull() -> Bool` inspect the tagged value;
+`kind()` returns `null`, `bool`, `int`, `float`, `string`, `array` or `object`.
+`asString`, `asInt`, `asFloat`, `asBool`, `arrayLength`, `objectLength`,
+`arrayAt(Int)`, `objectGet(String)` and `objectKeys()` return `Option` values.
+Their payload type is the corresponding primitive, length, `Json`, or
+`List<String>`. A wrong container kind, missing key, or out-of-range index
+returns `None`; there are no implicit numeric conversions. JSON values can be
+inspected or encoded, but automatic mapping to user-defined classes is not yet
+implemented. These operations are bootstrap intrinsics and do not yet live in
+an importable `tyvera.json` source module.
+
+```tyv
+match parseJson("{\"ready\":true}") {
+    Ok(document) => match document.objectGet("ready") {
+        Some(value) => match value.asBool() {
+            Some(ready) => println(ready)
+            None => println(false)
+        }
+        None => println(false)
+    }
+    Err(_) => println(false)
+}
+```
+
 ## Text I/O, paths and secrets
 
 The bootstrap core provides `readText(path) -> Result<String,String>`,
@@ -408,7 +449,8 @@ limit (or the bootstrap host stack limit, if reached sooner).
 Current limits: classes and interfaces are supported, but there is no
 inheritance, generic methods/interfaces/constraints, collection literals,
 `try`/`catch`, actor/process model, messaging, supervisor, async runtime,
-networking API, JSON library, external secret-store provider, native interop, garbage collector
+networking API, importable standard-library modules, external secret-store
+provider, native interop, garbage collector
 implementation, package manager or Discord SDK. No compiler backend or
 performance claim. No termination checking or loop execution budget; users can
 write infinite loops. Parsing and execution use the host stack, so extremely
