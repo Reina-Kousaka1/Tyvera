@@ -4,12 +4,14 @@ Tyvera is an independent, statically typed language. Java, Elixir and C++ inform
 its design; they are not compatibility targets. TypeScript is not part of the
 design. Python hosts the bootstrap implementation only.
 
-## Files, functions and statements
+## Files, declarations and statements
 
-Source files use `.tyv`. Each program is one file containing function
-declarations, including `fn main()` returning `Void`. Functions can call later
-declarations and recurse. Parameters require types and are immutable. Return
-annotations use `-> Type`; an omitted annotation means `Void`.
+Source files use `.tyv`. The current compiler accepts one source file per
+program. It can contain functions, classes and interfaces, including a global
+`fn main()` returning `Void`. Functions, types and methods can use declarations
+that appear later in the same file. Functions can recurse. Parameters require
+types and are immutable. Return annotations use `-> Type`; an omitted
+annotation means `Void`.
 
 ```tyv
 fn max(a: Int, b: Int) -> Int {
@@ -33,21 +35,34 @@ the next independent statement. Expressions and conditions stay on one line;
 the opening `{` follows the condition on that line. `else` may follow `}` on
 the same line or after newlines, but not after a semicolon.
 
-Supported statement grammar (EBNF; expression follows the precedence below):
+Supported declaration and statement grammar (EBNF; expression follows the
+precedence below):
 
 ```text
 block       = "{" [statements] "}" ;
 declaration = ("let" | "var") identifier [":" type] "=" expression ;
 assignment  = identifier "=" expression ;
+field-set   = expression "." identifier "=" expression ;
 conditional = "if" expression block ["else" (block | conditional)] ;
 loop        = "while" expression block ;
 return      = "return" [expression] ;
-statement   = declaration | assignment | conditional | loop | return
+statement   = declaration | assignment | field-set | conditional | loop | return
             | "break" | "continue" | block | function-call ;
+function    = "fn" identifier "(" [parameters] ")" ["->" type] block ;
+class       = "class" identifier ["implements" type-list] "{" {field | method} "}" ;
+field       = ("let" | "var") identifier ":" type ;
+method      = function ;
+interface   = "interface" identifier "{" {method-signature} "}" ;
+method-signature = "fn" identifier "(" [parameters] ")" ["->" type] ;
+type-list   = identifier {"," identifier} ;
+parameters  = identifier ":" type {"," identifier ":" type} ;
+type        = identifier ;
 ```
 
-Assignments are statements, not expressions. Only function calls can be used
-as expression statements. Declarations require an initializer.
+Assignments are statements, not expressions. Function and method calls can be
+used as expression statements. Local declarations require an initializer;
+class fields declare their type without an initializer and are initialized by
+the constructor.
 
 ## Lexical rules and literals
 
@@ -73,13 +88,15 @@ as expression statements. Declarations require an initializer.
 
 `Unit` remains an exact compatibility alias for `Void`; signatures and
 diagnostics use `Void`. Inference applies to initialized local bindings only.
-Assignment, initialization, arguments and returns require exact type matches:
-an `Int` cannot silently be stored in a `Float` binding. Numeric promotion is
+Assignment, initialization, arguments and returns require exact type matches,
+except that a class implementing an interface is assignable to that interface.
+An `Int` cannot silently be stored in a `Float` binding. Numeric promotion is
 limited to the explicit arithmetic rules below.
 
 `println(value)` accepts one `Int`, `Float`, `Bool` or `String` and returns
 `Void`. Booleans print in lowercase. Function names and local bindings occupy
-separate namespaces; calls name declared functions directly. `println` cannot
+separate namespaces; global calls name declared functions directly, constructors
+use the class name, and instance methods use member-call syntax. `println` cannot
 be redeclared or shadowed.
 
 ## Scope, bindings and mutation
@@ -106,6 +123,67 @@ outer `n`. Assignment targets the nearest binding and requires that binding
 to be mutable. Leaving the child scope restores the outer binding. Assignment
 to an unshadowed outer `var` persists after the block. Loop iterations create
 fresh body scopes; declarations do not leak into the next iteration.
+
+## Classes, fields and interfaces
+
+Classes are reference values with named fields and instance methods; `==` and
+`!=` compare instances by identity. A method receives its instance through the
+reserved `self` name. Fields and methods are public; there are no access
+modifiers or static methods yet. Field access uses
+`instance.field`, method calls use `instance.method(arguments)`, and assignment
+to a field is a statement.
+
+```tyv
+class User {
+    let name: String
+    var score: Int
+
+    fn init(name: String, score: Int) {
+        self.name = name
+        self.score = score
+    }
+
+    fn addScore(points: Int) {
+        self.score = self.score + points
+    }
+}
+```
+
+`init` is the constructor. Constructing `User("Charlotte", 10)` calls
+`init` with those arguments and produces a `User` instance. A class with fields
+must declare one `init`; a class without fields may omit it, in which case
+`ClassName()` constructs an empty instance. Constructors return `Void`.
+Every field must be initialized on every path that can finish construction.
+An immutable `let` field must be initialized exactly once on each path;
+mutable `var` fields may be reassigned. Constructor field assignments through
+`self` are the only way to initialize immutable fields. The checker rejects
+reads of an uninitialized field and passing or using `self` before all fields
+are initialized. Immutable fields cannot be initialized inside loops.
+
+Interfaces declare method signatures, and a class can implement multiple
+interfaces:
+
+```tyv
+interface Printable {
+    fn print() -> Void
+}
+
+class User implements Printable {
+    let name: String
+    fn init(name: String) { self.name = name }
+    fn print() { println(self.name) }
+}
+
+fn display(value: Printable) { value.print() }
+```
+
+The checker verifies that each required method exists and has exactly matching
+parameter and return types. A class implementing an interface can be assigned
+to an interface-typed binding or passed to an interface-typed parameter;
+method calls dispatch to the instance's class implementation. Interfaces have
+no fields, default methods or inheritance. Classes/interfaces and global
+functions share one declaration namespace. Visibility is currently uniform and
+public within the single source file.
 
 ## Operators
 
@@ -178,10 +256,13 @@ limit (or the bootstrap host stack limit, if reached sooner).
 `tyvera check file.tyv` checks without running;
 `tyvera run file.tyv` checks and interprets the AST.
 
-Current limits: one file; no imports/modules, classes, interfaces, generics,
-collections, pattern matching, actors/processes, messages, supervisors, native
-interop, garbage collector implementation, package manager or Discord SDK.
-No compiler backend or performance claim. No termination checking or loop
-execution budget; users can write infinite loops. Parsing and execution use
-the host stack, so extremely deeply nested source is not supported. The
-interpreter is replaceable bootstrap technology, not part of Tyvera semantics.
+Current limits: one source file per program; classes and interfaces are
+supported, but there is no inheritance, visibility modifier, generic type,
+collection, `for` loop, module/import system, pattern matching, `try`/`catch`,
+actor/process model, messaging, supervisor, async/I/O or networking API, JSON
+library, environment-variable API, native interop, garbage collector
+implementation, package manager or Discord SDK. No compiler backend or
+performance claim. No termination checking or loop execution budget; users can
+write infinite loops. Parsing and execution use the host stack, so extremely
+deeply nested source is not supported. The interpreter is replaceable bootstrap
+technology, not part of Tyvera semantics.

@@ -10,6 +10,7 @@ from .ast import (
     Binary,
     Block,
     Call,
+    ClassDeclaration,
     Expression,
     ExpressionStatement,
     Function,
@@ -17,6 +18,9 @@ from .ast import (
     LetStatement,
     Literal,
     LoopControl,
+    MemberAccess,
+    MemberCall,
+    Method,
     Name,
     Program,
     ReturnStatement,
@@ -38,9 +42,16 @@ class _LoopSignal(Exception):
     kind: str
 
 
+@dataclass(slots=True, eq=False)
+class _TyveraInstance:
+    class_name: str
+    fields: dict[str, object]
+
+
 class Interpreter:
     def __init__(self, program: Program, output: TextIO, max_call_depth: int = 256) -> None:
         self.functions = {function.name: function for function in program.functions}
+        self.classes: dict[str, ClassDeclaration] = {declaration.name: declaration for declaration in program.classes}
         self.output = output
         self.max_call_depth = max_call_depth
 
@@ -65,10 +76,17 @@ class Interpreter:
             if isinstance(statement, LetStatement):
                 variables[statement.name] = self._evaluate(statement.value, variables, depth)
             elif isinstance(statement, Assignment):
+                if isinstance(statement.target, MemberAccess):
+                    receiver = self._evaluate(statement.target.receiver, variables, depth)
+                    value = self._evaluate(statement.value, variables, depth)
+                    if not isinstance(receiver, _TyveraInstance):
+                        raise AssertionError("checked field assignment receiver is not an instance")
+                    receiver.fields[statement.target.member] = value
+                    continue
                 value = self._evaluate(statement.value, variables, depth)
                 for scope in variables.maps:
-                    if statement.name in scope:
-                        scope[statement.name] = value
+                    if statement.target in scope:
+                        scope[statement.target] = value
                         break
                 else:
                     raise AssertionError("checked assignment has no binding")
@@ -104,7 +122,22 @@ class Interpreter:
             if expression.callee == "println":
                 self.output.write(self._display(arguments[0]) + "\n")
                 return None
+            if expression.callee in self.classes:
+                return self._construct(self.classes[expression.callee], arguments, expression.location, depth + 1)
             return self._call(self.functions[expression.callee], arguments, expression.location, depth + 1)
+        if isinstance(expression, MemberAccess):
+            receiver = self._evaluate(expression.receiver, variables, depth)
+            if not isinstance(receiver, _TyveraInstance):
+                raise AssertionError("checked field access receiver is not an instance")
+            return receiver.fields[expression.member]
+        if isinstance(expression, MemberCall):
+            receiver = self._evaluate(expression.receiver, variables, depth)
+            arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+            if not isinstance(receiver, _TyveraInstance):
+                raise AssertionError("checked method receiver is not an instance")
+            declaration = self.classes[receiver.class_name]
+            method = next(method for method in declaration.methods if method.name == expression.method)
+            return self._call_method(method, receiver, arguments, expression.location, depth + 1)
         if isinstance(expression, Unary):
             value = self._evaluate(expression.operand, variables, depth)
             if expression.operator == "!":
@@ -126,6 +159,32 @@ class Interpreter:
             self._check_numeric_result(result, expression.location)
             return result
         raise AssertionError(f"unhandled expression node: {type(expression).__name__}")
+
+    def _construct(
+        self, declaration: ClassDeclaration, arguments: list[object], call_location: Location, depth: int,
+    ) -> _TyveraInstance:
+        instance = _TyveraInstance(declaration.name, {})
+        constructor = next((method for method in declaration.methods if method.name == "init"), None)
+        if constructor is not None:
+            self._call_method(constructor, instance, arguments, call_location, depth)
+        return instance
+
+    def _call_method(
+        self, method: Method, receiver: _TyveraInstance, arguments: list[object],
+        call_location: Location, depth: int,
+    ) -> object:
+        if depth >= self.max_call_depth:
+            raise Diagnostic(call_location, "runtime", f"maximum call depth ({self.max_call_depth}) exceeded")
+        initial = {parameter.name: value for parameter, value in zip(method.parameters, arguments)}
+        initial["self"] = receiver
+        variables = ChainMap(initial)
+        try:
+            self._execute_block(method.body, variables, depth)
+        except _ReturnSignal as signal:
+            return signal.value
+        except RecursionError as error:
+            raise Diagnostic(call_location, "runtime", "bootstrap runtime stack limit exceeded") from error
+        return None
 
     @staticmethod
     def _check_numeric_result(value: object, location: Location) -> None:

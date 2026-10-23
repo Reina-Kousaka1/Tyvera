@@ -1,0 +1,32 @@
+interface Printable {
+    fn label() -> String
+}
+
+class User implements Printable {
+    let name: String
+    var score: Int
+
+    fn init(name: String, score: Int) {
+        self.name = name
+        self.score = score
+    }
+
+    fn addScore(points: Int) {
+        self.score = self.score + points
+    }
+
+    fn label() -> String {
+        return self.name
+    }
+}
+
+fn describe(value: Printable) {
+    println(value.label())
+}
+
+fn main() {
+    let user: User = User("Charlotte", 10)
+    user.addScore(5)
+    println(user.score)
+    describe(user)
+}

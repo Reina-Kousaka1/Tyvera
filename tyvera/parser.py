@@ -4,14 +4,21 @@ from .ast import (
     Assignment,
     Binary,
     Block,
+    ClassDeclaration,
     Call,
     Expression,
     ExpressionStatement,
+    Field,
     Function,
     IfStatement,
+    InterfaceDeclaration,
     LetStatement,
     Literal,
     LoopControl,
+    MemberAccess,
+    MemberCall,
+    Method,
+    MethodSignature,
     Name,
     Parameter,
     Program,
@@ -61,18 +68,30 @@ class Parser:
 
     def parse(self) -> Program:
         functions: list[Function] = []
+        classes: list[ClassDeclaration] = []
+        interfaces: list[InterfaceDeclaration] = []
         self._skip_separators()
         while not self._check("EOF"):
-            if not self._check("FN"):
-                self._error(self._current(), "expected a function declaration beginning with 'fn'")
-            functions.append(self._function())
+            if self._check("FN"):
+                functions.append(self._function())
+            elif self._check("CLASS"):
+                classes.append(self._class_declaration())
+            elif self._check("INTERFACE"):
+                interfaces.append(self._interface_declaration())
+            else:
+                self._error(self._current(), "expected a function, class, or interface declaration")
             if not self._check_any("NEWLINE", "SEMICOLON", "EOF"):
-                self._error(self._current(), "expected a line break after the function body")
+                self._error(self._current(), "expected a line break after the declaration")
             self._skip_separators()
-        return Program(functions)
+        return Program(functions, classes, interfaces)
 
     def _function(self) -> Function:
         fn_token = self._expect("FN", "expected 'fn'")
+        name, parameters, return_type = self._function_header()
+        body = self._block()
+        return Function(name, parameters, return_type, body, fn_token.location)
+
+    def _function_header(self) -> tuple[str, list[Parameter], str]:
         name_token = self._expect("IDENTIFIER", "expected a function name after 'fn'")
         self._expect("LPAREN", "expected '(' after function name")
         parameters: list[Parameter] = []
@@ -90,8 +109,58 @@ class Parser:
         return_type = "Void"
         if self._match("ARROW"):
             return_type = self._expect("IDENTIFIER", "expected a return type after '->'").lexeme
-        body = self._block()
-        return Function(name_token.lexeme, parameters, return_type, body, fn_token.location)
+        return name_token.lexeme, parameters, return_type
+
+    def _class_declaration(self) -> ClassDeclaration:
+        class_token = self._expect("CLASS", "expected 'class'")
+        name = self._expect("IDENTIFIER", "expected a class name after 'class'")
+        interfaces: list[str] = []
+        if self._match("IMPLEMENTS"):
+            while True:
+                interfaces.append(self._expect("IDENTIFIER", "expected an interface name after 'implements'").lexeme)
+                if not self._match("COMMA"):
+                    break
+        self._expect("LBRACE", "expected '{' after class header")
+        fields: list[Field] = []
+        methods: list[Method] = []
+        self._skip_separators()
+        while not self._check_any("RBRACE", "EOF"):
+            if self._match("LET", "VAR"):
+                declaration = self._previous()
+                field_name = self._expect("IDENTIFIER", "expected a field name")
+                self._expect("COLON", "expected ':' after field name")
+                field_type = self._expect("IDENTIFIER", "expected a field type after ':'")
+                fields.append(Field(field_name.lexeme, field_type.lexeme, declaration.kind == "VAR", declaration.location))
+            elif self._check("FN"):
+                method_token = self._advance()
+                method_name, parameters, return_type = self._function_header()
+                body = self._block()
+                methods.append(Method(method_name, parameters, return_type, body, method_token.location))
+            else:
+                self._error(self._current(), "expected a field declaration or method in class body")
+            if not self._check_any("NEWLINE", "SEMICOLON", "RBRACE", "EOF"):
+                self._error(self._current(), "expected a line break or ';' after class member")
+            self._skip_separators()
+        self._expect("RBRACE", "expected '}' to close class body")
+        return ClassDeclaration(name.lexeme, interfaces, fields, methods, class_token.location)
+
+    def _interface_declaration(self) -> InterfaceDeclaration:
+        interface_token = self._expect("INTERFACE", "expected 'interface'")
+        name = self._expect("IDENTIFIER", "expected an interface name after 'interface'")
+        self._expect("LBRACE", "expected '{' after interface name")
+        methods: list[MethodSignature] = []
+        self._skip_separators()
+        while not self._check_any("RBRACE", "EOF"):
+            method_token = self._expect("FN", "expected a method signature beginning with 'fn'")
+            method_name, parameters, return_type = self._function_header()
+            if self._check("LBRACE"):
+                self._error(self._current(), "interface methods declare signatures and cannot have bodies")
+            methods.append(MethodSignature(method_name, parameters, return_type, method_token.location))
+            if not self._check_any("NEWLINE", "SEMICOLON", "RBRACE", "EOF"):
+                self._error(self._current(), "expected a line break or ';' after interface method")
+            self._skip_separators()
+        self._expect("RBRACE", "expected '}' to close interface body")
+        return InterfaceDeclaration(name.lexeme, methods, interface_token.location)
 
     def _block(self) -> list[Statement]:
         self._expect("LBRACE", "expected '{' to start the block")
@@ -119,15 +188,16 @@ class Parser:
         if self._check("LBRACE"):
             location = self._current().location
             return Block(self._block(), location)
-        if self._check("IDENTIFIER") and self.tokens[self.index + 1].kind == "EQUAL":
-            name = self._advance()
-            self._advance()
-            return Assignment(name.lexeme, self._expression(), name.location)
         if self._match("RETURN"):
             return self._return_statement(self._previous())
         token = self._current()
         expression = self._expression()
-        if not isinstance(expression, Call):
+        if self._match("EQUAL"):
+            if not isinstance(expression, (Name, MemberAccess)):
+                self._error(token, "assignment target must be a variable or field")
+            return Assignment(expression.identifier if isinstance(expression, Name) else expression,
+                              self._expression(), token.location)
+        if not isinstance(expression, (Call, MemberCall)):
             self._error(token, "only a function call can be used as an expression statement")
         return ExpressionStatement(expression, token.location)
 
@@ -169,6 +239,14 @@ class Parser:
             if self._check("LPAREN") and isinstance(expression, Name):
                 expression = self._call(expression)
                 continue
+            if self._check("DOT"):
+                dot = self._advance()
+                member = self._expect("IDENTIFIER", "expected a field or method name after '.'")
+                if self._check("LPAREN"):
+                    expression = self._member_call(expression, member.lexeme, dot.location)
+                else:
+                    expression = MemberAccess(expression, member.lexeme, dot.location)
+                continue
             precedence = _PRECEDENCE.get(self._current().kind, -1)
             if precedence < minimum_precedence:
                 break
@@ -205,6 +283,17 @@ class Parser:
 
     def _call(self, callee: Name) -> Call:
         self._expect("LPAREN", "expected '(' after function name")
+        arguments = self._arguments()
+        self._expect("RPAREN", "expected ')' after function arguments")
+        return Call(callee.identifier, arguments, callee.location)
+
+    def _member_call(self, receiver: Expression, method: str, location) -> MemberCall:
+        self._expect("LPAREN", "expected '(' after method name")
+        arguments = self._arguments()
+        self._expect("RPAREN", "expected ')' after method arguments")
+        return MemberCall(receiver, method, arguments, location)
+
+    def _arguments(self) -> list[Expression]:
         arguments: list[Expression] = []
         if not self._check("RPAREN"):
             while True:
@@ -213,8 +302,7 @@ class Parser:
                     break
                 if self._check("RPAREN"):
                     break
-        self._expect("RPAREN", "expected ')' after function arguments")
-        return Call(callee.identifier, arguments, callee.location)
+        return arguments
 
     def _skip_separators(self) -> None:
         while self._match("NEWLINE", "SEMICOLON"):

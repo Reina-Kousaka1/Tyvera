@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .source import Location
@@ -9,6 +9,49 @@ from .source import Location
 @dataclass(slots=True)
 class Program:
     functions: list[Function]
+    classes: list[ClassDeclaration] = field(default_factory=list)
+    interfaces: list[InterfaceDeclaration] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class Field:
+    name: str
+    type_name: str
+    mutable: bool
+    location: Location
+
+
+@dataclass(slots=True)
+class Method:
+    name: str
+    parameters: list[Parameter]
+    return_type: str
+    body: list[Statement]
+    location: Location
+
+
+@dataclass(slots=True)
+class MethodSignature:
+    name: str
+    parameters: list[Parameter]
+    return_type: str
+    location: Location
+
+
+@dataclass(slots=True)
+class ClassDeclaration:
+    name: str
+    interfaces: list[str]
+    fields: list[Field]
+    methods: list[Method]
+    location: Location
+
+
+@dataclass(slots=True)
+class InterfaceDeclaration:
+    name: str
+    methods: list[MethodSignature]
+    location: Location
 
 
 @dataclass(slots=True)
@@ -42,7 +85,7 @@ class LetStatement(Statement):
 
 @dataclass(slots=True)
 class Assignment(Statement):
-    name: str
+    target: str | MemberAccess
     value: Expression
     location: Location
 
@@ -106,6 +149,21 @@ class Name(Expression):
 @dataclass(slots=True)
 class Call(Expression):
     callee: str
+    arguments: list[Expression]
+    location: Location
+
+
+@dataclass(slots=True)
+class MemberAccess(Expression):
+    receiver: Expression
+    member: str
+    location: Location
+
+
+@dataclass(slots=True)
+class MemberCall(Expression):
+    receiver: Expression
+    method: str
     arguments: list[Expression]
     location: Location
 

@@ -5,48 +5,78 @@
 A source file passes through four explicit stages:
 
 1. `lexer.py` converts characters into tokens with source locations.
-2. `parser.py` builds the AST in `ast.py`.
-3. `typesys.py` validates declarations, expressions, calls, and the entry point before execution.
-4. `interpreter.py` evaluates only a successfully checked AST.
+2. `parser.py` builds the Tyvera-specific AST in `ast.py`.
+3. `typesys.py` collects and validates declarations, expressions, calls,
+   constructors, interface contracts and the entry point before execution.
+4. `interpreter.py` evaluates only a successfully checked AST, including
+   Tyvera-owned object instances and method dispatch.
 
-`source.py` owns shared file/line/column locations and user-facing diagnostics. `cli.py` provides the `tyvera run` and `tyvera check` commands. The implementation uses Python's standard library only.
+`source.py` owns shared file/line/column locations and user-facing diagnostics.
+`cli.py` provides `tyvera run` and `tyvera check`. The implementation uses
+Python's standard library only.
 
-## Initial design choices
+## Design decisions
 
-- **Own source model:** The grammar, type names, operators, AST, and diagnostics are Tyvera-specific. No Java, Elixir, C++, or TypeScript parser/runtime is embedded.
-- **Check before running:** The complete file is parsed and type-checked before `main` can print anything. This makes static errors deterministic and prevents a partially executed program from hiding a later type error.
-- **Defined numeric widths:** `Int` uses a checked signed 64-bit range and `Float` uses finite binary64 values. The interpreter reports overflow rather than inheriting Python's arbitrary-precision integer behavior or silently exposing host-specific results.
-- **Interpreter first:** An AST interpreter makes the smallest useful `.tyv` program executable without requiring a native compiler, VM, or external build tools. The lexer, AST, checker, and CLI boundaries leave room for a future bytecode or native backend. This implementation does not claim C++-level performance or native access.
-- **Host language is an implementation detail:** Python is used only to bootstrap the first toolchain because it is available in the execution environment and has no runtime package dependencies here. Tyvera programs do not inherit Python syntax, libraries, or dynamic typing.
-- **Concurrency and native systems features are deferred:** Processes/actors, message passing, supervision, fault isolation, classes/interfaces, generics, and controlled native access are explicit design directions, not placeholder APIs in 0.1. The current AST keeps functions and expression/statement nodes distinct so these can be added without changing the CLI contract.
-- **No formatter yet:** Statement separation and a compact indentation convention are documented. A future formatter needs its own round-trip and idempotence tests once the core grammar is stable.
+- **Own source model:** Grammar, type names, operators, AST and diagnostics are
+  Tyvera-specific. No Java, Elixir, C++, TypeScript or Python parser/runtime is
+  embedded.
+- **Check before running:** The complete file is parsed and type-checked before
+  `main` can print anything. Static errors are deterministic and cannot be
+  hidden by earlier execution effects.
+- **Defined numeric widths:** `Int` uses a checked signed 64-bit range and
+  `Float` uses finite binary64 values. The interpreter reports overflow rather
+  than inheriting Python's arbitrary-precision integer behavior.
+- **Interpreter first:** The AST interpreter makes `.tyv` programs executable
+  without a native compiler, VM or external build tools. Lexer, AST, checker
+  and CLI boundaries leave room for a future bytecode or native backend. This
+  implementation makes no C++-level performance or native access claim.
+- **Host language is an implementation detail:** Python hosts the first
+  toolchain. Tyvera programs do not inherit Python syntax, libraries, dynamic
+  typing or object model.
+- **No formatter yet:** Statement separation and indentation conventions are
+  documented. A future formatter needs round-trip and idempotence tests.
 
-## Current limits
+## Core language and object model
 
-The implementation accepts one source file, primitive types, functions, lexical
-blocks, immutable and mutable bindings, conditions and loops. It has no modules
-or package manager. Calls are synchronous and execute in one process. These
-limits are reflected in the language reference.
+- Dedicated AST nodes represent assignment, scoped blocks, branches, loops,
+  loop controls, classes, fields, interfaces, member access and method calls.
+  Assignment remains a statement; the precedence parser is expression-only.
+- Checker environments contain typed bindings and mutability. Nested scopes
+  resolve nearest-first and prohibit duplicates only in the current scope.
+- Return analysis composes possible exits (`next`, `return`, `break`,
+  `continue`) independently of runtime exceptions or host control flow.
+- Interface implementation is nominal: a class lists one or more interfaces,
+  and required method names, parameter types and return types must match
+  exactly. A conforming class is assignable to its interface. There is no
+  class inheritance or structural duck typing.
+- Constructors are named `init` and return `Void`. Classes with fields must
+  define one. A path-sensitive constructor analysis ensures fields have been
+  initialized before a successful return; it checks immutable assignment,
+  early field reads and premature escape of `self`.
+- Runtime instances use a Tyvera-owned value record containing the nominal type
+  and fields. Method dispatch consults Tyvera class declarations. Python
+  classes are not exposed as language values.
+- Runtime environments mirror the lexical scope topology but hold values.
+  Internal return and loop signals unwind nested blocks and are caught only by
+  their owning function or loop.
+- `Void` is canonical; `Unit` is normalized as a compatibility spelling.
+  Numeric promotion, finite `Float` and checked 64-bit `Int` rules are explicit
+  Tyvera semantics rather than host defaults.
 
-## Core control-flow decisions
+The compiler currently accepts one source file per program. Calls execute
+synchronously in one process. Modules, collections, generics, error handling,
+pattern matching, actors, supervisors, async I/O, JSON and environment access
+are not implemented. These boundaries are reflected in the
+[language reference](language.md) and [roadmap](roadmap.md).
 
-- Dedicated AST nodes represent assignment, scoped blocks, branches, loops and
-  loop controls. The precedence parser remains expression-only; assignment is a
-  statement. `else if` is an alternative containing a nested conditional.
-- Checker environments contain typed bindings with mutability. Nested scopes
-  resolve nearest-first and prohibit duplicates only in the current scope;
-  parameters are immutable bindings in the function body scope.
-- Return analysis composes sets of possible exits (`next`, `return`, `break`,
-  `continue`). It handles literal conditions and endless loops but does not
-  infer arbitrary expression values. This analysis is independent of runtime
-  exceptions or host control flow and can be reused before a compiler backend.
-- Runtime environments have the same lexical topology but hold values rather
-  than types. Assignment updates the nearest owning scope. Each iteration gets
-  a fresh body environment. Internal return/loop signals unwind nested blocks;
-  loop signals are caught only by the nearest loop, returns only by a function.
-- `Void` is canonical; the initial `Unit` spelling is normalized during type
-  checking. Existing numeric promotion, finite Float and checked 64-bit Int
-  rules remain explicit Tyvera semantics rather than host defaults.
-- Future classes/interfaces can add declarations, type information and AST
-  nodes at these boundaries without embedding interpreter behavior in their
-  semantics.
+## Native backend direction
+
+The C++ influence is an architectural goal, not a current performance or
+interop claim. Keep a future compiler backend separate from the interpreter
+and define Tyvera's value, integer-overflow, floating-point and resource
+semantics before selecting a target ABI. A native layer should use explicit
+ownership or resource handles, value types with documented layout rules and a
+narrow, typed FFI boundary. Avoid exposing raw C++ object layouts or host
+exceptions as Tyvera semantics. Prototype a backend and ABI after modules,
+generics and the core library stabilize; retain the interpreter as the
+executable reference implementation during that transition.

@@ -28,6 +28,9 @@ KEYWORDS = {
     "false": "FALSE",
     "and": "AND",
     "or": "OR",
+    "class": "CLASS",
+    "interface": "INTERFACE",
+    "implements": "IMPLEMENTS",
 }
 
 SINGLE_CHAR_TOKENS = {
@@ -36,6 +39,7 @@ SINGLE_CHAR_TOKENS = {
     "{": "LBRACE",
     "}": "RBRACE",
     ",": "COMMA",
+    ".": "DOT",
     ":": "COLON",
     ";": "SEMICOLON",
     "+": "PLUS",
