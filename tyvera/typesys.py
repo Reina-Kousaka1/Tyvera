@@ -703,12 +703,13 @@ class TypeChecker:
                 exits = set()
                 seen: set[tuple[object, ...]] = set()
                 coverage: set[str] = set()
+                checked_patterns = []
                 has_catchall = False
                 for arm in statement.arms:
                     pattern = arm.pattern
                     if has_catchall:
                         raise Diagnostic(pattern.location, "type", "match arm is unreachable after a wildcard or binding pattern")
-                    if self._match_is_exhaustive(subject_type, coverage, has_catchall):
+                    if self._patterns_are_exhaustive(subject_type, checked_patterns):
                         raise Diagnostic(pattern.location, "type", "match arm is unreachable after exhaustive patterns")
                     if isinstance(pattern, VariantPattern) and pattern.variant in coverage:
                         raise Diagnostic(pattern.location, "type", f"match arm for '{pattern.variant}' is unreachable")
@@ -717,25 +718,22 @@ class TypeChecker:
                     key = self._check_pattern(pattern, subject_type, variables)
                     if key in seen:
                         raise Diagnostic(pattern.location, "type", "duplicate match pattern")
+                    if not self._pattern_is_useful(checked_patterns, pattern, subject_type):
+                        raise Diagnostic(pattern.location, "type", "match arm is unreachable after previous patterns")
                     seen.add(key)
-                    if key and key[0] == "variant" and key[2]:
-                        coverage.add(str(key[1]))
-                    if key and key[0] == "enum" and key[2]:
-                        coverage.add(str(key[1]))
-                    if key and key[0] == "literal" and key[1] == "Bool":
-                        coverage.add("true" if key[2] else "false")
+                    checked_patterns.append(pattern)
+                    coverage = self._fully_covered_cases(subject_type, checked_patterns)
                     if key and key[0] == "catchall":
                         has_catchall = True
                     arm_variables = variables.new_child()
                     self._bind_pattern(pattern, subject_type, arm_variables)
                     exits |= self._check_block(arm.body, arm_variables, return_type, loop_depth,
                                                owner, method_name, async_allowed)
-                if not self._match_is_exhaustive(subject_type, coverage, has_catchall):
+                exhaustive = self._patterns_are_exhaustive(subject_type, checked_patterns)
+                if not exhaustive:
                     exits.add("next")
                 self.match_coverage[statement.location] = frozenset(coverage)
-                self.match_exhaustiveness[statement.location] = self._match_is_exhaustive(
-                    subject_type, coverage, has_catchall,
-                )
+                self.match_exhaustiveness[statement.location] = exhaustive
             elif isinstance(statement, LoopControl):
                 if not loop_depth:
                     raise Diagnostic(statement.location, "type", f"'{statement.kind}' is only valid inside a loop")
@@ -1539,20 +1537,182 @@ class TypeChecker:
             return arguments[0]
         return arguments[0] if pattern.variant == "Ok" else arguments[1]
 
-    def _match_is_exhaustive(self, subject_type: str, coverage: set[str], catchall: bool) -> bool:
-        if catchall:
-            return True
-        base, _ = split_type(subject_type)
-        if base == "Option":
-            return {"Some", "None"} <= coverage
-        if base == "Result":
-            return {"Ok", "Err"} <= coverage
+    def _finite_constructors(self, type_name: str):
+        type_name = self._canonical_type(type_name)
+        base, arguments = split_type(type_name)
+        if base == "Bool":
+            return [(("literal", "Bool", value), ()) for value in (True, False)]
+        if base == "Option" and len(arguments) == 1:
+            return [(('variant', 'Some'), (arguments[0],)), (('variant', 'None'), ())]
+        if base == "Result" and len(arguments) == 2:
+            return [(('variant', 'Ok'), (arguments[0],)), (('variant', 'Err'), (arguments[1],))]
         enum = self.enums.get(base)
         if enum is not None:
-            return set(enum.variants) <= coverage
-        if subject_type == "Bool":
-            return {"true", "false"} <= coverage
-        return False
+            substitutions = dict(zip(enum.type_parameters, arguments))
+            return [(("enum", base, variant), tuple(
+                self._canonical_type(substitute_type(payload, substitutions)) for payload in payloads
+            )) for variant, payloads in enum.variants.items()]
+        if base == "Tuple" and len(arguments) >= 2:
+            return [(('tuple', base), tuple(arguments))]
+        record = self.records.get(base)
+        if record is not None:
+            substitutions = dict(zip(record.type_parameters, arguments))
+            fields = tuple(self._canonical_type(substitute_type(field.type_name, substitutions))
+                           for field in record.fields.values())
+            return [(('record', base), fields)]
+        newtype = self.newtypes.get(base)
+        if newtype is not None:
+            substitutions = dict(zip(newtype.type_parameters, arguments))
+            payload = self._canonical_type(substitute_type(newtype.underlying_type, substitutions))
+            return [(('newtype', base), (payload,))]
+        if base == "Void":
+            return []
+        return None
+
+    def _pattern_head(self, pattern, type_name: str):
+        if isinstance(pattern, (BindingPattern, WildcardPattern)):
+            return None
+        if isinstance(pattern, LiteralPattern):
+            return ("literal", pattern.type_name, pattern.value), ()
+        base, _ = split_type(self._canonical_type(type_name))
+        if isinstance(pattern, VariantPattern):
+            if base == "Option":
+                tag = ("variant", pattern.variant)
+                if pattern.variant == "None":
+                    return tag, ()
+            elif base == "Result":
+                tag = ("variant", pattern.variant)
+            else:
+                return None
+            child = pattern.payload_pattern
+            if child is None:
+                child = (BindingPattern(pattern.binding, pattern.location) if pattern.binding is not None
+                         else WildcardPattern(pattern.location))
+            return tag, (child,)
+        if isinstance(pattern, EnumPattern):
+            return ("enum", pattern.enum_name, pattern.variant), tuple(pattern.payload_patterns)
+        if isinstance(pattern, TuplePattern):
+            return ("tuple", base), tuple(pattern.elements)
+        if isinstance(pattern, RecordPattern):
+            if pattern.name in self.newtypes:
+                return ("newtype", base), tuple(pattern.fields)
+            return ("record", base), tuple(pattern.fields)
+        return None
+
+    def _specialize_matrix(self, matrix, type_name: str, tag, argument_types: tuple[str, ...]):
+        specialized = []
+        for row in matrix:
+            head, *tail = row
+            if isinstance(head, (BindingPattern, WildcardPattern)):
+                payloads = [WildcardPattern(head.location) for _ in argument_types]
+            else:
+                info = self._pattern_head(head, type_name)
+                if info is None or info[0] != tag:
+                    continue
+                payloads = list(info[1])
+            if len(payloads) == len(argument_types):
+                specialized.append(payloads + tail)
+        return specialized
+
+    def _patterns_are_exhaustive(self, subject_type: str, patterns) -> bool:
+        return self._matrix_is_exhaustive([[pattern] for pattern in patterns], [subject_type])
+
+    def _fully_covered_cases(self, subject_type: str, patterns) -> set[str]:
+        constructors = self._finite_constructors(subject_type)
+        if constructors is None:
+            return set()
+        matrix = [[pattern] for pattern in patterns]
+        covered: set[str] = set()
+        for tag, argument_types in constructors:
+            specialized = self._specialize_matrix(matrix, subject_type, tag, argument_types)
+            if not self._matrix_is_exhaustive(specialized, list(argument_types)):
+                continue
+            if tag[0] == "literal" and tag[1] == "Bool":
+                covered.add("true" if tag[2] else "false")
+            elif tag[0] == "variant":
+                covered.add(tag[1])
+            elif tag[0] == "enum":
+                covered.add(tag[2])
+        return covered
+
+    def _matrix_is_exhaustive(self, matrix, type_names: list[str]) -> bool:
+        if not matrix:
+            return False
+        if any(all(isinstance(pattern, (BindingPattern, WildcardPattern)) for pattern in row)
+               for row in matrix):
+            return True
+        if not type_names:
+            return bool(matrix)
+        type_name, *remaining_types = type_names
+        constructors = self._finite_constructors(type_name)
+        if constructors is None:
+            defaults = [row[1:] for row in matrix
+                        if isinstance(row[0], (BindingPattern, WildcardPattern))]
+            return self._matrix_is_exhaustive(defaults, remaining_types)
+        return all(
+            self._matrix_is_exhaustive(
+                self._specialize_matrix(matrix, type_name, tag, argument_types),
+                list(argument_types) + remaining_types,
+            )
+            for tag, argument_types in constructors
+        )
+
+    def _pattern_is_useful(self, patterns, candidate, subject_type: str) -> bool:
+        return self._matrix_pattern_is_useful(
+            [[pattern] for pattern in patterns], [candidate], [subject_type],
+        )
+
+    def _matrix_pattern_is_useful(self, matrix, candidate, type_names: list[str]) -> bool:
+        if not matrix:
+            return True
+        if not type_names:
+            return False
+        if any(all(isinstance(pattern, (BindingPattern, WildcardPattern)) for pattern in row)
+               for row in matrix):
+            return False
+        type_name, *remaining_types = type_names
+        head, *remaining_candidate = candidate
+        constructors = self._finite_constructors(type_name)
+        if constructors is not None:
+            if isinstance(head, (BindingPattern, WildcardPattern)):
+                return any(
+                    self._matrix_pattern_is_useful(
+                        self._specialize_matrix(matrix, type_name, tag, argument_types),
+                        [WildcardPattern(head.location) for _ in argument_types] + remaining_candidate,
+                        list(argument_types) + remaining_types,
+                    )
+                    for tag, argument_types in constructors
+                )
+            info = self._pattern_head(head, type_name)
+            if info is None:
+                return False
+            tag, payloads = info
+            matching = next(((candidate_tag, argument_types) for candidate_tag, argument_types in constructors
+                             if candidate_tag == tag), None)
+            if matching is None:
+                return False
+            _, argument_types = matching
+            return self._matrix_pattern_is_useful(
+                self._specialize_matrix(matrix, type_name, tag, argument_types),
+                list(payloads) + remaining_candidate, list(argument_types) + remaining_types,
+            )
+
+        if isinstance(head, LiteralPattern):
+            literal_tag, _ = self._pattern_head(head, type_name)
+            specialized = []
+            for row in matrix:
+                previous = row[0]
+                if isinstance(previous, (BindingPattern, WildcardPattern)):
+                    specialized.append(row[1:])
+                else:
+                    previous_info = self._pattern_head(previous, type_name)
+                    if previous_info is not None and previous_info[0] == literal_tag:
+                        specialized.append(row[1:])
+            return self._matrix_pattern_is_useful(specialized, remaining_candidate, remaining_types)
+
+        defaults = [row[1:] for row in matrix
+                    if isinstance(row[0], (BindingPattern, WildcardPattern))]
+        return self._matrix_pattern_is_useful(defaults, remaining_candidate, remaining_types)
 
     def _infer_type_arguments(
         self, formal: str, actual: str, parameters: set[str], substitutions: dict[str, str],

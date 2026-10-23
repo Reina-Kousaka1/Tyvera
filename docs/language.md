@@ -383,9 +383,11 @@ Supported patterns include primitive literals, `_`, bindings, nested tuple and
 record destructuring, newtype wrappers, built-in Option/Result cases, and
 user-defined enum cases. A binding is immutable and visible only in its arm.
 Literal types must match the subject type. Option/Result, Bool and enum matches
-are checked for exhaustiveness; other partial patterns may use a
-wildcard/binding default. A non-exhaustive match simply executes no arm when no
-pattern matches. Duplicate cases and arms after exhaustive coverage are errors.
+are checked recursively for exhaustiveness, including nested tuple, record and
+newtype fields. Infinite domains such as `Int`, `Float` and `String` cannot be
+exhausted by listing literals; their matched values need a wildcard/binding.
+A non-exhaustive match simply executes no arm when no pattern matches.
+Duplicate and subsumed patterns, and arms after exhaustive coverage, are errors.
 
 ```tyv
 match response {

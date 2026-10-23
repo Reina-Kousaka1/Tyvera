@@ -31,6 +31,21 @@ fn main() {
         with self.assertRaises(TypeError):
             checked.expression_types[next(iter(checked.expression_types))] = "String"
 
+    def test_match_metadata_reports_recursive_exhaustiveness_and_cases(self) -> None:
+        checked = compile_checked_source('''enum Reply { Data(Option<Bool>) Closed }
+fn main() {
+    let reply: Reply = Reply.Data(None<Bool>())
+    match reply {
+        Reply.Data(Some(true)) => {}
+        Reply.Data(Some(false)) => {}
+        Reply.Data(None) => {}
+        Reply.Closed => {}
+    }
+}
+''', "match-metadata.tyv")
+        self.assertEqual(list(checked.match_exhaustiveness.values()), [True])
+        self.assertEqual(list(checked.match_coverage.values()), [frozenset({"Data", "Closed"})])
+
 
 if __name__ == "__main__":
     unittest.main()

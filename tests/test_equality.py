@@ -230,6 +230,58 @@ fn main() {
 }
 ''')
 
+    def test_nested_adt_patterns_prove_exhaustiveness_for_return_analysis(self) -> None:
+        self.assertEqual(self._run('''enum Reply { Data(Option<Bool>) Closed }
+fn score(reply: Reply) -> Int {
+    match reply {
+        Reply.Data(Some(true)) => return 1
+        Reply.Data(Some(false)) => return 2
+        Reply.Data(None) => return 3
+        Reply.Closed => return 0
+    }
+}
+fn main() {
+    println(score(Reply.Data(Some(false))))
+    println(score(Reply.Closed))
+}
+'''), "2\n0\n")
+
+    def test_nested_adt_patterns_reject_covered_subcases_as_unreachable(self) -> None:
+        with self.assertRaisesRegex(Diagnostic, "match arm is unreachable"):
+            compile_source('''enum Reply { Data(Option<Int>) Closed }
+fn main() {
+    match Reply.Data(Some(5)) {
+        Reply.Data(Some(_)) => {}
+        Reply.Data(Some(5)) => {}
+        Reply.Data(None) => {}
+        Reply.Closed => {}
+    }
+}
+''')
+
+    def test_recursive_enum_match_exhaustiveness_terminates(self) -> None:
+        self.assertEqual(self._run('''enum Tree<T> { Leaf(T) Branch(Tree<T>, Tree<T>) }
+fn depth(tree: Tree<Int>) -> Int {
+    match tree {
+        Tree.Leaf(_) => return 1
+        Tree.Branch(_, _) => return 2
+    }
+}
+fn main() { println(depth(Tree.Leaf(3))) }
+'''), "1\n")
+
+    def test_tuple_product_patterns_are_checked_recursively(self) -> None:
+        self.assertEqual(self._run('''fn code(pair: (Bool, Bool)) -> Int {
+    match pair {
+        (true, true) => return 1
+        (true, false) => return 2
+        (false, true) => return 3
+        (false, false) => return 4
+    }
+}
+fn main() { println(code((false, true))) }
+'''), "3\n")
+
 
 if __name__ == "__main__":
     unittest.main()

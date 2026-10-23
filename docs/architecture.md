@@ -79,9 +79,11 @@ and `--version`. The implementation uses Python's standard library only.
 - `Option<T>`, `Result<T,E>`, enums, records, tuples and newtypes are typed
   values. Equality is value-based for immutable structures, collection-based
   for lists/maps, and identity-based for classes and runtime handles. `match`
-  checks nested pattern types, arm scopes, duplicate coverage and top-level
-  exhaustiveness for `Bool`, `Option`, `Result` and user enums. These ordinary
-  error values remain separate from runtime diagnostics and actor crashes.
+  checks nested pattern types, arm scopes, subsumed cases and recursive
+  exhaustiveness across finite sum and product patterns. CheckedProgram records
+  the recursive exhaustiveness result and top-level fully covered cases. These
+  ordinary error values remain separate from runtime diagnostics and actor
+  crashes.
 - Actor declarations have a checked message protocol and private state. The
   bootstrap scheduler owns FIFO mailboxes and schedules one message per actor
   per round. It is cooperative and deterministic, not parallel. Messages are
