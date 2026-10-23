@@ -1,0 +1,65 @@
+name: Bug report
+description: Report a reproducible problem in the Tyvera toolchain or language.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never post tokens, credentials, or the contents of `.tyvera.secrets`.** Replace sensitive values in code and diagnostics before submitting.
+  - type: input
+    id: version
+    attributes:
+      label: Tyvera version or commit
+      description: Include the output of `tyvera --version` and the commit if using a checkout.
+      placeholder: "tyvera 0.1.0 / commit SHA"
+    validations:
+      required: true
+  - type: input
+    id: operating-system
+    attributes:
+      label: Operating system
+      placeholder: "Ubuntu 24.04, macOS 15, Windows 11"
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python bootstrap version
+      placeholder: "Output of python --version"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproducible Tyvera source
+      description: Include the smallest `.tyv` example that reproduces the issue. Remove secrets and private data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostic
+    attributes:
+      label: Compiler diagnostic or output
+      description: Redact secrets, file-system details, and private data.
+    validations:
+      required: false
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Run `tyvera check ...`
+        2. Observe the diagnostic
+    validations:
+      required: true

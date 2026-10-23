@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [Dev]
+  pull_request:
+    branches: [Dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Tyvera
+        run: python -m pip install --editable .
+
+      - name: Run complete test suite
+        run: python -m unittest discover -v
+
+      - name: Check secret-file protection
+        shell: bash
+        run: |
+          python - <<'PY'
+          import subprocess
+          import sys
+          from pathlib import PurePosixPath
+
+          tracked = subprocess.run(
+              ["git", "ls-files", "-z"], check=True, capture_output=True
+          ).stdout.decode("utf-8").split("\0")
+          if any(PurePosixPath(path).name == ".tyvera.secrets" for path in tracked if path):
+              sys.exit("A .tyvera.secrets file is tracked; remove it and rotate any exposed values.")
+
+          ignored = subprocess.run(
+              ["git", "check-ignore", "--quiet", "--no-index", ".tyvera.secrets"]
+          )
+          if ignored.returncode != 0:
+              sys.exit(".gitignore must ignore .tyvera.secrets.")
+
+          example = subprocess.run(
+              ["git", "check-ignore", "--quiet", "--no-index", ".tyvera.secrets.example"]
+          )
+          if example.returncode == 0:
+              sys.exit(".gitignore must leave .tyvera.secrets.example available for safe examples.")
+          if example.returncode != 1:
+              sys.exit("Could not verify the .tyvera.secrets.example ignore rule.")
+          PY
+
+      - name: Check and run every executable example
+        shell: bash
+        run: |
+          set -euo pipefail
+          tyvera --version
+          tyvera check hello.tyv
+          tyvera run hello.tyv
+          for source in examples/*.tyv; do
+            test -f "$source"
+            tyvera check "$source"
+            tyvera run "$source"
+          done
+
+      - name: Smoke-test generated project
+        run: |
+          python - <<'PY'
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          with tempfile.TemporaryDirectory(prefix="tyvera-ci-") as temporary_directory:
+              work = Path(temporary_directory)
+              subprocess.run(["tyvera", "new", "ci_smoke"], cwd=work, check=True)
+              project = work / "ci_smoke"
+              subprocess.run(["tyvera", "check", str(project)], check=True)
+              subprocess.run(["tyvera", "run", str(project)], check=True)
+          PY

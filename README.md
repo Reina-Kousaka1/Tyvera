@@ -1,5 +1,7 @@
 # Tyvera
 
+[![CI](https://github.com/Reina-Kousaka1/Tyvera/actions/workflows/ci.yml/badge.svg?branch=Dev)](https://github.com/Reina-Kousaka1/Tyvera/actions/workflows/ci.yml)
+
 Tyvera is an independent, statically typed programming language with a design direction informed by Java's structure, Elixir's resilient concurrency model, and C++'s performance and system-level capabilities. It is not an extension or fork of those languages. TypeScript is not part of the current Tyvera design.
 
 ## Core language bootstrap
@@ -9,6 +11,8 @@ The repository contains a working bootstrap toolchain: a lexer, parser and AST, 
 Supported and tested: `Int`, `Float`, `Bool`, `String`, `Void`; generic functions/classes; typed `List<T>` and `Map<K,V>`; `Option<T>`/`Result<T,E>` and statement-level pattern matching; `for` iteration; checked text-file I/O and path helpers; local/environment-backed `Secret<String>` access with explicit reveal; typed JSON parsing, access and encoding; checked returns and lexical scopes; `let`/`var`; arithmetic, comparisons, `if`/`else`, and `while` with `break`/`continue`. Classes support constructors, fields, `self`, methods and checked initialization. Interfaces support exact contracts, multiple implementation and dynamic dispatch. Multi-file projects support explicit relative imports and `pub` exports. A deterministic cooperative actor runtime supports typed messages, isolated actor state, mailboxes and crash reporting. `Unit`, `and`, and `or` remain compatibility spellings.
 
 Requirements: Python 3.10 or newer. The toolchain has no third-party runtime dependencies.
+
+Tyvera is licensed under **GNU GPLv3**; see [LICENSE](LICENSE).
 
 ```sh
 python -m pip install -e .
@@ -69,6 +73,11 @@ Run the test suite from the repository root:
 ```sh
 python -m unittest discover -v
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the local quality checks and pull
+request workflow. Bug reports and language proposals use the repository's
+[issue forms](.github/ISSUE_TEMPLATE); vulnerability reports follow the
+[security policy](SECURITY.md).
 
 The detailed supported grammar and type rules are in [the language reference](docs/language.md). Current and planned library APIs are in [the standard library reference](docs/standard-library.md). CLI commands are listed in [the CLI reference](docs/cli.md). The staged toolchain and recorded architecture decisions are in [the architecture note](docs/architecture.md). Planned stages toward a general-purpose bot runtime are in [the roadmap](docs/roadmap.md).
 

@@ -1,0 +1,68 @@
+name: Feature request / language proposal
+description: Propose a library, toolchain, or language change with its semantics made explicit.
+title: "[Proposal]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas are starting points for design review; filing a proposal does not mean it will be accepted as a language feature. **Do not include tokens, credentials, or `.tyvera.secrets` values.**
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Problem and motivation
+      description: What concrete use case or limitation should this address?
+    validations:
+      required: true
+  - type: textarea
+    id: syntax
+    attributes:
+      label: Proposed syntax
+      description: Show a short Tyvera example, if syntax is relevant.
+    validations:
+      required: false
+  - type: textarea
+    id: semantics
+    attributes:
+      label: Proposed semantics
+      description: Describe typing, evaluation, errors, and edge cases precisely.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: textarea
+    id: type-system
+    attributes:
+      label: Type-system impact
+      description: Include inference, compatibility, and diagnostics where relevant.
+    validations:
+      required: false
+  - type: textarea
+    id: runtime
+    attributes:
+      label: Runtime and toolchain impact
+      description: Consider interpreter, actors, standard library, and future compiler backends.
+    validations:
+      required: false
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Backward-compatibility impact
+    validations:
+      required: false
+  - type: dropdown
+    id: influence
+    attributes:
+      label: Relevant design direction
+      description: Tyvera combines independent design goals; a proposal may have no direct influence.
+      multiple: true
+      options:
+        - Java-inspired structure and static typing
+        - Elixir-inspired concurrency and fault tolerance
+        - C++-inspired performance and native access
+        - No direct influence
+    validations:
+      required: false
