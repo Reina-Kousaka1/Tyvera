@@ -649,7 +649,9 @@ fn main() {
         Err(_) => {}
     }
 }''', "ownership-metadata.tyv")
-        self.assertEqual(checked.resource_types, frozenset({"TextFile", "TextReader", "TextWriter"}))
+        self.assertEqual(checked.resource_types, frozenset({
+            "TextFile", "TextReader", "TextWriter", "TcpConnection", "TcpListener",
+        }))
         self.assertTrue(checked.move_sites)
         self.assertTrue(checked.owner_scopes)
         self.assertTrue(checked.cleanup_points)

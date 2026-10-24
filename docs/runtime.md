@@ -66,13 +66,15 @@ even while other tasks remain runnable. When no task can run, the scheduler
 services one queued actor message for a pending reply, then checks deadlines
 again.
 
-`runTasks()` waits only until the nearest monotonic task, request, or scheduled
-message deadline when no other useful work is runnable. A task deadlock or an
-unresolved reply with no queued actor work or deadline returns `Err`. The
-program may make more work available and call `runTasks()` again; if `main`
-ends first, shutdown cancels all remaining tasks. The scheduler has a
-100,000-step safety limit. `runActors()` separately drains actor messages up to
-its 100,000-message limit and never waits for a future timer.
+`runTasks()` waits on the nearest monotonic deadline or a registered I/O
+readiness/completion event when no other useful work is runnable. Socket waits
+are selector-backed; worker completion wakes the same wait path. The scheduler
+does not poll with sleep loops. A task deadlock or an unresolved reply with no
+queued actor work, I/O operation, or deadline returns `Err`. The program may
+make more work available and call `runTasks()` again; if `main` ends first,
+shutdown cancels all remaining tasks. The scheduler has a 100,000-step safety
+limit. `runActors()` separately drains actor messages up to its 100,000-message
+limit and never waits for a future timer.
 
 `runTasks()` reports task continuation steps on success. Actor message delivery
 does not contribute to that count. Neither scheduler provides parallel
@@ -99,19 +101,51 @@ message or interrupt a running handler.
 
 ## Resource cleanup
 
-`TextFile`, `TextReader`, and `TextWriter` handles are move-only. `Option` and
-`Result` may carry them; other aggregate and collection types reject them.
-Owned handles close in reverse acquisition order at block exit, function
-return, runtime failure, `break`, `continue`, task completion or failure,
-cancellation, actor-handler failure, and supervised restart. Explicit
-`close()` makes later cleanup a no-op. Cleanup errors retain source locations
-and are added to an existing diagnostic without replacing its primary cause.
-Detached tasks keep their own resource handles until completion or runtime
-shutdown. File operations are synchronous and do not suspend.
+`TextFile`, `TextReader`, `TextWriter`, `TcpConnection`, and `TcpListener`
+handles are move-only. `Option`, `Result`, and resource-returning `Task` values
+may carry them; other aggregate and collection types reject them. Owned
+handles close in reverse acquisition order at block exit, function return,
+runtime failure, `break`, `continue`, task completion or failure, cancellation,
+actor-handler failure, and supervised restart. Explicit `close()` makes later
+cleanup a no-op. Cleanup errors retain source locations and are added to an
+existing diagnostic without replacing its primary cause. Detached tasks keep
+their own resource handles until completion or runtime shutdown. A completed
+resource result is transferred once through `await` or consuming `tryResult()`;
+an unclaimed task result is closed during owner or runtime cleanup. A
+resource-returning task is itself move-only while pending, so leaving its scope
+cancels it. `tryResult()` consumes that task; if it is still pending, it cancels
+the operation and returns `Ok(None)` so a resource cannot be produced without
+an owner.
+
+Async file operations use the same move-only file handles as synchronous file
+I/O. A handle permits one in-flight worker operation. Scope cleanup marks a
+busy handle for close and the worker completion path closes it after the
+operation returns. Cancellation stops a queued worker operation where
+possible; a worker operation already running completes before its owned file
+is closed. Runtime shutdown waits for the bounded worker pool to drain.
+
+TCP connect, accept, read, and write are scheduler I/O operations. A waiting
+task is in `io_wait`; the platform adapter registers selector readiness and
+returns the awakened operation to the scheduler. Cancellation unregisters the
+wait. Closing a connection also cancels any pending read/write with a
+controlled `Result::Err`. The task scheduler can continue other tasks while a
+socket is waiting. `read(maxBytes)` returns a partial byte chunk or `None` at
+EOF; one read is capped at 1 MiB. `write` reports partial progress and
+`writeAll` retains one supplied buffer and waits for each further writable
+event, so Tyvera does not add an unbounded producer queue.
+
+Expected DNS, socket and file failures are `Result<T,String>` values with
+normalized messages; host exceptions are not part of Tyvera's API. Task
+timeouts reuse `Task.withTimeout(Duration)`: expiry cancels the I/O task and
+fails the timeout wrapper with `"task timed out"`. The `runTasks()` caller can
+observe that state with `tryResult()`. The reference adapter currently uses
+selectors and a bounded worker pool, but those mechanisms do not define the
+language contract.
 
 ## Not implemented
 
-True parallelism, async I/O, networking, non-file resource families, and
-native execution remain planned. See the
+True parallel task execution, TLS, HTTP, WebSockets, protocols, and native
+execution remain planned. TCP V1 and async text-file operations are
+implemented. See the
 [memory model](memory-model.md) and
 [backend architecture](backend-architecture.md).

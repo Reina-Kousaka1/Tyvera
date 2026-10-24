@@ -22,6 +22,14 @@ resource kinds, move sites, cleanup scopes, and ownership transfers. The CLI sel
 `ReferenceInterpreterBackend`; `parser.py` and `typesys.py` do not import or
 depend on execution code.
 
+Async I/O intrinsics are checked as typed task results and use the same
+`CheckedProgram.resource_types`, move sites, cleanup points, and ownership
+transfers as files. `TcpConnection` and `TcpListener` are move-only resources;
+task results carrying them are consumed once. The reference runtime's
+`tyvera/io_backend.py` is an internal platform adapter for readiness
+registration, worker completion, and wakeup. It does not expose Python socket
+objects or Python errors to Tyvera programs.
+
 This is a backend boundary, not a complete typed representation. It does not
 retain resolved member symbols, full class/interface layouts, match lowering,
 or all mutability and control-flow facts required for code generation. Modules
@@ -60,6 +68,24 @@ Provide the operations required by a Tyvera program: allocation and object
 identity, strings, collections, actor mailboxes, task scheduling, timers,
 diagnostics, I/O, and resource cleanup. These services implement language
 semantics; their internal data structures may vary by platform.
+
+### I/O platform boundary
+
+The Tyvera-facing contract is typed tasks plus move-only resource handles,
+partial byte operations, EOF, cancellation, deadlines, normalized errors,
+bounded pending operations, and deterministic cleanup. The current adapter
+uses `selectors.DefaultSelector` for TCP and a bounded worker pool for DNS and
+file work. A future runtime may use completion ports, `epoll`, `kqueue`, or
+another OS facility as long as the observable Tyvera scheduling and ownership
+rules stay the same. Native code generation and a native I/O backend are not
+implemented in this branch.
+
+The first networking layer has no user-defined general Stream interface. TCP
+establishes a byte-stream contract; text files retain their UTF-8 resource
+API. A TLS adapter can later wrap that owned byte-stream boundary using a
+vetted platform cryptography library. Tyvera does not implement TLS or
+cryptography here. HTTP, WebSockets, database protocols, and other application
+protocols belong above this transport boundary and are outside this block.
 
 ### Backend implementation
 

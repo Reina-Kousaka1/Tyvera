@@ -16,15 +16,15 @@ implemented.
 | 4. Standard library | Core slice implemented | Generic collections, `for`, `Option<T>`, `Result<T,E>`, core matching, text I/O/path helpers, move-only `TextFile`/`TextReader`/`TextWriter` ownership with general move transfer and deterministic LIFO cleanup, local/environment secret providers, typed JSON, signed `Duration`, monotonic one-shot timers, timer-backed sleep tasks, cooperative parent-scoped lifecycle, owner-local `TaskGroup` joins/cancellation, explicit child detachment, actor-owned task cancellation, one-shot runtime shutdown and typed task deadlines. Separate stdlib modules remain planned. |
 | 5. Actor runtime | First slice implemented | Actor declarations, typed immutable message transfer, isolated state, FIFO mailboxes, deterministic round-robin cooperative scheduling, typed one-shot request/reply, cancellation, request deadlines, delayed typed messages, stop/alive lifecycle, and isolated crash reporting. Parallel scheduling and backpressure remain open. |
 | 6. Supervisors | First slice implemented | Child lifecycle, crash detection, bounded restart intensity and deterministic `one_for_one` restarts. `one_for_all` and `rest_for_one` remain planned. |
-| 7. Networking | Planned | Async I/O integration with the cooperative task runtime, then HTTP and WebSocket clients and event dispatch without Promise-specific language semantics. |
+| 7. Async I/O & TCP | V1 implemented | Selector-backed TCP connect/listen/accept/read/write, worker-backed DNS and async text-file I/O, cancellation, deadlines, move-only network resources, address/error values, and bounded write behavior. TLS, HTTP, WebSockets, and protocol libraries remain planned. |
 | 8. Native backend | Planned; backend boundary implemented | `CheckedProgram` and `ExecutionBackend` currently select the Python reference interpreter. Native code generation, runtime ABI, and `tyvera build` remain unimplemented. Initial targets are Windows x86-64, Linux x86-64, Linux ARM64, and macOS ARM64. |
 | 9. Package system | Planned | Reproducible package metadata, dependency resolution and versioning after modules and the standard library stabilize. |
 | 10. Application library ecosystem | Planned | Build general-purpose libraries and use larger applications as later conformance and load tests; application protocols stay outside compiler semantics. |
 
 ## Near-term sequence
 
-1. After Resource Ownership V1 is approved and merged, start
-   `feature/async-io-networking` for async I/O and networking.
+1. After Async I/O & Networking V1 is approved and merged, start
+   `feature/http-backend` for the separate HTTP client/server architecture.
 2. Move or wrap collection, I/O, JSON, and secret operations behind normal
    `tyvera.*` modules as the module model stabilizes; continue generic interface
    and constraint work with conformance tests.
@@ -56,18 +56,16 @@ provider-backed secrets, typed JSON core, supervised actors, typed replies,
 cooperative async tasks with typed return values, parent-scoped cancellation,
 deadlines, delayed actor messages, explicit task groups, detached child tasks
 and typed task timeouts are usable. Await resumes inside nested blocks,
-branches, loops and match arms. Move-only `TextFile`, `TextReader`, and
-`TextWriter` resources support `Option`/`Result` carriers, function/task
-transfer, control-flow checking, and deterministic cleanup. True parallelism,
-structured async I/O,
-non-file resource families, standard library modules, networking and a native
-backend are still missing. Text-resource scopes close on normal exit, return,
-errors, task cancellation, loop control, actor failure, and supervisor restart.
-Runtime ownership,
-shutdown, detached task failures, timed
-wrappers, and actor reply fairness now have explicit semantics and tests. The
-portable value and equality contract is now implemented in the bootstrap.
-Async I/O and networking are the next separately scoped milestone, followed
-by stable standard-library module boundaries and cross-backend conformance
-programs.
+branches, loops and match arms. Move-only text and TCP resources support
+`Option`/`Result` carriers, task transfer, control-flow checking, and
+deterministic cleanup. Async text-file operations, DNS, selector-backed TCP,
+backpressure, and cancellation are implemented in the reference runtime.
+True parallelism, TLS, HTTP, WebSockets, non-network resource families,
+standard-library modules, and a native backend remain planned. Resource scopes
+close on normal exit, return, errors, task cancellation, loop control, actor
+failure, and supervisor restart. Runtime ownership, shutdown, detached task
+failures, timed wrappers, and actor reply fairness have explicit semantics and
+tests. The portable value and equality contract is implemented in the
+bootstrap. HTTP is the next separately scoped milestone, followed by stable
+standard-library module boundaries and cross-backend conformance programs.
 
