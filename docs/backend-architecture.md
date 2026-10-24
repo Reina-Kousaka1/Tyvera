@@ -16,33 +16,33 @@ Tyvera source
 ```
 
 `compile_checked_source()` and `compile_checked_project()` return a
-`CheckedProgram` only after type checking succeeds. It currently contains the
-AST and top-level function signatures. The CLI selects
+`CheckedProgram` only after type checking succeeds. It contains the AST,
+function signatures, expression types, generic substitutions, match coverage,
+resource kinds, move sites, cleanup scopes, and ownership transfers. The CLI selects
 `ReferenceInterpreterBackend`; `parser.py` and `typesys.py` do not import or
 depend on execution code.
 
-This is a backend boundary, not a complete typed representation. The checker
-currently discards inferred expression types and does not retain resolved
-member symbols, full class/interface layouts, match lowering, generic
-instantiations, mutability facts, or resource ownership facts in the
-`CheckedProgram`. Modules do rewrite cross-module references to qualified
-names, and the interpreter consumes the resulting AST directly.
+This is a backend boundary, not a complete typed representation. It does not
+retain resolved member symbols, full class/interface layouts, match lowering,
+or all mutability and control-flow facts required for code generation. Modules
+rewrite cross-module references to qualified names, and the interpreter
+consumes the resulting AST directly.
 
 ## Typed representation and IR decision
 
 An explicit backend-independent typed AST is not added yet. `CheckedProgram`
-marks the successful compiler stage and carries the function signatures that
-already exist; it does not duplicate all checker state or claim that native
-codegen-ready type information is present.
+marks the successful compiler stage and carries useful semantic metadata, but
+does not duplicate all checker state or claim that native codegen-ready type
+information is present.
 
 A Tyvera IR would be useful once a second backend or a meaningful lowering
 transformation exists. Neither condition holds today. Maintaining an IR now
 would mean translating the current AST and then translating it back into the
 same interpreter behavior without gaining reuse. Before native codegen, Tyvera
-needs an authoritative representation that can retain resolved types and
-symbols, generic instantiations, class/interface layout, mutability,
-pattern-match decisions, actor/task operations, source locations, and the
-resource ownership facts required by lowering. Add IR only with the first
+needs an authoritative representation that can retain resolved symbols,
+class/interface layout, mutability, pattern-match decisions, actor/task
+operations, source locations, and the resource ownership facts required by
+lowering. Add IR only with the first
 consumer that demonstrates those needs; version it with explicit compatibility
 rules and tests.
 
@@ -86,8 +86,9 @@ The ABI is not selected or implemented. Before committing to one, specify:
 
 The first ABI should be internal and versioned with the runtime. Safe Tyvera
 must not expose raw allocation pointers. A future native/unsafe boundary must
-make ownership and foreign error conversion explicit. The planned value and
-resource rules are in the [Memory Model](memory-model.md).
+make ownership and foreign error conversion explicit. The language-level
+value and resource rules are in the [Memory Model](memory-model.md); the native
+resource ABI remains planned.
 
 ## Native backend options
 

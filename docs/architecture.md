@@ -158,14 +158,14 @@ atomic. Full lifecycle rules are in the [Runtime documentation](runtime.md).
 
 No native backend or Tyvera IR exists. The CLI now hands a `CheckedProgram` to
 `ExecutionBackend`, with `ReferenceInterpreterBackend` as the only
-implementation. The current representation retains the checked AST and
-top-level function signatures, not the expression-level type and ownership
-facts that a native backend will need. A shared IR is deferred until a second
-consumer or a real lowering step establishes its purpose. The runtime ABI,
+implementation. The checked representation retains expression types, match
+coverage, resource kinds, move sites, cleanup scopes, and ownership transfers
+alongside the AST and function signatures. A shared IR is deferred until a
+second consumer or a real lowering step establishes its purpose. The runtime ABI,
 initial target plan, native backend comparison, and `tyvera build` acceptance
 criteria are in [Backend Architecture](backend-architecture.md). Tyvera's
-value and resource ownership rules, including the current `TextFile` slice,
-are documented in the [Memory Model](memory-model.md).
+value and resource ownership rules are documented in the
+[Memory Model](memory-model.md).
 
 ## Local bootstrap benchmarks
 

@@ -46,6 +46,7 @@ KEYWORDS = {
     "as": "AS",
     "pub": "PUB",
     "using": "USING",
+    "move": "MOVE",
 }
 
 SINGLE_CHAR_TOKENS = {

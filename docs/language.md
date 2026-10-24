@@ -690,10 +690,10 @@ The bootstrap core provides `readText(path) -> Result<String,String>`,
 String`, `pathExists(path) -> Bool`, `println` and `eprintln`. Relative file
 paths resolve from the project root. I/O failures return `Err` values; file
 contents and operating-system error details are not copied into the error
-message. Path joining follows the host platform's path rules. The text-file
-API cannot read or overwrite the project `.tyvera.secrets` file.
+message. Path joining follows the host platform's path rules. Text file
+resource APIs cannot read or overwrite the project `.tyvera.secrets` file.
 
-`using` gives one text-file handle a deterministic lexical owner:
+`using` gives an acquired file resource a deterministic lexical owner:
 
 ```tyv
 using file = openText("notes.txt", "write") {
@@ -702,23 +702,38 @@ using file = openText("notes.txt", "write") {
 ```
 
 `openText(path, mode)` supports `"read"`, `"write"` (truncate or create), and
-`"append"` (create if missing). It opens UTF-8 text and reports an open failure
-as `Err(String)`. `using` unwraps that acquisition result; its optional
-`else error { ... }` block handles failures, and without that block an `Err`
-becomes a source-located runtime diagnostic. `TextFile.readAll()` returns
-`Result<String,String>` in read mode; `TextFile.write(contents)` returns
-`Result<Bool,String>` in write or append mode. `isOpen()` observes the handle,
-and `close()` releases it once, returning `false` if it was already closed or
-could not be closed. Reading or writing with the wrong mode returns `Err`; using
-a closed handle is a runtime error. Scope exit closes the handle, including on `return`, runtime/task
-failure, loop control, and task cancellation while suspended at `await`.
+`"append"` (create if missing), returning `Result<TextFile,String>`. It opens
+UTF-8 text and reports an open failure as `Err(String)`. `openTextReader(path)`
+returns a read-only `Result<TextReader,String>`. `openTextWriter(path, mode)`
+returns `Result<TextWriter,String>` for `"write"` or `"append"` mode. `using`
+unwraps any of these acquisition results; its optional `else error { ... }`
+block handles failures, and without that block an `Err` becomes a source-located
+runtime diagnostic.
 
-`TextFile` is a restricted move-only resource: it can only be acquired by a
-direct `using ... = openText(...)` statement, and the type checker rejects
-copying, passing, returning, storing, or sending its handle. It cannot cross
-actor boundaries. These file operations are synchronous and can block the
-cooperative scheduler; async I/O is not implemented. The scope mechanism can
-be extended to more resource types, but currently owns only text files.
+`TextFile.readAll()` returns `Result<String,String>` in read mode;
+`TextFile.write(contents)` returns `Result<Bool,String>` in write or append
+mode. `TextReader` provides `readAll()`. `TextWriter` provides `write`,
+`append`, and `flush`. All three types provide `close()` and `isOpen()`.
+`close()` releases a handle once, returning `false` on a later close. Reading or
+writing with the wrong mode returns `Err`; using a closed handle is a runtime
+error. Scope exit closes handles in reverse acquisition order, including on
+`return`, runtime/task failure, `break`, `continue`, actor failure, supervisor
+restart, and task cancellation while suspended at `await`.
+
+These types are move-only resources. `move name` transfers the sole owner and
+makes the prior binding unusable. Move analysis follows branches and loops, so
+use after move, double move, and maybe-moved paths receive type diagnostics.
+Resources can be passed through function parameters and returns. `Option` and
+`Result` may carry them when matches bind every resource-bearing payload.
+Resources cannot be copied, compared by value, hashed, used as Map keys,
+stored in collections, tuples, records, classes, newtypes, enums, or user
+generic instantiations, or transferred through actor messages/state. Async
+functions may take owned resources as parameters but cannot return them; the
+task owns each moved parameter until completion, failure, cancellation, or
+runtime shutdown. Detaching a task leaves its resource ownership with that
+task. No explicit borrow syntax is needed for receiver method calls. These
+file operations are synchronous and can block the cooperative scheduler;
+async I/O and networking are not implemented.
 
 The built-in namespace `secrets.NAME` returns `Option<Secret<String>>`. The
 local provider reads `.tyvera.secrets` first, then checks the process
@@ -794,7 +809,8 @@ tasks, timers, supervisors and reply handles compare by identity. Lists and
 maps compare structurally; map equality does not depend on insertion order.
 Tuples, records, newtypes, enums, `Option`, `Result`, and `Json` compare by
 their tagged value structure, recursively applying the nested type's rules.
-Scoped `TextFile` handles cannot be compared as values or used as Map keys.
+`TextFile`, `TextReader`, and `TextWriter` handles and their resource-bearing
+`Option`/`Result` carriers cannot be compared as values or used as Map keys.
 For `%`, the quotient is truncated toward zero and the remainder has the
 dividend's sign, for both integer and finite binary64 operands. A zero divisor
 is a runtime error.

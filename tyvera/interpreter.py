@@ -53,6 +53,7 @@ from .typesys import INT_MAX, INT_MIN, canonical_type
 
 
 _MISSING = object()
+_MOVED = object()
 _MAX_ACTOR_MAILBOX = 100_000
 _MAX_ACTOR_DELIVERIES = 100_000
 _MAX_SUPERVISOR_RESTARTS = 1_000
@@ -145,11 +146,14 @@ class _TyveraTimer:
 class _TyveraTextFile:
     stream: TextIO
     mode: str
+    resource_type: str = "TextFile"
     closed: bool = False
+    scoped: bool = False
+    location: Location | None = None
     identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
     def __repr__(self) -> str:
-        return "<TextFile>"
+        return f"<{self.resource_type}>"
 
 
 @dataclass(slots=True, eq=False)
@@ -572,7 +576,9 @@ class Interpreter:
 
     def _call(self, function: Function, arguments: list[object], call_location: Location, depth: int) -> object:
         if depth >= self.max_call_depth:
-            raise Diagnostic(call_location, "runtime", f"maximum call depth ({self.max_call_depth}) exceeded")
+            error = Diagnostic(call_location, "runtime", f"maximum call depth ({self.max_call_depth}) exceeded")
+            self._cleanup_failed_argument_transfer(arguments, error)
+            raise error
         variables = ChainMap({parameter.name: value for parameter, value in zip(function.parameters, arguments)})
         try:
             self._execute_block(function.body, variables, depth)
@@ -583,6 +589,29 @@ class Interpreter:
         return None
 
     def _execute_block(self, body: list[Statement], variables: ChainMap[str, object], depth: int) -> None:
+        try:
+            self._execute_block_inner(body, variables, depth)
+        except Exception as primary:
+            errors = self._cleanup_owned_scope(variables.maps[0])
+            if not errors:
+                raise
+            cleanup_message = "; ".join(
+                f"{location.filename}:{location.line}:{location.column}: {message}"
+                for location, message in errors
+            )
+            if isinstance(primary, Diagnostic):
+                raise Diagnostic(primary.location, primary.stage,
+                                 f"{primary.message}; resource cleanup also failed: {cleanup_message}") from primary
+            location, message = errors[0]
+            raise Diagnostic(location, "runtime", f"resource cleanup failed: {message}; {cleanup_message}") from primary
+        errors = self._cleanup_owned_scope(variables.maps[0])
+        if errors:
+            location, message = errors[0]
+            remaining = "; ".join(item for _, item in errors[1:])
+            suffix = f"; additional cleanup failures: {remaining}" if remaining else ""
+            raise Diagnostic(location, "runtime", f"resource cleanup failed: {message}{suffix}")
+
+    def _execute_block_inner(self, body: list[Statement], variables: ChainMap[str, object], depth: int) -> None:
         for statement in body:
             if isinstance(statement, LetStatement):
                 variables[statement.name] = self._evaluate(statement.value, variables, depth)
@@ -621,7 +650,8 @@ class Interpreter:
                 elif acquisition.variant == "Ok":
                     resource = acquisition.payload
                     if not isinstance(resource, _TyveraTextFile):
-                        raise AssertionError("checked using acquisition is not a TextFile")
+                        raise AssertionError("checked using acquisition is not a text resource")
+                    resource.scoped = True
                     scope = variables.new_child()
                     scope[statement.name] = resource
                     try:
@@ -683,13 +713,44 @@ class Interpreter:
             else:
                 raise AssertionError(f"unhandled statement node: {type(statement).__name__}")
 
+    def _evaluate_arguments(
+        self, expressions: list[Expression], variables: ChainMap[str, object], depth: int,
+    ) -> list[object]:
+        arguments: list[object] = []
+        try:
+            for expression in expressions:
+                arguments.append(self._evaluate(expression, variables, depth))
+        except Exception as primary:
+            self._cleanup_failed_argument_transfer(arguments, primary)
+            raise
+        return arguments
+
+    def _cleanup_failed_argument_transfer(self, arguments: list[object], primary: Exception) -> None:
+        scopes = {f"argument_{index}": value for index, value in enumerate(arguments)}
+        errors = self._cleanup_owned_scope(scopes)
+        if not errors:
+            return
+        cleanup_message = "; ".join(
+            f"{location.filename}:{location.line}:{location.column}: {message}"
+            for location, message in errors
+        )
+        if isinstance(primary, Diagnostic):
+            raise Diagnostic(primary.location, primary.stage,
+                             f"{primary.message}; argument resource cleanup also failed: {cleanup_message}") from primary
+        location, message = errors[0]
+        raise Diagnostic(location, "runtime",
+                         f"argument resource cleanup failed: {message}; {cleanup_message}") from primary
+
     def _evaluate(self, expression: Expression, variables: ChainMap[str, object], depth: int) -> object:
         if isinstance(expression, Literal):
             return expression.value
         if isinstance(expression, TupleExpression):
             return _TyveraTuple(tuple(self._evaluate(element, variables, depth) for element in expression.elements))
         if isinstance(expression, Name):
-            return variables[expression.identifier]
+            value = variables[expression.identifier]
+            if value is _MOVED:
+                raise Diagnostic(expression.location, "runtime", f"resource '{expression.identifier}' was already moved")
+            return value
         if isinstance(expression, Call):
             if expression.callee == "taskGroup":
                 if self._current_actor is not None:
@@ -702,10 +763,10 @@ class Interpreter:
                 if not isinstance(construction, Call):
                     raise AssertionError("checked spawn expression is not an actor construction")
                 declaration = self.actors[construction.callee]
-                arguments = [self._evaluate(argument, variables, depth) for argument in construction.arguments]
+                arguments = self._evaluate_arguments(construction.arguments, variables, depth)
                 return self._spawn_actor(declaration, arguments, expression.location, depth + 1)
             if expression.callee == "oneForOne":
-                arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+                arguments = self._evaluate_arguments(expression.arguments, variables, depth)
                 max_restarts, window_milliseconds = arguments
                 if max_restarts < 0:
                     raise Diagnostic(expression.location, "runtime", "oneForOne maxRestarts must be zero or greater")
@@ -720,7 +781,7 @@ class Interpreter:
                 return self._run_actors(expression.location, depth)
             if expression.callee == "runTasks":
                 return self._run_tasks(expression.location, depth)
-            arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+            arguments = self._evaluate_arguments(expression.arguments, variables, depth)
             if expression.callee == "milliseconds":
                 return self._make_duration(arguments[0], expression.location)
             if expression.callee == "seconds":
@@ -731,11 +792,21 @@ class Interpreter:
                 if not isinstance(duration, _TyveraDuration):
                     raise AssertionError("checked timerAfter argument is not Duration")
                 return _TyveraTimer(self._clock(), duration.milliseconds, self._clock)
-            if expression.callee == "openText":
+            if expression.callee in {"openText", "openTextReader", "openTextWriter"}:
                 path = self._project_path(arguments[0])
-                mode = arguments[1]
-                if mode not in {"read", "write", "append"}:
-                    return _TyveraVariant("Err", "openText mode must be 'read', 'write', or 'append'", "Result", 1)
+                if expression.callee == "openTextReader":
+                    mode = "read"
+                    resource_type = "TextReader"
+                elif expression.callee == "openTextWriter":
+                    mode = arguments[1]
+                    resource_type = "TextWriter"
+                    if mode not in {"write", "append"}:
+                        return _TyveraVariant("Err", "openTextWriter mode must be 'write' or 'append'", "Result", 1)
+                else:
+                    mode = arguments[1]
+                    resource_type = "TextFile"
+                    if mode not in {"read", "write", "append"}:
+                        return _TyveraVariant("Err", "openText mode must be 'read', 'write', or 'append'", "Result", 1)
                 if self._is_secret_storage_path(path):
                     return _TyveraVariant("Err", "secret file can only be accessed through the secrets provider", "Result", 1)
                 python_mode = {"read": "r", "write": "w", "append": "a"}[mode]
@@ -743,7 +814,10 @@ class Interpreter:
                     stream = path.open(python_mode, encoding="utf-8", newline="")
                 except OSError:
                     return _TyveraVariant("Err", "cannot open text file", "Result", 1)
-                return _TyveraVariant("Ok", _TyveraTextFile(stream, mode), "Result", 1)
+                return _TyveraVariant(
+                    "Ok", _TyveraTextFile(stream, mode, resource_type=resource_type,
+                                          location=expression.location), "Result", 1,
+                )
             if expression.callee == "sleepFor":
                 duration = arguments[0]
                 if not isinstance(duration, _TyveraDuration):
@@ -853,7 +927,7 @@ class Interpreter:
             return receiver.fields[expression.member]
         if isinstance(expression, MemberCall):
             if isinstance(expression.receiver, Name) and expression.receiver.identifier in self.enums:
-                payloads = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+                payloads = self._evaluate_arguments(expression.arguments, variables, depth)
                 if not payloads:
                     payload = None
                 elif len(payloads) == 1:
@@ -869,8 +943,8 @@ class Interpreter:
                     was_open = not receiver.closed
                     return was_open and self._close_text_file(receiver) is None
                 if receiver.closed:
-                    raise Diagnostic(expression.location, "runtime", "TextFile is closed")
-                arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+                    raise Diagnostic(expression.location, "runtime", f"{receiver.resource_type} is closed")
+                arguments = self._evaluate_arguments(expression.arguments, variables, depth)
                 if expression.method == "readAll":
                     if receiver.mode != "read":
                         return _TyveraVariant("Err", "text file is not open for reading")
@@ -878,6 +952,20 @@ class Interpreter:
                         return _TyveraVariant("Ok", receiver.stream.read())
                     except (OSError, UnicodeDecodeError):
                         return _TyveraVariant("Err", "cannot read text file")
+                if expression.method == "flush":
+                    try:
+                        receiver.stream.flush()
+                        return _TyveraVariant("Ok", True)
+                    except OSError:
+                        return _TyveraVariant("Err", "cannot flush text file")
+                if expression.method == "append":
+                    if receiver.mode != "append":
+                        return _TyveraVariant("Err", "text file is not open for appending")
+                    try:
+                        receiver.stream.write(arguments[0])
+                        return _TyveraVariant("Ok", True)
+                    except OSError:
+                        return _TyveraVariant("Err", "cannot append to text file")
                 if expression.method == "write":
                     if receiver.mode == "read":
                         return _TyveraVariant("Err", "text file is not open for writing")
@@ -895,7 +983,7 @@ class Interpreter:
                     if not isinstance(construction, Call):
                         raise AssertionError("checked supervisor.start argument is not an actor construction")
                     declaration = self.actors[construction.callee]
-                    arguments = [self._evaluate(argument, variables, depth) for argument in construction.arguments]
+                    arguments = self._evaluate_arguments(construction.arguments, variables, depth)
                     return self._spawn_actor(declaration, arguments, expression.location, depth + 1, receiver)
                 if expression.method == "isAlive":
                     return receiver.status == "alive"
@@ -914,10 +1002,9 @@ class Interpreter:
                 selector = expression.arguments[prefix]
                 if not isinstance(selector, Name):
                     raise AssertionError("checked actor request selector is not a name")
-                request_arguments = [
-                    self._evaluate(argument, variables, depth)
-                    for argument in expression.arguments[prefix + 1:]
-                ]
+                request_arguments = self._evaluate_arguments(
+                    expression.arguments[prefix + 1:], variables, depth,
+                )
                 if scheduled:
                     if not isinstance(duration, _TyveraDuration):
                         raise AssertionError("checked sendAfter duration is not Duration")
@@ -944,7 +1031,7 @@ class Interpreter:
                     actor, selector.identifier, [*request_arguments, _TyveraReplySender(cell)], expression.location,
                 )
                 return receiver_value
-            arguments = [self._evaluate(argument, variables, depth) for argument in expression.arguments]
+            arguments = self._evaluate_arguments(expression.arguments, variables, depth)
             if isinstance(receiver, _TyveraTaskGroup):
                 if self._current_actor is not None or receiver.owner is not self._current_task:
                     raise Diagnostic(expression.location, "runtime", "TaskGroup may only be used by its creating task")
@@ -1080,6 +1167,20 @@ class Interpreter:
             method = next(method for method in declaration.methods if method.name == expression.method)
             return self._call_method(method, receiver, arguments, expression.location, depth + 1)
         if isinstance(expression, Unary):
+            if expression.operator == "move":
+                if not isinstance(expression.operand, Name):
+                    raise AssertionError("checked move operand is not a binding name")
+                name = expression.operand.identifier
+                value = variables[name]
+                if value is _MOVED:
+                    raise Diagnostic(expression.location, "runtime", f"resource '{name}' was already moved")
+                for scope in variables.maps:
+                    if name in scope:
+                        scope[name] = _MOVED
+                        break
+                else:
+                    raise AssertionError("checked move binding disappeared")
+                return value
             value = self._evaluate(expression.operand, variables, depth)
             if expression.operator == "!":
                 return not value
@@ -1114,6 +1215,48 @@ class Interpreter:
         return None
 
     @staticmethod
+    def _resource_handles(value: object) -> list[_TyveraTextFile]:
+        if isinstance(value, _TyveraTextFile):
+            return [value]
+        if isinstance(value, _TyveraVariant):
+            return Interpreter._resource_handles(value.payload)
+        if isinstance(value, _TyveraTuple):
+            return [resource for item in reversed(value.values)
+                    for resource in Interpreter._resource_handles(item)]
+        if isinstance(value, _TyveraRecord):
+            return [resource for item in reversed(tuple(value.fields.values()))
+                    for resource in Interpreter._resource_handles(item)]
+        if isinstance(value, _TyveraNewtype):
+            return Interpreter._resource_handles(value.value)
+        if isinstance(value, _TyveraList):
+            return [resource for item in reversed(value.values)
+                    for resource in Interpreter._resource_handles(item)]
+        if isinstance(value, _TyveraMap):
+            return [resource for _, key, item in reversed(value.entries)
+                    for candidate in (item, key)
+                    for resource in Interpreter._resource_handles(candidate)]
+        if isinstance(value, _TyveraInstance):
+            return [resource for item in reversed(tuple(value.fields.values()))
+                    for resource in Interpreter._resource_handles(item)]
+        return []
+
+    def _cleanup_owned_scope(self, scope: dict[str, object]) -> list[tuple[Location, str]]:
+        errors: list[tuple[Location, str]] = []
+        resources: dict[int, _TyveraTextFile] = {}
+        for value in scope.values():
+            if value is _MOVED:
+                continue
+            for resource in self._resource_handles(value):
+                resources.setdefault(id(resource), resource)
+        for resource in sorted(resources.values(), key=lambda item: item.identity, reverse=True):
+            if resource.closed or resource.scoped:
+                continue
+            cleanup_error = self._close_text_file(resource)
+            if cleanup_error is not None:
+                errors.append((resource.location or Location("<resource>", 1, 1), cleanup_error))
+        return errors
+
+    @staticmethod
     def _resource_cleanup_diagnostic(location: Location, message: str) -> str:
         return f"{location.filename}:{location.line}:{location.column}: runtime error: {message}"
 
@@ -1122,7 +1265,12 @@ class Interpreter:
     ) -> list[str]:
         errors: list[str] = []
         for frame in reversed(frames):
-            if isinstance(frame, _AsyncResourceFrame):
+            if isinstance(frame, _AsyncBlockFrame):
+                errors.extend(
+                    self._resource_cleanup_diagnostic(location, message)
+                    for location, message in self._cleanup_owned_scope(frame.variables.maps[0])
+                )
+            elif isinstance(frame, _AsyncResourceFrame):
                 cleanup_error = self._close_text_file(frame.resource)
                 if cleanup_error is not None:
                     errors.append(self._resource_cleanup_diagnostic(frame.location, cleanup_error))
@@ -1520,7 +1668,9 @@ class Interpreter:
         if not function.is_async:
             raise AssertionError("only async functions create Task values")
         if depth >= self.max_call_depth:
-            raise Diagnostic(location, "runtime", f"maximum call depth ({self.max_call_depth}) exceeded")
+            error = Diagnostic(location, "runtime", f"maximum call depth ({self.max_call_depth}) exceeded")
+            self._cleanup_failed_argument_transfer(arguments, error)
+            raise error
         variables = ChainMap({parameter.name: value for parameter, value in zip(function.parameters, arguments)})
         task = _TyveraTask(function, variables, location, depth + 1, canonical_type(function.return_type))
         task.parent = self._current_task
@@ -1710,6 +1860,11 @@ class Interpreter:
 
         if frame.index >= len(frame.body):
             task.frames.pop()
+            cleanup_errors = self._cleanup_owned_scope(frame.variables.maps[0])
+            if cleanup_errors:
+                diagnostics = [self._resource_cleanup_diagnostic(location, message)
+                               for location, message in cleanup_errors]
+                self._fail_task(task, "; ".join(diagnostics))
             return
         statement = frame.body[frame.index]
         if isinstance(statement, AwaitStatement):
@@ -1746,7 +1901,8 @@ class Interpreter:
             elif acquisition.variant == "Ok":
                 resource = acquisition.payload
                 if not isinstance(resource, _TyveraTextFile):
-                    raise AssertionError("checked using acquisition is not a TextFile")
+                    raise AssertionError("checked using acquisition is not a text resource")
+                resource.scoped = True
                 scope = frame.variables.new_child()
                 scope[statement.name] = resource
                 task.frames.append(_AsyncResourceFrame(resource, statement.location))
@@ -1787,7 +1943,7 @@ class Interpreter:
                 break
             return
 
-        self._execute_block([statement], frame.variables, task.depth)
+        self._execute_block_inner([statement], frame.variables, task.depth)
         frame.index += 1
 
     def _handle_async_loop_control(self, task: _TyveraTask, signal: _LoopSignal) -> None:
@@ -2125,7 +2281,9 @@ class Interpreter:
         call_location: Location, depth: int,
     ) -> object:
         if depth >= self.max_call_depth:
-            raise Diagnostic(call_location, "runtime", f"maximum call depth ({self.max_call_depth}) exceeded")
+            error = Diagnostic(call_location, "runtime", f"maximum call depth ({self.max_call_depth}) exceeded")
+            self._cleanup_failed_argument_transfer(arguments, error)
+            raise error
         initial = {parameter.name: value for parameter, value in zip(method.parameters, arguments)}
         initial["self"] = receiver
         variables = ChainMap(initial)
