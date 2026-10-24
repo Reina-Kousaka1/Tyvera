@@ -53,6 +53,15 @@ fn main() { println(relay(Person("Mira", 17))) }
 '''
         self.assertEqual(self._run(source), "17\nMira\n")
 
+    def test_interface_implementations_must_match_return_types(self) -> None:
+        with self.assertRaisesRegex(Diagnostic, "method 'name' does not match 'Named': expected return type String, found Int"):
+            compile_source('''interface Named { fn name() -> String }
+class Broken implements Named {
+    fn name() -> Int { return 1 }
+}
+fn main() {}
+''')
+
     def test_generic_function_constraint_rejects_unimplemented_capability(self) -> None:
         with self.assertRaisesRegex(Diagnostic, "type 'Int' does not satisfy constraint 'Named'"):
             compile_source('''interface Named { fn name() -> String }

@@ -1832,11 +1832,13 @@ class TypeChecker:
                 return "Duration"
             if operator in {"==", "!=", "<", "<=", ">", ">="}:
                 return "Bool"
-        if operator in {"+", "-", "*", "/"}:
+        if operator in {"+", "-", "*", "/", "%"}:
             if left not in _NUMERIC_TYPES or right not in _NUMERIC_TYPES:
                 raise Diagnostic(expression.location, "type", f"operator '{operator}' expects numeric operands, found {left} and {right}")
             if operator == "/":
                 return "Float"
+            if operator == "%":
+                return "Float" if "Float" in {left, right} else "Int"
             return "Float" if "Float" in {left, right} else "Int"
         if operator in {"==", "!="}:
             if left == "Void" or right == "Void":

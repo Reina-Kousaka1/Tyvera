@@ -33,6 +33,8 @@ fn display<T: Named>(person: T) -> String {
 }
 
 fn main() {
+    println(-7 % 3)
+
     let user = User<UserId>(17, "Mira")
     let copy = User(17, "Mira")
     println(user == copy)

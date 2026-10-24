@@ -111,8 +111,29 @@ let mixed: Float = 1 + 2.5
 println(mixed)
 println(4.5 - 0.5)
 println(2.0 * 3.0)
+println(-7 % 3)
+println(7 % -3)
+println(-7.5 % 2.0)
+println(7 % -2.5)
+println(14 % 5 * 2)
 println("Ty" + "vera")
-}'''), "14\n20\n5\n-6\n2.5\n3.5\n4.0\n6.0\nTyvera\n")
+}'''), "14\n20\n5\n-6\n2.5\n3.5\n4.0\n6.0\n-1\n1\n-1.5\n2.0\n8\nTyvera\n")
+
+    def test_remainder_by_zero_is_a_located_runtime_error(self):
+        for expression in ("7 % 0", "7.0 % -0.0"):
+            with self.subTest(expression=expression):
+                program, _ = compile_source(f"fn main() {{ println({expression}) }}", "remainder.tyv")
+                with self.assertRaisesRegex(Diagnostic, "remainder by zero") as caught:
+                    Interpreter(program, io.StringIO()).run()
+                self.assertEqual(caught.exception.location.filename, "remainder.tyv")
+
+    def test_integer_literals_do_not_depend_on_python_bigint_digit_limits(self):
+        with self.assertRaisesRegex(Diagnostic, "Int literal is outside the signed 64-bit range"):
+            compile_source(f"fn main() {{ println({'9' * 5000}) }}", "large-int.tyv")
+        with self.assertRaisesRegex(Diagnostic, "Int literal is outside the signed 64-bit range"):
+            compile_source("fn main() { println(-9223372036854775809) }", "negative-large-int.tyv")
+        output = self.run_source(f"fn main() {{ println({'0' * 5000}1) }}")
+        self.assertEqual(output, "1\n")
 
     def test_comparisons(self):
         self.assertEqual(self.run_source('''fn main() {

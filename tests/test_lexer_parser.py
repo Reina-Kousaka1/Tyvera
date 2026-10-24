@@ -28,6 +28,11 @@ class LexerTests(unittest.TestCase):
         with self.assertRaisesRegex(Diagnostic, "unsupported escape sequence"):
             Lexer('"\\q"').tokenize()
 
+    def test_string_literals_reject_non_scalar_surrogate_code_points(self) -> None:
+        with self.assertRaisesRegex(Diagnostic, "Unicode surrogate") as caught:
+            Lexer('"' + chr(0xD800) + '"').tokenize()
+        self.assertEqual(caught.exception.stage, "lexical")
+
     def test_non_ascii_identifier_is_rejected(self) -> None:
         with self.assertRaisesRegex(Diagnostic, "unexpected character"):
             Lexer("fn café() {}", "ascii.tyv").tokenize()

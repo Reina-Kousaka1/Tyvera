@@ -64,6 +64,7 @@ _PRECEDENCE = {
     "MINUS": 5,
     "STAR": 6,
     "SLASH": 6,
+    "PERCENT": 6,
 }
 _OPERATOR = {
     "OR": "or",
@@ -78,6 +79,7 @@ _OPERATOR = {
     "MINUS": "-",
     "STAR": "*",
     "SLASH": "/",
+    "PERCENT": "%",
 }
 
 

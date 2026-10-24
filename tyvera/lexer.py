@@ -85,7 +85,17 @@ class Lexer:
             while self._peek() in "0123456789":
                 self._advance()
         lexeme = self.source[start:self.index]
-        value = float(lexeme) if is_float else int(lexeme)
+        if is_float:
+            value = float(lexeme)
+        else:
+            # Keep integer parsing independent of Python's configurable limit
+            # for converting very long decimal strings. One extra magnitude
+            # is retained for the unary spelling of Int's minimum value.
+            digits = lexeme.lstrip("0") or "0"
+            if len(digits) > 19 or (len(digits) == 19 and digits > "9223372036854775808"):
+                value = (1 << 63) + 1
+            else:
+                value = int(digits)
         if is_float and not math.isfinite(value):
             raise Diagnostic(location, "lexical", "Float literal is outside the supported range")
         self.tokens.append(Token("FLOAT" if is_float else "INTEGER", lexeme, value, location))
@@ -97,9 +107,12 @@ class Lexer:
         pieces: list[str] = []
         escapes = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
         while not self._at_end() and self._peek() != '"':
+            character_location = self._location()
             char = self._advance()
             if char == "\n":
                 raise Diagnostic(location, "lexical", "string literal cannot cross a line")
+            if 0xD800 <= ord(char) <= 0xDFFF:
+                raise Diagnostic(character_location, "lexical", "string literal contains a Unicode surrogate, not a scalar value")
             if char == "\\":
                 if self._at_end():
                     raise Diagnostic(location, "lexical", "unterminated escape in string literal")

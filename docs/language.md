@@ -113,7 +113,7 @@ the constructor.
 | `Int` | Signed 64-bit integers, −9223372036854775808 through 9223372036854775807. Out-of-range literals are static errors; arithmetic overflow is a located runtime error. |
 | `Float` | Finite IEEE binary64 values. Decimal literals round to binary64. Non-finite literals and arithmetic overflow are errors; ordinary binary64 rounding and underflow apply. |
 | `Bool` | Exactly `true` or `false`, printed in lowercase; no truthiness conversion. |
-| `String` | Unicode scalar sequence decoded from UTF-8 source and text-file input; equality compares exact scalar sequence without normalization. Concatenation is supported; no indexing, slicing, or implicit string conversion exists. |
+| `String` | Unicode scalar sequence decoded from UTF-8 source and text-file input; equality compares exact scalar sequence without normalization. Concatenation is supported; length, ordering, indexing, iteration, slicing, and implicit string conversion are not implemented. |
 | `Void` | No return value; not allowed for bindings or parameters. No literal. |
 
 `Unit` remains an exact compatibility alias for `Void`; signatures and
@@ -121,7 +121,8 @@ diagnostics use `Void`. Inference applies to initialized local bindings only.
 Assignment, initialization, arguments and returns require exact type matches,
 except that a class implementing an interface is assignable to that interface.
 An `Int` cannot silently be stored in a `Float` binding. Numeric promotion is
-limited to the explicit arithmetic rules below.
+limited to the explicit arithmetic rules below. No explicit numeric conversion
+functions are implemented.
 
 `println(value)` accepts one `Int`, `Float`, `Bool` or `String` and returns
 `Void`. Booleans print in lowercase. Function names and local bindings occupy
@@ -765,7 +766,7 @@ Precedence, lowest first; binary operators associate left:
 | 3 | `==`, `!=` |
 | 4 | `<`, `<=`, `>`, `>=` |
 | 5 | `+`, `-` |
-| 6 | `*`, `/` |
+| 6 | `*`, `/`, `%` |
 | 7 | Prefix `-`, `!` |
 
 Parentheses override precedence. Calls bind above prefix operators. Binary
@@ -773,8 +774,8 @@ operands and function arguments evaluate left to right.
 
 | Operator | Accepted operands | Result |
 | --- | --- | --- |
-| `+`, `-`, `*` | `Int`/`Int` | checked `Int` |
-| `+`, `-`, `*` | numeric pair containing `Float` | `Float` (integer operand promoted to binary64) |
+| `+`, `-`, `*`, `%` | `Int`/`Int` | checked `Int` |
+| `+`, `-`, `*`, `%` | numeric pair containing `Float` | `Float` (integer operand promoted to binary64) |
 | `/` | any numeric pair | `Float`, including `Int / Int`; zero divisor is a runtime error |
 | `+` | `String`/`String` | `String` concatenation |
 | `==`, `!=` | same non-`Void` types, or a numeric pair | `Bool`; numeric comparison compares values, not their type names |
@@ -793,6 +794,10 @@ tasks, timers, supervisors and reply handles compare by identity. Lists and
 maps compare structurally; map equality does not depend on insertion order.
 Tuples, records, newtypes, enums, `Option`, `Result`, and `Json` compare by
 their tagged value structure, recursively applying the nested type's rules.
+Scoped `TextFile` handles cannot be compared as values or used as Map keys.
+For `%`, the quotient is truncated toward zero and the remainder has the
+dividend's sign, for both integer and finite binary64 operands. A zero divisor
+is a runtime error.
 No other operator combinations or conversions are permitted.
 Both sides of a short-circuit expression are still statically checked.
 

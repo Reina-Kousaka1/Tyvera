@@ -1096,7 +1096,8 @@ class Interpreter:
             try:
                 result = self._apply_binary(expression.operator, left, right)
             except ZeroDivisionError as error:
-                raise Diagnostic(expression.location, "runtime", "division by zero") from error
+                message = "remainder by zero" if expression.operator == "%" else "division by zero"
+                raise Diagnostic(expression.location, "runtime", message) from error
             self._check_numeric_result(result, expression.location)
             return result
         raise AssertionError(f"unhandled expression node: {type(expression).__name__}")
@@ -2188,6 +2189,19 @@ class Interpreter:
             return left * right  # type: ignore[operator]
         if operator == "/":
             return left / right  # type: ignore[operator]
+        if operator == "%":
+            if type(left) is int and type(right) is int:
+                if right == 0:
+                    raise ZeroDivisionError
+                quotient = abs(left) // abs(right)
+                if (left < 0) != (right < 0):
+                    quotient = -quotient
+                return left - quotient * right
+            left_float = float(left)
+            right_float = float(right)
+            if right_float == 0.0:
+                raise ZeroDivisionError
+            return math.fmod(left_float, right_float)
         if operator == "==":
             return _tyvera_equal(left, right)
         if operator == "!=":

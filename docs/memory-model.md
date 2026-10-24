@@ -15,8 +15,9 @@ features.
   `type` aliases are transparent and do not create runtime wrappers.
 - Lists, maps, records, tuples, enums, newtypes, `Option`, `Result`, and `Json`
   use Tyvera-defined structural equality. Class and runtime-handle equality is
-  identity-based. Mixed `Int`/`Float` equality compares the exact represented
-  numeric values; Bool is a separate type.
+  identity-based. Scoped resources cannot be compared as public values. Mixed
+  `Int`/`Float` equality compares the exact represented numeric values; Bool is
+  a separate type.
 - Map storage uses a Tyvera-defined stable hash/equality contract. Keys are
   restricted to recursively hashable values and stable identity references;
   mutable collections and values containing them cannot be keys.

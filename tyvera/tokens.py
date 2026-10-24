@@ -61,6 +61,7 @@ SINGLE_CHAR_TOKENS = {
     "-": "MINUS",
     "*": "STAR",
     "/": "SLASH",
+    "%": "PERCENT",
     "!": "BANG",
     "=": "EQUAL",
     "<": "LESS",

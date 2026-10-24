@@ -193,6 +193,14 @@ fn main() {
                 with self.assertRaisesRegex(Diagnostic, message):
                     compile_source(source, "invalid-resource.tyv")
 
+    def test_scoped_resources_have_no_public_equality(self) -> None:
+        with self.assertRaisesRegex(Diagnostic, "can only be used as the receiver"):
+            compile_source('''fn main() {
+    using file = openText("x.txt", "write") {
+        println(file == file)
+    }
+}''', "resource-equality.tyv")
+
     def test_explicit_close_is_idempotent_and_use_after_close_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
