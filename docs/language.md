@@ -587,6 +587,12 @@ ready tasks round-robin, drives actor messages needed by awaited replies, and
 waits until a deadline when no task can otherwise run. A deadlock with pending
 work but no runnable task or deadline is returned as `Err`.
 
+A task whose result can carry a move-only Resource is itself linear. `await`
+transfers its completed result once. `withTimeout()` transfers the task handle
+to its wrapper. `tryResult()` consumes the handle; if it is still pending, the
+operation is cancelled and `Ok(None)` is returned so a later resource cannot
+become ownerless.
+
 An interpreter runtime is one-shot: `main` starts it and runtime shutdown runs
 when `main` returns or raises. `runTasks()` may be called repeatedly while
 `main` is active; it is idle between calls and cannot be pumped recursively or
@@ -636,9 +642,38 @@ not parallel execution. When tasks await actor replies, the scheduler delivers
 at most one queued actor message between task turns, so a continuously runnable
 task cannot starve the reply. Synchronous calls, expressions, and actor
 handlers are atomic and can still delay other work. `runTasks()` waits against
-the injected monotonic clock for task or awaited-reply deadlines; `runActors()`
-never sleeps for a future message. Both schedulers have bounded safety limits.
-Async I/O and networking are not implemented.
+the injected monotonic clock for task, actor-reply, or I/O readiness; socket
+readiness and worker completion wake the scheduler without polling or blocking
+other runnable tasks. `runActors()` never sleeps for a future message. Both
+schedulers have bounded safety limits.
+
+The reference runtime implements async text-file operations and TCP V1.
+`openTextAsync` and async methods on the existing text-resource types perform
+file work on a bounded runtime worker pool. TCP connect/accept/read/write use
+non-blocking readiness. The byte-oriented networking API, address and error
+types are described in the [standard library reference](standard-library.md).
+`read(maxBytes)` may return fewer bytes than requested; an empty stream is
+reported as `Ok(None)`. `write(Bytes)` may accept only part of its input;
+`writeAll(Bytes)` continues when the connection becomes writable. Each
+connection permits at most one pending read and one pending write, and read
+allocations are capped at 1 MiB. The runtime retains only the caller-supplied
+payload for an in-flight write; it does not queue an unbounded producer buffer.
+
+I/O methods return `Task<Result<T,String>>`: expected file, DNS, and socket
+failures are normalized Tyvera strings inside `Result`. `Task.withTimeout`
+uses the existing task deadline behavior; expiry cancels the underlying wait
+and fails the timeout task with `"task timed out"`. Cancellation unregisters
+socket readiness or cancels a queued worker request. A worker operation already
+running is allowed to finish; if its owned file is closing, the runtime closes
+the handle immediately after that operation finishes. Runtime shutdown
+cancels waits, closes owned resources and drains the bounded worker pool.
+Timeout and I/O cancellation do not change the ownership rules of the resource.
+
+This first version has no user-defined general `Stream` interface. TCP
+connections establish the byte-stream contract and text files keep their
+existing text API. TLS can later adapt the owned byte-stream boundary through
+an established platform cryptography library; TLS itself is not implemented.
+HTTP, WebSockets, networking protocols and native I/O backends remain planned.
 
 ## JSON values
 
@@ -730,10 +765,28 @@ stored in collections, tuples, records, classes, newtypes, enums, or user
 generic instantiations, or transferred through actor messages/state. Async
 functions may take owned resources as parameters but cannot return them; the
 task owns each moved parameter until completion, failure, cancellation, or
-runtime shutdown. Detaching a task leaves its resource ownership with that
-task. No explicit borrow syntax is needed for receiver method calls. These
-file operations are synchronous and can block the cooperative scheduler;
-async I/O and networking are not implemented.
+runtime shutdown. `Task<Result<Resource,String>>` values returned by built-in
+resource operations are linear: await them into a binding or consume their
+result once with `tryResult()`. A pending resource-returning task is cancelled
+when its owning scope ends. Detaching a task leaves its resource ownership
+with that task. No explicit borrow syntax is needed for receiver method calls.
+
+`openText`, `openTextReader`, and `openTextWriter` remain synchronous. The same
+move-only handles also support `openTextAsync`, `readAllAsync`, `writeAsync`,
+`appendAsync`, `flushAsync`, and `closeAsync`; worker operations return typed
+tasks and preserve the existing LIFO scope cleanup. Synchronous text operations
+remain available and can block the cooperative scheduler.
+
+`Bytes` is an immutable byte value built with `bytesFromString`. `Bytes.length()`
+reports its byte length and `Bytes.toString()` validates UTF-8 through a
+`Result`. `resolveHost`, `tcpConnect`, and `tcpListen` return tasks. TCP listener
+and connection handles are move-only resources; `accept`, `read`, `write`, and
+`writeAll` suspend through the task scheduler. Address values expose host, port,
+and address family without exposing host-platform socket structs. `read` may be
+partial and uses `None` for EOF. `write` may be partial; `writeAll` waits for
+socket readiness, retaining one caller-provided payload at a time. No general
+Stream trait exists yet. HTTP, TLS, and WebSockets are not part of this API
+version.
 
 The built-in namespace `secrets.NAME` returns `Option<Secret<String>>`. The
 local provider reads `.tyvera.secrets` first, then checks the process

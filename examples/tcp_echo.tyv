@@ -1,0 +1,106 @@
+async fn echoClient(port: Int) {
+    let connected = await tcpConnect("127.0.0.1", port)
+    match move connected {
+        Ok(connection) => {
+            let sent = await connection.writeAll(bytesFromString("hello from Tyvera"))
+            match sent {
+                Ok(_) => {}
+                Err(error) => println(error)
+            }
+            let received = await connection.read(5)
+            match received {
+                Ok(value) => match value {
+                    Some(first) => {
+                        match first.toString() {
+                            Ok(text) => println(text)
+                            Err(error) => println(error)
+                        }
+                        let rest = await connection.read(64)
+                        match rest {
+                            Ok(value) => match value {
+                                Some(bytes) => match bytes.toString() {
+                                    Ok(text) => println(text)
+                                    Err(error) => println(error)
+                                }
+                                None => println("unexpected EOF")
+                            }
+                            Err(error) => println(error)
+                        }
+                    }
+                    None => println("unexpected EOF")
+                }
+                Err(error) => println(error)
+            }
+            let ended = await connection.read(64)
+            match ended {
+                Ok(value) => match value {
+                    None => println("eof")
+                    Some(_) => println("unexpected extra data")
+                }
+                Err(error) => println(error)
+            }
+            connection.close()
+        }
+        Err(error) => println(error)
+    }
+}
+
+async fn echoRoundTrip() {
+    let opened = await tcpListen("127.0.0.1", 0, 16)
+    match move opened {
+        Ok(listener) => {
+            match listener.localAddress() {
+                Ok(address) => {
+                    let client = echoClient(address.port())
+                    let accepted = await listener.accept()
+                    match move accepted {
+                        Ok(connection) => {
+                            let received = await connection.read(5)
+                            match received {
+                                Ok(value) => match value {
+                                    Some(bytes) => {
+                                        let rest = await connection.read(64)
+                                        match rest {
+                                            Ok(value) => match value {
+                                                Some(more) => {
+                                                    let sent = await connection.writeAll(bytes)
+                                                    match sent {
+                                                        Ok(_) => {}
+                                                        Err(error) => println(error)
+                                                    }
+                                                    let sentRest = await connection.writeAll(more)
+                                                    match sentRest {
+                                                        Ok(_) => {}
+                                                        Err(error) => println(error)
+                                                    }
+                                                }
+                                                None => println("unexpected EOF")
+                                            }
+                                            Err(error) => println(error)
+                                        }
+                                    }
+                                    None => println("unexpected EOF")
+                                }
+                                Err(error) => println(error)
+                            }
+                            connection.close()
+                        }
+                        Err(error) => println(error)
+                    }
+                    await client
+                    listener.close()
+                }
+                Err(error) => println(error)
+            }
+        }
+        Err(error) => println(error)
+    }
+}
+
+fn main() {
+    let task = echoRoundTrip()
+    match runTasks() {
+        Ok(_) => println("echo complete")
+        Err(error) => println(error)
+    }
+}
