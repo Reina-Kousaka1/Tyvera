@@ -27,7 +27,8 @@ At runtime shutdown:
 Shutdown cleanup does not replace the diagnostic that caused `main` to fail.
 Cancellation is cooperative: it clears suspended continuations and cancels
 descendants, but cannot interrupt a synchronous function, actor handler, or
-expression while it is executing.
+expression while it is executing. Discarding a continuation closes any active
+`using` resources in reverse scope order; cleanup itself does not suspend.
 
 ## Task ownership
 
@@ -97,7 +98,8 @@ message or interrupt a running handler.
 
 ## Not implemented
 
-True parallelism, async I/O, networking, resource scopes, deterministic
-cleanup, and native execution remain planned. See the
+True parallelism, async I/O, networking, general resource types, and native
+execution remain planned. `using` scopes and deterministic `TextFile` cleanup
+are implemented in the reference runtime. See the
 [memory model](memory-model.md) and
 [backend architecture](backend-architecture.md).

@@ -60,23 +60,30 @@ and `--version`. The implementation uses Python's standard library only.
   and required method names, parameter types and return types must match
   exactly. A conforming class is assignable to its interface. There is no
   class inheritance or structural duck typing.
-- Generic function and class signatures retain type parameters in the checked
-  type representation. Calls infer parameters from actual arguments or accept
-  explicit type arguments; recursive substitution validates nested
-  applications before execution. Generic methods, interfaces and constraints
-  are not supported. The interpreter erases type arguments in object records;
-  runtime dispatch still uses the statically selected nominal class methods.
+- Generic function, class, record, enum and newtype signatures retain type
+  parameters in the checked type representation. Calls infer parameters from
+  actual arguments or accept explicit type arguments; recursive substitution
+  validates nested applications before execution. Generic functions support
+  interface bounds with statically checked constrained method calls. Generic
+  methods/interfaces and bounds on generic type declarations are not supported.
+  The interpreter erases type arguments in runtime values; dispatch still uses
+  statically selected nominal methods.
 - `List<T>` and `Map<K,V>` expose Tyvera-specific typed APIs through private
   bootstrap value records. The checker owns their method signatures and
   iteration element types. A `for` evaluates its collection once and the
   runtime iterates an immutable snapshot, so mutation during iteration is
-  deterministic. Map storage currently uses Python's dictionary/hash behavior;
-  keyability is not yet a complete static constraint. See the
+  deterministic. Map storage uses a Tyvera-owned hash/equality contract and
+  the checker accepts only recursively hashable value types or stable identity
+  references as keys. No Python hash value is observable. See the
   [Memory Model](memory-model.md#implemented-reference-behavior).
-- `Option<T>` and `Result<T,E>` are tagged Tyvera values. `match` checks
-  literal and variant pattern types, arm scopes, duplicate coverage, and
-  exhaustiveness for `Bool`, `Option` and `Result`. These ordinary error values
-  remain separate from runtime diagnostics and actor crashes.
+- `Option<T>`, `Result<T,E>`, enums, records, tuples and newtypes are typed
+  values. Equality is value-based for immutable structures, collection-based
+  for lists/maps, and identity-based for classes and runtime handles. `match`
+  checks nested pattern types, arm scopes, subsumed cases and recursive
+  exhaustiveness across finite sum and product patterns. CheckedProgram records
+  the recursive exhaustiveness result and top-level fully covered cases. These
+  ordinary error values remain separate from runtime diagnostics and actor
+  crashes.
 - Actor declarations have a checked message protocol and private state. The
   bootstrap scheduler owns FIFO mailboxes and schedules one message per actor
   per round. It is cooperative and deterministic, not parallel. Messages are
@@ -157,8 +164,8 @@ facts that a native backend will need. A shared IR is deferred until a second
 consumer or a real lowering step establishes its purpose. The runtime ABI,
 initial target plan, native backend comparison, and `tyvera build` acceptance
 criteria are in [Backend Architecture](backend-architecture.md). Tyvera's
-proposed value and resource ownership rules are in the
-[Memory Model](memory-model.md).
+value and resource ownership rules, including the current `TextFile` slice,
+are documented in the [Memory Model](memory-model.md).
 
 ## Local bootstrap benchmarks
 

@@ -34,6 +34,10 @@ KEYWORDS = {
     "and": "AND",
     "or": "OR",
     "class": "CLASS",
+    "record": "RECORD",
+    "enum": "ENUM",
+    "newtype": "NEWTYPE",
+    "type": "TYPE",
     "actor": "ACTOR",
     "on": "ON",
     "interface": "INTERFACE",
@@ -41,6 +45,7 @@ KEYWORDS = {
     "import": "IMPORT",
     "as": "AS",
     "pub": "PUB",
+    "using": "USING",
 }
 
 SINGLE_CHAR_TOKENS = {
@@ -56,6 +61,7 @@ SINGLE_CHAR_TOKENS = {
     "-": "MINUS",
     "*": "STAR",
     "/": "SLASH",
+    "%": "PERCENT",
     "!": "BANG",
     "=": "EQUAL",
     "<": "LESS",

@@ -13,6 +13,10 @@ class Program:
     interfaces: list[InterfaceDeclaration] = field(default_factory=list)
     imports: list[ImportDeclaration] = field(default_factory=list)
     actors: list[ActorDeclaration] = field(default_factory=list)
+    records: list[RecordDeclaration] = field(default_factory=list)
+    enums: list[EnumDeclaration] = field(default_factory=list)
+    newtypes: list[NewtypeDeclaration] = field(default_factory=list)
+    type_aliases: list[TypeAliasDeclaration] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -59,6 +63,49 @@ class ClassDeclaration:
 
 
 @dataclass(slots=True)
+class RecordDeclaration:
+    name: str
+    fields: list[Field]
+    location: Location
+    public: bool = False
+    type_parameters: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class EnumVariant:
+    name: str
+    payload_types: list[str]
+    location: Location
+
+
+@dataclass(slots=True)
+class EnumDeclaration:
+    name: str
+    variants: list[EnumVariant]
+    location: Location
+    public: bool = False
+    type_parameters: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class NewtypeDeclaration:
+    name: str
+    underlying_type: str
+    location: Location
+    public: bool = False
+    type_parameters: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class TypeAliasDeclaration:
+    name: str
+    target_type: str
+    location: Location
+    public: bool = False
+    type_parameters: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class InterfaceDeclaration:
     name: str
     methods: list[MethodSignature]
@@ -96,6 +143,7 @@ class Function:
     public: bool = False
     type_parameters: list[str] = field(default_factory=list)
     is_async: bool = False
+    type_constraints: dict[str, list[str]] = field(default_factory=dict)
 
 
 class Statement:
@@ -122,6 +170,16 @@ class Assignment(Statement):
 class Block(Statement):
     body: list[Statement]
     location: Location
+
+
+@dataclass(slots=True)
+class UsingStatement(Statement):
+    name: str
+    resource: Expression
+    body: list[Statement]
+    location: Location
+    error_name: str | None = None
+    else_body: list[Statement] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -180,6 +238,28 @@ class BindingPattern(Pattern):
 class VariantPattern(Pattern):
     variant: str
     binding: str | None
+    location: Location
+    payload_pattern: Pattern | None = None
+
+
+@dataclass(slots=True)
+class TuplePattern(Pattern):
+    elements: list[Pattern]
+    location: Location
+
+
+@dataclass(slots=True)
+class RecordPattern(Pattern):
+    name: str
+    fields: list[Pattern]
+    location: Location
+
+
+@dataclass(slots=True)
+class EnumPattern(Pattern):
+    enum_name: str
+    variant: str
+    payload_patterns: list[Pattern]
     location: Location
 
 
@@ -256,6 +336,12 @@ class MemberCall(Expression):
     arguments: list[Expression]
     location: Location
     type_arguments: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class TupleExpression(Expression):
+    elements: list[Expression]
+    location: Location
 
 
 @dataclass(slots=True)

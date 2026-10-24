@@ -30,6 +30,74 @@ fn main() {
 }
 '''), "42\ntyped\n")
 
+    def test_generic_function_interface_constraints_enable_checked_dispatch(self) -> None:
+        source = '''
+interface Named { fn name() -> String }
+interface Identified { fn id() -> Int }
+class Person implements Named, Identified {
+    let displayName: String
+    let identifier: Int
+    fn init(displayName: String, identifier: Int) {
+        self.displayName = displayName
+        self.identifier = identifier
+    }
+    fn name() -> String { return self.displayName }
+    fn id() -> Int { return self.identifier }
+}
+fn describe<T: Named + Identified>(person: T) -> String {
+    println(person.id())
+    return person.name()
+}
+fn relay<T: Named + Identified>(person: T) -> String { return describe(person) }
+fn main() { println(relay(Person("Mira", 17))) }
+'''
+        self.assertEqual(self._run(source), "17\nMira\n")
+
+    def test_interface_implementations_must_match_return_types(self) -> None:
+        with self.assertRaisesRegex(Diagnostic, "method 'name' does not match 'Named': expected return type String, found Int"):
+            compile_source('''interface Named { fn name() -> String }
+class Broken implements Named {
+    fn name() -> Int { return 1 }
+}
+fn main() {}
+''')
+
+    def test_generic_function_constraint_rejects_unimplemented_capability(self) -> None:
+        with self.assertRaisesRegex(Diagnostic, "type 'Int' does not satisfy constraint 'Named'"):
+            compile_source('''interface Named { fn name() -> String }
+fn describe<T: Named>(value: T) -> String { return value.name() }
+fn main() { println(describe(4)) }
+''')
+
+    def test_generic_function_without_a_bound_cannot_call_interface_methods(self) -> None:
+        with self.assertRaisesRegex(Diagnostic, "no interface constraint providing method 'name'"):
+            compile_source('''interface Named { fn name() -> String }
+fn describe<T>(value: T) -> String { return value.name() }
+fn main() {}
+''')
+
+    def test_generic_function_constraints_work_across_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "src").mkdir()
+            (root / "src" / "main.tyv").write_text(
+                'import "named.tyv" as named\n'
+                'fn main() { println(named.label(named.Person("Ada"))) }\n', encoding="utf-8"
+            )
+            (root / "src" / "named.tyv").write_text(
+                'pub interface Named { fn name() -> String }\n'
+                'pub class Person implements Named {\n'
+                '    let value: String\n'
+                '    fn init(value: String) { self.value = value }\n'
+                '    fn name() -> String { return self.value }\n'
+                '}\n'
+                'pub fn label<T: Named>(value: T) -> String { return value.name() }\n', encoding="utf-8"
+            )
+            program, _ = compile_project(root / "src/main.tyv", root)
+            output = io.StringIO()
+            Interpreter(program, output).run()
+            self.assertEqual(output.getvalue(), "Ada\n")
+
     def test_explicit_type_arguments_work_when_inference_has_no_input(self) -> None:
         self.assertEqual(self._run('''
 fn marker<T>() -> String {

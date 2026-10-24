@@ -1,21 +1,28 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 
 from .ast import Program
 from .lexer import Lexer
 from .parser import Parser
+from .source import Location
 from .typesys import Signature, TypeChecker
 
 
 @dataclass(frozen=True, slots=True)
 class CheckedProgram:
-    """An AST that completed semantic analysis and its top-level function signatures."""
+    """An AST plus source-located semantic metadata produced by type checking."""
 
     program: Program
     function_signatures: Mapping[str, Signature]
+    expression_types: Mapping[Location, str] = field(default_factory=dict)
+    generic_substitutions: Mapping[Location, Mapping[str, str]] = field(default_factory=dict)
+    type_alias_targets: Mapping[str, str] = field(default_factory=dict)
+    match_coverage: Mapping[Location, frozenset[str]] = field(default_factory=dict)
+    match_exhaustiveness: Mapping[Location, bool] = field(default_factory=dict)
 
 
 def compile_source(source: str, filename: str = "<memory>") -> tuple[Program, dict[str, Signature]]:
@@ -32,8 +39,15 @@ def compile_checked_source(source: str, filename: str = "<memory>") -> CheckedPr
         from .source import Diagnostic
 
         raise Diagnostic(program.imports[0].location, "module", "imports require project compilation")
-    signatures = TypeChecker(program, filename).check()
-    return CheckedProgram(program, signatures)
+    checker = TypeChecker(program, filename)
+    signatures = checker.check()
+    return CheckedProgram(
+        program, MappingProxyType(dict(signatures)), MappingProxyType(dict(checker.expression_types)),
+        MappingProxyType({location: MappingProxyType(dict(arguments))
+                          for location, arguments in checker.generic_substitutions.items()}),
+        MappingProxyType({name: declaration.target_type for name, declaration in checker.type_aliases.items()}),
+        MappingProxyType(dict(checker.match_coverage)), MappingProxyType(dict(checker.match_exhaustiveness)),
+    )
 
 
 def compile_project(entry_file: str | Path, project_root: str | Path) -> tuple[Program, dict[str, Signature]]:
@@ -51,6 +65,13 @@ def compile_checked_project(entry_file: str | Path, project_root: str | Path) ->
         entry = Path(project_root) / entry
     root = Path(project_root)
     program = ModuleLoader(root, entry).load()
-    signatures = TypeChecker(program, str(entry)).check()
-    return CheckedProgram(program, signatures)
+    checker = TypeChecker(program, str(entry))
+    signatures = checker.check()
+    return CheckedProgram(
+        program, MappingProxyType(dict(signatures)), MappingProxyType(dict(checker.expression_types)),
+        MappingProxyType({location: MappingProxyType(dict(arguments))
+                          for location, arguments in checker.generic_substitutions.items()}),
+        MappingProxyType({name: declaration.target_type for name, declaration in checker.type_aliases.items()}),
+        MappingProxyType(dict(checker.match_coverage)), MappingProxyType(dict(checker.match_exhaustiveness)),
+    )
 
