@@ -53,10 +53,10 @@ from .type_names import make_type, split_type, substitute_type
 
 _BUILTIN_TYPES = {
     "Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result",
-    "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile",
+    "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile", "TextReader", "TextWriter",
 }
 _BUILTIN_FUNCTIONS = {
-    "println", "eprintln", "readText", "writeText", "openText", "pathJoin", "pathExists",
+    "println", "eprintln", "readText", "writeText", "openText", "openTextReader", "openTextWriter", "pathJoin", "pathExists",
     "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool",
     "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors", "oneForOne",
     "milliseconds", "seconds", "timerAfter", "sleepFor", "runTasks", "taskGroup",
@@ -80,6 +80,10 @@ def canonical_type(name: str) -> str:
 class Binding:
     type_name: str
     mutable: bool = False
+    resource_kind: str | None = None
+    ownership_id: int | None = None
+    scope_id: int | None = None
+    location: Location | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,7 +148,74 @@ class TypeChecker:
             "ReplySender": 1, "ReplyReceiver": 1, "Task": 1,
         }
         self.active_type_variables: set[str] = set()
-        self._checking_using_resource = False
+        self._ownership_flow: dict[int, str] = {}
+        self._next_ownership_id = 1
+        self._next_scope_id = 1
+        self.resource_types = {"TextFile", "TextReader", "TextWriter"}
+        self.move_sites: dict[Location, str] = {}
+        self.resource_scopes: dict[Location, str] = {}
+        self.cleanup_points: dict[Location, tuple[str, ...]] = {}
+        self.ownership_transfers: dict[Location, str] = {}
+        self._ownership_effects: list[tuple[int, str]] = []
+
+    def _contains_resource(self, type_name: str) -> bool:
+        """Return whether a type can carry a move-only resource value."""
+        canonical = self._canonical_type(type_name)
+        base, arguments = split_type(canonical)
+        return base in self.resource_types or any(self._contains_resource(argument) for argument in arguments)
+
+    def _new_binding(
+        self, type_name: str, mutable: bool = False, *, resource_kind: str | None = None,
+        scope_id: int | None = None, location: Location | None = None,
+    ) -> Binding:
+        canonical = self._canonical_type(type_name)
+        if resource_kind is None and self._contains_resource(canonical):
+            resource_kind = "owned"
+        ownership_id = None
+        if resource_kind is not None:
+            ownership_id = self._next_ownership_id
+            self._next_ownership_id += 1
+            self._ownership_flow[ownership_id] = "owned"
+            if location is not None:
+                self.resource_scopes[location] = resource_kind
+        return Binding(canonical, mutable, resource_kind, ownership_id, scope_id, location)
+
+    def _ownership_status(self, binding: Binding) -> str:
+        if binding.ownership_id is None:
+            return "owned"
+        return self._ownership_flow.get(binding.ownership_id, "owned")
+
+    def _require_resource_live(
+        self, name: str, binding: Binding, location: Location, *, allow_closed_query: bool = False,
+    ) -> None:
+        status = self._ownership_status(binding)
+        if status == "moved":
+            raise Diagnostic(location, "type", f"resource '{name}' was already moved")
+        if status == "maybe_moved":
+            raise Diagnostic(location, "type", f"resource '{name}' may have been moved on another control-flow path")
+        if status == "closed" and not allow_closed_query:
+            raise Diagnostic(location, "type", f"resource '{name}' was already closed")
+        if status == "maybe_closed" and not allow_closed_query:
+            raise Diagnostic(location, "type", f"resource '{name}' may have been closed on another control-flow path")
+
+    @staticmethod
+    def _merge_ownership_statuses(statuses: list[str]) -> str:
+        if not statuses:
+            return "owned"
+        if all(status == statuses[0] for status in statuses):
+            return statuses[0]
+        if "moved" in statuses or "maybe_moved" in statuses:
+            return "maybe_moved"
+        if "closed" in statuses or "maybe_closed" in statuses:
+            return "maybe_closed"
+        return "owned"
+
+    def _merge_ownership_flows(
+        self, target: dict[int, str], base: dict[int, str], alternatives: list[dict[int, str]],
+    ) -> None:
+        for ownership_id, base_status in base.items():
+            statuses = [flow.get(ownership_id, base_status) for flow in alternatives]
+            target[ownership_id] = self._merge_ownership_statuses(statuses)
 
     def check(self) -> dict[str, Signature]:
         self._collect_types()
@@ -208,6 +279,8 @@ class TypeChecker:
             self._validate_alias_cycle(declaration.target_type, {declaration.name})
             self._require_known_type(declaration.target_type, declaration.location,
                                      set(declaration.type_parameters))
+            if self._contains_resource(declaration.target_type):
+                raise Diagnostic(declaration.location, "type", "type aliases cannot hide a move-only Resource type")
             if self._canonical_type(declaration.target_type) == "Void":
                 raise Diagnostic(declaration.location, "type", "type aliases cannot target Void")
         for declaration in self.program.interfaces:
@@ -227,6 +300,8 @@ class TypeChecker:
                 if member.name in fields:
                     raise Diagnostic(member.location, "type", f"record field '{member.name}' is already declared")
                 self._require_known_type(member.type_name, member.location, record_type_variables)
+                if self._contains_resource(member.type_name):
+                    raise Diagnostic(member.location, "type", "records cannot contain move-only Resource values")
                 if self._canonical_type(member.type_name) == "Void":
                     raise Diagnostic(member.location, "type", "record fields cannot have type Void")
                 if member.mutable:
@@ -243,6 +318,8 @@ class TypeChecker:
                 payload_types: list[str] = []
                 for payload_type in variant.payload_types:
                     self._require_known_type(payload_type, variant.location, type_variables)
+                    if self._contains_resource(payload_type):
+                        raise Diagnostic(variant.location, "type", "enum payloads cannot contain move-only Resource values")
                     if self._canonical_type(payload_type) == "Void":
                         raise Diagnostic(variant.location, "type", "enum payloads cannot have type Void")
                     payload_types.append(payload_type)
@@ -252,6 +329,8 @@ class TypeChecker:
         for declaration in self.program.newtypes:
             type_variables = set(declaration.type_parameters)
             self._require_known_type(declaration.underlying_type, declaration.location, type_variables)
+            if self._contains_resource(declaration.underlying_type):
+                raise Diagnostic(declaration.location, "type", "newtypes cannot wrap move-only Resource values")
             if self._canonical_type(declaration.underlying_type) == "Void":
                 raise Diagnostic(declaration.location, "type", "newtypes cannot wrap Void")
             self.newtypes[declaration.name] = declaration
@@ -263,6 +342,8 @@ class TypeChecker:
                 if member.name in fields:
                     raise Diagnostic(member.location, "type", f"field '{member.name}' is already declared")
                 self._require_known_type(member.type_name, member.location, class_type_variables)
+                if self._contains_resource(member.type_name):
+                    raise Diagnostic(member.location, "type", "class fields cannot contain move-only Resource values")
                 if self._canonical_type(member.type_name) == "Void":
                     raise Diagnostic(member.location, "type", "fields cannot have type Void")
                 fields[member.name] = member
@@ -284,6 +365,8 @@ class TypeChecker:
                 if member.name in fields:
                     raise Diagnostic(member.location, "type", f"actor state field '{member.name}' is already declared")
                 self._require_known_type(member.type_name, member.location)
+                if self._contains_resource(member.type_name):
+                    raise Diagnostic(member.location, "type", "actor state cannot contain move-only Resource values; acquire a scoped resource inside a handler")
                 if self._canonical_type(member.type_name) == "Void":
                     raise Diagnostic(member.location, "type", "actor state fields cannot have type Void")
                 fields[member.name] = member
@@ -411,7 +494,10 @@ class TypeChecker:
             parameter_types.append(self._canonical_type(parameter.type_name))
         self._require_known_type(function.return_type, function.location, known_variables)
         is_async = bool(getattr(function, "is_async", False))
-        return Signature(tuple(parameter_types), self._canonical_type(function.return_type), function.location,
+        return_type = self._canonical_type(function.return_type)
+        if is_async and self._contains_resource(return_type):
+            raise Diagnostic(function.location, "type", "async functions cannot return Resource values; transfer ownership through an owned parameter instead")
+        return Signature(tuple(parameter_types), return_type, function.location,
                          tuple(declared_parameters), is_async, declared_constraints)
 
     def _validate_function_constraints(
@@ -450,8 +536,6 @@ class TypeChecker:
             return
         if base not in self.type_names:
             raise Diagnostic(location, "type", f"unknown type '{base}'")
-        if base == "TextFile":
-            raise Diagnostic(location, "type", "TextFile is a scoped resource and cannot appear in declared types")
         if base in self.actor_names and not allow_actor:
             raise Diagnostic(location, "type", f"actor type '{base}' can only be used inside ActorRef<{base}>")
         expected_arity = self.generic_arities.get(base, 0)
@@ -473,6 +557,10 @@ class TypeChecker:
             actor_base, actor_arguments = split_type(arguments[0])
             if actor_arguments or actor_base not in self.actor_names:
                 raise Diagnostic(location, "type", "ActorRef requires one actor type, such as ActorRef<Counter>")
+        if base == "Map" and arguments and self._contains_resource(arguments[0]):
+            raise Diagnostic(location, "type", f"{arguments[0]} is not hashable and cannot be used as a Map key")
+        if self._contains_resource(type_name) and base not in {*self.resource_types, "Option", "Result"}:
+            raise Diagnostic(location, "type", f"{base} cannot contain move-only Resource values")
         if base == "Map" and arguments:
             if not self._is_hashable_key_type(arguments[0], known_variables):
                 raise Diagnostic(location, "type", f"Map key type '{arguments[0]}' is not a supported primitive or object-reference type")
@@ -554,29 +642,42 @@ class TypeChecker:
     def _check_function(self, function: Function, signature: Signature) -> None:
         previous = self.active_type_variables
         previous_constraints = self.active_type_constraints
+        previous_flow = self._ownership_flow
         self.active_type_variables = set(signature.type_parameters)
         self.active_type_constraints = dict(signature.type_constraints)
-        variables = ChainMap({p.name: Binding(self._canonical_type(p.type_name)) for p in function.parameters})
+        self._ownership_flow = {}
+        self._ownership_effects = []
+        variables = ChainMap({
+            p.name: self._new_binding(p.type_name, location=p.location)
+            for p in function.parameters
+        })
         try:
             outcomes = self._check_block(function.body, variables, signature.return_type, 0,
-                                         async_allowed=function.is_async)
+                                         async_allowed=function.is_async, scope_location=function.location)
             self._require_return_paths(function.name, signature.return_type, outcomes, function.location)
         finally:
             self.active_type_variables = previous
             self.active_type_constraints = previous_constraints
+            self._ownership_flow = previous_flow
 
     def _check_method(self, method: Method, signature: Signature, owner: ClassInfo) -> None:
         if method.name == "init" and signature.return_type != "Void":
             raise Diagnostic(method.location, "type", "constructors must return Void")
         previous = self.active_type_variables
+        previous_flow = self._ownership_flow
         self.active_type_variables = set(owner.type_parameters)
-        variables = ChainMap({p.name: Binding(self._canonical_type(p.type_name)) for p in method.parameters})
-        variables["self"] = Binding(owner.declaration.name)
+        self._ownership_flow = {}
+        self._ownership_effects = []
+        variables = ChainMap({p.name: self._new_binding(p.type_name, location=p.location)
+                              for p in method.parameters})
+        variables["self"] = self._new_binding(owner.declaration.name)
         try:
-            outcomes = self._check_block(method.body, variables, signature.return_type, 0, owner, method.name)
+            outcomes = self._check_block(method.body, variables, signature.return_type, 0, owner, method.name,
+                                         scope_location=method.location)
             self._require_return_paths(f"{owner.declaration.name}.{method.name}", signature.return_type, outcomes, method.location)
         finally:
             self.active_type_variables = previous
+            self._ownership_flow = previous_flow
 
     @staticmethod
     def _require_return_paths(name: str, return_type: str, outcomes: set[str], location: Location) -> None:
@@ -587,9 +688,16 @@ class TypeChecker:
         self, body: list[Statement], variables: ChainMap[str, Binding],
         return_type: str, loop_depth: int, owner: ClassInfo | None = None,
         method_name: str | None = None, async_allowed: bool = False,
+        ownership_flow: dict[int, str] | None = None, scope_location: Location | None = None,
     ) -> set[str]:
+        previous_flow = self._ownership_flow
+        if ownership_flow is not None:
+            self._ownership_flow = ownership_flow
         outcomes = {"next"}
         for statement in body:
+            reachable = "next" in outcomes
+            flow_before = dict(self._ownership_flow) if not reachable else None
+            effects_before = len(self._ownership_effects)
             exits = {"next"}
             if isinstance(statement, LetStatement):
                 if statement.name == "println":
@@ -613,7 +721,9 @@ class TypeChecker:
                     if value_type == "Void":
                         raise Diagnostic(statement.location, "type", "cannot infer a variable type from a Void expression")
                     variable_type = value_type
-                variables[statement.name] = Binding(variable_type, statement.mutable)
+                variables[statement.name] = self._new_binding(
+                    variable_type, statement.mutable, location=statement.location,
+                )
             elif isinstance(statement, Assignment):
                 value_type = self._expression_type(statement.value, variables, owner)
                 if isinstance(statement.target, str):
@@ -623,6 +733,12 @@ class TypeChecker:
                     if not binding.mutable:
                         raise Diagnostic(statement.location, "type", f"cannot assign to immutable binding '{statement.target}'")
                     self._require_same_type(binding.type_name, value_type, statement.location)
+                    if binding.resource_kind is not None and binding.ownership_id is not None:
+                        status = self._ownership_status(binding)
+                        if status not in {"moved", "closed"}:
+                            raise Diagnostic(statement.location, "type", f"cannot overwrite live Resource '{statement.target}'; move or close it first")
+                        self._ownership_flow[binding.ownership_id] = "owned"
+                        self.ownership_transfers[statement.location] = f"assignment to {statement.target}"
                 else:
                     field_type, field = self._member_field(statement.target, variables, owner)
                     is_self_field = isinstance(statement.target.receiver, Name) and statement.target.receiver.identifier == "self"
@@ -634,6 +750,8 @@ class TypeChecker:
             elif isinstance(statement, ReturnStatement):
                 value_type = "Void" if statement.value is None else self._expression_type(statement.value, variables, owner)
                 self._require_same_type(return_type, value_type, statement.location)
+                if self._contains_resource(value_type):
+                    self.ownership_transfers[statement.location] = "owned return"
                 exits = {"return"}
             elif isinstance(statement, AwaitStatement):
                 if not async_allowed:
@@ -662,56 +780,102 @@ class TypeChecker:
                             raise Diagnostic(statement.location, "type", "variables cannot have type Void")
                         self._require_same_type(self._canonical_type(statement.annotation), result_type, statement.location)
                         result_type = self._canonical_type(statement.annotation)
-                    variables[name] = Binding(result_type, statement.mutable)
+                    variables[name] = self._new_binding(result_type, statement.mutable, location=statement.location)
             elif isinstance(statement, Block):
                 exits = self._check_block(statement.body, variables.new_child(), return_type, loop_depth,
-                                          owner, method_name, async_allowed)
+                                          owner, method_name, async_allowed,
+                                          ownership_flow=self._ownership_flow, scope_location=statement.location)
             elif isinstance(statement, UsingStatement):
                 if statement.name in {"self", "secrets", *_BUILTIN_FUNCTIONS}:
                     raise Diagnostic(statement.location, "type", f"'{statement.name}' is reserved and cannot name a resource")
                 if statement.name in variables.maps[0]:
                     raise Diagnostic(statement.location, "type", f"variable '{statement.name}' is already declared")
-                if not isinstance(statement.resource, Call) or statement.resource.callee != "openText":
-                    raise Diagnostic(statement.location, "type", "using currently requires a direct openText(path, mode) acquisition")
-                previous_resource_context = self._checking_using_resource
-                self._checking_using_resource = True
-                try:
-                    resource_type = self._expression_type(statement.resource, variables, owner)
-                finally:
-                    self._checking_using_resource = previous_resource_context
-                if resource_type != "Result<TextFile,String>":
-                    raise Diagnostic(statement.resource.location, "type", "using requires a TextFile acquisition result")
+                resource_type = self._expression_type(statement.resource, variables, owner)
+                resource_base, resource_arguments = split_type(resource_type)
+                if (resource_base != "Result" or len(resource_arguments) != 2
+                        or resource_arguments[0] not in self.resource_types
+                        or resource_arguments[1] != "String"):
+                    raise Diagnostic(statement.resource.location, "type", "using requires an owned Result<Resource,String> acquisition")
+                self.ownership_transfers[statement.location] = f"{resource_arguments[0]} to scoped owner {statement.name}"
+                base_flow = dict(self._ownership_flow)
+                body_flow = dict(base_flow)
                 using_variables = variables.new_child()
-                using_variables[statement.name] = Binding("TextFile")
+                scope_id = self._next_scope_id
+                self._next_scope_id += 1
+                previous_resource_flow = self._ownership_flow
+                self._ownership_flow = body_flow
+                using_variables[statement.name] = self._new_binding(
+                    resource_arguments[0], resource_kind="scoped", scope_id=scope_id, location=statement.location,
+                )
+                self._ownership_flow = previous_resource_flow
                 exits = self._check_block(statement.body, using_variables, return_type, loop_depth,
-                                          owner, method_name, async_allowed)
+                                          owner, method_name, async_allowed,
+                                          ownership_flow=body_flow, scope_location=statement.location)
+                self.cleanup_points[statement.location] = tuple(dict.fromkeys(
+                    (*self.cleanup_points.get(statement.location, ()), statement.name)
+                ))
+                continuing_flows = [body_flow] if "next" in exits else []
                 if statement.error_name is not None:
                     if statement.error_name in {"self", "secrets", *_BUILTIN_FUNCTIONS}:
                         raise Diagnostic(statement.location, "type", f"'{statement.error_name}' is reserved and cannot name an error")
                     error_variables = variables.new_child()
-                    error_variables[statement.error_name] = Binding("String")
-                    exits |= self._check_block(statement.else_body, error_variables, return_type, loop_depth,
-                                               owner, method_name, async_allowed)
+                    error_variables[statement.error_name] = self._new_binding("String")
+                    error_flow = dict(base_flow)
+                    error_exits = self._check_block(statement.else_body, error_variables, return_type, loop_depth,
+                                               owner, method_name, async_allowed,
+                                               ownership_flow=error_flow, scope_location=statement.location)
+                    exits |= error_exits
+                    if "next" in error_exits:
+                        continuing_flows.append(error_flow)
+                if "next" in exits and continuing_flows:
+                    self._merge_ownership_flows(self._ownership_flow, base_flow, continuing_flows)
             elif isinstance(statement, IfStatement):
                 self._require_same_type("Bool", self._expression_type(statement.condition, variables, owner), statement.condition.location)
+                base_flow = dict(self._ownership_flow)
+                then_flow = dict(base_flow)
+                else_flow = dict(base_flow)
                 then_exits = self._check_block(statement.then_body, variables.new_child(), return_type, loop_depth,
-                                               owner, method_name, async_allowed)
+                                               owner, method_name, async_allowed,
+                                               ownership_flow=then_flow, scope_location=statement.location)
                 else_exits = self._check_block(statement.else_body, variables.new_child(), return_type, loop_depth,
-                                               owner, method_name, async_allowed)
+                                               owner, method_name, async_allowed,
+                                               ownership_flow=else_flow, scope_location=statement.location)
                 if isinstance(statement.condition, Literal):
                     exits = then_exits if statement.condition.value else else_exits
+                    continuing_flows = [then_flow if statement.condition.value else else_flow]
                 else:
                     exits = then_exits | else_exits
+                    continuing_flows = []
+                    if "next" in then_exits:
+                        continuing_flows.append(then_flow)
+                    if "next" in else_exits:
+                        continuing_flows.append(else_flow)
+                if "next" in exits and continuing_flows:
+                    self._merge_ownership_flows(self._ownership_flow, base_flow, continuing_flows)
             elif isinstance(statement, WhileStatement):
                 self._require_same_type("Bool", self._expression_type(statement.condition, variables, owner), statement.condition.location)
+                base_flow = dict(self._ownership_flow)
+                body_flow = dict(base_flow)
+                effect_start = len(self._ownership_effects)
                 body_exits = self._check_block(statement.body, variables.new_child(), return_type, loop_depth + 1,
-                                               owner, method_name, async_allowed)
+                                               owner, method_name, async_allowed,
+                                               ownership_flow=body_flow, scope_location=statement.location)
                 literal = isinstance(statement.condition, Literal)
                 exits = set()
                 if not literal or statement.condition.value:
                     exits |= body_exits & {"return"}
                 if not literal or not statement.condition.value or "break" in body_exits:
                     exits.add("next")
+                if "next" in exits:
+                    alternatives = []
+                    if not literal or not statement.condition.value:
+                        alternatives.append(base_flow)
+                    if body_exits & {"next", "break", "continue"}:
+                        alternatives.append(body_flow)
+                    self._merge_ownership_flows(self._ownership_flow, base_flow, alternatives)
+                    for ownership_id, effect in self._ownership_effects[effect_start:]:
+                        if ownership_id in base_flow and base_flow[ownership_id] == "owned":
+                            self._ownership_flow[ownership_id] = "maybe_closed" if effect == "closed" else "maybe_moved"
             elif isinstance(statement, ForStatement):
                 if statement.name in {"self", "secrets", *_BUILTIN_FUNCTIONS}:
                     raise Diagnostic(statement.location, "type", f"'{statement.name}' is reserved and cannot be a loop variable")
@@ -724,12 +888,22 @@ class TypeChecker:
                 else:
                     raise Diagnostic(statement.iterable.location, "type", f"for-loop value must be a List or Map, found {iterable_type}")
                 loop_variables = variables.new_child()
-                loop_variables[statement.name] = Binding(element_type)
+                loop_variables[statement.name] = self._new_binding(element_type, location=statement.location)
+                base_flow = dict(self._ownership_flow)
+                body_flow = dict(base_flow)
+                effect_start = len(self._ownership_effects)
                 body_exits = self._check_block(statement.body, loop_variables, return_type, loop_depth + 1,
-                                               owner, method_name, async_allowed)
+                                               owner, method_name, async_allowed,
+                                               ownership_flow=body_flow, scope_location=statement.location)
                 exits = {"next"} | (body_exits & {"return"})
+                self._merge_ownership_flows(self._ownership_flow, base_flow, [base_flow, body_flow])
+                for ownership_id, effect in self._ownership_effects[effect_start:]:
+                    if ownership_id in base_flow and base_flow[ownership_id] == "owned":
+                        self._ownership_flow[ownership_id] = "maybe_closed" if effect == "closed" else "maybe_moved"
             elif isinstance(statement, MatchStatement):
                 subject_type = self._expression_type(statement.value, variables, owner)
+                base_flow = dict(self._ownership_flow)
+                continuing_flows: list[dict[int, str]] = []
                 exits = set()
                 seen: set[tuple[object, ...]] = set()
                 coverage: set[str] = set()
@@ -756,12 +930,25 @@ class TypeChecker:
                     if key and key[0] == "catchall":
                         has_catchall = True
                     arm_variables = variables.new_child()
+                    arm_flow = dict(base_flow)
+                    previous_arm_flow = self._ownership_flow
+                    self._ownership_flow = arm_flow
                     self._bind_pattern(pattern, subject_type, arm_variables)
-                    exits |= self._check_block(arm.body, arm_variables, return_type, loop_depth,
-                                               owner, method_name, async_allowed)
+                    arm_exits = self._check_block(arm.body, arm_variables, return_type, loop_depth,
+                                                  owner, method_name, async_allowed,
+                                                  ownership_flow=arm_flow, scope_location=arm.location)
+                    exits |= arm_exits
+                    self._ownership_flow = previous_arm_flow
+                    if "next" in arm_exits:
+                        continuing_flows.append(arm_flow)
                 exhaustive = self._patterns_are_exhaustive(subject_type, checked_patterns)
+                if self._contains_resource(subject_type) and not exhaustive:
+                    raise Diagnostic(statement.location, "type", "a match on a Resource value must handle every variant so ownership cannot be discarded")
                 if not exhaustive:
                     exits.add("next")
+                    continuing_flows.append(base_flow)
+                if "next" in exits and continuing_flows:
+                    self._merge_ownership_flows(self._ownership_flow, base_flow, continuing_flows)
                 self.match_coverage[statement.location] = frozenset(coverage)
                 self.match_exhaustiveness[statement.location] = exhaustive
             elif isinstance(statement, LoopControl):
@@ -769,11 +956,26 @@ class TypeChecker:
                     raise Diagnostic(statement.location, "type", f"'{statement.kind}' is only valid inside a loop")
                 exits = {statement.kind}
             elif isinstance(statement, ExpressionStatement):
-                self._expression_type(statement.expression, variables, owner)
+                expression_type = self._expression_type(statement.expression, variables, owner)
+                if self._contains_resource(expression_type):
+                    raise Diagnostic(statement.location, "type", "a Resource value cannot be discarded; move it, return it, or place it in a using scope")
             else:
                 raise AssertionError(f"unhandled statement node: {type(statement).__name__}")
             if "next" in outcomes:
                 outcomes = (outcomes - {"next"}) | exits
+            if not reachable:
+                self._ownership_flow.clear()
+                self._ownership_flow.update(flow_before or {})
+                del self._ownership_effects[effects_before:]
+        owned_here = tuple(
+            name for name, binding in variables.maps[0].items()
+            if binding.resource_kind == "owned"
+        )
+        if scope_location is not None and owned_here:
+            self.cleanup_points[scope_location] = tuple(dict.fromkeys(
+                (*self.cleanup_points.get(scope_location, ()), *owned_here)
+            ))
+        self._ownership_flow = previous_flow
         return outcomes
 
     def _expression_type(
@@ -794,24 +996,39 @@ class TypeChecker:
             return expression.type_name
         if isinstance(expression, TupleExpression):
             element_types = [self._expression_type(element, variables, owner) for element in expression.elements]
+            if any(self._contains_resource(element_type) for element_type in element_types):
+                raise Diagnostic(expression.location, "type", "tuples cannot contain move-only Resource values")
             return make_type("Tuple", element_types)
         if isinstance(expression, Name):
             binding = variables.get(expression.identifier)
             if binding is None:
                 raise Diagnostic(expression.location, "type", f"unknown variable '{expression.identifier}'")
-            if binding.type_name == "TextFile":
-                raise Diagnostic(expression.location, "type", "a TextFile handle can only be used as the receiver of a scoped file operation")
+            if binding.resource_kind is not None:
+                self._require_resource_live(expression.identifier, binding, expression.location)
+                raise Diagnostic(expression.location, "type", f"Resource '{expression.identifier}' is move-only; use 'move {expression.identifier}' to transfer ownership")
             return binding.type_name
         if isinstance(expression, Call):
             if expression.callee == "openText":
-                if not self._checking_using_resource:
-                    raise Diagnostic(expression.location, "type", "openText resources must be acquired by a 'using' scope")
                 if expression.type_arguments:
                     raise Diagnostic(expression.location, "type", "'openText' does not accept type arguments")
                 argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
                 self._check_arguments(expression.arguments, argument_types, ("String", "String"),
                                       expression.location, "openText")
                 return "Result<TextFile,String>"
+            if expression.callee == "openTextReader":
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'openTextReader' does not accept type arguments")
+                argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
+                self._check_arguments(expression.arguments, argument_types, ("String",),
+                                      expression.location, "openTextReader")
+                return "Result<TextReader,String>"
+            if expression.callee == "openTextWriter":
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'openTextWriter' does not accept type arguments")
+                argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
+                self._check_arguments(expression.arguments, argument_types, ("String", "String"),
+                                      expression.location, "openTextWriter")
+                return "Result<TextWriter,String>"
             if expression.callee == "spawn":
                 if expression.type_arguments:
                     raise Diagnostic(expression.location, "type", "'spawn' does not accept type arguments")
@@ -1016,28 +1233,53 @@ class TypeChecker:
                 raise Diagnostic(expression.location, "type", "generic methods are not supported yet")
             resource_binding = (variables.get(expression.receiver.identifier)
                                 if isinstance(expression.receiver, Name) else None)
-            if resource_binding is not None and resource_binding.type_name == "TextFile":
-                receiver_type = "TextFile"
+            if resource_binding is not None and resource_binding.type_name in self.resource_types:
+                self._require_resource_live(
+                    expression.receiver.identifier, resource_binding, expression.location,
+                    allow_closed_query=expression.method in {"close", "isOpen"},
+                )
+                receiver_type = resource_binding.type_name
             else:
                 receiver_type = self._expression_type(expression.receiver, variables, owner)
             if expression.method == "init":
                 raise Diagnostic(expression.location, "type", "constructors can only run when creating an instance")
             receiver_base, receiver_arguments = split_type(receiver_type)
-            if receiver_base == "TextFile":
+            if receiver_base in self.resource_types:
                 argument_types = [self._expression_type(argument, variables, owner)
                                   for argument in expression.arguments]
                 methods = {
-                    "readAll": ((), "Result<String,String>"),
-                    "write": (("String",), "Result<Bool,String>"),
-                    "close": ((), "Bool"),
-                    "isOpen": ((), "Bool"),
-                }
+                    "TextFile": {
+                        "readAll": ((), "Result<String,String>"),
+                        "write": (("String",), "Result<Bool,String>"),
+                        "append": (("String",), "Result<Bool,String>"),
+                        "flush": ((), "Result<Bool,String>"),
+                        "close": ((), "Bool"),
+                        "isOpen": ((), "Bool"),
+                    },
+                    "TextReader": {
+                        "readAll": ((), "Result<String,String>"),
+                        "close": ((), "Bool"),
+                        "isOpen": ((), "Bool"),
+                    },
+                    "TextWriter": {
+                        "write": (("String",), "Result<Bool,String>"),
+                        "append": (("String",), "Result<Bool,String>"),
+                        "flush": ((), "Result<Bool,String>"),
+                        "close": ((), "Bool"),
+                        "isOpen": ((), "Bool"),
+                    },
+                }[receiver_base]
                 method_signature = methods.get(expression.method)
                 if method_signature is None:
-                    raise Diagnostic(expression.location, "type", f"TextFile has no method '{expression.method}'")
+                    raise Diagnostic(expression.location, "type", f"{receiver_base} has no method '{expression.method}'")
                 expected_types, result_type = method_signature
                 self._check_arguments(expression.arguments, argument_types, expected_types,
-                                      expression.location, f"TextFile.{expression.method}")
+                                      expression.location, f"{receiver_base}.{expression.method}")
+                if resource_binding is not None and expression.method == "close":
+                    status = self._ownership_status(resource_binding)
+                    if status not in {"closed", "maybe_closed"} and resource_binding.ownership_id is not None:
+                        self._ownership_flow[resource_binding.ownership_id] = "closed"
+                        self._ownership_effects.append((resource_binding.ownership_id, "closed"))
                 return result_type
             if receiver_base == "Supervisor":
                 if receiver_arguments:
@@ -1287,6 +1529,22 @@ class TypeChecker:
                 and expression.operand.value == INT_MAX + 1
             ):
                 return "Int"
+            if expression.operator == "move":
+                if not isinstance(expression.operand, Name):
+                    raise Diagnostic(expression.location, "type", "move requires a Resource binding name")
+                name = expression.operand.identifier
+                binding = variables.get(name)
+                if binding is None:
+                    raise Diagnostic(expression.operand.location, "type", f"unknown variable '{name}'")
+                if binding.resource_kind is None or binding.ownership_id is None:
+                    raise Diagnostic(expression.location, "type", f"'{name}' is not a move-only Resource value")
+                if binding.resource_kind == "scoped":
+                    raise Diagnostic(expression.location, "type", f"scoped resource '{name}' cannot be moved or escape its scope")
+                self._require_resource_live(name, binding, expression.location)
+                self._ownership_flow[binding.ownership_id] = "moved"
+                self._ownership_effects.append((binding.ownership_id, "moved"))
+                self.move_sites[expression.location] = name
+                return binding.type_name
             operand_type = self._expression_type(expression.operand, variables, owner)
             if expression.operator == "!":
                 if operand_type != "Bool":
@@ -1296,6 +1554,12 @@ class TypeChecker:
                 raise Diagnostic(expression.location, "type", f"unary '-' expects a number, found {operand_type}")
             return operand_type
         if isinstance(expression, Binary):
+            if expression.operator in {"==", "!="}:
+                for operand in (expression.left, expression.right):
+                    if isinstance(operand, Name):
+                        binding = variables.get(operand.identifier)
+                        if binding is not None and binding.resource_kind is not None:
+                            raise Diagnostic(expression.location, "type", f"Resource values are not value-comparable; '{operand.identifier}' has no value equality")
             left_type = self._expression_type(expression.left, variables, owner)
             right_type = self._expression_type(expression.right, variables, owner)
             return self._binary_type(expression, left_type, right_type)
@@ -1368,6 +1632,11 @@ class TypeChecker:
             missing = [name for name in type_parameters if name not in substitutions]
             if missing:
                 raise Diagnostic(location, "type", f"cannot infer type argument '{missing[0]}' for '{callee}'; provide it explicitly")
+
+        if callee not in {"Some", "None", "Ok", "Err"}:
+            for parameter, type_argument in substitutions.items():
+                if self._contains_resource(type_argument):
+                    raise Diagnostic(location, "type", f"generic parameter '{parameter}' in '{callee}' cannot contain a move-only Resource")
 
         resolved_parameters = tuple(substitute_type(item, substitutions) for item in formal_types)
         self._check_arguments(arguments, actual_types, resolved_parameters, location, callee)
@@ -1446,6 +1715,8 @@ class TypeChecker:
 
     def _check_pattern(self, pattern, subject_type: str, variables: ChainMap[str, Binding]) -> tuple[object, ...]:
         if isinstance(pattern, WildcardPattern):
+            if self._contains_resource(subject_type):
+                raise Diagnostic(pattern.location, "type", "a Resource-containing pattern cannot discard ownership with '_'")
             return ("catchall",)
         if isinstance(pattern, BindingPattern):
             if pattern.name in {"self", "secrets", *_BUILTIN_FUNCTIONS}:
@@ -1476,6 +1747,8 @@ class TypeChecker:
             payload_pattern = pattern.payload_pattern
             if pattern.variant == "None":
                 return ("variant", pattern.variant, True)
+            if self._contains_resource(payload_type) and payload_pattern is None and pattern.binding is None:
+                raise Diagnostic(pattern.location, "type", f"pattern '{pattern.variant}' must bind its move-only Resource payload")
             if payload_pattern is None:
                 return ("variant", pattern.variant, pattern.binding is not None)
             payload_key = self._check_pattern(payload_pattern, payload_type, variables)
@@ -1552,7 +1825,7 @@ class TypeChecker:
         if isinstance(pattern, BindingPattern):
             if pattern.name in variables.maps[0]:
                 raise Diagnostic(pattern.location, "type", f"pattern binding '{pattern.name}' is declared more than once")
-            variables[pattern.name] = Binding(subject_type)
+            variables[pattern.name] = self._new_binding(subject_type, location=pattern.location)
             return
         if isinstance(pattern, TuplePattern):
             _, arguments = split_type(subject_type)
@@ -1582,7 +1855,7 @@ class TypeChecker:
             elif pattern.binding is not None:
                 if pattern.binding in variables.maps[0]:
                     raise Diagnostic(pattern.location, "type", f"pattern binding '{pattern.binding}' is declared more than once")
-                variables[pattern.binding] = Binding(payload_type)
+                variables[pattern.binding] = self._new_binding(payload_type, location=pattern.location)
             return
         if isinstance(pattern, EnumPattern):
             _, arguments = split_type(subject_type)
@@ -1806,6 +2079,10 @@ class TypeChecker:
             canonical_actual = self._canonical_type(actual)
             if not self._is_assignable(canonical_expected, canonical_actual):
                 raise Diagnostic(arguments[index - 1].location, "type", f"argument {index} of '{callee}' expects {canonical_expected}, found {canonical_actual}")
+            if self._contains_resource(canonical_actual):
+                argument = arguments[index - 1]
+                transfer_kind = "explicit move" if isinstance(argument, Unary) and argument.operator == "move" else "owned temporary"
+                self.ownership_transfers[argument.location] = f"{transfer_kind} to parameter {index} of {callee}"
 
     def _is_assignable(self, expected: str, actual: str) -> bool:
         expected = self._canonical_type(expected)
@@ -1843,6 +2120,8 @@ class TypeChecker:
         if operator in {"==", "!="}:
             if left == "Void" or right == "Void":
                 raise Diagnostic(expression.location, "type", "Void values cannot be compared")
+            if self._contains_resource(left) or self._contains_resource(right):
+                raise Diagnostic(expression.location, "type", "Resource values are not value-comparable")
             if left != right and not ({left, right} <= _NUMERIC_TYPES):
                 if not (self._is_assignable(left, right) or self._is_assignable(right, left)):
                     raise Diagnostic(expression.location, "type", f"cannot compare {left} with {right}")

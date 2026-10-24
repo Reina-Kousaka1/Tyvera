@@ -1,0 +1,14 @@
+fn consume(reader: TextReader) {
+    match reader.readAll() {
+        Ok(contents) => println(contents)
+        Err(error) => println(error)
+    }
+}
+
+fn main() {
+    let opened = openTextReader("resource_sample.txt")
+    match move opened {
+        Ok(reader) => consume(move reader)
+        Err(error) => println(error)
+    }
+}

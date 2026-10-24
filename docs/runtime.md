@@ -27,8 +27,8 @@ At runtime shutdown:
 Shutdown cleanup does not replace the diagnostic that caused `main` to fail.
 Cancellation is cooperative: it clears suspended continuations and cancels
 descendants, but cannot interrupt a synchronous function, actor handler, or
-expression while it is executing. Discarding a continuation closes any active
-`using` resources in reverse scope order; cleanup itself does not suspend.
+expression while it is executing. Discarding a continuation closes all owned
+resources in reverse acquisition order; cleanup itself does not suspend.
 
 ## Task ownership
 
@@ -49,7 +49,8 @@ restart cancels tasks from the failed instance before the actor is rebuilt.
 Tasks created by an actor-owned task are its structured children. Explicitly
 detaching one of those children removes that child from the task owner, so it
 can finish independently of the actor; runtime shutdown remains the final
-boundary.
+boundary. Resource parameters moved into a task remain owned by that task
+until it completes, fails, is cancelled, or runtime shutdown cancels it.
 
 Actor handlers and constructors are synchronous. They may start an async task,
 but cannot await it or pump either scheduler from inside the actor turn. The
@@ -96,10 +97,21 @@ Stop, crash, restart, request cancellation, and request deadlines settle
 outstanding reply receivers. Request cancellation does not remove a queued
 message or interrupt a running handler.
 
+## Resource cleanup
+
+`TextFile`, `TextReader`, and `TextWriter` handles are move-only. `Option` and
+`Result` may carry them; other aggregate and collection types reject them.
+Owned handles close in reverse acquisition order at block exit, function
+return, runtime failure, `break`, `continue`, task completion or failure,
+cancellation, actor-handler failure, and supervised restart. Explicit
+`close()` makes later cleanup a no-op. Cleanup errors retain source locations
+and are added to an existing diagnostic without replacing its primary cause.
+Detached tasks keep their own resource handles until completion or runtime
+shutdown. File operations are synchronous and do not suspend.
+
 ## Not implemented
 
-True parallelism, async I/O, networking, general resource types, and native
-execution remain planned. `using` scopes and deterministic `TextFile` cleanup
-are implemented in the reference runtime. See the
+True parallelism, async I/O, networking, non-file resource families, and
+native execution remain planned. See the
 [memory model](memory-model.md) and
 [backend architecture](backend-architecture.md).

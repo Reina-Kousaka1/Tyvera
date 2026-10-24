@@ -561,8 +561,8 @@ class Parser:
             return Literal(token.kind == "TRUE", "Bool", token.location)
         if token.kind == "IDENTIFIER":
             return Name(token.lexeme, token.location)
-        if token.kind in {"MINUS", "BANG"}:
-            operator = "-" if token.kind == "MINUS" else "!"
+        if token.kind in {"MINUS", "BANG", "MOVE"}:
+            operator = {"MINUS": "-", "BANG": "!", "MOVE": "move"}[token.kind]
             return Unary(operator, self._expression(7), token.location)
         if token.kind == "LPAREN":
             expression = self._expression()

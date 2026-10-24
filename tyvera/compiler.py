@@ -23,6 +23,11 @@ class CheckedProgram:
     type_alias_targets: Mapping[str, str] = field(default_factory=dict)
     match_coverage: Mapping[Location, frozenset[str]] = field(default_factory=dict)
     match_exhaustiveness: Mapping[Location, bool] = field(default_factory=dict)
+    resource_types: frozenset[str] = frozenset()
+    move_sites: Mapping[Location, str] = field(default_factory=dict)
+    owner_scopes: Mapping[Location, str] = field(default_factory=dict)
+    cleanup_points: Mapping[Location, tuple[str, ...]] = field(default_factory=dict)
+    ownership_transfers: Mapping[Location, str] = field(default_factory=dict)
 
 
 def compile_source(source: str, filename: str = "<memory>") -> tuple[Program, dict[str, Signature]]:
@@ -47,6 +52,9 @@ def compile_checked_source(source: str, filename: str = "<memory>") -> CheckedPr
                           for location, arguments in checker.generic_substitutions.items()}),
         MappingProxyType({name: declaration.target_type for name, declaration in checker.type_aliases.items()}),
         MappingProxyType(dict(checker.match_coverage)), MappingProxyType(dict(checker.match_exhaustiveness)),
+        frozenset(checker.resource_types), MappingProxyType(dict(checker.move_sites)),
+        MappingProxyType(dict(checker.resource_scopes)), MappingProxyType(dict(checker.cleanup_points)),
+        MappingProxyType(dict(checker.ownership_transfers)),
     )
 
 
@@ -73,5 +81,8 @@ def compile_checked_project(entry_file: str | Path, project_root: str | Path) ->
                           for location, arguments in checker.generic_substitutions.items()}),
         MappingProxyType({name: declaration.target_type for name, declaration in checker.type_aliases.items()}),
         MappingProxyType(dict(checker.match_coverage)), MappingProxyType(dict(checker.match_exhaustiveness)),
+        frozenset(checker.resource_types), MappingProxyType(dict(checker.move_sites)),
+        MappingProxyType(dict(checker.resource_scopes)), MappingProxyType(dict(checker.cleanup_points)),
+        MappingProxyType(dict(checker.ownership_transfers)),
     )
 

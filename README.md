@@ -17,9 +17,10 @@ The implemented language includes `Int`, `Float`, `Bool`, `String`, `Void`,
 interface-constrained generic functions, classes, records, enums and newtypes, transparent type
 aliases, typed tuples, `List<T>` and `Map<K,V>`, `Option<T>` and `Result<T,E>`,
 nested statement-level pattern matching, checked equality and map keyability,
-`for`, checked text I/O and path helpers, move-only `TextFile` scopes with
-deterministic cleanup, secrets, typed JSON, checked returns, lexical scopes,
-arithmetic, comparisons, conditionals, and loops. Classes, interfaces, and
+`for`, checked text I/O and path helpers, move-only `TextFile`, `TextReader`, and
+`TextWriter` resources with explicit ownership transfer and deterministic cleanup,
+secrets, typed JSON, checked returns, lexical scopes, arithmetic, comparisons,
+conditionals, and loops. Classes, interfaces, and
 multi-file projects support checked initialization, dynamic dispatch, relative
 imports, and `pub` exports.
 
