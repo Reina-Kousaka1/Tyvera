@@ -24,6 +24,13 @@ conditionals, and loops. Classes, interfaces, and
 multi-file projects support checked initialization, dynamic dispatch, relative
 imports, and `pub` exports.
 
+The reference runtime also provides asynchronous text-file operations,
+non-blocking TCP connect/listen/accept/read/write, DNS lookup, portable
+IPv4/IPv6 address values, and move-only connection/listener resources. See
+[`examples/tcp_echo.tyv`](examples/tcp_echo.tyv) for a local asynchronous TCP
+echo example. HTTP, TLS, WebSockets, and native code generation are not part of
+this milestone.
+
 The deterministic actor runtime supports typed messages, isolated state, FIFO
 mailboxes, crash isolation, bounded `one_for_one` supervision, request/reply,
 cancellation, and delayed delivery. The cooperative task runtime supports
@@ -84,6 +91,8 @@ tyvera check examples/user.tyv
 tyvera run examples/user.tyv
 tyvera check examples/collections.tyv
 tyvera run examples/collections.tyv
+tyvera check examples/tcp_echo.tyv
+tyvera run examples/tcp_echo.tyv
 tyvera check examples/json.tyv
 tyvera run examples/json.tyv
 tyvera check examples/actors.tyv
@@ -130,9 +139,10 @@ and result values, pattern matching, text I/O, local/environment-backed
 secrets, typed JSON, deterministic actor supervision, one-shot actor replies,
 and a cooperative task scheduler with nested `await`, scoped cancellation,
 implicit child joining, owner-local task groups, explicit child detachment,
-and task deadlines are implemented. True parallel execution, async/network
-I/O, general resource types, separate standard-library modules, external
-secret stores, and native backends remain planned. See the
+and task deadlines are implemented. Async text-file I/O, DNS, and TCP V1 are
+implemented. True parallel execution, TLS, HTTP, WebSockets, separate
+standard-library modules, external secret stores, and native backends remain
+planned. See the
 [roadmap](docs/roadmap.md) for sequence and
 scope, and [release/versioning notes](docs/release-process.md) for the
 pre-1.0 release approach.

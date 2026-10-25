@@ -26,11 +26,13 @@ remaining design work for later backends.
 - Tasks share references captured in their arguments. Tasks are serial and
   cooperative, so they do not race in parallel, but their interleaving can
   make shared mutation order observable.
-- `TextFile`, `TextReader`, and `TextWriter` are identity resources with one
-  move-only owner. `Option` and `Result` may carry resources; other aggregates
-  and collections cannot. Text-file operations are synchronous. The
-  interpreter's Python garbage collector manages its own implementation
-  objects; that allocation strategy is not a Tyvera guarantee.
+- `TextFile`, `TextReader`, `TextWriter`, `TcpConnection`, and `TcpListener`
+  are identity resources with one move-only owner. `Option`, `Result`, and the
+  `Task` handles produced by resource-returning intrinsics may carry resources;
+  other aggregates and collections cannot. Async and synchronous file
+  operations share the same file handles. The interpreter's Python garbage
+  collector manages its own implementation objects; that allocation strategy
+  is not a Tyvera guarantee.
 
 The bootstrap's internal 64-bit hash algorithm is not exposed as a language
 value. Backends may choose different hash bytes as long as equality, key
@@ -52,7 +54,7 @@ ownership. It does not require a general borrow checker.
 | Records | Immutable nominal value records; fields compare structurally. Nested mutable references remain shared. | Implemented, including generic types, destructuring, and safe derived map keys. |
 | Class instances, lists, maps | Classes use stable identity; lists and maps compare by contents. Assignment copies references; collection contents remain shared. | Implemented in the bootstrap. |
 | Actor references, tasks, reply handles, timers, supervisors | Opaque identity handles. Copying a handle does not copy the actor, task, or operation it names. | Implemented in the interpreter; public runtime ABI is planned. |
-| Resource handles | One live owner, explicit transfer, deterministic release. | Implemented for `TextFile`, `TextReader`, and `TextWriter`, including `Option`/`Result` carriers, path-sensitive moves, function/task transfer, and cleanup. |
+| Resource handles | One live owner, explicit transfer, deterministic release. | Implemented for text files, TCP connections and listeners, including resource-bearing task results, path-sensitive moves, and task/scope cleanup. |
 
 For mutable ordinary references, `==` compares identity. Value equality
 compares scalar and immutable tagged values structurally, recursively applying
@@ -113,15 +115,49 @@ The resource-scope contract is:
 `using name = openText(path, mode) { ... }` preserves the original scoped
 `TextFile` API. `openTextReader(path)` creates a read-only `TextReader`, while
 `openTextWriter(path, mode)` creates a `TextWriter` in write or append mode.
-Their operations are synchronous and do not suspend. Owned resources can move
-through function parameters and returns, and into task parameters. A task owns
-its resources until completion, failure, cancellation, or runtime shutdown;
-detaching the task leaves ownership with that task. Resources cannot be
-stored in collections, tuples, records, classes, newtypes, enums, or user
-generic instantiations. `Option` and `Result` can carry them and participate
-in exhaustive ownership-preserving matches. No explicit borrowing syntax is
-needed for receiver method calls; a Rust-style lifetime system is not part of
-V1.
+Their original operations remain synchronous. The async file operations use
+the same owned handles and defer close until in-flight worker operations
+finish. `tcpConnect` and `tcpListen` return task results that own a connection
+or listener; `accept` transfers a newly accepted connection through the same
+`Result` carrier. A task result holding a resource must be bound and consumed
+once by `await` or `tryResult()`; unclaimed results are closed during task,
+scope, or runtime cleanup. A pending resource-returning task is move-only and
+is cancelled when its scope ends; consuming `tryResult()` on a pending task
+also cancels it and returns `Ok(None)`. Owned resources can move through function
+parameters and into task parameters. A task owns its moved resources until
+completion, failure, cancellation, actor stop/restart, or runtime shutdown;
+detaching the task leaves ownership with that task. Resources cannot be stored
+in collections, tuples, records, classes, newtypes, enums, actor state, or user
+generic instantiations. `Option` and `Result` can carry resources and
+participate in exhaustive ownership-preserving matches. No explicit borrowing
+syntax is needed for receiver method calls; a Rust-style lifetime system is
+not part of V1.
+
+### Async I/O and platform boundary
+
+The Tyvera contract describes task suspension, readiness wakeup, cancellation,
+deadline behavior, partial byte reads/writes, EOF, backpressure, ownership, and
+controlled `Result` errors. It does not expose Python sockets, asyncio,
+exceptions, file objects, or OS address structs. The current reference
+adapter uses a selector for TCP readiness and a bounded worker pool for DNS
+and file operations. A future native backend must implement the same
+observable behavior with the platform's completion or readiness facilities.
+
+`Bytes` is immutable and does not own an external resource. `SocketAddress`
+is a portable value containing a host string, a 16-bit port, and `IPv4` or
+`IPv6` family. `TcpConnection` and `TcpListener` are move-only. Each
+connection permits one pending read and one pending write; `read(maxBytes)`
+caps one allocation and may return fewer bytes, while `write(Bytes)` reports
+partial progress and `writeAll(Bytes)` waits before continuing. The runtime
+does not keep an unbounded write queue. Cancellation removes a readiness wait;
+the owning scope closes the socket as it unwinds. DNS and in-flight file work
+already running in a worker is allowed to complete, and shutdown drains those
+workers before closing the runtime.
+
+No general user-defined Stream interface is exposed yet. TCP is the first
+byte-stream implementation; text files retain text-oriented methods. TLS can
+later adapt the owned byte-stream boundary using a reviewed platform
+cryptography library. TLS and all protocol layers above TCP remain planned.
 
 ### Lifetimes and runtime ownership
 

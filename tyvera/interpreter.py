@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import errno
+import selectors
+import socket
 import sys
 import time
 from collections import ChainMap, deque
@@ -49,7 +52,9 @@ from .ast import (
 )
 from .source import Diagnostic, Location
 from .secrets import SecretProvider, SecretProviderError
+from .io_backend import IOBackend, IOBackendError
 from .typesys import INT_MAX, INT_MIN, canonical_type
+from .type_names import split_type
 
 
 _MISSING = object()
@@ -58,6 +63,7 @@ _MAX_ACTOR_MAILBOX = 100_000
 _MAX_ACTOR_DELIVERIES = 100_000
 _MAX_SUPERVISOR_RESTARTS = 1_000
 _MAX_TASK_STEPS = 100_000
+_MAX_NETWORK_READ = 1_048_576
 _IDENTITY_SEQUENCE = count(1)
 _HASH_MASK = (1 << 64) - 1
 
@@ -150,10 +156,50 @@ class _TyveraTextFile:
     closed: bool = False
     scoped: bool = False
     location: Location | None = None
+    pending_operations: int = 0
+    close_requested: bool = False
     identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
     def __repr__(self) -> str:
         return f"<{self.resource_type}>"
+
+
+@dataclass(slots=True, frozen=True, repr=False)
+class _TyveraBytes:
+    value: bytes
+
+    def __repr__(self) -> str:
+        return "<Bytes>"
+
+
+@dataclass(slots=True, frozen=True, repr=False)
+class _TyveraSocketAddress:
+    host: str
+    port: int
+    family: str
+
+    def __repr__(self) -> str:
+        return "<SocketAddress>"
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraNetworkResource:
+    stream: socket.socket
+    resource_type: str
+    closed: bool = False
+    scoped: bool = False
+    location: Location | None = None
+    pending_read: bool = False
+    pending_write: bool = False
+    pending_read_task: _TyveraTask | None = None
+    pending_write_task: _TyveraTask | None = None
+    identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
+
+    def __repr__(self) -> str:
+        return f"<{self.resource_type}>"
+
+
+_TyveraResource = _TyveraTextFile | _TyveraNetworkResource
 
 
 @dataclass(slots=True, eq=False)
@@ -174,7 +220,7 @@ class _AsyncLoopFrame:
 
 @dataclass(slots=True, eq=False)
 class _AsyncResourceFrame:
-    resource: _TyveraTextFile
+    resource: _TyveraResource
     location: Location
 
 
@@ -197,6 +243,8 @@ class _TyveraTask:
     parent: _TyveraTask | None = None
     owner_actor: _TyveraActor | None = None
     children: list[_TyveraTask] = dataclass_field(default_factory=list)
+    io_cancel: Callable[[], None] | None = None
+    io_resource: object | None = None
     identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
     def __repr__(self) -> str:
@@ -403,6 +451,12 @@ def _tyvera_equal(left: object, right: object, seen: set[tuple[int, int]] | None
         return left.identity == right.identity
     if isinstance(left, _TyveraTextFile):
         return left.identity == right.identity
+    if isinstance(left, _TyveraNetworkResource):
+        return left.identity == right.identity
+    if isinstance(left, _TyveraBytes):
+        return left.value == right.value
+    if isinstance(left, _TyveraSocketAddress):
+        return (left.host, left.port, left.family) == (right.host, right.port, right.family)
     if isinstance(left, _TyveraSecret):
         return left.identity == right.identity
     if isinstance(left, _TyveraList):
@@ -491,6 +545,14 @@ def _tyvera_hash(value: object) -> int:
         return _hash_parts(b"task-identity", value.identity)
     if isinstance(value, _TyveraTextFile):
         return _hash_parts(b"resource-identity", value.identity)
+    if isinstance(value, _TyveraNetworkResource):
+        return _hash_parts(b"resource-identity", value.identity)
+    if isinstance(value, _TyveraBytes):
+        return _hash_bytes(b"bytes\0" + value.value)
+    if isinstance(value, _TyveraSocketAddress):
+        return _hash_bytes(b"socket-address\0" + value.host.encode("ascii", "strict")
+                           + b"\0" + str(value.port).encode("ascii")
+                           + b"\0" + value.family.encode("ascii"))
     if isinstance(value, _TyveraVariant):
         return _hash_parts(b"variant", _hash_bytes((value.enum_name or "").encode("utf-8")),
                            _hash_bytes(value.variant.encode("utf-8")),
@@ -543,6 +605,7 @@ class Interpreter:
         self.secret_provider = SecretProvider(self.project_root)
         self._clock = time.monotonic if clock is None else clock
         self._sleep = time.sleep if sleeper is None else sleeper
+        self._io_backend: IOBackend | None = None
 
     def run(self) -> None:
         main = self.functions["main"]
@@ -571,6 +634,10 @@ class Interpreter:
             timer.cancelled = True
         self._scheduled_timers.clear()
         self._task_groups.clear()
+        for task in self._tasks:
+            self._cleanup_task_result(task)
+        if self._io_backend is not None:
+            self._io_backend.shutdown()
         self._scheduler_state = "closed"
         self._runtime_state = "closed"
 
@@ -649,15 +716,15 @@ class Interpreter:
                     self._execute_block(statement.else_body, error_scope, depth)
                 elif acquisition.variant == "Ok":
                     resource = acquisition.payload
-                    if not isinstance(resource, _TyveraTextFile):
-                        raise AssertionError("checked using acquisition is not a text resource")
+                    if not isinstance(resource, (_TyveraTextFile, _TyveraNetworkResource)):
+                        raise AssertionError("checked using acquisition is not a Resource")
                     resource.scoped = True
                     scope = variables.new_child()
                     scope[statement.name] = resource
                     try:
                         self._execute_block(statement.body, scope, depth)
                     except Exception as primary:
-                        cleanup_error = self._close_text_file(resource)
+                        cleanup_error = self._close_resource(resource)
                         if cleanup_error is None:
                             raise
                         if isinstance(primary, Diagnostic):
@@ -665,7 +732,7 @@ class Interpreter:
                                              f"{primary.message}; resource cleanup also failed: {cleanup_error}") from primary
                         raise Diagnostic(statement.location, "runtime",
                                          f"resource cleanup failed: {cleanup_error}") from primary
-                    cleanup_error = self._close_text_file(resource)
+                    cleanup_error = self._close_resource(resource)
                     if cleanup_error is not None:
                         raise Diagnostic(statement.location, "runtime", f"resource cleanup failed: {cleanup_error}")
                 else:
@@ -792,6 +859,36 @@ class Interpreter:
                 if not isinstance(duration, _TyveraDuration):
                     raise AssertionError("checked timerAfter argument is not Duration")
                 return _TyveraTimer(self._clock(), duration.milliseconds, self._clock)
+            if expression.callee == "bytesFromString":
+                return _TyveraBytes(arguments[0].encode("utf-8"))
+            if expression.callee == "resolveHost":
+                host, port = arguments
+                if not 0 <= port <= 65_535:
+                    task = self._create_io_task("Result<List<SocketAddress>,String>", expression.location)
+                    self._complete_io_task(task, _TyveraVariant("Err", "port must be between 0 and 65535", "Result", 1))
+                    return task
+                return self._resolve_host_task(host, port, expression.location)
+            if expression.callee == "tcpConnect":
+                host, port = arguments
+                if not 1 <= port <= 65_535:
+                    task = self._create_io_task("Result<TcpConnection,String>", expression.location)
+                    self._complete_io_task(task, _TyveraVariant("Err", "port must be between 1 and 65535", "Result", 1))
+                    return task
+                return self._tcp_connect_task(host, port, expression.location)
+            if expression.callee == "tcpListen":
+                host, port, backlog = arguments
+                if not 0 <= port <= 65_535:
+                    task = self._create_io_task("Result<TcpListener,String>", expression.location)
+                    self._complete_io_task(task, _TyveraVariant("Err", "port must be between 0 and 65535", "Result", 1))
+                    return task
+                if not 1 <= backlog <= 4096:
+                    task = self._create_io_task("Result<TcpListener,String>", expression.location)
+                    self._complete_io_task(task, _TyveraVariant("Err", "backlog must be between 1 and 4096", "Result", 1))
+                    return task
+                return self._tcp_listen_task(host, port, backlog, expression.location)
+            if expression.callee == "openTextAsync":
+                path, mode = arguments
+                return self._async_open_text_task(self._project_path(path), mode, expression.location)
             if expression.callee in {"openText", "openTextReader", "openTextWriter"}:
                 path = self._project_path(arguments[0])
                 if expression.callee == "openTextReader":
@@ -941,7 +1038,10 @@ class Interpreter:
                     return not receiver.closed
                 if expression.method == "close":
                     was_open = not receiver.closed
-                    return was_open and self._close_text_file(receiver) is None
+                    return was_open and self._close_resource(receiver) is None
+                if expression.method in {"readAllAsync", "writeAsync", "appendAsync", "flushAsync", "closeAsync"}:
+                    arguments = self._evaluate_arguments(expression.arguments, variables, depth)
+                    return self._async_text_file_task(receiver, expression.method, arguments, expression.location)
                 if receiver.closed:
                     raise Diagnostic(expression.location, "runtime", f"{receiver.resource_type} is closed")
                 arguments = self._evaluate_arguments(expression.arguments, variables, depth)
@@ -975,6 +1075,52 @@ class Interpreter:
                     except OSError:
                         return _TyveraVariant("Err", "cannot write text file")
                 raise AssertionError(f"unhandled checked TextFile method: {expression.method}")
+            if isinstance(receiver, _TyveraNetworkResource):
+                if expression.method == "isOpen":
+                    return not receiver.closed
+                if expression.method == "close":
+                    was_open = not receiver.closed
+                    return was_open and self._close_resource(receiver) is None
+                if receiver.closed:
+                    raise Diagnostic(expression.location, "runtime", f"{receiver.resource_type} is closed")
+                if expression.method in {"localAddress", "remoteAddress"}:
+                    try:
+                        raw = (receiver.stream.getsockname() if expression.method == "localAddress"
+                               else receiver.stream.getpeername())
+                        family = receiver.stream.family
+                        return _TyveraVariant("Ok", self._socket_address(raw, family), "Result", 1)
+                    except OSError as error:
+                        return _TyveraVariant("Err", self._network_error(error), "Result", 1)
+                arguments = self._evaluate_arguments(expression.arguments, variables, depth)
+                if receiver.resource_type == "TcpListener" and expression.method == "accept":
+                    return self._tcp_accept_task(receiver, expression.location)
+                if receiver.resource_type == "TcpConnection" and expression.method == "read":
+                    return self._tcp_read_task(receiver, arguments[0], expression.location)
+                if receiver.resource_type == "TcpConnection" and expression.method in {"write", "writeAll"}:
+                    payload = arguments[0]
+                    if not isinstance(payload, _TyveraBytes):
+                        raise AssertionError("checked TCP write argument is not Bytes")
+                    return self._tcp_write_task(receiver, payload.value,
+                                                expression.method == "writeAll", expression.location)
+                raise AssertionError(f"unhandled checked {receiver.resource_type} method: {expression.method}")
+            if isinstance(receiver, _TyveraBytes):
+                if expression.method == "length":
+                    return len(receiver.value)
+                if expression.method == "toString":
+                    try:
+                        return _TyveraVariant("Ok", receiver.value.decode("utf-8"), "Result", 1)
+                    except UnicodeDecodeError:
+                        return _TyveraVariant("Err", "bytes are not valid UTF-8", "Result", 1)
+            if isinstance(receiver, _TyveraSocketAddress):
+                if expression.method == "host":
+                    return receiver.host
+                if expression.method == "port":
+                    return receiver.port
+                if expression.method == "family":
+                    return receiver.family
+                if expression.method == "toString":
+                    host = f"[{receiver.host}]" if receiver.family == "IPv6" else receiver.host
+                    return f"{host}:{receiver.port}"
             if isinstance(receiver, _TyveraSupervisor):
                 if expression.method == "start":
                     if receiver.status != "alive":
@@ -1085,8 +1231,11 @@ class Interpreter:
                         return _TyveraVariant("Ok", _TyveraVariant("Some", value))
                     if cell.state in {"failed", "timed_out"}:
                         return _TyveraVariant("Err", cell.error or "request failed")
-                    return _TyveraVariant("Ok", _TyveraVariant("None"))
+                    return _TyveraVariant("Ok", _TyveraVariant("None", None, "Option", 1), "Result", 1)
             if isinstance(receiver, _TyveraTask):
+                carries_resource = self._type_contains_resource(receiver.result_type)
+                if carries_resource and expression.method in {"withTimeout", "tryResult"}:
+                    self._consume_task_binding(expression.receiver, variables)
                 if expression.method == "isDone":
                     return receiver.state in {"completed", "failed", "cancelled"}
                 if expression.method == "isCancelled":
@@ -1121,7 +1270,12 @@ class Interpreter:
                     if receiver.result_type == "Void":
                         return _TyveraVariant("Ok", receiver.state == "completed")
                     if receiver.state == "completed":
-                        return _TyveraVariant("Ok", _TyveraVariant("Some", receiver.result))
+                        value = receiver.result
+                        if self._resource_handles(value):
+                            receiver.result = None
+                        return _TyveraVariant("Ok", _TyveraVariant("Some", value, "Option", 1), "Result", 1)
+                    if carries_resource:
+                        self._cancel_task(receiver)
                     return _TyveraVariant("Ok", _TyveraVariant("None"))
             if isinstance(receiver, _TyveraDuration) and expression.method == "inMilliseconds":
                 return receiver.milliseconds
@@ -1214,46 +1368,103 @@ class Interpreter:
             return "cannot close text file"
         return None
 
-    @staticmethod
-    def _resource_handles(value: object) -> list[_TyveraTextFile]:
-        if isinstance(value, _TyveraTextFile):
+    def _close_resource(self, resource: object) -> str | None:
+        if isinstance(resource, _TyveraTextFile):
+            if resource.closed:
+                return None
+            if resource.pending_operations:
+                resource.closed = True
+                resource.close_requested = True
+                return None
+            return self._close_text_file(resource)
+        if isinstance(resource, _TyveraNetworkResource):
+            if resource.closed:
+                return None
+            resource.closed = True
+            for pending in (resource.pending_read_task, resource.pending_write_task):
+                if pending is not None and self._task_is_active(pending):
+                    if pending.io_cancel is not None:
+                        cancel, pending.io_cancel = pending.io_cancel, None
+                        cancel()
+                    self._complete_io_task(pending, _TyveraVariant("Err", "resource closed", "Result", 1))
+            try:
+                self._get_io_backend().unwatch(resource.stream, selectors.EVENT_READ)
+                self._get_io_backend().unwatch(resource.stream, selectors.EVENT_WRITE)
+                resource.stream.close()
+            except OSError:
+                return f"cannot close {resource.resource_type}"
+            return None
+        if isinstance(resource, _TyveraTask):
+            self._cancel_task(resource)
+            self._cleanup_task_result(resource)
+            return None
+        return "value is not an owned Resource"
+
+    def _cleanup_task_result(self, task: _TyveraTask) -> None:
+        handles = self._resource_handles(task.result)
+        for resource in handles:
+            if isinstance(resource, _TyveraTask):
+                if self._task_is_active(resource):
+                    self._cancel_task(resource)
+                self._cleanup_task_result(resource)
+            else:
+                self._close_resource(resource)
+        if handles:
+            task.result = None
+
+    def _resource_handles(self, value: object) -> list[object]:
+        if isinstance(value, (_TyveraTextFile, _TyveraNetworkResource)):
+            return [value]
+        if isinstance(value, _TyveraTask) and self._type_contains_resource(value.result_type):
             return [value]
         if isinstance(value, _TyveraVariant):
-            return Interpreter._resource_handles(value.payload)
+            return self._resource_handles(value.payload)
         if isinstance(value, _TyveraTuple):
-            return [resource for item in reversed(value.values)
-                    for resource in Interpreter._resource_handles(item)]
+            return [resource for item in reversed(value.values) for resource in self._resource_handles(item)]
         if isinstance(value, _TyveraRecord):
-            return [resource for item in reversed(tuple(value.fields.values()))
-                    for resource in Interpreter._resource_handles(item)]
+            return [resource for item in reversed(tuple(value.fields.values())) for resource in self._resource_handles(item)]
         if isinstance(value, _TyveraNewtype):
-            return Interpreter._resource_handles(value.value)
+            return self._resource_handles(value.value)
         if isinstance(value, _TyveraList):
-            return [resource for item in reversed(value.values)
-                    for resource in Interpreter._resource_handles(item)]
+            return [resource for item in reversed(value.values) for resource in self._resource_handles(item)]
         if isinstance(value, _TyveraMap):
             return [resource for _, key, item in reversed(value.entries)
                     for candidate in (item, key)
-                    for resource in Interpreter._resource_handles(candidate)]
+                    for resource in self._resource_handles(candidate)]
         if isinstance(value, _TyveraInstance):
-            return [resource for item in reversed(tuple(value.fields.values()))
-                    for resource in Interpreter._resource_handles(item)]
+            return [resource for item in reversed(tuple(value.fields.values())) for resource in self._resource_handles(item)]
         return []
+
+    @staticmethod
+    def _type_contains_resource(type_name: str) -> bool:
+        base, arguments = split_type(canonical_type(type_name))
+        resources = {"TextFile", "TextReader", "TextWriter", "TcpConnection", "TcpListener"}
+        return base in resources or any(Interpreter._type_contains_resource(argument) for argument in arguments)
+
+    @staticmethod
+    def _consume_task_binding(expression: Expression, variables: ChainMap[str, object]) -> None:
+        if not isinstance(expression, Name):
+            return
+        for scope in variables.maps:
+            if expression.identifier in scope:
+                scope[expression.identifier] = _MOVED
+                return
 
     def _cleanup_owned_scope(self, scope: dict[str, object]) -> list[tuple[Location, str]]:
         errors: list[tuple[Location, str]] = []
-        resources: dict[int, _TyveraTextFile] = {}
+        resources: dict[int, object] = {}
         for value in scope.values():
             if value is _MOVED:
                 continue
             for resource in self._resource_handles(value):
                 resources.setdefault(id(resource), resource)
         for resource in sorted(resources.values(), key=lambda item: item.identity, reverse=True):
-            if resource.closed or resource.scoped:
+            if isinstance(resource, (_TyveraTextFile, _TyveraNetworkResource)) and (resource.closed or resource.scoped):
                 continue
-            cleanup_error = self._close_text_file(resource)
+            cleanup_error = self._close_resource(resource)
             if cleanup_error is not None:
-                errors.append((resource.location or Location("<resource>", 1, 1), cleanup_error))
+                location = getattr(resource, "location", None) or Location("<resource>", 1, 1)
+                errors.append((location, cleanup_error))
         return errors
 
     @staticmethod
@@ -1271,7 +1482,7 @@ class Interpreter:
                     for location, message in self._cleanup_owned_scope(frame.variables.maps[0])
                 )
             elif isinstance(frame, _AsyncResourceFrame):
-                cleanup_error = self._close_text_file(frame.resource)
+                cleanup_error = self._close_resource(frame.resource)
                 if cleanup_error is not None:
                     errors.append(self._resource_cleanup_diagnostic(frame.location, cleanup_error))
         return errors
@@ -1692,6 +1903,539 @@ class Interpreter:
         self._tasks.append(task)
         return task
 
+    def _create_io_task(self, result_type: str, location: Location) -> _TyveraTask:
+        self._get_io_backend()
+        task = _TyveraTask(None, None, location, state="io_wait", result_type=canonical_type(result_type),
+                           parent=self._current_task, owner_actor=self._current_actor)
+        if task.parent is not None:
+            task.parent.children.append(task)
+        self._tasks.append(task)
+        return task
+
+    def _get_io_backend(self) -> IOBackend:
+        if self._io_backend is None:
+            self._io_backend = IOBackend()
+        return self._io_backend
+
+    @staticmethod
+    def _task_is_active(task: _TyveraTask) -> bool:
+        return task.state not in {"completed", "failed", "cancelled"}
+
+    def _complete_io_task(self, task: _TyveraTask, result: object) -> None:
+        task.io_cancel = None
+        resource = task.io_resource
+        if isinstance(resource, _TyveraNetworkResource):
+            if resource.pending_read_task is task:
+                resource.pending_read_task = None
+                resource.pending_read = False
+            if resource.pending_write_task is task:
+                resource.pending_write_task = None
+                resource.pending_write = False
+        task.io_resource = None
+        if not self._task_is_active(task):
+            for resource in self._resource_handles(result):
+                self._close_resource(resource)
+            return
+        task.result = result
+        task.state = "completed"
+
+    @staticmethod
+    def _network_error(error: BaseException) -> str:
+        if isinstance(error, IOBackendError):
+            if "capacity" in str(error):
+                return "I/O worker capacity is full"
+            return "I/O runtime is closed"
+        if isinstance(error, socket.gaierror):
+            return "DNS resolution failed"
+        code = getattr(error, "errno", None)
+        if code == errno.ECONNREFUSED:
+            return "connection refused"
+        if code in {errno.ECONNRESET, errno.EPIPE, errno.ESHUTDOWN}:
+            return "connection reset"
+        if code == errno.EADDRINUSE:
+            return "address already in use"
+        if code in {errno.EACCES, errno.EPERM}:
+            return "permission denied"
+        if isinstance(error, (TimeoutError, socket.timeout)):
+            return "operation timed out"
+        if isinstance(error, (ValueError, OverflowError)) or code == errno.EINVAL:
+            return "invalid address"
+        return "network operation failed"
+
+    @staticmethod
+    def _io_runtime_error(error: BaseException) -> str:
+        if isinstance(error, IOBackendError) and "capacity" in str(error):
+            return "I/O worker capacity is full"
+        return "I/O runtime is closed"
+
+    @staticmethod
+    def _socket_address(address: object, family: int) -> _TyveraSocketAddress:
+        if not isinstance(address, tuple) or len(address) < 2:
+            raise ValueError("backend returned an invalid socket address")
+        return _TyveraSocketAddress(str(address[0]), int(address[1]), "IPv6" if family == socket.AF_INET6 else "IPv4")
+
+    def _resolve_host_task(self, host: str, port: int, location: Location) -> _TyveraTask:
+        task = self._create_io_task("Result<List<SocketAddress>,String>", location)
+        if not host.strip() or not 0 <= port <= 65535:
+            self._complete_io_task(task, _TyveraVariant("Err", "invalid address", "Result", 1))
+            return task
+        try:
+            future = self._get_io_backend().submit(
+                lambda: socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM),
+                lambda addresses, error: self._finish_resolution(task, addresses, error),
+            )
+        except RuntimeError as error:
+            self._complete_io_task(task, _TyveraVariant("Err", self._network_error(error), "Result", 1))
+        else:
+            task.io_cancel = future.cancel
+        return task
+
+    def _finish_resolution(self, task: _TyveraTask, addresses: object, error: BaseException | None) -> None:
+        if error is not None:
+            self._complete_io_task(task, _TyveraVariant("Err", self._network_error(error), "Result", 1))
+            return
+        if not isinstance(addresses, list):
+            self._complete_io_task(task, _TyveraVariant("Err", "DNS resolution failed", "Result", 1))
+            return
+        values: list[_TyveraSocketAddress] = []
+        seen: set[tuple[str, int, str]] = set()
+        for family, _, _, _, sockaddr in addresses:
+            try:
+                address = self._socket_address(sockaddr, family)
+            except (TypeError, ValueError):
+                continue
+            key = (address.host, address.port, address.family)
+            if key not in seen:
+                seen.add(key)
+                values.append(address)
+        self._complete_io_task(task, _TyveraVariant("Ok", _TyveraList(values), "Result", 1))
+
+    def _tcp_connect_task(self, host: str, port: int, location: Location) -> _TyveraTask:
+        task = self._create_io_task("Result<TcpConnection,String>", location)
+        if not host.strip() or not 1 <= port <= 65535:
+            self._complete_io_task(task, _TyveraVariant("Err", "invalid address", "Result", 1))
+            return task
+        task_state: dict[str, object] = {"addresses": [], "index": 0, "stream": None, "watch": None}
+
+        def cancel() -> None:
+            stream = task_state.get("stream")
+            watch = task_state.get("watch")
+            if isinstance(stream, socket.socket):
+                if callable(watch):
+                    self._get_io_backend().unwatch(stream, selectors.EVENT_WRITE, watch)
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            task_state["stream"] = None
+
+        task.io_cancel = cancel
+
+        def resolved(addresses: object, error: BaseException | None) -> None:
+            if not self._task_is_active(task):
+                return
+            if error is not None:
+                self._complete_io_task(task, _TyveraVariant("Err", self._network_error(error), "Result", 1))
+                return
+            task_state["addresses"] = addresses if isinstance(addresses, list) else []
+            try_next()
+
+        def try_next() -> None:
+            if not self._task_is_active(task):
+                return
+            addresses = task_state["addresses"]
+            index = int(task_state["index"])
+            if not isinstance(addresses, list) or index >= len(addresses):
+                self._complete_io_task(task, _TyveraVariant("Err", "connection failed", "Result", 1))
+                return
+            family, socktype, protocol, _, address = addresses[index]
+            task_state["index"] = index + 1
+            try:
+                stream = socket.socket(family, socktype, protocol)
+                stream.setblocking(False)
+                status = stream.connect_ex(address)
+            except OSError as error:
+                try:
+                    stream.close()
+                except (UnboundLocalError, OSError):
+                    pass
+                if index + 1 < len(addresses):
+                    try_next()
+                else:
+                    self._complete_io_task(task, _TyveraVariant("Err", self._network_error(error), "Result", 1))
+                return
+            task_state["stream"] = stream
+            if status in {0, errno.EISCONN}:
+                succeed(stream)
+                return
+            if status not in {errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY, errno.EINTR,
+                              getattr(errno, "WSAEWOULDBLOCK", errno.EWOULDBLOCK)}:
+                stream.close()
+                task_state["stream"] = None
+                if index + 1 < len(addresses):
+                    try_next()
+                else:
+                    self._complete_io_task(task, _TyveraVariant("Err", self._network_error(OSError(status, "connect")), "Result", 1))
+                return
+
+            def connected() -> None:
+                task_state["watch"] = None
+                if not self._task_is_active(task):
+                    return
+                try:
+                    connect_error = stream.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                except OSError as error:
+                    connect_error = error.errno or errno.EIO
+                if connect_error == 0:
+                    succeed(stream)
+                    return
+                stream.close()
+                task_state["stream"] = None
+                if int(task_state["index"]) < len(addresses):
+                    try_next()
+                else:
+                    self._complete_io_task(task, _TyveraVariant("Err", self._network_error(OSError(connect_error, "connect")), "Result", 1))
+
+            task_state["watch"] = connected
+            try:
+                self._get_io_backend().watch(stream, selectors.EVENT_WRITE, connected)
+            except (OSError, RuntimeError) as error:
+                stream.close()
+                task_state["stream"] = None
+                self._complete_io_task(task, _TyveraVariant("Err", self._network_error(error), "Result", 1))
+
+        def succeed(stream: socket.socket) -> None:
+            if not self._task_is_active(task):
+                stream.close()
+                return
+            task_state["stream"] = None
+            self._complete_io_task(task, _TyveraVariant(
+                "Ok", _TyveraNetworkResource(stream, "TcpConnection", location=location), "Result", 1,
+            ))
+
+        try:
+            future = self._get_io_backend().submit(
+                lambda: socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM), resolved,
+            )
+        except RuntimeError as error:
+            self._complete_io_task(task, _TyveraVariant("Err", self._network_error(error), "Result", 1))
+        else:
+            task.io_cancel = lambda: (cancel(), future.cancel())
+        return task
+
+    def _tcp_listen_task(self, host: str, port: int, backlog: int, location: Location) -> _TyveraTask:
+        task = self._create_io_task("Result<TcpListener,String>", location)
+        if not host.strip() or not 0 <= port <= 65535:
+            self._complete_io_task(task, _TyveraVariant("Err", "invalid address", "Result", 1))
+            return task
+        if not 1 <= backlog <= 4096:
+            self._complete_io_task(task, _TyveraVariant("Err", "invalid listener backlog", "Result", 1))
+            return task
+
+        def resolved(addresses: object, error: BaseException | None) -> None:
+            if not self._task_is_active(task):
+                return
+            if error is not None or not isinstance(addresses, list):
+                self._complete_io_task(task, _TyveraVariant(
+                    "Err", self._network_error(error or OSError("no address")), "Result", 1,
+                ))
+                return
+            last_error: BaseException = OSError("no address")
+            for family, socktype, protocol, _, address in addresses:
+                stream: socket.socket | None = None
+                try:
+                    stream = socket.socket(family, socktype, protocol)
+                    stream.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    if family == socket.AF_INET6 and hasattr(socket, "IPV6_V6ONLY"):
+                        stream.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    stream.bind(address)
+                    stream.listen(backlog)
+                    stream.setblocking(False)
+                    self._complete_io_task(task, _TyveraVariant(
+                        "Ok", _TyveraNetworkResource(stream, "TcpListener", location=location), "Result", 1,
+                    ))
+                    return
+                except OSError as caught:
+                    last_error = caught
+                    if stream is not None:
+                        stream.close()
+            self._complete_io_task(task, _TyveraVariant("Err", self._network_error(last_error), "Result", 1))
+
+        try:
+            future = self._get_io_backend().submit(
+                lambda: socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE),
+                resolved,
+            )
+        except RuntimeError as error:
+            self._complete_io_task(task, _TyveraVariant("Err", self._network_error(error), "Result", 1))
+        else:
+            task.io_cancel = future.cancel
+        return task
+
+    def _tcp_accept_task(self, listener: _TyveraNetworkResource, location: Location) -> _TyveraTask:
+        task = self._create_io_task("Result<TcpConnection,String>", location)
+        task.io_resource = listener
+        if listener.pending_read:
+            self._complete_io_task(task, _TyveraVariant("Err", "listener already has a pending accept", "Result", 1))
+            return task
+
+        def attempt() -> None:
+            if not self._task_is_active(task):
+                return
+            try:
+                stream, _ = listener.stream.accept()
+                stream.setblocking(False)
+            except BlockingIOError:
+                register()
+                return
+            except OSError as error:
+                self._complete_io_task(task, _TyveraVariant("Err", self._network_error(error), "Result", 1))
+                return
+            self._complete_io_task(task, _TyveraVariant(
+                "Ok", _TyveraNetworkResource(stream, "TcpConnection", location=location), "Result", 1,
+            ))
+
+        def register() -> None:
+            if listener.pending_read:
+                self._complete_io_task(task, _TyveraVariant("Err", "listener already has a pending accept", "Result", 1))
+                return
+            listener.pending_read = True
+            listener.pending_read_task = task
+
+            def ready() -> None:
+                listener.pending_read = False
+                listener.pending_read_task = None
+                attempt()
+
+            task.io_cancel = lambda: self._cancel_socket_wait(listener, selectors.EVENT_READ, ready, "read", task)
+            try:
+                self._get_io_backend().watch(listener.stream, selectors.EVENT_READ, ready)
+            except (OSError, RuntimeError) as error:
+                listener.pending_read = False
+                listener.pending_read_task = None
+                self._complete_io_task(task, _TyveraVariant("Err", self._network_error(error), "Result", 1))
+
+        attempt()
+        return task
+
+    def _tcp_read_task(self, connection: _TyveraNetworkResource, max_bytes: int, location: Location) -> _TyveraTask:
+        task = self._create_io_task("Result<Option<Bytes>,String>", location)
+        task.io_resource = connection
+        if max_bytes < 1 or max_bytes > _MAX_NETWORK_READ:
+            self._complete_io_task(task, _TyveraVariant("Err", f"read size must be between 1 and {_MAX_NETWORK_READ} bytes", "Result", 1))
+            return task
+        if connection.pending_read:
+            self._complete_io_task(task, _TyveraVariant("Err", "connection already has a pending read", "Result", 1))
+            return task
+
+        def attempt() -> None:
+            if not self._task_is_active(task):
+                return
+            try:
+                data = connection.stream.recv(max_bytes)
+            except BlockingIOError:
+                register()
+                return
+            except OSError as error:
+                self._complete_io_task(task, _TyveraVariant("Err", self._network_error(error), "Result", 1))
+                return
+            value = _TyveraVariant("None", None, "Option", 1) if not data else _TyveraVariant(
+                "Some", _TyveraBytes(data), "Option", 1,
+            )
+            self._complete_io_task(task, _TyveraVariant("Ok", value, "Result", 1))
+
+        def register() -> None:
+            if connection.pending_read:
+                self._complete_io_task(task, _TyveraVariant("Err", "connection already has a pending read", "Result", 1))
+                return
+            connection.pending_read = True
+            connection.pending_read_task = task
+
+            def ready() -> None:
+                connection.pending_read = False
+                connection.pending_read_task = None
+                attempt()
+
+            task.io_cancel = lambda: self._cancel_socket_wait(connection, selectors.EVENT_READ, ready, "read", task)
+            try:
+                self._get_io_backend().watch(connection.stream, selectors.EVENT_READ, ready)
+            except (OSError, RuntimeError) as error:
+                connection.pending_read = False
+                connection.pending_read_task = None
+                self._complete_io_task(task, _TyveraVariant("Err", self._network_error(error), "Result", 1))
+
+        attempt()
+        return task
+
+    def _tcp_write_task(self, connection: _TyveraNetworkResource, data: bytes, write_all: bool,
+                        location: Location) -> _TyveraTask:
+        task = self._create_io_task("Result<Int,String>", location)
+        task.io_resource = connection
+        offset = 0
+        payload = memoryview(data)
+        if connection.pending_write:
+            self._complete_io_task(task, _TyveraVariant("Err", "connection already has a pending write", "Result", 1))
+            return task
+
+        def attempt() -> None:
+            nonlocal offset
+            if not self._task_is_active(task):
+                return
+            try:
+                sent = connection.stream.send(payload[offset:])
+            except BlockingIOError:
+                register()
+                return
+            except OSError as error:
+                self._complete_io_task(task, _TyveraVariant("Err", self._network_error(error), "Result", 1))
+                return
+            if sent <= 0:
+                self._complete_io_task(task, _TyveraVariant("Err", "connection reset", "Result", 1))
+                return
+            if not write_all:
+                self._complete_io_task(task, _TyveraVariant("Ok", sent, "Result", 1))
+                return
+            offset += sent
+            if offset >= len(data):
+                self._complete_io_task(task, _TyveraVariant("Ok", offset, "Result", 1))
+            else:
+                register()
+
+        def register() -> None:
+            if connection.pending_write:
+                self._complete_io_task(task, _TyveraVariant("Err", "connection already has a pending write", "Result", 1))
+                return
+            connection.pending_write = True
+            connection.pending_write_task = task
+
+            def ready() -> None:
+                connection.pending_write = False
+                connection.pending_write_task = None
+                attempt()
+
+            task.io_cancel = lambda: self._cancel_socket_wait(connection, selectors.EVENT_WRITE, ready, "write", task)
+            try:
+                self._get_io_backend().watch(connection.stream, selectors.EVENT_WRITE, ready)
+            except (OSError, RuntimeError) as error:
+                connection.pending_write = False
+                connection.pending_write_task = None
+                self._complete_io_task(task, _TyveraVariant("Err", self._network_error(error), "Result", 1))
+
+        if not data:
+            self._complete_io_task(task, _TyveraVariant("Ok", 0, "Result", 1))
+        else:
+            attempt()
+        return task
+
+    def _cancel_socket_wait(self, resource: _TyveraNetworkResource, event: int,
+                            callback: Callable[[], None], direction: str,
+                            task: _TyveraTask) -> None:
+        self._get_io_backend().unwatch(resource.stream, event, callback)
+        if direction == "read":
+            resource.pending_read = False
+            if resource.pending_read_task is task:
+                resource.pending_read_task = None
+        else:
+            resource.pending_write = False
+            if resource.pending_write_task is task:
+                resource.pending_write_task = None
+
+    def _async_open_text_task(self, path: Path, mode: str, location: Location) -> _TyveraTask:
+        task = self._create_io_task("Result<TextFile,String>", location)
+        if mode not in {"read", "write", "append"}:
+            self._complete_io_task(task, _TyveraVariant("Err", "text file mode must be 'read', 'write', or 'append'", "Result", 1))
+            return task
+        if self._is_secret_storage_path(path):
+            self._complete_io_task(task, _TyveraVariant("Err", "secret file can only be accessed through the secrets provider", "Result", 1))
+            return task
+        python_mode = {"read": "r", "write": "w", "append": "a"}[mode]
+
+        def opened(stream: object, error: BaseException | None) -> None:
+            if error is not None or not hasattr(stream, "read"):
+                self._complete_io_task(task, _TyveraVariant("Err", "cannot open text file", "Result", 1))
+                return
+            resource = _TyveraTextFile(stream, mode, location=location)
+            self._complete_io_task(task, _TyveraVariant("Ok", resource, "Result", 1))
+
+        try:
+            future = self._get_io_backend().submit(
+                lambda: path.open(python_mode, encoding="utf-8", newline=""), opened,
+            )
+        except RuntimeError as error:
+            self._complete_io_task(task, _TyveraVariant("Err", self._io_runtime_error(error), "Result", 1))
+        else:
+            task.io_cancel = future.cancel
+        return task
+
+    def _async_text_file_task(
+        self, resource: _TyveraTextFile, method: str, arguments: list[object], location: Location,
+    ) -> _TyveraTask:
+        result_type = "Result<Bool,String>" if method in {"writeAsync", "appendAsync", "flushAsync", "closeAsync"} else "Result<String,String>"
+        task = self._create_io_task(result_type, location)
+        task.io_resource = resource
+        if resource.closed:
+            self._complete_io_task(task, _TyveraVariant("Err", "text file is closed", "Result", 1))
+            return task
+        if resource.pending_operations:
+            self._complete_io_task(task, _TyveraVariant("Err", "text file already has an asynchronous operation pending", "Result", 1))
+            return task
+        if method == "readAllAsync" and resource.mode != "read":
+            self._complete_io_task(task, _TyveraVariant("Err", "text file is not open for reading", "Result", 1))
+            return task
+        if method == "writeAsync" and resource.mode == "read":
+            self._complete_io_task(task, _TyveraVariant("Err", "text file is not open for writing", "Result", 1))
+            return task
+        if method == "appendAsync" and resource.mode != "append":
+            self._complete_io_task(task, _TyveraVariant("Err", "text file is not open for appending", "Result", 1))
+            return task
+        if method == "closeAsync" and resource.closed:
+            self._complete_io_task(task, _TyveraVariant("Ok", False, "Result", 1))
+            return task
+
+        def operation() -> object:
+            if method == "readAllAsync":
+                return resource.stream.read()
+            if method in {"writeAsync", "appendAsync"}:
+                resource.stream.write(arguments[0])
+                return True
+            if method == "flushAsync":
+                resource.stream.flush()
+                return True
+            if method == "closeAsync":
+                resource.stream.close()
+                return True
+            raise AssertionError(f"unknown async text operation {method}")
+
+        resource.pending_operations += 1
+        if method == "closeAsync":
+            resource.close_requested = True
+
+        def completed(value: object, error: BaseException | None) -> None:
+            resource.pending_operations -= 1
+            if resource.close_requested and resource.pending_operations == 0:
+                resource.closed = True
+                try:
+                    if not resource.stream.closed:
+                        resource.stream.close()
+                except OSError:
+                    error = error or OSError("close failed")
+            if error is not None:
+                label = "cannot read text file" if method == "readAllAsync" else "cannot close text file" if method == "closeAsync" else "cannot write text file"
+                self._complete_io_task(task, _TyveraVariant("Err", label, "Result", 1))
+                return
+            if method == "closeAsync":
+                resource.closed = True
+            self._complete_io_task(task, _TyveraVariant("Ok", value, "Result", 1))
+
+        try:
+            future = self._get_io_backend().submit(operation, completed)
+        except RuntimeError as error:
+            resource.pending_operations -= 1
+            self._complete_io_task(task, _TyveraVariant("Err", self._io_runtime_error(error), "Result", 1))
+        else:
+            task.io_cancel = future.cancel
+        return task
+
     def _create_timeout_task(
         self, target: _TyveraTask, duration: _TyveraDuration, location: Location,
     ) -> _TyveraTask:
@@ -1772,7 +2516,7 @@ class Interpreter:
                     continue
 
                 active = [task for task in self._tasks
-                          if task.state in {"runnable", "running", "waiting", "sleeping", "joining", "timed_wait"}]
+                          if task.state in {"runnable", "running", "waiting", "sleeping", "joining", "timed_wait", "io_wait"}]
                 if not active:
                     break
 
@@ -1798,6 +2542,10 @@ class Interpreter:
                         continue
 
                 deadline = self._next_task_deadline()
+                if self._io_backend is not None and self._io_backend.has_pending:
+                    timeout = None if deadline is None else max(0.0, deadline - self._clock())
+                    self._io_backend.wait(timeout)
+                    continue
                 if deadline is not None:
                     delay = max(0.0, deadline - self._clock())
                     if delay > 0:
@@ -1835,7 +2583,7 @@ class Interpreter:
         frame = task.frames[-1]
         if isinstance(frame, _AsyncResourceFrame):
             task.frames.pop()
-            cleanup_error = self._close_text_file(frame.resource)
+            cleanup_error = self._close_resource(frame.resource)
             if cleanup_error is not None:
                 self._fail_task(task, self._resource_cleanup_diagnostic(frame.location, cleanup_error))
             return
@@ -1900,8 +2648,8 @@ class Interpreter:
                 task.frames.append(_AsyncBlockFrame(statement.else_body, scope))
             elif acquisition.variant == "Ok":
                 resource = acquisition.payload
-                if not isinstance(resource, _TyveraTextFile):
-                    raise AssertionError("checked using acquisition is not a text resource")
+                if not isinstance(resource, (_TyveraTextFile, _TyveraNetworkResource)):
+                    raise AssertionError("checked using acquisition is not a Resource")
                 resource.scoped = True
                 scope = frame.variables.new_child()
                 scope[statement.name] = resource
@@ -1977,6 +2725,8 @@ class Interpreter:
             target = task.timeout_target
             if target.state == "completed":
                 task.result = target.result
+                if self._resource_handles(target.result):
+                    target.result = None
                 task.timeout_target = None
                 task.due_at = None
                 task.state = "completed"
@@ -2045,15 +2795,16 @@ class Interpreter:
                 task.state = "runnable"
                 self._ready_tasks.append(task)
 
-    @staticmethod
     def _complete_task_await(
-        task: _TyveraTask, statement: AwaitStatement, target: object,
+        self, task: _TyveraTask, statement: AwaitStatement, target: object,
         variables: ChainMap[str, object],
     ) -> None:
         if statement.binding_name is None:
             return
         if isinstance(target, _TyveraTask):
             value = target.result
+            if self._resource_handles(value):
+                target.result = None
         elif isinstance(target, _TyveraTaskGroup):
             return
         elif isinstance(target, _TyveraReplyReceiver):
@@ -2075,7 +2826,7 @@ class Interpreter:
         task.wait_target = None
         task.wait_frame = None
         task.wait_statement = None
-        if any(child.state in {"runnable", "running", "waiting", "sleeping", "joining", "timed_wait"}
+        if any(child.state in {"runnable", "running", "waiting", "sleeping", "joining", "timed_wait", "io_wait"}
                for child in task.children):
             task.state = "joining"
         else:
@@ -2088,7 +2839,7 @@ class Interpreter:
             failed_child = next((child for child in task.children if child.state == "failed"), None)
             if failed_child is not None:
                 self._fail_task(task, f"owned child task failed: {failed_child.error or 'async task failed'}")
-            elif not any(child.state in {"runnable", "running", "waiting", "sleeping", "joining", "timed_wait"}
+            elif not any(child.state in {"runnable", "running", "waiting", "sleeping", "joining", "timed_wait", "io_wait"}
                          for child in task.children):
                 task.state = "completed"
 
@@ -2096,6 +2847,9 @@ class Interpreter:
         if task.state in {"completed", "failed", "cancelled"}:
             return
         task.state = "cancelled"
+        if task.io_cancel is not None:
+            cancel, task.io_cancel = task.io_cancel, None
+            cancel()
         task.wait_target = None
         task.wait_frame = None
         task.wait_statement = None
@@ -2107,6 +2861,7 @@ class Interpreter:
             task.timeout_target = None
         for child in task.children:
             self._cancel_task(child)
+        self._cleanup_task_result(task)
 
     def _fail_task(self, task: _TyveraTask, error: str) -> None:
         if task.state in {"completed", "failed", "cancelled"}:
@@ -2119,6 +2874,7 @@ class Interpreter:
         if cleanup_errors:
             error = f"{error}; resource cleanup also failed: {'; '.join(cleanup_errors)}"
         task.error = error
+        self._cleanup_task_result(task)
         for child in task.children:
             self._cancel_task(child)
         if task.parent is not None:

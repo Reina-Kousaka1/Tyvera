@@ -53,10 +53,10 @@ from .type_names import make_type, split_type, substitute_type
 
 _BUILTIN_TYPES = {
     "Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result",
-    "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile", "TextReader", "TextWriter",
+    "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile", "TextReader", "TextWriter", "Bytes", "SocketAddress", "TcpConnection", "TcpListener",
 }
 _BUILTIN_FUNCTIONS = {
-    "println", "eprintln", "readText", "writeText", "openText", "openTextReader", "openTextWriter", "pathJoin", "pathExists",
+    "println", "eprintln", "readText", "writeText", "openText", "openTextReader", "openTextWriter", "openTextAsync", "bytesFromString", "resolveHost", "tcpConnect", "tcpListen", "pathJoin", "pathExists",
     "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool",
     "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors", "oneForOne",
     "milliseconds", "seconds", "timerAfter", "sleepFor", "runTasks", "taskGroup",
@@ -151,7 +151,7 @@ class TypeChecker:
         self._ownership_flow: dict[int, str] = {}
         self._next_ownership_id = 1
         self._next_scope_id = 1
-        self.resource_types = {"TextFile", "TextReader", "TextWriter"}
+        self.resource_types = {"TextFile", "TextReader", "TextWriter", "TcpConnection", "TcpListener"}
         self.move_sites: dict[Location, str] = {}
         self.resource_scopes: dict[Location, str] = {}
         self.cleanup_points: dict[Location, tuple[str, ...]] = {}
@@ -559,7 +559,7 @@ class TypeChecker:
                 raise Diagnostic(location, "type", "ActorRef requires one actor type, such as ActorRef<Counter>")
         if base == "Map" and arguments and self._contains_resource(arguments[0]):
             raise Diagnostic(location, "type", f"{arguments[0]} is not hashable and cannot be used as a Map key")
-        if self._contains_resource(type_name) and base not in {*self.resource_types, "Option", "Result"}:
+        if self._contains_resource(type_name) and base not in {*self.resource_types, "Option", "Result", "Task"}:
             raise Diagnostic(location, "type", f"{base} cannot contain move-only Resource values")
         if base == "Map" and arguments:
             if not self._is_hashable_key_type(arguments[0], known_variables):
@@ -766,6 +766,8 @@ class TypeChecker:
                     result_type = "Void"
                 else:
                     raise Diagnostic(statement.value.location, "type", f"'await' expects Task<T>, TaskGroup, or ReplyReceiver<T>, found {awaited_type}")
+                if statement.binding_name is None and self._contains_resource(result_type):
+                    raise Diagnostic(statement.location, "type", "awaiting a Task that returns an owned Resource requires a result binding")
                 if statement.binding_name is not None:
                     name = statement.binding_name
                     if name in {"self", "secrets", *_BUILTIN_FUNCTIONS}:
@@ -1008,6 +1010,33 @@ class TypeChecker:
                 raise Diagnostic(expression.location, "type", f"Resource '{expression.identifier}' is move-only; use 'move {expression.identifier}' to transfer ownership")
             return binding.type_name
         if isinstance(expression, Call):
+            if expression.callee == "bytesFromString":
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'bytesFromString' does not accept type arguments")
+                argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
+                self._check_arguments(expression.arguments, argument_types, ("String",), expression.location, "bytesFromString")
+                return "Bytes"
+            if expression.callee == "resolveHost":
+                expected = ("String", "Int")
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'resolveHost' does not accept type arguments")
+                argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
+                self._check_arguments(expression.arguments, argument_types, expected, expression.location, "resolveHost")
+                return "Task<Result<List<SocketAddress>,String>>"
+            if expression.callee in {"tcpConnect", "tcpListen"}:
+                expected = ("String", "Int") if expression.callee == "tcpConnect" else ("String", "Int", "Int")
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", f"'{expression.callee}' does not accept type arguments")
+                argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
+                self._check_arguments(expression.arguments, argument_types, expected, expression.location, expression.callee)
+                result = "TcpConnection" if expression.callee == "tcpConnect" else "TcpListener"
+                return f"Task<Result<{result},String>>"
+            if expression.callee == "openTextAsync":
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'openTextAsync' does not accept type arguments")
+                argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
+                self._check_arguments(expression.arguments, argument_types, ("String", "String"), expression.location, "openTextAsync")
+                return "Task<Result<TextFile,String>>"
             if expression.callee == "openText":
                 if expression.type_arguments:
                     raise Diagnostic(expression.location, "type", "'openText' does not accept type arguments")
@@ -1233,10 +1262,14 @@ class TypeChecker:
                 raise Diagnostic(expression.location, "type", "generic methods are not supported yet")
             resource_binding = (variables.get(expression.receiver.identifier)
                                 if isinstance(expression.receiver, Name) else None)
-            if resource_binding is not None and resource_binding.type_name in self.resource_types:
+            resource_receiver_base = (split_type(resource_binding.type_name)[0]
+                                      if resource_binding is not None else "")
+            is_resource_task = (resource_binding is not None and resource_receiver_base == "Task"
+                                and self._contains_resource(resource_binding.type_name))
+            if resource_binding is not None and (resource_binding.type_name in self.resource_types or is_resource_task):
                 self._require_resource_live(
                     expression.receiver.identifier, resource_binding, expression.location,
-                    allow_closed_query=expression.method in {"close", "isOpen"},
+                                allow_closed_query=expression.method in {"close", "closeAsync", "isOpen"},
                 )
                 receiver_type = resource_binding.type_name
             else:
@@ -1250,21 +1283,47 @@ class TypeChecker:
                 methods = {
                     "TextFile": {
                         "readAll": ((), "Result<String,String>"),
+                        "readAllAsync": ((), "Task<Result<String,String>>"),
                         "write": (("String",), "Result<Bool,String>"),
+                        "writeAsync": (("String",), "Task<Result<Bool,String>>"),
                         "append": (("String",), "Result<Bool,String>"),
+                        "appendAsync": (("String",), "Task<Result<Bool,String>>"),
                         "flush": ((), "Result<Bool,String>"),
+                        "flushAsync": ((), "Task<Result<Bool,String>>"),
                         "close": ((), "Bool"),
+                        "closeAsync": ((), "Task<Result<Bool,String>>"),
                         "isOpen": ((), "Bool"),
                     },
                     "TextReader": {
                         "readAll": ((), "Result<String,String>"),
+                        "readAllAsync": ((), "Task<Result<String,String>>"),
                         "close": ((), "Bool"),
+                        "closeAsync": ((), "Task<Result<Bool,String>>"),
                         "isOpen": ((), "Bool"),
                     },
                     "TextWriter": {
                         "write": (("String",), "Result<Bool,String>"),
+                        "writeAsync": (("String",), "Task<Result<Bool,String>>"),
                         "append": (("String",), "Result<Bool,String>"),
+                        "appendAsync": (("String",), "Task<Result<Bool,String>>"),
                         "flush": ((), "Result<Bool,String>"),
+                        "flushAsync": ((), "Task<Result<Bool,String>>"),
+                        "close": ((), "Bool"),
+                        "closeAsync": ((), "Task<Result<Bool,String>>"),
+                        "isOpen": ((), "Bool"),
+                    },
+                    "TcpConnection": {
+                        "read": (("Int",), "Task<Result<Option<Bytes>,String>>"),
+                        "write": (("Bytes",), "Task<Result<Int,String>>"),
+                        "writeAll": (("Bytes",), "Task<Result<Int,String>>"),
+                        "localAddress": ((), "Result<SocketAddress,String>"),
+                        "remoteAddress": ((), "Result<SocketAddress,String>"),
+                        "close": ((), "Bool"),
+                        "isOpen": ((), "Bool"),
+                    },
+                    "TcpListener": {
+                        "accept": ((), "Task<Result<TcpConnection,String>>"),
+                        "localAddress": ((), "Result<SocketAddress,String>"),
                         "close": ((), "Bool"),
                         "isOpen": ((), "Bool"),
                     },
@@ -1275,7 +1334,7 @@ class TypeChecker:
                 expected_types, result_type = method_signature
                 self._check_arguments(expression.arguments, argument_types, expected_types,
                                       expression.location, f"{receiver_base}.{expression.method}")
-                if resource_binding is not None and expression.method == "close":
+                if resource_binding is not None and expression.method in {"close", "closeAsync"}:
                     status = self._ownership_status(resource_binding)
                     if status not in {"closed", "maybe_closed"} and resource_binding.ownership_id is not None:
                         self._ownership_flow[resource_binding.ownership_id] = "closed"
@@ -1399,8 +1458,32 @@ class TypeChecker:
                 if method_signature is None:
                     raise Diagnostic(expression.location, "type", f"Task has no method '{expression.method}'")
                 expected_types, result_type = method_signature
+                if self._contains_resource(task_value_type):
+                    if expression.method in {"tryResult", "withTimeout"} and resource_binding is not None:
+                        self._ownership_flow[resource_binding.ownership_id] = "moved"
+                        self._ownership_effects.append((resource_binding.ownership_id, "moved"))
+                        self.move_sites[expression.location] = expression.receiver.identifier
                 self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
                                       f"Task.{expression.method}")
+                return result_type
+            if receiver_base == "Bytes":
+                methods = {"length": ((), "Int"), "toString": ((), "Result<String,String>")}
+                method_signature = methods.get(expression.method)
+                if method_signature is None:
+                    raise Diagnostic(expression.location, "type", f"Bytes has no method '{expression.method}'")
+                expected_types, result_type = method_signature
+                self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
+                                      f"Bytes.{expression.method}")
+                return result_type
+            if receiver_base == "SocketAddress":
+                methods = {"host": ((), "String"), "port": ((), "Int"),
+                           "family": ((), "String"), "toString": ((), "String")}
+                method_signature = methods.get(expression.method)
+                if method_signature is None:
+                    raise Diagnostic(expression.location, "type", f"SocketAddress has no method '{expression.method}'")
+                expected_types, result_type = method_signature
+                self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
+                                      f"SocketAddress.{expression.method}")
                 return result_type
             if receiver_base == "TaskGroup":
                 if receiver_arguments:
