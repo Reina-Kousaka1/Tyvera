@@ -26,7 +26,8 @@ remaining design work for later backends.
 - Tasks share references captured in their arguments. Tasks are serial and
   cooperative, so they do not race in parallel, but their interleaving can
   make shared mutation order observable.
-- `TextFile`, `TextReader`, `TextWriter`, `TcpConnection`, and `TcpListener`
+- `TextFile`, `TextReader`, `TextWriter`, `TcpConnection`, `TcpListener`, and
+  `HttpServer`
   are identity resources with one move-only owner. `Option`, `Result`, and the
   `Task` handles produced by resource-returning intrinsics may carry resources;
   other aggregates and collections cannot. Async and synchronous file
@@ -54,7 +55,7 @@ ownership. It does not require a general borrow checker.
 | Records | Immutable nominal value records; fields compare structurally. Nested mutable references remain shared. | Implemented, including generic types, destructuring, and safe derived map keys. |
 | Class instances, lists, maps | Classes use stable identity; lists and maps compare by contents. Assignment copies references; collection contents remain shared. | Implemented in the bootstrap. |
 | Actor references, tasks, reply handles, timers, supervisors | Opaque identity handles. Copying a handle does not copy the actor, task, or operation it names. | Implemented in the interpreter; public runtime ABI is planned. |
-| Resource handles | One live owner, explicit transfer, deterministic release. | Implemented for text files, TCP connections and listeners, including resource-bearing task results, path-sensitive moves, and task/scope cleanup. |
+| Resource handles | One live owner, explicit transfer, deterministic release. | Implemented for text files, TCP connections/listeners, and HTTP servers, including resource-bearing task results, path-sensitive moves, and task/scope cleanup. |
 
 For mutable ordinary references, `==` compares identity. Value equality
 compares scalar and immutable tagged values structurally, recursively applying
@@ -145,8 +146,12 @@ observable behavior with the platform's completion or readiness facilities.
 
 `Bytes` is immutable and does not own an external resource. `SocketAddress`
 is a portable value containing a host string, a 16-bit port, and `IPv4` or
-`IPv6` family. `TcpConnection` and `TcpListener` are move-only. Each
-connection permits one pending read and one pending write; `read(maxBytes)`
+`IPv6` family. `TcpConnection`, `TcpListener`, and `HttpServer` are move-only.
+An HTTP server owns its listener and the connection tasks it accepts.
+`shutdown()` stops accepting and drains active connection tasks under their
+configured deadlines; `close()` cancels the server tree and closes accepted
+sockets. Active connections are capped by `HttpLimits.maxConnections`. Each
+TCP connection permits one pending read and one pending write; `read(maxBytes)`
 caps one allocation and may return fewer bytes, while `write(Bytes)` reports
 partial progress and `writeAll(Bytes)` waits before continuing. The runtime
 does not keep an unbounded write queue. Cancellation removes a readiness wait;
@@ -155,9 +160,12 @@ already running in a worker is allowed to complete, and shutdown drains those
 workers before closing the runtime.
 
 No general user-defined Stream interface is exposed yet. TCP is the first
-byte-stream implementation; text files retain text-oriented methods. TLS can
-later adapt the owned byte-stream boundary using a reviewed platform
-cryptography library. TLS and all protocol layers above TCP remain planned.
+byte-stream implementation; text files retain text-oriented methods. The
+experimental HTTP/1.1 codec/client/server operate on bounded `Bytes` messages
+over owned TCP connections. HTTP request/response values are ordinary values;
+`HttpServer` and its listener/connections remain move-only resources. TLS can
+later adapt the owned byte-stream boundary using a vetted platform
+cryptography library. TLS and protocols beyond HTTP/1.1 remain planned.
 
 ### Lifetimes and runtime ownership
 
@@ -166,5 +174,5 @@ collector or allocator is a runtime implementation choice. Task, actor, and
 resource lifetimes instead have explicit owners and shutdown rules. The
 implemented task and actor ownership rules are in the
 [runtime document](runtime.md). File and stream resources follow the scope
-rules above. Async I/O and networking need separate ownership designs before
-they are implemented.
+rules above. HTTP server ownership reuses the same move-only handles and
+structured task cleanup; it does not add a separate lifetime system.

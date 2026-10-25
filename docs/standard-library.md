@@ -24,6 +24,7 @@ These core types and functions are currently available without an import:
 | `TcpConnection` | Move-only TCP byte stream. `read(maxBytes)` returns `Task<Result<Option<Bytes>,String>>`; a positive read may be partial and EOF is `Ok(None)`. `write(Bytes)` returns the number of bytes accepted by the OS and may be partial. `writeAll(Bytes)` waits for readiness until the supplied payload is accepted. `localAddress`, `remoteAddress`, `close`, and `isOpen` expose lifecycle and addresses. |
 | `TcpListener` | Move-only listener. `accept()` returns `Task<Result<TcpConnection,String>>`; `localAddress`, `close`, and `isOpen` expose its bound address and lifecycle. `tcpListen(host, port, backlog)` accepts ports from 0 to 65535 and backlog from 1 to 4096; port `0` asks the OS to select a local port. |
 | Async networking | `resolveHost(host, port)`, `tcpConnect(host, port)`, `tcpListen(host, port, backlog)`, `TcpListener.accept`, and connection reads/writes return `Task<Result<...,String>>`. Connect ports are from 1 to 65535; resolution ports are from 0 to 65535. DNS and file operations use bounded runtime workers; TCP uses non-blocking readiness and wakes the scheduler on completion. Errors use normalized Tyvera strings, not host exception objects. |
+| Experimental HTTP/1.1 | `HttpMethod`, `HttpUrl`, `HttpLimits`, `HttpHeaders`, `HttpRequest`, `HttpResponse`, `HttpDecoder`, `HttpRouter`, and move-only `HttpServer`; `httpGet`, `httpPost`, `httpPut`, `httpDelete`, and custom `httpSend` use the same DNS/TCP tasks. Server-parsed requests expose their optional peer as portable `SocketAddress`. The incremental codec enforces bounded framing, Content-Length, and HTTP/1.1 Host rules; chunked coding is rejected. `httpServer` accepts concurrent connections with a configured connection cap and operation deadline. Routing currently stores static responses and supports 404/405 plus `:path` parameters. `HttpRequest.json()` and `httpJsonResponse` reuse the existing explicit `Json` core; record/ADT reflection is not implemented. See [HTTP foundation](http.md). |
 | Secrets | `secrets.NAME` reads `.tyvera.secrets` before the process environment and returns `Option<Secret<String>>`; `Secret.reveal()` is explicit. |
 | `Json` | `parseJson(String) -> Result<Json,String>`, `jsonStringify(Json) -> Result<String,String>`, typed constructors, and optional accessors for JSON values. |
 | Actor runtime | `spawn(Actor(...)) -> ActorRef<Actor>`, `oneForOne(maxRestarts, windowMilliseconds) -> Supervisor`, `Supervisor.start(Actor(...))`, `Supervisor.stop()`/`isAlive()`, handler calls that enqueue typed messages, `runActors() -> Result<Int,String>`, and `ActorRef.isAlive()`/`stop()`. Scheduling is cooperative and deterministic; supervised restarts rebuild child state from constructor arguments. `runTasks()` services one queued actor message between turns when a task awaits a reply. |
@@ -46,11 +47,13 @@ The module paths below are design targets, not current imports:
 | --- | --- |
 | `tyvera.time` | Importable wrappers around the implemented bootstrap `Duration` and `Timer` primitives. |
 | `tyvera.concurrent` | Importable wrappers around implemented task ownership, groups, timeout, and cancellation APIs. |
-| `tyvera.net` | Importable wrappers around the implemented TCP primitives; HTTP, TLS, and WebSocket clients remain planned. |
+| `tyvera.net` | Importable wrappers around the implemented TCP primitives. |
+| `tyvera.http` | Importable wrappers around the experimental HTTP intrinsics; module packaging remains planned. |
 | `tyvera.secrets` | A separately importable provider-backed secret library. |
 
 Cooperative tasks, selector-backed TCP I/O, asynchronous text-file operations,
-and DNS lookup are implemented in the reference runtime. There is not yet a
+and DNS lookup are implemented in the reference runtime. HTTP/1.1 client and
+server primitives are experimental and implemented above TCP. There is not yet a
 general user-defined Stream interface: `TcpConnection` defines the current
 byte-stream contract, and async text files reuse their existing resource API.
 JSON, collection, I/O and secret operations

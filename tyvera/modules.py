@@ -126,7 +126,7 @@ class ModuleLoader:
 
     @staticmethod
     def _declarations(module: _Module) -> dict[str, tuple[str, object]]:
-        builtin_functions = {"println", "eprintln", "readText", "writeText", "openText", "openTextReader", "openTextWriter", "openTextAsync", "bytesFromString", "resolveHost", "tcpConnect", "tcpListen", "pathJoin", "pathExists", "spawn", "runActors", "runTasks", "sleepFor", "taskGroup", "oneForOne", "milliseconds", "seconds", "timerAfter"}
+        builtin_functions = {"println", "eprintln", "readText", "writeText", "openText", "openTextReader", "openTextWriter", "openTextAsync", "bytesFromString", "resolveHost", "tcpConnect", "tcpListen", "pathJoin", "pathExists", "spawn", "runActors", "runTasks", "sleepFor", "taskGroup", "oneForOne", "milliseconds", "seconds", "timerAfter", "httpMethod", "httpUrl", "httpLimits", "httpDefaultLimits", "httpHeaders", "httpRequest", "httpResponse", "httpTextResponse", "httpJsonResponse", "httpRouter", "httpRequestDecoder", "httpResponseDecoder", "httpEncodeRequest", "httpEncodeResponse", "httpServer", "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete"}
         declarations: dict[str, tuple[str, object]] = {}
         all_declarations = [
             *(('function', declaration) for declaration in module.program.functions),
@@ -139,7 +139,7 @@ class ModuleLoader:
             *(('type_alias', declaration) for declaration in module.program.type_aliases),
         ]
         for kind, declaration in all_declarations:
-            if declaration.name in {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile", "TextReader", "TextWriter", "Bytes", "SocketAddress", "TcpConnection", "TcpListener"}:
+            if declaration.name in {"Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result", "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile", "TextReader", "TextWriter", "Bytes", "SocketAddress", "TcpConnection", "TcpListener", "HttpMethod", "HttpUrl", "HttpLimits", "HttpHeaders", "HttpRequest", "HttpResponse", "HttpDecoder", "HttpRouter", "HttpServer"}:
                 raise Diagnostic(declaration.location, "type", f"type name '{declaration.name}' is reserved")
             if declaration.name == "secrets":
                 raise Diagnostic(declaration.location, "type", "'secrets' is a reserved namespace")
@@ -171,7 +171,7 @@ class ModuleLoader:
             for declaration in module.program.imports:
                 path = (module.path.parent / declaration.path).resolve()
                 imported = self.modules[path]
-                if declaration.alias in {"secrets", "println", "eprintln", "readText", "writeText", "openText", "openTextReader", "openTextWriter", "openTextAsync", "bytesFromString", "resolveHost", "tcpConnect", "tcpListen", "pathJoin", "pathExists", "spawn", "runActors", "runTasks", "sleepFor", "taskGroup", "oneForOne", "milliseconds", "seconds", "timerAfter", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "Tuple", "TextFile", "TextReader", "TextWriter", "Bytes", "SocketAddress", "TcpConnection", "TcpListener"}:
+                if declaration.alias in {"secrets", "println", "eprintln", "readText", "writeText", "openText", "openTextReader", "openTextWriter", "openTextAsync", "bytesFromString", "resolveHost", "tcpConnect", "tcpListen", "pathJoin", "pathExists", "spawn", "runActors", "runTasks", "sleepFor", "taskGroup", "oneForOne", "milliseconds", "seconds", "timerAfter", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "Tuple", "TextFile", "TextReader", "TextWriter", "Bytes", "SocketAddress", "TcpConnection", "TcpListener", "HttpMethod", "HttpUrl", "HttpLimits", "HttpHeaders", "HttpRequest", "HttpResponse", "HttpDecoder", "HttpRouter", "HttpServer", "httpMethod", "httpUrl", "httpLimits", "httpDefaultLimits", "httpHeaders", "httpRequest", "httpResponse", "httpTextResponse", "httpJsonResponse", "httpRouter", "httpRequestDecoder", "httpResponseDecoder", "httpEncodeRequest", "httpEncodeResponse", "httpServer", "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete"}:
                     raise Diagnostic(declaration.location, "module", f"'{declaration.alias}' is a reserved name")
                 if declaration.alias in imports:
                     raise Diagnostic(declaration.location, "module", f"import alias '{declaration.alias}' is already declared")

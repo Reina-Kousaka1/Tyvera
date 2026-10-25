@@ -647,11 +647,13 @@ readiness and worker completion wake the scheduler without polling or blocking
 other runnable tasks. `runActors()` never sleeps for a future message. Both
 schedulers have bounded safety limits.
 
-The reference runtime implements async text-file operations and TCP V1.
-`openTextAsync` and async methods on the existing text-resource types perform
-file work on a bounded runtime worker pool. TCP connect/accept/read/write use
-non-blocking readiness. The byte-oriented networking API, address and error
-types are described in the [standard library reference](standard-library.md).
+The reference runtime implements async text-file operations, TCP V1, and an
+experimental HTTP/1.1 layer. `openTextAsync` and async methods on the existing
+text-resource types perform file work on a bounded runtime worker pool. TCP
+connect/accept/read/write use non-blocking readiness. The byte-oriented
+networking and HTTP values, address and error types are described in the
+[standard library reference](standard-library.md) and
+[HTTP foundation](http.md).
 `read(maxBytes)` may return fewer bytes than requested; an empty stream is
 reported as `Ok(None)`. `write(Bytes)` may accept only part of its input;
 `writeAll(Bytes)` continues when the connection becomes writable. Each
@@ -671,9 +673,10 @@ Timeout and I/O cancellation do not change the ownership rules of the resource.
 
 This first version has no user-defined general `Stream` interface. TCP
 connections establish the byte-stream contract and text files keep their
-existing text API. TLS can later adapt the owned byte-stream boundary through
-an established platform cryptography library; TLS itself is not implemented.
-HTTP, WebSockets, networking protocols and native I/O backends remain planned.
+existing text API. HTTP V1 uses bounded buffering and the TCP byte-stream API;
+TLS can later adapt the owned stream boundary through a vetted platform
+cryptography library. TLS, WebSockets, richer HTTP routing, and native I/O
+backends remain planned.
 
 ## JSON values
 
@@ -785,8 +788,9 @@ and connection handles are move-only resources; `accept`, `read`, `write`, and
 and address family without exposing host-platform socket structs. `read` may be
 partial and uses `None` for EOF. `write` may be partial; `writeAll` waits for
 socket readiness, retaining one caller-provided payload at a time. No general
-Stream trait exists yet. HTTP, TLS, and WebSockets are not part of this API
-version.
+Stream trait exists yet. The experimental HTTP API is described in
+[HTTP and web foundation](http.md); TLS and WebSockets are not part of this
+API version.
 
 The built-in namespace `secrets.NAME` returns `Option<Secret<String>>`. The
 local provider reads `.tyvera.secrets` first, then checks the process
@@ -910,8 +914,8 @@ Current limits: classes, interfaces and the deterministic cooperative actor
 runtime with bounded `one_for_one` supervision are supported, but there is no
 inheritance, generic methods/interfaces, generic type-declaration constraints,
 collection literals,
-`try`/`catch`, parallel process scheduling, async I/O, networking API,
-importable standard-library modules, external secret-store provider, native
+`try`/`catch`, parallel process scheduling, TLS, WebSockets, importable
+standard-library modules, external secret-store provider, native
 interop, garbage collector implementation, package manager or compiler
 backend. `await` remains statement-only; synchronous calls are atomic.
 `runActors()` remains non-blocking; `runTasks()` waits for task deadlines.
