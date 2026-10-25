@@ -26,10 +26,12 @@ imports, and `pub` exports.
 
 The reference runtime also provides asynchronous text-file operations,
 non-blocking TCP connect/listen/accept/read/write, DNS lookup, portable
-IPv4/IPv6 address values, and move-only connection/listener resources. See
-[`examples/tcp_echo.tyv`](examples/tcp_echo.tyv) for a local asynchronous TCP
-echo example. HTTP, TLS, WebSockets, and native code generation are not part of
-this milestone.
+IPv4/IPv6 address values, and move-only connection/listener resources. An
+experimental HTTP/1.1 codec, bounded concurrent server, static router, and
+typed HTTP client build on those same TCP tasks and resource rules. See
+[`examples/tcp_echo.tyv`](examples/tcp_echo.tyv) and
+[`examples/http_server.tyv`](examples/http_server.tyv) for local examples.
+TLS, WebSockets, and native code generation remain planned.
 
 The deterministic actor runtime supports typed messages, isolated state, FIFO
 mailboxes, crash isolation, bounded `one_for_one` supervision, request/reply,
@@ -93,6 +95,8 @@ tyvera check examples/collections.tyv
 tyvera run examples/collections.tyv
 tyvera check examples/tcp_echo.tyv
 tyvera run examples/tcp_echo.tyv
+tyvera check examples/http_server.tyv
+tyvera run examples/http_server.tyv
 tyvera check examples/json.tyv
 tyvera run examples/json.tyv
 tyvera check examples/actors.tyv
@@ -140,7 +144,8 @@ secrets, typed JSON, deterministic actor supervision, one-shot actor replies,
 and a cooperative task scheduler with nested `await`, scoped cancellation,
 implicit child joining, owner-local task groups, explicit child detachment,
 and task deadlines are implemented. Async text-file I/O, DNS, and TCP V1 are
-implemented. True parallel execution, TLS, HTTP, WebSockets, separate
+implemented. HTTP/1.1 V1 is implemented as an experimental codec, client,
+bounded server, and static router. True parallel execution, TLS, WebSockets, separate
 standard-library modules, external secret stores, and native backends remain
 planned. See the
 [roadmap](docs/roadmap.md) for sequence and

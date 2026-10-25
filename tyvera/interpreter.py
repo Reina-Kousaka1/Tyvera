@@ -53,6 +53,11 @@ from .ast import (
 from .source import Diagnostic, Location
 from .secrets import SecretProvider, SecretProviderError
 from .io_backend import IOBackend, IOBackendError
+from .http_protocol import (
+    HttpHeaders, HttpLimits, HttpMessageDecoder, HttpMethod, HttpProtocolError,
+    HttpRequest, HttpResponse, HttpRouter, HttpUrl, encode_request, encode_response,
+    make_method, parse_url, text_response,
+)
 from .typesys import INT_MAX, INT_MIN, canonical_type
 from .type_names import split_type
 
@@ -199,7 +204,23 @@ class _TyveraNetworkResource:
         return f"<{self.resource_type}>"
 
 
-_TyveraResource = _TyveraTextFile | _TyveraNetworkResource
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraHttpServer:
+    listener: _TyveraNetworkResource
+    router: HttpRouter
+    limits: HttpLimits
+    timeout_milliseconds: int
+    local_address: _TyveraSocketAddress
+    stopped: bool = False
+    closed: bool = False
+    run_task: _TyveraTask | None = None
+    identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
+
+    def __repr__(self) -> str:
+        return "<HttpServer>"
+
+
+_TyveraResource = _TyveraTextFile | _TyveraNetworkResource | _TyveraHttpServer
 
 
 @dataclass(slots=True, eq=False)
@@ -245,6 +266,11 @@ class _TyveraTask:
     children: list[_TyveraTask] = dataclass_field(default_factory=list)
     io_cancel: Callable[[], None] | None = None
     io_resource: object | None = None
+    native_step: Callable[[_TyveraTask], None] | None = None
+    native_state: dict[str, object] = dataclass_field(default_factory=dict)
+    native_wait_result: object = _MISSING
+    native_wait_error: str | None = None
+    native_resources: list[object] = dataclass_field(default_factory=list)
     identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
     def __repr__(self) -> str:
@@ -861,6 +887,107 @@ class Interpreter:
                 return _TyveraTimer(self._clock(), duration.milliseconds, self._clock)
             if expression.callee == "bytesFromString":
                 return _TyveraBytes(arguments[0].encode("utf-8"))
+            if expression.callee == "httpMethod":
+                try:
+                    return _TyveraVariant("Ok", make_method(arguments[0]), "Result", 1)
+                except ValueError as error:
+                    return _TyveraVariant("Err", str(error), "Result", 1)
+            if expression.callee == "httpUrl":
+                try:
+                    return _TyveraVariant("Ok", parse_url(arguments[0]), "Result", 1)
+                except ValueError as error:
+                    return _TyveraVariant("Err", str(error), "Result", 1)
+            if expression.callee == "httpLimits":
+                try:
+                    return _TyveraVariant("Ok", HttpLimits(*arguments), "Result", 1)
+                except ValueError as error:
+                    return _TyveraVariant("Err", str(error), "Result", 1)
+            if expression.callee == "httpDefaultLimits":
+                return HttpLimits()
+            if expression.callee == "httpHeaders":
+                return HttpHeaders()
+            if expression.callee == "httpRequest":
+                method, target, headers, body = arguments
+                try:
+                    if not isinstance(method, HttpMethod) or not isinstance(headers, HttpHeaders) or not isinstance(body, _TyveraBytes):
+                        raise ValueError("invalid HTTP request values")
+                    value = HttpRequest(method, target, headers, body.value)
+                    return _TyveraVariant("Ok", value, "Result", 1)
+                except (ValueError, TypeError) as error:
+                    return _TyveraVariant("Err", str(error), "Result", 1)
+            if expression.callee == "httpResponse":
+                status, headers, body = arguments
+                if not 100 <= status <= 599:
+                    return _TyveraVariant("Err", "invalid HTTP status code", "Result", 1)
+                if not isinstance(headers, HttpHeaders) or not isinstance(body, _TyveraBytes):
+                    return _TyveraVariant("Err", "invalid HTTP response values", "Result", 1)
+                return _TyveraVariant("Ok", HttpResponse(status, headers, body.value), "Result", 1)
+            if expression.callee == "httpTextResponse":
+                status, body = arguments
+                if not 100 <= status <= 599:
+                    return _TyveraVariant("Err", "invalid HTTP status code", "Result", 1)
+                return _TyveraVariant("Ok", text_response(status, body), "Result", 1)
+            if expression.callee == "httpJsonResponse":
+                status, value = arguments
+                if not 100 <= status <= 599:
+                    return _TyveraVariant("Err", "invalid HTTP status code", "Result", 1)
+                try:
+                    serialized = json.dumps(
+                        self._json_to_python(value), ensure_ascii=False,
+                        separators=(",", ":"), allow_nan=False,
+                    )
+                except (TypeError, ValueError, RecursionError):
+                    return _TyveraVariant("Err", "HTTP JSON encoding failed", "Result", 1)
+                headers = HttpHeaders()
+                headers.set("Content-Type", "application/json; charset=utf-8")
+                return _TyveraVariant("Ok", HttpResponse(status, headers, serialized.encode("utf-8")), "Result", 1)
+            if expression.callee == "httpRouter":
+                return HttpRouter()
+            if expression.callee == "httpRequestDecoder":
+                return HttpMessageDecoder(arguments[0])
+            if expression.callee == "httpResponseDecoder":
+                return HttpMessageDecoder(arguments[0], response=True, request_method=arguments[1].name)
+            if expression.callee == "httpEncodeRequest":
+                request = arguments[0]
+                try:
+                    return _TyveraVariant("Ok", _TyveraBytes(encode_request(request.method, request.target, request.headers, request.body)), "Result", 1)
+                except (HttpProtocolError, ValueError, UnicodeEncodeError) as error:
+                    return _TyveraVariant("Err", str(error), "Result", 1)
+            if expression.callee == "httpEncodeResponse":
+                response, keep_alive = arguments
+                try:
+                    return _TyveraVariant("Ok", _TyveraBytes(encode_response(response, keep_alive=keep_alive)), "Result", 1)
+                except (HttpProtocolError, ValueError, UnicodeEncodeError) as error:
+                    return _TyveraVariant("Err", str(error), "Result", 1)
+            if expression.callee == "httpServer":
+                listener, router, limits, timeout = arguments
+                if not isinstance(listener, _TyveraNetworkResource) or listener.resource_type != "TcpListener" or listener.closed:
+                    return _TyveraVariant("Err", "httpServer requires an open TcpListener", "Result", 1)
+                if not isinstance(router, HttpRouter) or not isinstance(limits, HttpLimits):
+                    return _TyveraVariant("Err", "invalid HTTP server configuration", "Result", 1)
+                if not isinstance(timeout, _TyveraDuration) or timeout.milliseconds <= 0:
+                    return _TyveraVariant("Err", "HTTP operation timeout must be greater than zero", "Result", 1)
+                try:
+                    address = listener.stream.getsockname()
+                    local_address = self._socket_address(address, listener.stream.family)
+                except OSError as error:
+                    return _TyveraVariant("Err", self._network_error(error), "Result", 1)
+                return _TyveraVariant("Ok", _TyveraHttpServer(
+                    listener, router, limits, timeout.milliseconds, local_address,
+                ), "Result", 1)
+            if expression.callee in {"httpSend", "httpGet", "httpPost", "httpPut", "httpDelete"}:
+                if expression.callee == "httpSend":
+                    url, request, timeout = arguments
+                elif expression.callee in {"httpGet", "httpDelete"}:
+                    url, timeout = arguments
+                    method_name = "GET" if expression.callee == "httpGet" else "DELETE"
+                    request = HttpRequest(HttpMethod(method_name), url.target, HttpHeaders(), b"")
+                else:
+                    url, headers, body, timeout = arguments
+                    method_name = "POST" if expression.callee == "httpPost" else "PUT"
+                    request = HttpRequest(method=HttpMethod(method_name), target=url.target,
+                                          headers=headers, body=body.value)
+                return self._http_client_task(url, request, timeout, expression.location)
             if expression.callee == "resolveHost":
                 host, port = arguments
                 if not 0 <= port <= 65_535:
@@ -1033,6 +1160,39 @@ class Interpreter:
                     payload = _TyveraTuple(tuple(payloads))
                 return _TyveraVariant(expression.method, payload, expression.receiver.identifier, len(payloads))
             receiver = self._evaluate(expression.receiver, variables, depth)
+            if isinstance(receiver, _TyveraHttpServer):
+                arguments = self._evaluate_arguments(expression.arguments, variables, depth)
+                if expression.method == "start":
+                    if receiver.run_task is not None:
+                        task = self._create_io_task("Result<Bool,String>", expression.location)
+                        self._complete_io_task(task, _TyveraVariant(
+                            "Err", "HTTP server has already been started", "Result", 1,
+                        ))
+                        return task
+                    if receiver.closed:
+                        task = self._create_io_task("Result<Bool,String>", expression.location)
+                        self._complete_io_task(task, _TyveraVariant(
+                            "Err", "HTTP server is closed", "Result", 1,
+                        ))
+                        return task
+                    return self._start_http_server_task(receiver, expression.location)
+                if expression.method == "shutdown":
+                    was_running = receiver.run_task is not None and self._task_is_active(receiver.run_task)
+                    receiver.stopped = True
+                    if not receiver.listener.closed:
+                        self._close_resource(receiver.listener)
+                    return was_running
+                if expression.method == "localAddress":
+                    return _TyveraVariant("Ok", receiver.local_address, "Result", 1)
+                if expression.method == "isOpen":
+                    return not receiver.closed
+                if expression.method == "isRunning":
+                    return receiver.run_task is not None and self._task_is_active(receiver.run_task)
+                if expression.method == "close":
+                    was_open = not receiver.closed
+                    self._close_resource(receiver)
+                    return was_open
+                raise AssertionError(f"unhandled checked HttpServer method: {expression.method}")
             if isinstance(receiver, _TyveraTextFile):
                 if expression.method == "isOpen":
                     return not receiver.closed
@@ -1121,6 +1281,138 @@ class Interpreter:
                 if expression.method == "toString":
                     host = f"[{receiver.host}]" if receiver.family == "IPv6" else receiver.host
                     return f"{host}:{receiver.port}"
+            if isinstance(receiver, (HttpMethod, HttpUrl, HttpLimits, HttpHeaders,
+                                     HttpRequest, HttpResponse, HttpMessageDecoder, HttpRouter)):
+                arguments = self._evaluate_arguments(expression.arguments, variables, depth)
+                if isinstance(receiver, HttpMethod):
+                    return receiver.name if expression.method == "name" else receiver.is_standard
+                if isinstance(receiver, HttpUrl):
+                    if expression.method == "scheme":
+                        return receiver.scheme
+                    if expression.method == "host":
+                        return receiver.host
+                    if expression.method == "port":
+                        return receiver.port
+                    if expression.method == "target":
+                        return receiver.target
+                    if expression.method == "authority":
+                        host = f"[{receiver.host}]" if ":" in receiver.host else receiver.host
+                        default_port = 80 if receiver.scheme == "http" else 443
+                        return host if receiver.port == default_port else f"{host}:{receiver.port}"
+                if isinstance(receiver, HttpLimits):
+                    return {
+                        "requestLineBytes": receiver.request_line_bytes,
+                        "headerBytes": receiver.header_bytes,
+                        "headerCount": receiver.header_count,
+                        "bodyBytes": receiver.body_bytes,
+                        "maxConnections": receiver.max_connections,
+                    }[expression.method]
+                if isinstance(receiver, HttpHeaders):
+                    name = arguments[0] if arguments else ""
+                    if expression.method in {"add", "set"}:
+                        try:
+                            getattr(receiver, expression.method)(arguments[0], arguments[1])
+                            return _TyveraVariant("Ok", True, "Result", 1)
+                        except ValueError as error:
+                            return _TyveraVariant("Err", str(error), "Result", 1)
+                    if expression.method == "remove":
+                        try:
+                            return receiver.remove(name)
+                        except ValueError:
+                            return 0
+                    if expression.method == "get":
+                        try:
+                            value = receiver.get(name)
+                        except ValueError:
+                            value = None
+                        return _TyveraVariant("None") if value is None else _TyveraVariant("Some", value)
+                    if expression.method == "values":
+                        try:
+                            return _TyveraList(receiver.values(name))
+                        except ValueError:
+                            return _TyveraList([])
+                    if expression.method == "contains":
+                        try:
+                            return receiver.contains(name)
+                        except ValueError:
+                            return False
+                    if expression.method == "length":
+                        return len(receiver.entries)
+                if isinstance(receiver, HttpRequest):
+                    if expression.method == "method":
+                        return receiver.method
+                    if expression.method == "target":
+                        return receiver.target
+                    if expression.method == "path":
+                        return receiver._path
+                    if expression.method == "version":
+                        return receiver.version
+                    if expression.method == "headers":
+                        return receiver.headers
+                    if expression.method == "body":
+                        return _TyveraBytes(receiver.body)
+                    if expression.method == "header":
+                        value = receiver.headers.get(arguments[0])
+                        return _TyveraVariant("None") if value is None else _TyveraVariant("Some", value)
+                    if expression.method == "query":
+                        values = receiver.query_values(arguments[0])
+                        return _TyveraVariant("None") if not values else _TyveraVariant("Some", values[0])
+                    if expression.method == "queryValues":
+                        return _TyveraList(receiver.query_values(arguments[0]))
+                    if expression.method == "routeParameter":
+                        value = receiver.route_parameters.get(arguments[0])
+                        return _TyveraVariant("None") if value is None else _TyveraVariant("Some", value)
+                    if expression.method == "remoteAddress":
+                        value = receiver._remote_address
+                        return _TyveraVariant("None") if value is None else _TyveraVariant("Some", value)
+                    if expression.method == "isKeepAlive":
+                        return receiver.is_keep_alive()
+                    if expression.method == "json":
+                        try:
+                            text = receiver.body.decode("utf-8")
+                        except UnicodeDecodeError:
+                            return _TyveraVariant("Err", "HTTP JSON body is not valid UTF-8", "Result", 1)
+                        return self._parse_json(text)
+                if isinstance(receiver, HttpResponse):
+                    if expression.method == "status":
+                        return receiver.status
+                    if expression.method == "headers":
+                        return receiver.headers
+                    if expression.method == "body":
+                        return _TyveraBytes(receiver.body)
+                if isinstance(receiver, HttpMessageDecoder):
+                    if expression.method == "feed":
+                        try:
+                            payload = arguments[0]
+                            if not isinstance(payload, _TyveraBytes):
+                                raise HttpProtocolError("feed expects Bytes")
+                            receiver.feed(payload.value)
+                            return _TyveraVariant("Ok", True, "Result", 1)
+                        except (HttpProtocolError, ValueError) as error:
+                            return _TyveraVariant("Err", str(error), "Result", 1)
+                    if expression.method == "finish":
+                        receiver.finish()
+                        return _TyveraVariant("Ok", True, "Result", 1)
+                    if expression.method == "bufferedBytes":
+                        return len(receiver.buffer)
+                    if expression.method in {"nextRequest", "nextResponse"}:
+                        if receiver.response != (expression.method == "nextResponse"):
+                            return _TyveraVariant("Err", "HTTP decoder used for the wrong message direction", "Result", 1)
+                        try:
+                            message = receiver.next_message()
+                            option = (_TyveraVariant("None") if message is None
+                                      else _TyveraVariant("Some", message))
+                            return _TyveraVariant("Ok", option, "Result", 1)
+                        except (HttpProtocolError, ValueError) as error:
+                            return _TyveraVariant("Err", str(error), "Result", 1)
+                if isinstance(receiver, HttpRouter):
+                    if expression.method == "add":
+                        try:
+                            return _TyveraVariant("Ok", receiver.add(*arguments), "Result", 1)
+                        except ValueError as error:
+                            return _TyveraVariant("Err", str(error), "Result", 1)
+                    if expression.method == "dispatch":
+                        return receiver.dispatch(arguments[0])
             if isinstance(receiver, _TyveraSupervisor):
                 if expression.method == "start":
                     if receiver.status != "alive":
@@ -1369,6 +1661,14 @@ class Interpreter:
         return None
 
     def _close_resource(self, resource: object) -> str | None:
+        if isinstance(resource, _TyveraHttpServer):
+            resource.stopped = True
+            if not resource.listener.closed:
+                self._close_resource(resource.listener)
+            resource.closed = True
+            if resource.run_task is not None and self._task_is_active(resource.run_task):
+                self._cancel_task(resource.run_task)
+            return None
         if isinstance(resource, _TyveraTextFile):
             if resource.closed:
                 return None
@@ -1413,7 +1713,7 @@ class Interpreter:
             task.result = None
 
     def _resource_handles(self, value: object) -> list[object]:
-        if isinstance(value, (_TyveraTextFile, _TyveraNetworkResource)):
+        if isinstance(value, (_TyveraTextFile, _TyveraNetworkResource, _TyveraHttpServer)):
             return [value]
         if isinstance(value, _TyveraTask) and self._type_contains_resource(value.result_type):
             return [value]
@@ -1438,7 +1738,7 @@ class Interpreter:
     @staticmethod
     def _type_contains_resource(type_name: str) -> bool:
         base, arguments = split_type(canonical_type(type_name))
-        resources = {"TextFile", "TextReader", "TextWriter", "TcpConnection", "TcpListener"}
+        resources = {"TextFile", "TextReader", "TextWriter", "TcpConnection", "TcpListener", "HttpServer"}
         return base in resources or any(Interpreter._type_contains_resource(argument) for argument in arguments)
 
     @staticmethod
@@ -1459,7 +1759,7 @@ class Interpreter:
             for resource in self._resource_handles(value):
                 resources.setdefault(id(resource), resource)
         for resource in sorted(resources.values(), key=lambda item: item.identity, reverse=True):
-            if isinstance(resource, (_TyveraTextFile, _TyveraNetworkResource)) and (resource.closed or resource.scoped):
+            if isinstance(resource, (_TyveraTextFile, _TyveraNetworkResource, _TyveraHttpServer)) and (resource.closed or getattr(resource, "scoped", False)):
                 continue
             cleanup_error = self._close_resource(resource)
             if cleanup_error is not None:
@@ -1490,7 +1790,15 @@ class Interpreter:
     def _release_task_frames(self, task: _TyveraTask) -> list[str]:
         frames = task.frames
         task.frames = []
-        return self._cleanup_resource_frames(frames)
+        errors = self._cleanup_resource_frames(frames)
+        resources, task.native_resources = task.native_resources, []
+        for resource in reversed(resources):
+            cleanup_error = self._close_resource(resource)
+            if cleanup_error is not None:
+                errors.append(self._resource_cleanup_diagnostic(
+                    getattr(resource, "location", None) or task.location, cleanup_error,
+                ))
+        return errors
 
     def _project_path(self, value: object) -> Path:
         if not isinstance(value, str):
@@ -1912,6 +2220,56 @@ class Interpreter:
         self._tasks.append(task)
         return task
 
+    def _create_native_task(
+        self, result_type: str, location: Location, step: Callable[[_TyveraTask], None],
+        state: dict[str, object], *, parent: _TyveraTask | None = None,
+        resources: list[object] | None = None,
+    ) -> _TyveraTask:
+        task = _TyveraTask(
+            None, None, location, result_type=canonical_type(result_type),
+            parent=self._current_task if parent is None else parent,
+            owner_actor=(parent.owner_actor if parent is not None else self._current_actor),
+            native_step=step, native_state=state,
+            native_resources=[] if resources is None else resources.copy(),
+        )
+        if task.parent is not None:
+            task.parent.children.append(task)
+        self._tasks.append(task)
+        self._ready_tasks.append(task)
+        return task
+
+    def _native_wait(self, task: _TyveraTask, target: _TyveraTask) -> None:
+        state, error = self._await_state(target)
+        if state == "pending":
+            task.wait_target = target
+            task.state = "waiting"
+            return
+        if state == "failed":
+            task.native_wait_error = error or "HTTP operation failed"
+            return
+        value = target.result
+        if self._resource_handles(value):
+            target.result = None
+        task.native_wait_result = value
+
+    @staticmethod
+    def _take_native_wait(task: _TyveraTask) -> tuple[bool, object, str | None]:
+        if task.native_wait_result is _MISSING and task.native_wait_error is None:
+            return False, None, None
+        value, error = task.native_wait_result, task.native_wait_error
+        task.native_wait_result = _MISSING
+        task.native_wait_error = None
+        return True, value, error
+
+    def _timeout_task_for_native_wait(
+        self, target: _TyveraTask, duration: _TyveraDuration, location: Location,
+    ) -> _TyveraTask:
+        timed = self._create_timeout_task(target, duration, location)
+        if timed.parent is not None:
+            timed.parent.children.remove(timed)
+            timed.parent = None
+        return timed
+
     def _get_io_backend(self) -> IOBackend:
         if self._io_backend is None:
             self._io_backend = IOBackend()
@@ -2327,6 +2685,432 @@ class Interpreter:
             attempt()
         return task
 
+    def _start_http_server_task(self, server: _TyveraHttpServer, location: Location) -> _TyveraTask:
+        task = self._create_native_task(
+            "Result<Bool,String>", location, self._advance_http_server_task,
+            {"server": server, "accept": None},
+        )
+        server.run_task = task
+        return task
+
+    def _http_client_task(
+        self, url: HttpUrl, request: HttpRequest, timeout: _TyveraDuration, location: Location,
+    ) -> _TyveraTask:
+        state: dict[str, object] = {
+            "url": url, "request": request, "timeout": timeout.milliseconds,
+            "phase": "connect", "operation": None, "connection": None,
+            "decoder": HttpMessageDecoder(HttpLimits(), response=True,
+                                           request_method=request.method.name),
+        }
+        if timeout.milliseconds <= 0:
+            state["failure"] = "HTTP timeout must be greater than zero"
+        return self._create_native_task(
+            "Result<HttpResponse,String>", location, self._advance_http_client_task, state,
+        )
+
+    def _schedule_http_client_io(self, task: _TyveraTask) -> None:
+        state = task.native_state
+        phase = state["phase"]
+        if phase == "connect":
+            url = state["url"]
+            assert isinstance(url, HttpUrl)
+            operation = self._tcp_connect_task(url.host, url.port, task.location)
+        elif phase == "write":
+            connection = state["connection"]
+            payload = state["request_bytes"]
+            assert isinstance(connection, _TyveraNetworkResource) and isinstance(payload, bytes)
+            operation = self._tcp_write_task(connection, payload, True, task.location)
+        elif phase == "read":
+            connection = state["connection"]
+            assert isinstance(connection, _TyveraNetworkResource)
+            operation = self._tcp_read_task(connection, 65_536, task.location)
+        else:
+            raise AssertionError("unknown HTTP client phase")
+        timed = self._timeout_task_for_native_wait(
+            operation, _TyveraDuration(int(state["timeout"])), task.location,
+        )
+        task.native_resources.append(timed)
+        state["operation"] = timed
+        self._native_wait(task, timed)
+
+    def _advance_http_client_task(self, task: _TyveraTask) -> None:
+        state = task.native_state
+        failure = state.get("failure")
+        if isinstance(failure, str):
+            self._finish_http_client(task, _TyveraVariant("Err", failure, "Result", 1))
+            return
+        operation = state.get("operation")
+        if not isinstance(operation, _TyveraTask):
+            if state["phase"] == "write":
+                request = state["request"]
+                url = state["url"]
+                assert isinstance(request, HttpRequest) and isinstance(url, HttpUrl)
+                headers = request.headers.copy()
+                try:
+                    headers.set("Host", url.authority)
+                    headers.set("Connection", "close")
+                    request_bytes = encode_request(
+                        request.method, request.target, headers, request.body,
+                    )
+                except (HttpProtocolError, ValueError, UnicodeEncodeError) as error:
+                    self._finish_http_client(task, _TyveraVariant(
+                        "Err", f"HTTP request encoding failed: {error}", "Result", 1,
+                    ))
+                    return
+                state["request_bytes"] = request_bytes
+            self._schedule_http_client_io(task)
+            return
+
+        ready, value, error = self._take_native_wait(task)
+        if not ready:
+            self._native_wait(task, operation)
+            ready, value, error = self._take_native_wait(task)
+            if not ready:
+                return
+        state["operation"] = None
+        phase = state["phase"]
+        if error is not None:
+            if error == "task timed out":
+                operation.state = "completed"
+                operation.error = None
+                message = "HTTP timeout"
+            else:
+                message = f"HTTP {phase} failed: {error}"
+            self._finish_http_client(task, _TyveraVariant("Err", message, "Result", 1))
+            return
+        if not isinstance(value, _TyveraVariant):
+            self._finish_http_client(task, _TyveraVariant(
+                "Err", "invalid HTTP operation completion", "Result", 1,
+            ))
+            return
+        if value.variant == "Err":
+            self._finish_http_client(task, _TyveraVariant(
+                "Err", f"HTTP {phase} failed: {value.payload}", "Result", 1,
+            ))
+            return
+
+        result = value.payload
+        if phase == "connect":
+            if not isinstance(result, _TyveraNetworkResource):
+                self._finish_http_client(task, _TyveraVariant(
+                    "Err", "HTTP connect returned no connection", "Result", 1,
+                ))
+                return
+            state["connection"] = result
+            task.native_resources.append(result)
+            state["phase"] = "write"
+            self._advance_http_client_task(task)
+            return
+        if phase == "write":
+            state["phase"] = "read"
+            self._schedule_http_client_io(task)
+            return
+
+        if not isinstance(result, _TyveraVariant):
+            self._finish_http_client(task, _TyveraVariant(
+                "Err", "invalid HTTP response read completion", "Result", 1,
+            ))
+            return
+        decoder = state["decoder"]
+        assert isinstance(decoder, HttpMessageDecoder)
+        if result.variant == "None":
+            decoder.finish()
+        else:
+            payload = result.payload
+            if not isinstance(payload, _TyveraBytes):
+                self._finish_http_client(task, _TyveraVariant(
+                    "Err", "invalid HTTP response byte chunk", "Result", 1,
+                ))
+                return
+            try:
+                decoder.feed(payload.value)
+            except HttpProtocolError as protocol_error:
+                self._finish_http_client(task, _TyveraVariant(
+                    "Err", f"HTTP response parse error: {protocol_error}", "Result", 1,
+                ))
+                return
+        try:
+            response = decoder.next_message()
+        except HttpProtocolError as protocol_error:
+            self._finish_http_client(task, _TyveraVariant(
+                "Err", f"HTTP response parse error: {protocol_error}", "Result", 1,
+            ))
+            return
+        if isinstance(response, HttpResponse):
+            if 100 <= response.status < 200 and response.status != 101:
+                state["phase"] = "read"
+                self._schedule_http_client_io(task)
+            else:
+                self._finish_http_client(task, _TyveraVariant("Ok", response, "Result", 1))
+            return
+        if result.variant == "None":
+            self._finish_http_client(task, _TyveraVariant(
+                "Err", "HTTP connection closed before a complete response", "Result", 1,
+            ))
+            return
+        self._schedule_http_client_io(task)
+
+    def _finish_http_client(self, task: _TyveraTask, result: _TyveraVariant) -> None:
+        task.result = result
+        self._complete_task(task)
+
+    def _advance_http_server_task(self, task: _TyveraTask) -> None:
+        server = task.native_state["server"]
+        assert isinstance(server, _TyveraHttpServer)
+        ready, value, error = self._take_native_wait(task)
+        if not ready:
+            if server.stopped or server.listener.closed:
+                task.result = _TyveraVariant("Ok", True, "Result", 1)
+                self._complete_task(task)
+                return
+            accept = task.native_state.get("accept")
+            if not isinstance(accept, _TyveraTask):
+                accept = self._tcp_accept_task(server.listener, task.location)
+                task.native_state["accept"] = accept
+            self._native_wait(task, accept)
+            ready, value, error = self._take_native_wait(task)
+            if not ready:
+                return
+        accept_task = task.native_state.get("accept")
+        if isinstance(accept_task, _TyveraTask) and accept_task.state in {"completed", "failed", "cancelled"}:
+            if accept_task in task.children:
+                task.children.remove(accept_task)
+            accept_task.parent = None
+        task.native_state["accept"] = None
+        if error is not None:
+            if server.stopped or server.listener.closed:
+                task.result = _TyveraVariant("Ok", True, "Result", 1)
+            else:
+                server.stopped = True
+                if not server.listener.closed:
+                    self._close_resource(server.listener)
+                task.result = _TyveraVariant("Err", error, "Result", 1)
+            self._complete_task(task)
+            return
+        if not isinstance(value, _TyveraVariant):
+            server.stopped = True
+            task.result = _TyveraVariant("Err", "invalid TCP accept completion", "Result", 1)
+            self._complete_task(task)
+            return
+        if value.variant == "Err":
+            if server.stopped or server.listener.closed:
+                task.result = _TyveraVariant("Ok", True, "Result", 1)
+            else:
+                server.stopped = True
+                if not server.listener.closed:
+                    self._close_resource(server.listener)
+                task.result = _TyveraVariant("Err", str(value.payload), "Result", 1)
+            self._complete_task(task)
+            return
+        connection = value.payload
+        if not isinstance(connection, _TyveraNetworkResource):
+            server.stopped = True
+            task.result = _TyveraVariant("Err", "invalid accepted TCP connection", "Result", 1)
+            self._complete_task(task)
+            return
+        active_connections = sum(
+            1 for child in task.children
+            if child.native_state.get("http_connection") and self._task_is_active(child)
+        )
+        if active_connections >= server.limits.max_connections:
+            self._close_resource(connection)
+            return
+        if server.stopped:
+            self._close_resource(connection)
+            task.result = _TyveraVariant("Ok", True, "Result", 1)
+            self._complete_task(task)
+            return
+        self._create_native_task(
+            "Void", task.location, self._advance_http_connection_task,
+            {
+                "connection": connection,
+                "server": server,
+                "router": server.router,
+                "limits": server.limits,
+                "timeout": server.timeout_milliseconds,
+                "decoder": HttpMessageDecoder(server.limits),
+                "operation": None,
+                "phase": "read",
+                "keep_alive": False,
+                "request_method": None,
+                "deadline": None,
+                "http_connection": True,
+            },
+            parent=task,
+            resources=[connection],
+        )
+
+    def _advance_http_connection_task(self, task: _TyveraTask) -> None:
+        state = task.native_state
+        connection = state["connection"]
+        decoder = state["decoder"]
+        assert isinstance(connection, _TyveraNetworkResource)
+        assert isinstance(decoder, HttpMessageDecoder)
+        operation = state.get("operation")
+        if isinstance(operation, _TyveraTask):
+            ready, value, error = self._take_native_wait(task)
+            if not ready:
+                self._native_wait(task, operation)
+                ready, value, error = self._take_native_wait(task)
+                if not ready:
+                    return
+            state["operation"] = None
+            if error is not None:
+                if state["phase"] == "read" and error == "task timed out":
+                    if isinstance(operation, _TyveraTask):
+                        operation.state = "completed"
+                        operation.error = None
+                    self._http_connection_write_response(task, text_response(408, "Request Timeout"), close=True)
+                    return
+                if error == "task timed out" and isinstance(operation, _TyveraTask):
+                    operation.state = "completed"
+                    operation.error = None
+                self._complete_task(task)
+                return
+            if not isinstance(value, _TyveraVariant) or value.variant != "Ok":
+                self._complete_task(task)
+                return
+            result = value.payload
+            if state["phase"] == "read":
+                if not isinstance(result, _TyveraVariant):
+                    self._complete_task(task)
+                    return
+                if result.variant == "None":
+                    self._complete_task(task)
+                    return
+                payload = result.payload
+                if not isinstance(payload, _TyveraBytes):
+                    self._complete_task(task)
+                    return
+                try:
+                    decoder.feed(payload.value)
+                except HttpProtocolError as protocol_error:
+                    self._http_protocol_error_response(task, protocol_error)
+                    return
+                request, protocol_error = self._http_take_request(decoder)
+                if protocol_error is not None:
+                    self._http_protocol_error_response(task, protocol_error)
+                    return
+                if request is None:
+                    self._http_connection_read(task)
+                    return
+                self._http_dispatch_request(task, request)
+                return
+            if state["phase"] == "write":
+                if state.get("keep_alive") and not state.get("closing"):
+                    state["deadline"] = None
+                    state["phase"] = "read"
+                    request, protocol_error = self._http_take_request(decoder)
+                    if protocol_error is not None:
+                        self._http_protocol_error_response(task, protocol_error)
+                    elif request is not None:
+                        self._http_dispatch_request(task, request)
+                    else:
+                        self._http_connection_read(task)
+                    return
+                self._complete_task(task)
+                return
+
+        if state["phase"] == "read":
+            request, protocol_error = self._http_take_request(decoder)
+            if protocol_error is not None:
+                self._http_protocol_error_response(task, protocol_error)
+            elif request is not None:
+                self._http_dispatch_request(task, request)
+            else:
+                self._http_connection_read(task)
+
+    @staticmethod
+    def _http_take_request(decoder: HttpMessageDecoder) -> tuple[HttpRequest | None, HttpProtocolError | None]:
+        try:
+            message = decoder.next_message()
+        except HttpProtocolError as error:
+            return None, error
+        return (message if isinstance(message, HttpRequest) else None), None
+
+    def _http_connection_read(self, task: _TyveraTask) -> None:
+        state = task.native_state
+        connection = state["connection"]
+        deadline = state.get("deadline")
+        if deadline is None:
+            deadline = self._clock() + int(state["timeout"]) / 1000.0
+            state["deadline"] = deadline
+        remaining = int((float(deadline) - self._clock()) * 1000)
+        if remaining <= 0:
+            self._http_connection_write_response(task, text_response(408, "Request Timeout"), close=True)
+            return
+        read = self._tcp_read_task(connection, 65_536, task.location)
+        state["phase"] = "read"
+        timed = self._timeout_task_for_native_wait(read, _TyveraDuration(remaining), task.location)
+        task.native_resources.append(timed)
+        state["operation"] = timed
+        self._native_wait(task, timed)
+
+    def _http_dispatch_request(self, task: _TyveraTask, request: HttpRequest) -> None:
+        state = task.native_state
+        connection = state["connection"]
+        assert isinstance(connection, _TyveraNetworkResource)
+        try:
+            request._remote_address = self._socket_address(
+                connection.stream.getpeername(), connection.stream.family,
+            )
+        except (OSError, ValueError):
+            request._remote_address = None
+        router = state["router"]
+        assert isinstance(router, HttpRouter)
+        keep_alive = request.is_keep_alive()
+        server = state["server"]
+        if isinstance(server, _TyveraHttpServer) and server.stopped:
+            keep_alive = False
+        try:
+            response = router.dispatch(request)
+            encoded = encode_response(
+                response, keep_alive=keep_alive, request_method=request.method.name,
+                limits=state["limits"],
+            )
+        except (HttpProtocolError, ValueError, UnicodeEncodeError):
+            response = text_response(500, "Internal Server Error")
+            encoded = encode_response(response, keep_alive=False)
+            keep_alive = False
+        state["request_method"] = request.method.name
+        state["keep_alive"] = keep_alive
+        state["closing"] = not keep_alive
+        self._http_connection_write(task, encoded)
+
+    def _http_protocol_error_response(self, task: _TyveraTask, error: HttpProtocolError) -> None:
+        message = str(error)
+        status = 414 if "request line" in message or "start line" in message else (
+            431 if "header" in message else 413 if "size limit" in message else 400
+        )
+        response = text_response(status, message)
+        self._http_connection_write_response(task, response, close=True)
+
+    def _http_connection_write_response(self, task: _TyveraTask, response: HttpResponse, *, close: bool) -> None:
+        state = task.native_state
+        try:
+            payload = encode_response(
+                response, keep_alive=not close,
+                request_method=state.get("request_method"),
+            )
+        except (HttpProtocolError, ValueError, UnicodeEncodeError):
+            self._complete_task(task)
+            return
+        state["keep_alive"] = not close
+        state["closing"] = close
+        self._http_connection_write(task, payload)
+
+    def _http_connection_write(self, task: _TyveraTask, payload: bytes) -> None:
+        state = task.native_state
+        connection = state["connection"]
+        write = self._tcp_write_task(connection, payload, True, task.location)
+        state["phase"] = "write"
+        timed = self._timeout_task_for_native_wait(
+            write, _TyveraDuration(int(state["timeout"])), task.location,
+        )
+        task.native_resources.append(timed)
+        state["operation"] = timed
+        self._native_wait(task, timed)
+
     def _cancel_socket_wait(self, resource: _TyveraNetworkResource, event: int,
                             callback: Callable[[], None], direction: str,
                             task: _TyveraTask) -> None:
@@ -2482,7 +3266,10 @@ class Interpreter:
                     previous_task = self._current_task
                     self._current_task = task
                     try:
-                        self._advance_async_task(task)
+                        if task.native_step is not None:
+                            task.native_step(task)
+                        else:
+                            self._advance_async_task(task)
                     except _ReturnSignal as signal:
                         task.result = signal.value
                         self._complete_task(task)
@@ -2492,7 +3279,10 @@ class Interpreter:
                         self._handle_async_loop_control(task, signal)
                     finally:
                         self._current_task = previous_task
-                    if task.state == "running":
+                    if task.state == "running" and task.native_step is not None:
+                        task.state = "runnable"
+                        self._ready_tasks.append(task)
+                    elif task.state == "running":
                         if task.frames:
                             task.state = "runnable"
                             self._ready_tasks.append(task)
@@ -2781,6 +3571,16 @@ class Interpreter:
             if state == "pending":
                 continue
             task.wait_target = None
+            if task.native_step is not None:
+                if state == "failed":
+                    task.native_wait_error = error or "HTTP operation failed"
+                else:
+                    task.native_wait_result = target.result
+                    if self._resource_handles(target.result):
+                        target.result = None
+                task.state = "runnable"
+                self._ready_tasks.append(task)
+                continue
             frame = task.wait_frame
             statement = task.wait_statement
             task.wait_frame = None
@@ -2831,6 +3631,16 @@ class Interpreter:
             task.state = "joining"
         else:
             task.state = "completed"
+        self._forget_http_connection_child(task)
+
+    @staticmethod
+    def _forget_http_connection_child(task: _TyveraTask) -> None:
+        if not task.native_state.get("http_connection") or task.state != "completed":
+            return
+        parent = task.parent
+        if parent is not None and task in parent.children:
+            parent.children.remove(task)
+        task.parent = None
 
     def _settle_joining_tasks(self) -> None:
         for task in self._tasks:
@@ -2842,6 +3652,7 @@ class Interpreter:
             elif not any(child.state in {"runnable", "running", "waiting", "sleeping", "joining", "timed_wait", "io_wait"}
                          for child in task.children):
                 task.state = "completed"
+                self._forget_http_connection_child(task)
 
     def _cancel_task(self, task: _TyveraTask) -> None:
         if task.state in {"completed", "failed", "cancelled"}:

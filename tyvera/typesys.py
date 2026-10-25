@@ -54,12 +54,15 @@ from .type_names import make_type, split_type, substitute_type
 _BUILTIN_TYPES = {
     "Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result",
     "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile", "TextReader", "TextWriter", "Bytes", "SocketAddress", "TcpConnection", "TcpListener",
+    "HttpMethod", "HttpUrl", "HttpLimits", "HttpHeaders", "HttpRequest", "HttpResponse", "HttpDecoder", "HttpRouter", "HttpServer",
 }
 _BUILTIN_FUNCTIONS = {
     "println", "eprintln", "readText", "writeText", "openText", "openTextReader", "openTextWriter", "openTextAsync", "bytesFromString", "resolveHost", "tcpConnect", "tcpListen", "pathJoin", "pathExists",
     "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool",
     "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors", "oneForOne",
     "milliseconds", "seconds", "timerAfter", "sleepFor", "runTasks", "taskGroup",
+    "httpMethod", "httpUrl", "httpLimits", "httpDefaultLimits", "httpHeaders", "httpRequest", "httpResponse",
+    "httpTextResponse", "httpJsonResponse", "httpRouter", "httpRequestDecoder", "httpResponseDecoder", "httpEncodeRequest", "httpEncodeResponse", "httpServer", "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete",
 }
 _DISPLAYABLE_TYPES = {"Int", "Float", "Bool", "String"}
 _NUMERIC_TYPES = {"Int", "Float"}
@@ -151,7 +154,7 @@ class TypeChecker:
         self._ownership_flow: dict[int, str] = {}
         self._next_ownership_id = 1
         self._next_scope_id = 1
-        self.resource_types = {"TextFile", "TextReader", "TextWriter", "TcpConnection", "TcpListener"}
+        self.resource_types = {"TextFile", "TextReader", "TextWriter", "TcpConnection", "TcpListener", "HttpServer"}
         self.move_sites: dict[Location, str] = {}
         self.resource_scopes: dict[Location, str] = {}
         self.cleanup_points: dict[Location, tuple[str, ...]] = {}
@@ -1016,6 +1019,35 @@ class TypeChecker:
                 argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
                 self._check_arguments(expression.arguments, argument_types, ("String",), expression.location, "bytesFromString")
                 return "Bytes"
+            http_signatures = {
+                "httpMethod": (("String",), "Result<HttpMethod,String>"),
+                "httpUrl": (("String",), "Result<HttpUrl,String>"),
+                "httpLimits": (("Int", "Int", "Int", "Int", "Int"), "Result<HttpLimits,String>"),
+                "httpDefaultLimits": ((), "HttpLimits"),
+                "httpHeaders": ((), "HttpHeaders"),
+                "httpRequest": (("HttpMethod", "String", "HttpHeaders", "Bytes"), "Result<HttpRequest,String>"),
+                "httpResponse": (("Int", "HttpHeaders", "Bytes"), "Result<HttpResponse,String>"),
+                "httpTextResponse": (("Int", "String"), "Result<HttpResponse,String>"),
+                "httpJsonResponse": (("Int", "Json"), "Result<HttpResponse,String>"),
+                "httpRouter": ((), "HttpRouter"),
+                "httpRequestDecoder": (("HttpLimits",), "HttpDecoder"),
+                "httpResponseDecoder": (("HttpLimits", "HttpMethod"), "HttpDecoder"),
+                "httpEncodeRequest": (("HttpRequest",), "Result<Bytes,String>"),
+                "httpEncodeResponse": (("HttpResponse", "Bool"), "Result<Bytes,String>"),
+                "httpServer": (("TcpListener", "HttpRouter", "HttpLimits", "Duration"), "Result<HttpServer,String>"),
+                "httpSend": (("HttpUrl", "HttpRequest", "Duration"), "Task<Result<HttpResponse,String>>"),
+                "httpGet": (("HttpUrl", "Duration"), "Task<Result<HttpResponse,String>>"),
+                "httpPost": (("HttpUrl", "HttpHeaders", "Bytes", "Duration"), "Task<Result<HttpResponse,String>>"),
+                "httpPut": (("HttpUrl", "HttpHeaders", "Bytes", "Duration"), "Task<Result<HttpResponse,String>>"),
+                "httpDelete": (("HttpUrl", "Duration"), "Task<Result<HttpResponse,String>>"),
+            }
+            if expression.callee in http_signatures:
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", f"'{expression.callee}' does not accept type arguments")
+                argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
+                expected, result = http_signatures[expression.callee]
+                self._check_arguments(expression.arguments, argument_types, expected, expression.location, expression.callee)
+                return result
             if expression.callee == "resolveHost":
                 expected = ("String", "Int")
                 if expression.type_arguments:
@@ -1327,6 +1359,14 @@ class TypeChecker:
                         "close": ((), "Bool"),
                         "isOpen": ((), "Bool"),
                     },
+                    "HttpServer": {
+                        "start": ((), "Task<Result<Bool,String>>"),
+                        "shutdown": ((), "Bool"),
+                        "localAddress": ((), "Result<SocketAddress,String>"),
+                        "isOpen": ((), "Bool"),
+                        "isRunning": ((), "Bool"),
+                        "close": ((), "Bool"),
+                    },
                 }[receiver_base]
                 method_signature = methods.get(expression.method)
                 if method_signature is None:
@@ -1484,6 +1524,58 @@ class TypeChecker:
                 expected_types, result_type = method_signature
                 self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
                                       f"SocketAddress.{expression.method}")
+                return result_type
+            http_methods = {
+                "HttpMethod": {
+                    "name": ((), "String"), "isStandard": ((), "Bool"),
+                },
+                "HttpUrl": {
+                    "scheme": ((), "String"), "host": ((), "String"), "port": ((), "Int"),
+                    "target": ((), "String"), "authority": ((), "String"),
+                },
+                "HttpLimits": {
+                    "requestLineBytes": ((), "Int"), "headerBytes": ((), "Int"),
+                    "headerCount": ((), "Int"), "bodyBytes": ((), "Int"),
+                    "maxConnections": ((), "Int"),
+                },
+                "HttpHeaders": {
+                    "add": (("String", "String"), "Result<Bool,String>"),
+                    "set": (("String", "String"), "Result<Bool,String>"),
+                    "remove": (("String",), "Int"), "get": (("String",), "Option<String>"),
+                    "values": (("String",), "List<String>"), "contains": (("String",), "Bool"),
+                    "length": ((), "Int"),
+                },
+                "HttpRequest": {
+                    "method": ((), "HttpMethod"), "target": ((), "String"), "path": ((), "String"),
+                    "version": ((), "String"), "headers": ((), "HttpHeaders"), "body": ((), "Bytes"),
+                    "header": (("String",), "Option<String>"), "query": (("String",), "Option<String>"),
+                    "queryValues": (("String",), "List<String>"),
+                    "routeParameter": (("String",), "Option<String>"),
+                    "remoteAddress": ((), "Option<SocketAddress>"), "isKeepAlive": ((), "Bool"),
+                    "json": ((), "Result<Json,String>"),
+                },
+                "HttpResponse": {
+                    "status": ((), "Int"), "headers": ((), "HttpHeaders"), "body": ((), "Bytes"),
+                },
+                "HttpDecoder": {
+                    "feed": (("Bytes",), "Result<Bool,String>"),
+                    "nextRequest": ((), "Result<Option<HttpRequest>,String>"),
+                    "nextResponse": ((), "Result<Option<HttpResponse>,String>"),
+                    "finish": ((), "Result<Bool,String>"), "bufferedBytes": ((), "Int"),
+                },
+                "HttpRouter": {
+                    "add": (("HttpMethod", "String", "HttpResponse"), "Result<Bool,String>"),
+                    "dispatch": (("HttpRequest",), "HttpResponse"),
+                },
+            }
+            if receiver_base in http_methods:
+                methods = http_methods[receiver_base]
+                method_signature = methods.get(expression.method)
+                if method_signature is None:
+                    raise Diagnostic(expression.location, "type", f"{receiver_base} has no method '{expression.method}'")
+                expected_types, result_type = method_signature
+                self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
+                                      f"{receiver_base}.{expression.method}")
                 return result_type
             if receiver_base == "TaskGroup":
                 if receiver_arguments:

@@ -101,7 +101,8 @@ message or interrupt a running handler.
 
 ## Resource cleanup
 
-`TextFile`, `TextReader`, `TextWriter`, `TcpConnection`, and `TcpListener`
+`TextFile`, `TextReader`, `TextWriter`, `TcpConnection`, `TcpListener`, and
+`HttpServer`
 handles are move-only. `Option`, `Result`, and resource-returning `Task` values
 may carry them; other aggregate and collection types reject them. Owned
 handles close in reverse acquisition order at block exit, function return,
@@ -142,10 +143,22 @@ observe that state with `tryResult()`. The reference adapter currently uses
 selectors and a bounded worker pool, but those mechanisms do not define the
 language contract.
 
+The experimental HTTP server creates one owned task per accepted connection,
+with a configured cap from `HttpLimits.maxConnections`. Request header and body
+reads share one monotonic request deadline, so sending occasional bytes does
+not extend a slow-client deadline indefinitely. Writes use the same configured
+per-operation timeout and the existing bounded `writeAll` readiness path. A
+read timeout produces a controlled HTTP 408 response; other network and parse
+errors close that connection without crashing the server task. `shutdown()`
+closes the listener and joins active connection tasks; `close()` cancels the
+server task tree. Runtime or actor cancellation follows the ordinary owned
+task/resource cleanup path. See [HTTP foundation](http.md) for the protocol
+limits and client lifecycle.
+
 ## Not implemented
 
-True parallel task execution, TLS, HTTP, WebSockets, protocols, and native
-execution remain planned. TCP V1 and async text-file operations are
-implemented. See the
+True parallel task execution, TLS, WebSockets, HTTP streaming, and native
+execution remain planned. TCP V1, async text-file operations, and experimental
+HTTP/1.1 V1 are implemented. See the
 [memory model](memory-model.md) and
 [backend architecture](backend-architecture.md).

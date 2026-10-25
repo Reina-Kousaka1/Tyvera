@@ -80,12 +80,15 @@ another OS facility as long as the observable Tyvera scheduling and ownership
 rules stay the same. Native code generation and a native I/O backend are not
 implemented in this branch.
 
-The first networking layer has no user-defined general Stream interface. TCP
+The networking layer has no user-defined general Stream interface. TCP
 establishes a byte-stream contract; text files retain their UTF-8 resource
-API. A TLS adapter can later wrap that owned byte-stream boundary using a
+API. Experimental HTTP/1.1 codecs, a typed client, and a bounded concurrent
+server use that same owned byte-stream path. The HTTP parser/encoder is
+backend-independent; the reference interpreter adapts it to existing TCP
+tasks. A TLS adapter can later wrap the owned byte-stream boundary using a
 vetted platform cryptography library. Tyvera does not implement TLS or
-cryptography here. HTTP, WebSockets, database protocols, and other application
-protocols belong above this transport boundary and are outside this block.
+cryptography here. HTTP/2, HTTP/3, WebSockets, database protocols, and other
+application protocols beyond this foundation remain separate work.
 
 ### Backend implementation
 

@@ -1,0 +1,135 @@
+async fn requestHello(url: HttpUrl) {
+    let result = await httpGet(url, milliseconds(2000))
+    match result {
+        Err(error) => println(error)
+        Ok(response) => {
+            println(response.status())
+            let body = response.body().toString()
+            match body {
+                Err(error) => println(error)
+                Ok(text) => println(text)
+            }
+        }
+    }
+}
+
+async fn submitHello(url: HttpUrl) {
+    let method = httpMethod("POST")
+    match method {
+        Err(error) => println(error)
+        Ok(value) => {
+            let headers = httpHeaders()
+            let requestResult = httpRequest(value, url.target(), headers, bytesFromString("payload"))
+            match requestResult {
+                Err(error) => println(error)
+                Ok(request) => {
+                    let result = await httpSend(url, request, milliseconds(2000))
+                    match result {
+                        Err(error) => println(error)
+                        Ok(response) => {
+                            println(response.status())
+                            let body = response.body().toString()
+                            match body {
+                                Err(error) => println(error)
+                                Ok(text) => println(text)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn runHttpExample() {
+    let opened = await tcpListen("127.0.0.1", 0, 16)
+    match move opened {
+        Err(error) => println(error)
+        Ok(listener) => {
+            let addressResult = listener.localAddress()
+            match addressResult {
+                Err(error) => {
+                    println(error)
+                    listener.close()
+                }
+                Ok(address) => {
+                    let urlResult = httpUrl("http://" + address.toString() + "/hello")
+                    let responseResult = httpTextResponse(200, "Hello from Tyvera")
+                    let createdResult = httpTextResponse(201, "Created")
+                    match urlResult {
+                        Err(error) => {
+                            println(error)
+                            listener.close()
+                        }
+                        Ok(url) => match responseResult {
+                            Err(error) => {
+                                println(error)
+                                listener.close()
+                            }
+                            Ok(response) => {
+                                let router = httpRouter()
+                                let methodResult = httpMethod("GET")
+                                match methodResult {
+                                    Err(error) => {
+                                        println(error)
+                                        listener.close()
+                                    }
+                                    Ok(method) => {
+                                let route = router.add(method, "/hello", response)
+                                match route {
+                                    Err(error) => {
+                                        println(error)
+                                        listener.close()
+                                    }
+                                    Ok(_) => {
+                                        let postMethod = httpMethod("POST")
+                                        match postMethod {
+                                            Err(error) => println(error)
+                                            Ok(value) => match createdResult {
+                                                Err(error) => println(error)
+                                                Ok(created) => {
+                                                    let postRoute = router.add(value, "/hello", created)
+                                                    match postRoute {
+                                                        Err(error) => println(error)
+                                                        Ok(_) => {}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let configured = httpServer(move listener, router, httpDefaultLimits(), milliseconds(2000))
+                                        match move configured {
+                                            Err(error) => println(error)
+                                            Ok(server) => {
+                                                let serving = server.start()
+                                                let firstClient = requestHello(url)
+                                                let secondClient = requestHello(url)
+                                                let postClient = submitHello(url)
+                                                await firstClient
+                                                await secondClient
+                                                await postClient
+                                                server.shutdown()
+                                                let stopped = await serving
+                                                match stopped {
+                                                    Err(error) => println(error)
+                                                    Ok(_) => println("HTTP server stopped")
+                                                }
+                                                server.close()
+                                            }
+                                        }
+                                    }
+                                }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    let task = runHttpExample()
+    runTasks()
+}
