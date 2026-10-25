@@ -1,17 +1,21 @@
 # Tyvera
 
+[![Python bootstrap 3.10+; CI 3.10 and 3.13](https://img.shields.io/badge/Python%20bootstrap-3.10%2B%20%7C%20CI%203.10%2F3.13-3776AB?logo=python&logoColor=white)](#core-language-bootstrap)
 [![CI](https://github.com/Reina-Kousaka1/Tyvera/actions/workflows/ci.yml/badge.svg?branch=Dev)](https://github.com/Reina-Kousaka1/Tyvera/actions/workflows/ci.yml)
+[![License: GPLv3](https://img.shields.io/github/license/Reina-Kousaka1/Tyvera)](LICENSE)
+[![Bootstrap toolchain version: 0.1.0](https://img.shields.io/badge/bootstrap%20toolchain-0.1.0-informational)](pyproject.toml)
 
 Tyvera is an independent, statically typed programming language with a design direction informed by Java's structure, Elixir's resilient concurrency model, and C++'s performance and system-level capabilities. It is not an extension or fork of those languages. TypeScript is not part of the current Tyvera design.
 
 ## Core language bootstrap
 
 The repository contains a working bootstrap toolchain: a lexer, parser and AST,
-static type checker, source-located diagnostics, and interpreter. Python is the
-bootstrap host and current reference implementation for Tyvera semantics; it
-is not part of the long-term language contract. The present toolchain requires
-Python 3.10 or newer. Native executables that run without Python remain a
-planned goal, and no native backend exists yet.
+static type checker, source-located diagnostics, and interpreter. Python/CPython
+hosts the bootstrap toolchain and current reference implementation for Tyvera
+semantics; Tyvera source is not compiled to Python, and Python is not part of
+the long-term language contract. The present toolchain requires Python 3.10 or
+newer. Native executables that run without Python remain a planned goal, and no
+native backend exists yet.
 
 The implemented language includes `Int`, `Float`, `Bool`, `String`, `Void`,
 interface-constrained generic functions, classes, records, enums and newtypes, transparent type
@@ -42,6 +46,38 @@ tasks waiting on actor replies are specified and tested. `Unit`, `and`, and
 `or` remain compatibility spellings.
 
 Bootstrap requirements: Python 3.10 or newer. The toolchain has no third-party runtime dependencies.
+
+## Dependency graphs
+
+### Package dependencies
+
+The runtime uses Python's standard library and declares no third-party runtime
+packages. `setuptools` is required only to build/install the bootstrap package.
+
+```mermaid
+flowchart LR
+    cli["Tyvera CLI / reference runtime"] --> py["Python / CPython 3.10+"]
+    py --> stdlib["Python standard library"]
+    pip["pip install -e ."] --> backend["setuptools.build_meta"]
+    backend --> setuptools["setuptools >= 61 (build time)"]
+```
+
+### Compiler and execution path
+
+```mermaid
+flowchart LR
+    source["Tyvera .tyv source"] --> frontend["Lexer, parser and AST"]
+    frontend --> modules["Module linking"]
+    modules --> checker["Type checking and semantic analysis"]
+    checker --> checked["CheckedProgram"]
+    checked --> boundary["ExecutionBackend"]
+    boundary --> reference["ReferenceInterpreterBackend"]
+    reference --> runtime["Tyvera reference runtime"]
+    runtime --> python["Python / CPython host"]
+```
+
+The native backend is not implemented; `ExecutionBackend` currently selects
+the reference interpreter.
 
 Tyvera is licensed under **GNU GPLv3**; see [LICENSE](LICENSE).
 
