@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [Dev]
+    branches: [Dev, feature/language-runtime-foundations]
   pull_request:
     branches: [Dev]
   workflow_dispatch:
