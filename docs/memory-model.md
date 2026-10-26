@@ -56,17 +56,19 @@ still future work.
 ## Memory Model V1
 
 V1 keeps ordinary value and reference behavior while giving resources explicit
-ownership. It does not require a general borrow checker.
+ownership. It does not require a general borrow checker. These rules describe
+Tyvera semantics and the reference runtime; the experimental native backend
+implements only the primitive synchronous subset noted below.
 
 ### Values and references
 
 | Category | V1 direction | Status |
 | --- | --- | --- |
 | `Int`, `Float`, `Bool`, `Duration` | Immutable scalar values; assignment copies the value. | Implemented; signed 64-bit and finite binary64 rules are specified. |
-| `Byte` | Immutable unsigned 8-bit scalar, explicitly converted to/from `Int` with range checking. | Implemented; values outside 0..255 return `Err`, with no implicit conversion. |
+| `Byte` | Immutable unsigned 8-bit scalar, explicitly converted to/from `Int` with range checking. | Reference runtime implemented; native backend V1 remains interpreter-only. |
 | `String` | Immutable Unicode scalar sequence; equality compares exact sequence, without normalization. | Implemented for source and file I/O; indexing and grapheme APIs remain open. |
-| `Bytes` | Immutable byte value; equality compares contents. Assignment, calls, returns, and actor messages preserve value semantics. Binary slices and indexed reads return checked results. | Implemented; UTF-8 decoding remains explicit through `toString()`. |
-| `ByteBuffer` | Shared mutable reference to zero-initialized, runtime-managed bytes; access is bounds checked and snapshots are immutable. | Implemented with a 64 MiB length cap; raw pointers, unchecked access, custom allocators, and manual deallocation are not exposed. |
+| `Bytes` | Immutable byte value; equality compares contents. Assignment, calls, returns, and actor messages preserve value semantics. Binary slices and indexed reads return checked results. | Reference runtime implemented; native backend V1 remains interpreter-only. UTF-8 decoding is explicit through `toString()`. |
+| `ByteBuffer` | Shared mutable reference to zero-initialized, runtime-managed bytes; access is bounds checked and snapshots are immutable. | Reference runtime implemented with a 64 MiB cap; native backend V1 remains interpreter-only. Raw pointers, unchecked access, custom allocators, and manual deallocation are not exposed. |
 | `Json`, `Option<T>`, `Result<T,E>`, enums, newtypes, tuples | Immutable tagged values with structural equality; nested references retain their own identity/value behavior. | Implemented in the bootstrap; native representation remains planned. |
 | Records | Immutable nominal value records; fields compare structurally. Nested mutable references remain shared. | Implemented, including generic types, destructuring, and safe derived map keys. |
 | Class instances, lists, maps | Classes use stable identity; lists and maps compare by contents. Assignment copies references; collection contents remain shared. | Implemented in the bootstrap. |
@@ -157,8 +159,22 @@ deadline behavior, partial byte reads/writes, EOF, backpressure, ownership, and
 controlled `Result` errors. It does not expose Python sockets, asyncio,
 exceptions, file objects, or OS address structs. The current reference
 adapter uses a selector for TCP readiness and a bounded worker pool for DNS
-and file operations. A future native backend must implement the same
-observable behavior with the platform's completion or readiness facilities.
+and file operations. Native Backend V1 does not compile these APIs. A future
+native I/O runtime must implement the same observable behavior with the
+platform's completion or readiness facilities.
+
+### Native executable subset
+
+Native V1 currently compiles `Int`, `Float`, `Bool`, `String`, and `Void`,
+local variables and assignments, synchronous functions and calls, arithmetic,
+comparisons, boolean short-circuiting, `if`/`else`, `while`, loop control, and
+scalar output. The generated C++17 support code keeps checked integer and
+finite-Float behavior and reports source-located runtime errors. Native
+programs do not invoke or embed Python. `Byte`, `Bytes`, `ByteBuffer`, binary
+and text I/O, resources and cleanup, `Option`/`Result`, collections, classes,
+generics, Tasks, Actors, networking, and HTTP remain reference-interpreter
+features; native build rejects them explicitly. No public native ABI or FFI is
+implemented.
 
 `Bytes` is immutable and does not own an external resource. Binary file
 operations and `ByteBuffer` allocation/access are bounded to 67,108,864 bytes;

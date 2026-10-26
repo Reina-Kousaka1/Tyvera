@@ -8,17 +8,20 @@ A source file passes through the frontend and selected backend:
 2. `parser.py` builds the Tyvera-specific AST in `ast.py`.
 3. `typesys.py` collects and validates declarations, expressions, calls,
    constructors, interface contracts and the entry point before execution.
-4. `compiler.py` returns a `CheckedProgram` after semantic analysis. The
-   current top-level function signature table is retained; inferred expression
-   types and most resolved semantic facts are not.
-5. `backend.py` defines the `ExecutionBackend` boundary. The CLI currently
-   selects `ReferenceInterpreterBackend`, which delegates to `interpreter.py`.
+4. `compiler.py` returns a `CheckedProgram` after semantic analysis, retaining
+   function signatures, expression types and other semantic metadata.
+5. `tyvera run` selects `ReferenceInterpreterBackend` through the
+   `ExecutionBackend` boundary.
+6. `tyvera build` lowers the supported synchronous scalar subset from
+   `CheckedProgram` into typed IR, validates it, emits C++17 and invokes a host
+   C++ compiler to produce an executable.
 
 `source.py` owns shared file/line/column locations and user-facing diagnostics.
 `modules.py` resolves relative imports, checks visibility and links source
 modules before the shared type checker runs. `project.py` reads the small
-manifest and creates starter projects. `cli.py` provides `new`, `run`, `check`
-and `--version`. The implementation uses Python's standard library only.
+manifest and creates starter projects. `cli.py` provides `new`, `run`, `check`,
+`build` and `--version`. The bootstrap uses Python's standard library;
+`build` additionally requires a C++17 host compiler.
 
 ## Design decisions
 
@@ -31,19 +34,20 @@ and `--version`. The implementation uses Python's standard library only.
 - **Defined numeric widths:** `Int` uses a checked signed 64-bit range and
   `Float` uses finite binary64 values. The interpreter reports overflow rather
   than inheriting Python's arbitrary-precision integer behavior.
-- **Interpreter first:** The AST interpreter makes `.tyv` programs executable
-  without a native compiler, VM or external build tools. Lexer, AST, checker
-  and CLI boundaries leave room for a future bytecode or native backend. This
-  implementation makes no C++-level performance or native access claim.
+- **Interpreter and native slice:** The AST interpreter remains the full
+  reference execution path and needs no native compiler. The experimental
+  native compiler handles a small documented subset. It makes no C++-level
+  performance claim and never sends compiled programs back through the
+  interpreter.
 - **Python is the reference implementation:** Python is the bootstrap
   implementation, current interpreter host, development tool, and conformance
   reference for Tyvera behavior. It is not part of the language contract or
-  the planned native program runtime. Python-specific dependencies remain at
+  the future full-language native runtime. Python-specific dependencies remain at
   collection hashing, JSON conversion, object lifetime, exceptions, and host
   I/O boundaries; see the [Memory Model](memory-model.md).
 - **Execution follows semantic analysis:** The lexer, parser, module loader,
   and type checker have no execution-backend dependency. The CLI passes a
-  `CheckedProgram` to `ExecutionBackend`; no native implementation exists.
+  `CheckedProgram` either to `ExecutionBackend` or native lowering.
 - **No formatter yet:** Statement separation and indentation conventions are
   documented. A future formatter needs round-trip and idempotence tests.
 
@@ -154,18 +158,17 @@ reply, the scheduler interleaves a bounded actor turn with task steps to avoid
 starving that reply. Synchronous calls and individual expressions remain
 atomic. Full lifecycle rules are in the [Runtime documentation](runtime.md).
 
-## Native backend direction
+## Native backend V1
 
-No native backend or Tyvera IR exists. The CLI now hands a `CheckedProgram` to
-`ExecutionBackend`, with `ReferenceInterpreterBackend` as the only
-implementation. The checked representation retains expression types, match
-coverage, resource kinds, move sites, cleanup scopes, and ownership transfers
-alongside the AST and function signatures. A shared IR is deferred until a
-second consumer or a real lowering step establishes its purpose. The runtime ABI,
-initial target plan, native backend comparison, and `tyvera build` acceptance
-criteria are in [Backend Architecture](backend-architecture.md). Tyvera's
-value and resource ownership rules are documented in the
-[Memory Model](memory-model.md).
+`CheckedProgram` feeds both the interpreter and `lower_checked_program()`.
+Typed IR records scalar types, binding IDs, calls, operators, source locations
+and structured control flow. The first backend emits C++17 with checked
+arithmetic and diagnostics, then invokes a host compiler. Linux x86-64 is the
+CI-tested target. Generated executables do not require Python. Byte/Bytes,
+binary I/O, collections, classes, generics, resources, Tasks, Actors, networking
+and HTTP remain interpreter-only. The full boundary and backend evaluation are
+in [Backend Architecture](backend-architecture.md); Tyvera's value and
+resource rules are in the [Memory Model](memory-model.md).
 
 ## Local bootstrap benchmarks
 

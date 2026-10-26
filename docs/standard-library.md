@@ -42,6 +42,16 @@ relative paths from the project root and refuse direct access to
 `.tyvera.secrets`. Secret values are redacted in diagnostics, and
 `println`/`eprintln` reject `Secret<T>`.
 
+## Native compiler V1 support
+
+The native build path directly supports `Int`, `Float`, `Bool`, `String`,
+`Void`, synchronous functions, locals, arithmetic, comparisons, conditionals,
+loops, and scalar output. The standard-library APIs in this document—including
+`Byte`, `Bytes`, `ByteBuffer`, `Option`, `Result`, collections, file I/O,
+networking, HTTP, Tasks, Actors, and resource handles—are currently supported
+by the reference interpreter only. `tyvera build` reports unsupported calls
+or types; it never routes a native program through Python.
+
 ## Planned namespaces
 
 The module paths below are design targets, not current imports:

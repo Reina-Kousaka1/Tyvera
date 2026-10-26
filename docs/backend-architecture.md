@@ -1,7 +1,7 @@
 # Backend architecture and native compilation
 
-This document distinguishes implemented boundaries from planned native
-compilation. Tyvera remains licensed under GPLv3.
+This document separates the reference path, the experimental native compiler
+subset, and planned runtime/ABI work. Tyvera remains licensed under GPLv3.
 
 ## Implemented pipeline
 
@@ -11,16 +11,17 @@ Tyvera source
   -> Tyvera AST
   -> module linking and semantic analysis
   -> CheckedProgram
-  -> ExecutionBackend
-       -> ReferenceInterpreterBackend
+       -> tyvera run -> ReferenceInterpreterBackend -> Python-hosted runtime
+       -> tyvera build -> typed IR -> C++17 generator -> host C++ compiler -> executable
 ```
 
 `compile_checked_source()` and `compile_checked_project()` return a
 `CheckedProgram` only after type checking succeeds. It contains the AST,
 function signatures, expression types, generic substitutions, match coverage,
-resource kinds, move sites, cleanup scopes, and ownership transfers. The CLI selects
-`ReferenceInterpreterBackend`; `parser.py` and `typesys.py` do not import or
-depend on execution code.
+resource kinds, move sites, cleanup scopes, and ownership transfers. `tyvera
+run` selects `ReferenceInterpreterBackend`; `tyvera build` lowers only the
+supported subset to a separate native path. `parser.py` and `typesys.py` do
+not import or depend on execution code.
 
 Async I/O intrinsics are checked as typed task results and use the same
 `CheckedProgram.resource_types`, move sites, cleanup points, and ownership
@@ -30,29 +31,28 @@ task results carrying them are consumed once. The reference runtime's
 registration, worker completion, and wakeup. It does not expose Python socket
 objects or Python errors to Tyvera programs.
 
-This is a backend boundary, not a complete typed representation. It does not
-retain resolved member symbols, full class/interface layouts, match lowering,
-or all mutability and control-flow facts required for code generation. Modules
-rewrite cross-module references to qualified names, and the interpreter
-consumes the resulting AST directly.
+`CheckedProgram` is still not a complete typed representation. It does not
+retain resolved member symbols, full class/interface layouts, or match
+lowering facts. The native subset uses the expression types and checked
+function signatures already recorded by the type checker. Its IR makes local
+binding identity, scalar type, calls, source positions, and structured control
+flow explicit. Unsupported nodes fail with a source-located backend diagnostic.
 
-## Typed representation and IR decision
+## Typed IR V1
 
-An explicit backend-independent typed AST is not added yet. `CheckedProgram`
-marks the successful compiler stage and carries useful semantic metadata, but
-does not duplicate all checker state or claim that native codegen-ready type
-information is present.
+`tyvera/ir.py` defines a small backend-neutral IR: typed scalar literals and
+local references, direct function calls, unary/binary operations, local
+declarations and assignments, output, returns, lexical blocks, `if`, `while`,
+`break`, and `continue`. Every node retains its Tyvera type and source
+location. Locals have unique identifiers, so shadowing and mutation do not
+depend on C++ name lookup. `validate_ir()` checks calls, operator/result types,
+binding scopes and mutability, entry-point shape, and loop-control placement.
 
-A Tyvera IR would be useful once a second backend or a meaningful lowering
-transformation exists. Neither condition holds today. Maintaining an IR now
-would mean translating the current AST and then translating it back into the
-same interpreter behavior without gaining reuse. Before native codegen, Tyvera
-needs an authoritative representation that can retain resolved symbols,
-class/interface layout, mutability, pattern-match decisions, actor/task
-operations, source locations, and the resource ownership facts required by
-lowering. Add IR only with the first
-consumer that demonstrates those needs; version it with explicit compatibility
-rules and tests.
+`tyvera/lowering.py` consumes only a checked program; it does not re-run type
+inference. The IR intentionally omits classes/interfaces, generics, pattern
+matching, resources, Tasks, Actors, collections, and I/O. These remain
+available through `tyvera run` and are rejected by `tyvera build` until their
+semantic and runtime boundaries are represented.
 
 ## Three separate contracts
 
@@ -80,7 +80,8 @@ bounds-checked managed `ByteBuffer` values; neither interface exposes host
 file objects or memory addresses. A future runtime may use completion ports,
 `epoll`, `kqueue`, or another OS facility as long as the observable Tyvera
 scheduling, byte and ownership rules stay the same. Native code generation
-and a native I/O backend are not implemented in this branch.
+does not yet implement a native I/O backend; all async I/O, TCP, DNS, and HTTP
+remain available only through the Python reference runtime.
 
 The networking layer has no user-defined general Stream interface. TCP
 establishes a byte-stream contract; text files retain their UTF-8 resource
@@ -99,34 +100,30 @@ selects target calling conventions and object formats, emits debug data, and
 links a runtime for the chosen target. A backend must not redefine a Tyvera
 operator or silently substitute host-language error behavior.
 
-## Runtime ABI contract (planned)
+## Native runtime and ABI boundary
 
-The ABI is not selected or implemented. Before committing to one, specify:
+Native Backend V1 emits C++17 and invokes a host compiler. Its internal
+generated-code representation is:
 
-- Stable layouts and ownership rules for scalar, string, collection, object,
-  actor, task, error, and resource handles.
-- `Byte` should have an unsigned 8-bit ABI representation. `Bytes` should cross
-  a call as a borrowed pointer/length pair valid for that call only; a mutable
-  `ByteBuffer` requires an explicit exclusive borrow and cannot be retained by
-  foreign code. These mappings are design constraints, not implemented FFI.
-- Allocation/deallocation responsibilities and how out-of-memory is reported.
-- String encoding, length, and lifetime rules.
-- Collection operations and iteration order without exposing host hash-table
-  layout.
-- Actor and task creation, scheduling, cancellation, joins, timers, and
-  runtime shutdown.
-- How source locations and typed diagnostics cross generated/runtime calls.
-- I/O services, resource close behavior, and cleanup when a task is cancelled.
-- A narrow FFI mapping for Tyvera values, errors, and ownership transfer.
+- `Int`: `std::int64_t` with checked signed 64-bit arithmetic.
+- `Float`: finite IEEE-754 binary64 (`double`); overflow and division by zero
+  become Tyvera runtime diagnostics.
+- `Bool`: C++ `bool`; `String`: `std::string` containing UTF-8 bytes; `Void`:
+  C++ `void`.
+- Direct generated functions pass these scalar values by value. The
+  executable links the platform C++ runtime and small generated support code.
+- Runtime failures retain source file, line, and column and become a controlled
+  stderr diagnostic plus a nonzero process exit.
 
-The first ABI should be internal and versioned with the runtime. Safe Tyvera
-must not expose raw allocation pointers. A future native/unsafe boundary must
-make ownership and foreign error conversion explicit. The language-level
-value and resource rules are in the [Memory Model](memory-model.md); the native
-resource ABI remains planned. There is no `unsafe` syntax or FFI declaration
-syntax today. A foreign status may become a controlled Tyvera result only at a
-defined boundary; a native crash or memory fault cannot be turned into a
-recoverable `Result`.
+This is a private V1 code-generation contract, not a stable public C ABI or an
+FFI. Generated executables do not embed or invoke Python. `Byte`, `Bytes`,
+`ByteBuffer`, `Option`, `Result`, binary/text I/O, collections, classes,
+resources, Tasks, Actors, and Supervisors remain interpreter-only. No native
+object, resource, task, actor, or error ABI is implemented. There is no
+`unsafe` or FFI declaration syntax. Any later FFI must define ownership,
+lifetimes, mutability, and error conversion explicitly; a native crash cannot
+become a recoverable Tyvera `Result`. See the [Memory Model](memory-model.md)
+for Tyvera's value and resource rules.
 
 ## Native backend options
 
@@ -138,15 +135,15 @@ linked at the end of this section.
 | --- | --- | --- | --- | --- | --- |
 | LLVM | Strong fit for all four required targets and object formats: COFF for Windows x64, ELF for Linux x64/ARM64, Mach-O for macOS ARM64. macOS x64 is also available in LLVM's x86 targets. | Broad target optimizers and target selection. Building, packaging, or finding a compatible LLVM toolchain is substantial; Tyvera compile-time impact is unmeasured. | Source-level debug metadata can lower to DWARF and Windows CodeView. Tyvera still has to describe its own source values and locations accurately. | Mature object/linker ecosystem. Cross compilation still needs the target sysroot, libraries, assembler/linker, and system integration. C ABI is available but must not become Tyvera's semantic model. | LLVM states that its Apache-2.0-with-LLVM-exceptions license can be combined with GPLv3. A Python bootstrap can emit IR or invoke a tool initially, but shipping a stable LLVM toolchain is a separate packaging decision. |
 | Cranelift | Strong ISA fit for Windows x64, Linux x64, Linux ARM64, and macOS ARM64; the project documents Windows x64 and System V x64 conventions, Linux AArch64, and Apple Silicon support. | Designed as a relatively fast, simpler code generator. No Tyvera compile-time or optimization comparison exists. | Object generation exists; source-level interactive debugging is less established than LLVM's cross-platform debug metadata and needs an early prototype. | AOT native object output exists. Cranelift is a Rust library, so a Python bootstrap would need a Rust helper or a later native Tyvera compiler. Runtime/FFI integration remains Tyvera work. | The upstream crates use Apache-2.0 WITH LLVM-exception. Check exact dependency and redistribution obligations for the full compiler distribution. |
-| C transpilation | Depends on a host C compiler. Clang can target these architectures, but target headers, libraries, sysroots, and linkers must be supplied. | Fastest route to a small end-to-end native experiment; optimization quality is delegated to the installed C compiler. No Tyvera timings exist. | C compiler debug info is useful, but Tyvera source-level names and locations need generated mappings such as line directives and carefully preserved temporary names. | C ABI and system libraries are familiar. Requires an external C toolchain and a Tyvera runtime written or linked as C; C++ adds exception/runtime ABI complexity without an immediate benefit. | Compatible toolchain licensing depends on the chosen compiler. Generated native programs must not require Python. Useful as a temporary bootstrap experiment, not yet a user-facing build guarantee. |
+| C/C++ transpilation | Depends on a host compiler; cross targets still need matching sysroots, libraries, and linkers. | Fast route to a small executable slice; machine code and optimization are delegated to the installed compiler. No Tyvera performance results exist. | Compiler debug information is available, but source-level mappings need deliberate work. | C has a smaller runtime surface; C++ offers standard strings and a straightforward private helper runtime. Both need an external toolchain. | Toolchain licensing depends on the compiler. Generated executables must not require Python. |
 | Own native backend | No target is implemented. Each OS/architecture combination needs instruction selection, calling convention, object format, linker/debug integration, and runtime testing. | Full control, but optimization passes, register allocation, instruction selection, and ABI support would become Tyvera's responsibility. | DWARF, CodeView/PDB, and Mach-O debug integration would need to be built and maintained. | Maximum integration control and maximum maintenance burden; a typed FFI and runtime still remain necessary. | No third-party backend license issue, but it does not simplify GPLv3 distribution or the Python-bootstrap transition. Not realistic as the first backend. |
 
 ### Target matrix
 
-| Target | LLVM | Cranelift | C transpilation |
+| Target | LLVM | Cranelift | C/C++ transpilation |
 | --- | --- | --- | --- |
 | Windows x86-64 | Supported target/object path; Windows toolchain and runtime linking still required. | x86-64 backend and Windows x64 calling convention documented. | Possible with MSVC or Clang plus Windows headers/libraries; not guaranteed by Tyvera. |
-| Linux x86-64 | Supported target/object path. | x86-64 System V backend documented. | Possible with a matching C toolchain/sysroot. |
+| Linux x86-64 | Supported target/object path. | x86-64 System V backend documented. | CI-tested with the host C++17 compiler. |
 | Linux ARM64 | Supported AArch64/ELF target path. | AArch64 Linux convention documented. | Possible with a matching cross toolchain/sysroot. |
 | macOS ARM64 | Supported AArch64/Mach-O target path. | Apple Silicon support documented. | Possible with an Apple-targeting toolchain and SDK. |
 | macOS x86-64 | LLVM has x86 Mach-O support; retain only if the user base justifies it. | Not required; validate Darwin ABI/object support before promising it. | Possible with a matching Apple toolchain and SDK. |
@@ -156,35 +153,54 @@ target also needs its runtime, linker, system libraries, debug format, and CI
 coverage. Mobile and WebAssembly are not required targets, but the semantic
 and backend boundaries should not hard-code the four initial targets.
 
-## Recommendation
+## Backend choice for V1
 
-Keep the final backend choice open. LLVM is the strongest first candidate for
-the long-term target and debug-information requirements. Cranelift is a serious
-alternative if compile latency, code size, or a Rust-hosted compiler becomes a
-priority. A C transpiler is useful for a short native-runtime proof because it
-can keep the current Python frontend, but its external-toolchain dependency
-makes it an incomplete `tyvera build` implementation. A custom machine-code
-backend is not justified for the first native milestone.
+Native Backend V1 uses C++17 source generation followed by a host C++ compiler.
+This is the smallest path from the Python frontend and checked IR to real
+machine code. It avoids shipping LLVM or a Rust helper and keeps the native
+runtime separate from the Python interpreter. Checked integer operations,
+finite Float behavior, Tyvera string output, and source-located runtime errors
+are implemented in generated support code. It requires a C++17 compiler at
+build time; no speed or optimization claim is made.
 
-The next decision should follow small prototypes against the same Tyvera
-conformance programs. Measure compile latency and binary size, inspect source
-debugging on each target, verify runtime/FFI behavior, and build without Python
-on the target. No speed comparison is claimed today.
+LLVM remains a candidate for broader target selection, optimization, and debug
+information. Cranelift remains a candidate if an in-process Rust code generator
+becomes practical. A custom machine-code backend remains unjustified. Revisit
+the choice as the native feature set grows; using C++ as the bootstrap target
+does not make C++ part of Tyvera's language.
+
+## Native support boundary
+
+| Area | Status in Native V1 |
+| --- | --- |
+| `Int`, `Float`, `Bool`, `String`, `Void`; locals and assignments | Implemented in typed IR and C++17 backend. |
+| Synchronous functions, calls, returns, recursion | Implemented. |
+| Arithmetic, numeric comparisons, exact mixed `Int`/`Float` comparison, boolean short-circuiting | Implemented with Tyvera overflow, finite-Float, division, and remainder rules. |
+| `if`/`else`, `while`, lexical scopes, `break`, `continue` | Implemented. |
+| `println`, `eprintln` | Implemented for Int, Float, Bool, String. |
+| Byte/Bytes/ByteBuffer, binary/text I/O, resources and cleanup | Interpreter-only; native build reports an unsupported type or operation. |
+| `Option`, `Result`, pattern matching, collections, records, tuples, enums, classes, interfaces, generics | Interpreter-only. |
+| Actors, Supervisors, Tasks, async I/O, TCP, DNS, HTTP | Interpreter-only. |
+| Native FFI, stable public ABI, cross-compilation | Planned; no syntax or runtime contract is exposed. |
+
+Unsupported features never fall back to the interpreter. The full source is
+type-checked before lowering, and the first unsupported construct produces a
+source-located diagnostic without creating an executable.
 
 ## `tyvera build` and differential testing
 
-`tyvera build` is planned to produce a real native executable from the project
-entry point. It must fail clearly when the target toolchain is unavailable,
-and a successful build must run without Python on the target. The command is
-not implemented and must not be reported as implemented until an executable
-backend exists.
+`tyvera build PATH [-o OUTPUT]` is implemented. It lowers after successful
+semantic analysis, emits temporary C++17, invokes `CXX` or a discovered
+`clang++`, `g++`, `c++`, or `cl`, and replaces the output only after the host
+compiler succeeds. Missing toolchains and unsupported source constructs
+produce controlled diagnostics. CI builds and runs the native examples on
+Linux x86-64 with Python removed from the executable's `PATH`.
 
-Differential testing is also planned. A shared program corpus should run
-through each backend and compare stdout, stderr, exit status, normalized
-diagnostics, runtime errors, and other documented observable behavior.
-Addresses, host tracebacks, and timing are not semantic outputs. The reference
-interpreter is the first oracle; there is no second backend and no
-differential test infrastructure yet.
+End-to-end tests compare stdout and exit behavior for the native examples
+against `ReferenceInterpreterBackend`; they also cover located integer
+overflow failures, IR validation, unsupported-feature diagnostics, and the
+CLI. This is a focused V1 corpus, not full-language differential testing.
+Addresses, host tracebacks, and timing are not semantic outputs.
 
 ## Upstream references
 

@@ -14,8 +14,9 @@ static type checker, source-located diagnostics, and interpreter. Python/CPython
 hosts the bootstrap toolchain and current reference implementation for Tyvera
 semantics; Tyvera source is not compiled to Python, and Python is not part of
 the long-term language contract. The present toolchain requires Python 3.10 or
-newer. Native executables that run without Python remain a planned goal, and no
-native backend exists yet.
+newer. An experimental C++17 native backend compiles a documented core subset
+to executables that run without Python. The interpreter remains the complete
+reference path for language features outside that compiler subset.
 
 The implemented language includes `Int`, `Float`, `Bool`, `String`, `Void`,
 interface-constrained generic functions, classes, records, enums and newtypes, transparent type
@@ -35,7 +36,9 @@ experimental HTTP/1.1 codec, bounded concurrent server, static router, and
 typed HTTP client build on those same TCP tasks and resource rules. See
 [`examples/tcp_echo.tyv`](examples/tcp_echo.tyv) and
 [`examples/http_server.tyv`](examples/http_server.tyv) for local examples.
-TLS, WebSockets, and native code generation remain planned.
+The native compiler currently targets synchronous scalar programs; see the
+[Backend Architecture](docs/backend-architecture.md) support table. TLS and
+WebSockets remain planned.
 
 The deterministic actor runtime supports typed messages, isolated state, FIFO
 mailboxes, crash isolation, bounded `one_for_one` supervision, request/reply,
@@ -45,14 +48,18 @@ and explicit joins. Runtime shutdown, detached task failures, and fairness for
 tasks waiting on actor replies are specified and tested. `Unit`, `and`, and
 `or` remain compatibility spellings.
 
-Bootstrap requirements: Python 3.10 or newer. The toolchain has no third-party runtime dependencies.
+Bootstrap requirements: Python 3.10 or newer. The bootstrap has no third-party
+runtime dependencies. `tyvera build` additionally requires a host C++17
+compiler; generated executables use the platform C++ runtime and do not require
+Python.
 
 ## Dependency graphs
 
 ### Package dependencies
 
-The runtime uses Python's standard library and declares no third-party runtime
-packages. `setuptools` is required only to build/install the bootstrap package.
+The reference runtime uses Python's standard library and declares no
+third-party runtime packages. `setuptools` is required only to build/install
+the bootstrap package. Native builds require a host C++17 compiler.
 
 ```mermaid
 flowchart LR
@@ -70,14 +77,28 @@ flowchart LR
     frontend --> modules["Module linking"]
     modules --> checker["Type checking and semantic analysis"]
     checker --> checked["CheckedProgram"]
-    checked --> boundary["ExecutionBackend"]
-    boundary --> reference["ReferenceInterpreterBackend"]
+    checked --> run["tyvera run"]
+    run --> reference["ReferenceInterpreterBackend"]
     reference --> runtime["Tyvera reference runtime"]
     runtime --> python["Python / CPython host"]
+    checked --> lowering["Native subset lowering"]
+    lowering --> ir["Typed Tyvera IR"]
+    ir --> cpp["C++17 code generator"]
+    cpp --> compiler["Host C++ compiler"]
+    compiler --> executable["Native executable"]
 ```
 
-The native backend is not implemented; `ExecutionBackend` currently selects
-the reference interpreter.
+The native compiler is a separate build path; it does not replace the
+`ExecutionBackend` used by `tyvera run`. Its current support boundary and
+interpreter-only runtime areas are listed in
+[Backend Architecture](docs/backend-architecture.md).
+
+```sh
+tyvera build examples/native_hello.tyv
+./native_hello
+```
+
+On Windows, run `native_hello.exe` from the current directory.
 
 Tyvera is licensed under **GNU GPLv3**; see [LICENSE](LICENSE).
 
@@ -141,6 +162,9 @@ tyvera check examples/supervision.tyv
 tyvera run examples/supervision.tyv
 tyvera check examples/runtime_foundations.tyv
 tyvera run examples/runtime_foundations.tyv
+tyvera check examples/native_hello.tyv
+tyvera run examples/native_hello.tyv
+tyvera build examples/native_hello.tyv
 tyvera check examples/async_tasks.tyv
 tyvera run examples/async_tasks.tyv
 tyvera check examples/type_system_v2.tyv
@@ -181,9 +205,12 @@ and a cooperative task scheduler with nested `await`, scoped cancellation,
 implicit child joining, owner-local task groups, explicit child detachment,
 and task deadlines are implemented. Async text-file I/O, DNS, and TCP V1 are
 implemented. HTTP/1.1 V1 is implemented as an experimental codec, client,
-bounded server, and static router. True parallel execution, TLS, WebSockets, separate
-standard-library modules, external secret stores, and native backends remain
-planned. See the
+bounded server, and static router. The experimental native compiler supports
+only the typed synchronous scalar/control-flow subset documented in
+[Backend Architecture](docs/backend-architecture.md); Actors, Tasks, resources,
+collections and I/O remain interpreter-only. True parallel execution, TLS,
+WebSockets, separate standard-library modules, external secret stores, and
+broader native runtime support remain planned. See the
 [roadmap](docs/roadmap.md) for sequence and
 scope, and [release/versioning notes](docs/release-process.md) for the
 pre-1.0 release approach.

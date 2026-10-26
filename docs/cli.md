@@ -8,6 +8,7 @@
 | `tyvera new NAME` | Create `NAME/tyvera.toml`, `src/main.tyv`, a second imported module, `.gitignore` and `.tyvera.secrets.example`. Refuses to replace an existing path. |
 | `tyvera check PATH` | Load and type-check a project directory or `.tyv` source file without running `main`. |
 | `tyvera run PATH` | Load, type-check and run a project directory or `.tyv` source file. |
+| `tyvera build PATH [-o OUTPUT]` | Compile the supported native subset to a host executable using an installed C++17 compiler. |
 
 For a project directory, `PATH` must contain `tyvera.toml`. For a source file,
 Tyvera uses the nearest parent manifest when present; otherwise the file's
@@ -22,12 +23,26 @@ entry = "src/main.tyv"
 Without an explicit path, `run` and `check` use the current directory as a
 project. Package commands, `test`, and `fmt` are not implemented yet.
 
-## Planned native build
+## Native build V1 (experimental)
 
-`tyvera build` is not implemented. Its acceptance condition is a successful
-native executable for a selected target that runs without Python installed on
-the target system. A command that only validates a project, emits source, or
-launches the interpreter does not satisfy that contract. Target selection,
-toolchain diagnostics, output paths, and build profiles will be finalized with
-the first executable backend; see [Backend Architecture](backend-architecture.md).
+`tyvera build program.tyv` emits a native executable named after the source
+file in the current directory (`.exe` on Windows). `-o`/`--output` selects a
+different path. For a project directory, the executable uses the project
+directory name. A successful build produces machine code through a host
+compiler; the output does not launch Tyvera's Python interpreter and does not
+need Python at runtime. The host must have `clang++`, `g++`, `c++`, or `cl`
+available, or the `CXX` environment variable must name a C++17 compiler.
+
+The native subset currently includes synchronous functions over `Int`,
+`Float`, `Bool`, and `String`; local `let`/`var`, assignments, calls, returns,
+arithmetic, comparisons, boolean short-circuiting, `if`/`else`, `while`,
+`break`/`continue`, `println`, and `eprintln`. A source program that type-checks
+but uses a feature outside that subset fails with a source-located backend
+diagnostic and produces no executable. The full support table and runtime
+boundary are in [Backend Architecture](backend-architecture.md).
+
+V1 targets the host platform selected by its C++ compiler. Linux x86-64 is the
+CI-tested native target. Other host compilers use the same generated C++17
+boundary but are not yet covered by project CI. Cross-compilation, build
+profiles, native FFI, and a stable public ABI are not implemented.
 

@@ -18,7 +18,7 @@ implemented.
 | 6. Supervisors | First slice implemented | Child lifecycle, crash detection, bounded restart intensity and deterministic `one_for_one` restarts. `one_for_all` and `rest_for_one` remain planned. |
 | 7. Async I/O & TCP | V1 implemented | Selector-backed TCP connect/listen/accept/read/write, worker-backed DNS and async text-file I/O, cancellation, deadlines, move-only network resources, address/error values, and bounded write behavior. TLS and protocols beyond HTTP/1.1 remain planned. |
 | 8. HTTP & Web Backend Foundation | V1 implemented; experimental | Bounded HTTP/1.1 codec, typed request/response values, TCP client and concurrent server, keep-alive, static routing, query/path parameters, JSON core integration, deadlines, and ownership cleanup. Streaming, dynamic handlers, TLS, and HTTP/2/3 remain planned. |
-| 9. Native backend | Planned; backend boundary implemented | `CheckedProgram` and `ExecutionBackend` currently select the Python reference interpreter. Native code generation, runtime ABI, and `tyvera build` remain unimplemented. Initial targets are Windows x86-64, Linux x86-64, Linux ARM64, and macOS ARM64. |
+| 9. Native backend | V1 implemented; experimental | Typed IR and C++17 host compilation support a synchronous scalar/control-flow subset. Linux x86-64 is CI-tested; Actors, Tasks, resources, I/O, `Byte`/`Bytes`, collections, objects, and FFI remain interpreter-only or planned. |
 | 10. Package system | Planned | Reproducible package metadata, dependency resolution and versioning after modules and the standard library stabilize. |
 | 11. Application library ecosystem | Planned | Build general-purpose libraries and use larger applications as later conformance and load tests; application protocols stay outside compiler semantics. |
 
@@ -33,22 +33,21 @@ implemented.
 3. Extend generic constraints to type declarations; keep adding conformance
    cases for recursive patterns, structural types and backend-independent
    equality.
-4. Keep code generation independent from the Python reference interpreter.
-   Prototype shortlisted backends against one shared program corpus before
-   selecting a native toolchain or implementing `tyvera build`.
+4. Keep native lowering independent from the Python reference interpreter and
+   expand the supported subset only with differential conformance tests. Revisit
+   LLVM or Cranelift if broader target/debug requirements justify the additional
+   toolchain complexity.
 
 ## Native and C++-inspired direction
 
-The future native path should preserve the same source grammar, AST, type
-checking and diagnostics while replacing only execution/code generation.
-Integer, Float, Bool, left-to-right evaluation, Unicode scalar string equality,
-tagged-value equality, and portable Map keyability are specified in the
-bootstrap language contract. String indexing, a native resource ABI, and FFI
-error mapping still need contracts and implementations.
-The implemented backend boundary and the comparison of LLVM, Cranelift, C
-transpilation, and a custom backend are in
-[Backend Architecture](backend-architecture.md). Implemented ownership rules are
-in the [Memory Model](memory-model.md). Benchmark only after semantics and
+The native path preserves the existing source grammar and type checker while
+lowering the supported subset from checked metadata into backend-neutral IR.
+Integer, Float, Bool, evaluation order, strings, and control flow are compared
+against the reference interpreter for the V1 corpus. A native resource ABI,
+FFI error mapping, and runtime services for the remaining language are still
+planned. The backend evaluation and exact current boundary are in
+[Backend Architecture](backend-architecture.md); ownership rules are in the
+[Memory Model](memory-model.md). Benchmark only after broader semantics and
 conformance tests match the interpreter.
 
 ## General application readiness gap
@@ -63,7 +62,8 @@ branches, loops and match arms. Move-only text and TCP resources support
 deterministic cleanup. Async text-file operations, DNS, selector-backed TCP,
 backpressure, and cancellation are implemented in the reference runtime.
 True parallelism, TLS, HTTP streaming, WebSockets, non-network resource families,
-standard-library modules, and a native backend remain planned. HTTP/1.1 V1 is
+standard-library modules, and a native runtime for the full language remain
+planned. The synchronous scalar native backend V1 is implemented. HTTP/1.1 V1 is
 experimental and implemented. Resource scopes
 close on normal exit, return, errors, task cancellation, loop control, actor
 failure, and supervisor restart. Runtime ownership, shutdown, detached task

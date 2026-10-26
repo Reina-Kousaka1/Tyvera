@@ -155,10 +155,20 @@ server task tree. Runtime or actor cancellation follows the ordinary owned
 task/resource cleanup path. See [HTTP foundation](http.md) for the protocol
 limits and client lifecycle.
 
+## Native runtime boundary
+
+The experimental native compiler executes only synchronous scalar programs;
+it does not include the task scheduler, actor runtime, resource cleanup, async
+I/O, networking, or HTTP services described above. Those features continue to
+run through the reference interpreter and native build rejects them instead
+of falling back. The native subset and its internal runtime helpers are
+documented in [Backend Architecture](backend-architecture.md).
+
 ## Not implemented
 
-True parallel task execution, TLS, WebSockets, HTTP streaming, and native
-execution remain planned. TCP V1, async text-file operations, and experimental
-HTTP/1.1 V1 are implemented. See the
+True parallel task execution, TLS, WebSockets, HTTP streaming, and a native
+runtime for Tasks, Actors, resources, or I/O remain planned. TCP V1, async
+text-file operations, experimental HTTP/1.1 V1, and the synchronous scalar
+native compiler slice are implemented. See the
 [memory model](memory-model.md) and
 [backend architecture](backend-architecture.md).

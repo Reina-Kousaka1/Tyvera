@@ -958,14 +958,25 @@ limit (or the bootstrap host stack limit, if reached sooner).
 `tyvera check file.tyv` checks without running;
 `tyvera run file.tyv` checks and interprets the AST.
 
+`tyvera build file.tyv` additionally lowers a supported subset to native code
+through a host C++17 compiler. V1 supports synchronous functions over `Int`,
+`Float`, `Bool`, `String`, and `Void`; locals, assignments, calls, arithmetic,
+comparisons, boolean short-circuiting, `if`/`else`, `while`, loop control, and
+scalar `println`/`eprintln`. The generated executable does not require Python.
+This build path is experimental and does not change Tyvera's language
+semantics.
+
 Current limits: classes, interfaces and the deterministic cooperative actor
 runtime with bounded `one_for_one` supervision are supported, but there is no
 inheritance, generic methods/interfaces, generic type-declaration constraints,
 collection literals,
 `try`/`catch`, parallel process scheduling, TLS, WebSockets, importable
-standard-library modules, external secret-store provider, native
-interop, garbage collector implementation, package manager or compiler
-backend. `await` remains statement-only; synchronous calls are atomic.
+standard-library modules, external secret-store provider, native interop,
+garbage collector implementation, and package manager. The native compiler
+does not yet support classes, generics, collections, `Option`/`Result`,
+pattern matching, resources, `Byte`/`Bytes`, I/O, Tasks, Actors, networking,
+or HTTP; these remain interpreter-supported. `await` remains statement-only;
+synchronous calls are atomic.
 `runActors()` remains non-blocking; `runTasks()` waits for task deadlines.
 Actor request timeouts do not interrupt work. No performance claim is made. No
 termination checking or loop execution budget is provided;
