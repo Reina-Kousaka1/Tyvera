@@ -1,0 +1,54 @@
+pub enum GatewayDispatch {
+    Ready(String)
+    MessageCreate(String, String, String)
+    Unknown(String)
+}
+
+fn requiredString(object: Json, key: String) -> Result<String, String> {
+    var result: Result<String, String> = Err<String, String>("gateway field is missing")
+    match object.objectGet(key) {
+        Some(value) => match value.asString() {
+            Some(text) => result = Ok<String, String>(text)
+            None => result = Err<String, String>("gateway field must be a string")
+        }
+        None => {}
+    }
+    return result
+}
+
+pub fn decodeDispatch(payload: String) -> Result<GatewayDispatch, String> {
+    var result: Result<GatewayDispatch, String> = Err<GatewayDispatch, String>("invalid gateway JSON payload")
+    match parseJson(payload) {
+        Ok(root) => {
+            match requiredString(root, "t") {
+                Ok(eventName) => match root.objectGet("d") {
+                Some(data) => {
+                    if eventName == "READY" {
+                        match requiredString(data, "session_id") {
+                            Ok(sessionId) => result = Ok<GatewayDispatch, String>(GatewayDispatch.Ready(sessionId))
+                            Err(error) => result = Err<GatewayDispatch, String>(error)
+                        }
+                    } else if eventName == "MESSAGE_CREATE" {
+                        match requiredString(data, "id") {
+                            Ok(messageId) => match requiredString(data, "channel_id") {
+                                Ok(channelId) => match requiredString(data, "content") {
+                                    Ok(content) => result = Ok<GatewayDispatch, String>(GatewayDispatch.MessageCreate(messageId, channelId, content))
+                                    Err(error) => result = Err<GatewayDispatch, String>(error)
+                                }
+                                Err(error) => result = Err<GatewayDispatch, String>(error)
+                            }
+                            Err(error) => result = Err<GatewayDispatch, String>(error)
+                        }
+                    } else {
+                        result = Ok<GatewayDispatch, String>(GatewayDispatch.Unknown(eventName))
+                    }
+                }
+                None => result = Err<GatewayDispatch, String>("gateway dispatch data is missing")
+            }
+                Err(error) => result = Err<GatewayDispatch, String>(error)
+            }
+        }
+        Err(_) => {}
+    }
+    return result
+}

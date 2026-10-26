@@ -1,0 +1,96 @@
+pub record RestFailure {
+    status: Int
+    code: Option<Int>
+    message: String
+    retryAfterSeconds: Option<Float>
+    global: Bool
+}
+
+fn requiredString(object: Json, key: String) -> Result<String, String> {
+    var result: Result<String, String> = Err<String, String>("REST error field is missing")
+    match object.objectGet(key) {
+        Some(value) => match value.asString() {
+            Some(text) => result = Ok<String, String>(text)
+            None => result = Err<String, String>("REST error field must be a string")
+        }
+        None => {}
+    }
+    return result
+}
+
+fn optionalInt(object: Json, key: String) -> Result<Option<Int>, String> {
+    var result: Result<Option<Int>, String> = Ok<Option<Int>, String>(None<Int>())
+    match object.objectGet(key) {
+        Some(value) => match value.asInt() {
+            Some(number) => result = Ok<Option<Int>, String>(Some(number))
+            None => result = Err<Option<Int>, String>("REST error code must be an integer")
+        }
+        None => {}
+    }
+    return result
+}
+
+fn optionalRetryAfter(object: Json) -> Result<Option<Float>, String> {
+    var result: Result<Option<Float>, String> = Ok<Option<Float>, String>(None<Float>())
+    match object.objectGet("retry_after") {
+        Some(value) => match value.asFloat() {
+            Some(retryDelay) => {
+                if retryDelay < 0.0 {
+                    result = Err<Option<Float>, String>("retry_after must not be negative")
+                } else {
+                    result = Ok<Option<Float>, String>(Some(retryDelay))
+                }
+            }
+            None => result = Err<Option<Float>, String>("retry_after must be a floating-point number")
+        }
+        None => {}
+    }
+    return result
+}
+
+fn optionalGlobal(object: Json) -> Result<Bool, String> {
+    var result: Result<Bool, String> = Ok<Bool, String>(false)
+    match object.objectGet("global") {
+        Some(value) => match value.asBool() {
+            Some(enabled) => result = Ok<Bool, String>(enabled)
+            None => result = Err<Bool, String>("global must be a boolean")
+        }
+        None => {}
+    }
+    return result
+}
+
+pub fn decodeFailure(status: Int, body: String) -> Result<RestFailure, String> {
+    var result: Result<RestFailure, String> = Err<RestFailure, String>("invalid Discord REST error response")
+    if status < 100 || status > 599 {
+        return result
+    }
+    match parseJson(body) {
+        Ok(root) => {
+            match requiredString(root, "message") {
+                Ok(message) => match optionalInt(root, "code") {
+                    Ok(code) => match optionalRetryAfter(root) {
+                        Ok(retryAfter) => match optionalGlobal(root) {
+                            Ok(isGlobal) => {
+                                if status == 429 {
+                                    match retryAfter {
+                                        Some(_) => result = Ok<RestFailure, String>(RestFailure(status, code, message, retryAfter, isGlobal))
+                                        None => result = Err<RestFailure, String>("rate-limit response is missing retry_after")
+                                    }
+                                } else {
+                                    result = Ok<RestFailure, String>(RestFailure(status, code, message, retryAfter, isGlobal))
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                        Err(_) => {}
+                    }
+                    Err(_) => {}
+                }
+                Err(_) => {}
+            }
+        }
+        Err(_) => {}
+    }
+    return result
+}

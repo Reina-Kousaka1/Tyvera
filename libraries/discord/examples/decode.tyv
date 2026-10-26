@@ -1,0 +1,24 @@
+import "../src/gateway.tyv" as gateway
+import "../src/rest.tyv" as rest
+
+fn main() {
+    match gateway.decodeDispatch("{\"t\":\"READY\",\"d\":{\"session_id\":\"demo-session\"}}") {
+        Ok(event) => match event {
+            gateway.GatewayDispatch.Ready(sessionId) => println(sessionId)
+            gateway.GatewayDispatch.MessageCreate(_, _, _) => println("message")
+            gateway.GatewayDispatch.Unknown(name) => println(name)
+        }
+        Err(_) => println("invalid dispatch")
+    }
+    match rest.decodeFailure(429, "{\"message\":\"rate limited\",\"retry_after\":0.5,\"global\":true}") {
+        Ok(failure) => {
+            println(failure.status)
+            match failure.retryAfterSeconds {
+                Some(retryDelay) => println(retryDelay)
+                None => println("no retry delay")
+            }
+            println(failure.global)
+        }
+        Err(_) => println("invalid REST error")
+    }
+}
