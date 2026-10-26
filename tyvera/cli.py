@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Sequence
 
 from .backend import ReferenceInterpreterBackend
+from .cpp_backend import CppNativeBackend
 from .compiler import compile_checked_project
+from .lowering import lower_checked_program
 from .project import create_project, find_manifest
 from .source import Diagnostic, Location
 
@@ -21,13 +24,16 @@ def _read_source(filename: str) -> str:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="tyvera", description="Check and run Tyvera projects and source files.")
+    parser = argparse.ArgumentParser(prog="tyvera", description="Check, run, and build Tyvera projects and source files.")
     parser.add_argument("--version", action="version", version="tyvera 0.1.0")
     commands = parser.add_subparsers(dest="command", required=True)
     run_command = commands.add_parser("run", help="type-check and run a project or .tyv file")
     run_command.add_argument("path", nargs="?", default=".", help="project directory or Tyvera source file")
     check_command = commands.add_parser("check", help="type-check a project or .tyv file without running it")
     check_command.add_argument("path", nargs="?", default=".", help="project directory or Tyvera source file")
+    build_command = commands.add_parser("build", help="compile a supported Tyvera program to a native executable")
+    build_command.add_argument("path", nargs="?", default=".", help="project directory or Tyvera source file")
+    build_command.add_argument("-o", "--output", help="executable path (default: source/project name)")
     new_command = commands.add_parser("new", help="create a small Tyvera project")
     new_command.add_argument("name", help="new project directory and project name")
     return parser
@@ -76,10 +82,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             ReferenceInterpreterBackend().execute(
                 checked, output=sys.stdout, error_output=sys.stderr, project_root=root,
             )
+        elif arguments.command == "build":
+            output = Path(arguments.output).expanduser().resolve() if arguments.output else _default_build_output(
+                arguments.path, entry, root,
+            )
+            if output == entry.resolve():
+                raise Diagnostic(Location(str(entry), 1, 1), "backend", "native output cannot replace the Tyvera source file")
+            native_ir = lower_checked_program(checked)
+            built = CppNativeBackend().build(native_ir, output)
+            print(f"built {built}")
         else:
             print(f"checked {label}")
     except Diagnostic as error:
         print(error.render(), file=sys.stderr)
         return 1
     return 0
+
+
+def _default_build_output(path_argument: str, entry: Path, root: Path) -> Path:
+    candidate = Path(path_argument).resolve()
+    name = entry.stem if candidate.is_file() else root.name
+    executable = name + (".exe" if os.name == "nt" else "")
+    return (Path.cwd() / executable).resolve()
 

@@ -1,0 +1,24 @@
+fn sum_to(limit: Int) -> Int {
+    var total = 0
+    var current = 1
+    while current <= limit {
+        total = total + current
+        current = current + 1
+    }
+    return total
+}
+
+fn describe(value: Int) -> String {
+    if value > 0 {
+        return "positive"
+    } else if value < 0 {
+        return "negative"
+    } else {
+        return "zero"
+    }
+}
+
+fn main() {
+    println(sum_to(10))
+    println(describe(0))
+}

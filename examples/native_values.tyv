@@ -1,0 +1,13 @@
+fn combine(left: Int, right: Float) -> Float {
+    return left + right
+}
+
+fn main() {
+    println(1.0)
+    println(0.0001)
+    println(0.00001)
+    println(combine(2, 0.5))
+    println(9007199254740993 == 9007199254740992.0)
+    println("Ty" + "vera")
+    println(true && !false)
+}
