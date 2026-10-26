@@ -664,6 +664,7 @@ fn main() {
             sources = (source_for(roots[0]), source_for(roots[1]))
             expected = self._reference_result(sources[0], roots[0])
             native = self._native_source_result(sources[1], roots[1], workspace / "native-errors", workspace)
+            self.maxDiff = None
             self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
             self.assertNotIn("must-not-appear", native.stdout + native.stderr)
             for root in roots:

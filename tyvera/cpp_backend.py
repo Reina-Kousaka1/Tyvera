@@ -748,7 +748,7 @@ inline std::string cleanup_failure_suffix() {
     for (std::size_t index = 0; index < errors.size(); ++index) {
         if (index) result += "; ";
         const auto& error = errors[index];
-        result += error.file + ":" + std::to_string(error.line) + ":" + std::to_string(error.column) + ": " + error.message;
+        result += error.message;
     }
     errors.clear();
     return result;
@@ -1170,20 +1170,36 @@ inline std::string path_comparison_key(const std::filesystem::path& path) {
     return key;
 #endif
 }
+inline bool path_is_secret_or_child(const std::string& candidate, const std::string& secret) {
+    if (candidate == secret) return true;
+    if (candidate.size() <= secret.size() || candidate.compare(0, secret.size(), secret) != 0)
+        return false;
+    const auto boundary = candidate[secret.size()];
+    if (boundary == '/') return true;
+#ifdef _WIN32
+    // NTFS alternate data stream syntax can name the protected file's default stream.
+    if (boundary == ':') return true;
+#endif
+    return false;
+}
 inline bool is_secret_storage_path(const std::filesystem::path& path) noexcept {
     try {
-        std::error_code path_error, secret_error;
-        const auto candidate = normalized_path(path, path_error);
-        const auto secret = normalized_path(project_root() / ".tyvera.secrets", secret_error);
-        // Fail closed if canonicalization is inconclusive: I/O must never become a
-        // way to bypass the provider-only boundary for local secrets.
-        if (path_error || secret_error) return true;
-        const auto candidate_key = path_comparison_key(candidate);
-        const auto secret_key = path_comparison_key(secret);
-        if (candidate_key == secret_key) return true;
-        return candidate_key.size() > secret_key.size()
-            && candidate_key.compare(0, secret_key.size(), secret_key) == 0
-            && candidate_key[secret_key.size()] == '/';
+        const auto secret_path = project_root() / ".tyvera.secrets";
+        std::error_code candidate_absolute_error, secret_absolute_error;
+        const auto candidate_absolute = std::filesystem::absolute(path, candidate_absolute_error).lexically_normal();
+        const auto secret_absolute = std::filesystem::absolute(secret_path, secret_absolute_error).lexically_normal();
+        // Lexical checks still protect direct, absolute, and traversal paths when
+        // canonicalization cannot inspect an unrelated permission-restricted path.
+        if (candidate_absolute_error || secret_absolute_error) return true;
+        const auto candidate_lexical_key = path_comparison_key(candidate_absolute);
+        const auto secret_lexical_key = path_comparison_key(secret_absolute);
+        if (path_is_secret_or_child(candidate_lexical_key, secret_lexical_key)) return true;
+
+        std::error_code candidate_error, secret_error;
+        const auto candidate = normalized_path(path, candidate_error);
+        const auto secret = normalized_path(secret_path, secret_error);
+        if (candidate_error || secret_error) return false;
+        return path_is_secret_or_child(path_comparison_key(candidate), path_comparison_key(secret));
     } catch (...) { return true; }
 }
 inline std::string path_join(const std::string& left, const std::string& right,
