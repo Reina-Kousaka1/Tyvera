@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [Dev, feature/language-runtime-foundations]
+    branches: [Dev, feature/language-runtime-foundations, feature/linux-runtime-platform]
   pull_request:
     branches: [Dev]
   workflow_dispatch:
@@ -39,6 +39,21 @@ jobs:
 
       - name: Install Tyvera
         run: python -m pip install --editable .
+
+      - name: Verify Ubuntu platform foundation
+        run: |
+          python - <<'PY'
+          from tyvera.platform_runtime import Architecture, OperatingSystem, detect_host_platform
+
+          host = detect_host_platform()
+          assert host.operating_system is OperatingSystem.LINUX, host
+          assert host.architecture is Architecture.X86_64, host
+          assert host.linux_architecture_supported, host
+          PY
+          tyvera check examples/platform_runtime.tyv
+          tyvera run examples/platform_runtime.tyv
+          tyvera check libraries/discord
+          tyvera run libraries/discord
 
       - name: Run complete test suite
         run: python -m unittest discover -v
