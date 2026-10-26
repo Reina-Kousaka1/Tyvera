@@ -73,15 +73,15 @@ semantics; their internal data structures may vary by platform.
 
 The Tyvera-facing contract is typed tasks plus move-only resource handles,
 partial byte operations, EOF, cancellation, deadlines, normalized errors,
-bounded pending operations, and deterministic cleanup. The current adapter
+bounded pending operations, and deterministic cleanup. The reference adapter
 uses `selectors.DefaultSelector` for TCP and a bounded worker pool for DNS and
-file work. Binary file operations use immutable `Bytes` and bounded,
-bounds-checked managed `ByteBuffer` values; neither interface exposes host
-file objects or memory addresses. A future runtime may use completion ports,
-`epoll`, `kqueue`, or another OS facility as long as the observable Tyvera
-scheduling, byte and ownership rules stay the same. Native code generation
-does not yet implement a native I/O backend; all async I/O, TCP, DNS, and HTTP
-remain available only through the Python reference runtime.
+file work. The native C++17 subset now implements synchronous binary/text file,
+path, `ByteBuffer`, and owned text-file handle APIs. Binary operations use
+immutable `Bytes`; neither backend exposes host file objects or memory
+addresses. Native async I/O, TCP, DNS, and HTTP remain interpreter-only. A
+future runtime may use completion ports, `epoll`, `kqueue`, or another OS
+facility as long as observable scheduling, byte, and ownership rules stay the
+same.
 
 The networking layer has no user-defined general Stream interface. TCP
 establishes a byte-stream contract; text files retain their UTF-8 resource
@@ -112,6 +112,17 @@ generated-code representation is:
   C++ `void`.
 - `Byte`: `std::uint8_t`; `Bytes`: an immutable Tyvera byte value represented
   privately as `std::vector<std::uint8_t>`.
+- `ByteBuffer`: private shared storage for zero-initialized managed bytes,
+  capped at 67,108,864 bytes. `length`, `get`, `set`, and `toBytes` preserve
+  the checked Tyvera API; snapshots copy into immutable `Bytes`.
+- `TextFile`, `TextReader`, and `TextWriter`: private stream handles. Checked
+  move analysis still permits one Tyvera owner. Generated cleanup scopes close
+  handles in reverse acquisition order; C++ RAII is an implementation detail.
+- I/O errors use `Result<T,String>`. C++ exceptions are caught at the runtime
+  boundary and normalized to Tyvera errors or source-located diagnostics.
+- Relative file paths use the project directory embedded by `tyvera build`.
+  Canonical path checks protect `.tyvera.secrets` through direct, traversal,
+  absolute, and symlink paths.
 - `Option<T>` and `Result<T,E>` use `std::optional<T>` and an indexed
   `std::variant<T,E>` in generated code. `List<T>` and `Map<K,V>` use private
   shared runtime storage so assignment and calls preserve Tyvera's shared
@@ -123,11 +134,11 @@ generated-code representation is:
 
 This is a private V1 code-generation contract, not a stable public C ABI or an
 FFI. These representations are private compiler details, not a public ABI.
-Generated executables do not embed or invoke Python. Binary/text file I/O,
-`ByteBuffer`, classes, records, user-defined enums, tuples, generic functions,
-resources, Tasks, Actors, Supervisors, networking, and HTTP remain
-interpreter-only. No native object, resource, task, actor, or error ABI is
-implemented. There is no
+Generated executables do not embed or invoke Python. Synchronous file and
+binary I/O, `ByteBuffer`, and text-file resources are supported in the native
+subset. Classes, records, user-defined enums, tuples, generic functions, Tasks,
+Actors, Supervisors, async I/O, networking, and HTTP remain interpreter-only.
+No native object, task, actor, or public error ABI is implemented. There is no
 `unsafe` or FFI declaration syntax. Any later FFI must define ownership,
 lifetimes, mutability, and error conversion explicitly; a native crash cannot
 become a recoverable Tyvera `Result`. See the [Memory Model](memory-model.md)
@@ -190,7 +201,9 @@ does not make C++ part of Tyvera's language.
 | Pattern matching | Implemented for scalar literal patterns and nested Option/Result constructor patterns with binding/wildcard cases; source exhaustiveness rules remain enforced by the checker. |
 | `List<T>`, `Map<K,V>` | Implemented for native-supported element/key/value types, including mutation, lookup, removal, equality, length, and snapshot iteration. Map lookup preserves Tyvera equality and insertion-order iteration semantics. |
 | `Byte`, immutable `Bytes` | `byteFromInt`, `Byte.toInt`, Byte equality/output, `bytesFromString`, Bytes equality, length, bounds-checked `get`/`slice`, and UTF-8-checked `toString` are implemented. |
-| Binary/text file I/O, `ByteBuffer`, resources and cleanup | Interpreter-only; native build reports an unsupported call or type. |
+| `ByteBuffer` | Shared mutable 64 MiB bounded buffer; checked allocation, length, get/set, and immutable `toBytes` snapshots use `Result` errors. |
+| Synchronous file/path I/O | `readText`, `writeText`, `readBytes`, `writeBytes`, `pathJoin`, and `pathExists`; relative paths use the project root and `.tyvera.secrets` is protected. |
+| Text resources | `TextFile`, `TextReader`, `TextWriter`, `using`, move transfer, `Result`/function transfer, synchronous methods, modes, close/isOpen, and deterministic LIFO cleanup are implemented. |
 | Records, tuples, user-defined enums, classes, interfaces, generic functions | Interpreter-only. |
 | Actors, Supervisors, Tasks, async I/O, TCP, DNS, HTTP | Interpreter-only. |
 | Native FFI, stable public ABI, cross-compilation | Planned; no syntax or runtime contract is exposed. |

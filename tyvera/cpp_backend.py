@@ -30,9 +30,11 @@ from .ir import (
     IRLoopControl,
     IRMatch,
     IRMethodCall,
+    IRMove,
     IRModule,
     IROutput,
     IRReturn,
+    IRUsing,
     IRType,
     IRTypeRef,
     IRUnary,
@@ -53,7 +55,7 @@ class CppNativeBackend:
 
     name = "cpp17-native"
 
-    def build(self, module: IRModule, output: str | Path) -> Path:
+    def build(self, module: IRModule, output: str | Path, project_root: str | Path | None = None) -> Path:
         validate_ir(module)
         destination = Path(output).expanduser().resolve()
         if destination.exists() and destination.is_dir():
@@ -63,7 +65,7 @@ class CppNativeBackend:
         except OSError as error:
             raise Diagnostic(module.functions[0].location, "backend", f"cannot prepare native output directory: {error}") from error
         compiler = _find_compiler(module.functions[0].location)
-        source = emit_cpp(module)
+        source = emit_cpp(module, project_root=project_root)
         try:
             with tempfile.TemporaryDirectory(prefix=".tyvera-build-", dir=destination.parent) as temporary:
                 directory = Path(temporary)
@@ -136,23 +138,29 @@ def _compiler_command(compiler: tuple[str, ...], source: Path, output: Path) -> 
     return [*command, "-std=c++17", "-O2", str(source), "-o", str(output)]
 
 
-def emit_cpp(module: IRModule) -> str:
+def emit_cpp(module: IRModule, project_root: str | Path | None = None) -> str:
     """Return complete C++17 source for a validated Tyvera IR module."""
     validate_ir(module)
-    generator = _CppGenerator(module)
+    generator = _CppGenerator(module, project_root)
     return generator.generate()
 
 
 class _CppGenerator:
-    def __init__(self, module: IRModule) -> None:
+    def __init__(self, module: IRModule, project_root: str | Path | None = None) -> None:
         self.module = module
+        self.project_root = Path(project_root or Path.cwd()).expanduser().resolve()
         self.function_symbols = {function.symbol: function for function in module.functions}
         self.lines: list[str] = []
         self.indent = 0
         self.temporary = 0
 
     def generate(self) -> str:
-        self.lines.extend(_RUNTIME.splitlines())
+        encoded_root = self.project_root.as_posix().encode("utf-8")
+        runtime = _RUNTIME.replace(
+            "/*TYVERA_PROJECT_ROOT*/",
+            f"inline const std::string project_root_text = std::string({_cpp_byte_string(encoded_root)}, {len(encoded_root)});",
+        )
+        self.lines.extend(runtime.splitlines())
         self._line("namespace tyvera_generated {")
         self.indent += 1
         for function in self.module.functions:
@@ -168,16 +176,17 @@ class _CppGenerator:
         self._line("try {")
         self.indent += 1
         self._line(f"tyvera_generated::{self.module.entry_symbol}();")
+        self._line("if (tyvera_runtime::report_cleanup_failures()) return 1;")
         self._line("return 0;")
         self.indent -= 1
         self._line("} catch (const tyvera_runtime::Failure& error) {")
         self.indent += 1
-        self._line("""std::cerr << error.file << ':' << error.line << ':' << error.column << ": runtime error: " << error.message << '\\n';""")
+        self._line("""std::cerr << error.file << ':' << error.line << ':' << error.column << ": runtime error: " << error.message << tyvera_runtime::cleanup_failure_suffix() << '\\n';""")
         self._line("return 1;")
         self.indent -= 1
         self._line("} catch (const std::exception&) {")
         self.indent += 1
-        self._line('std::cerr << "<native>:1:1: runtime error: native runtime failure\\n";')
+        self._line("""std::cerr << "<native>:1:1: runtime error: native runtime failure" << tyvera_runtime::cleanup_failure_suffix() << '\\n';""")
         self._line("return 1;")
         self.indent -= 1
         self._line("}")
@@ -208,12 +217,16 @@ class _CppGenerator:
             IRType.STRING: "std::string",
             IRType.BYTE: "std::uint8_t",
             IRType.BYTES: "std::vector<std::uint8_t>",
+            IRType.BYTE_BUFFER: "std::shared_ptr<tyvera_runtime::ByteBuffer>",
+            IRType.TEXT_FILE: "std::shared_ptr<tyvera_runtime::TextFile>",
+            IRType.TEXT_READER: "std::shared_ptr<tyvera_runtime::TextFile>",
+            IRType.TEXT_WRITER: "std::shared_ptr<tyvera_runtime::TextFile>",
             IRType.VOID: "void",
         }[type_name]
 
     def _function_signature(self, function: IRFunction) -> str:
         parameters = ", ".join(
-            f"{self._cpp_type(parameter.type)} tyv_local_{parameter.identifier}"
+            f"{self._cpp_type(parameter.type)} tyv_argument_{parameter.identifier}"
             for parameter in function.parameters
         )
         return f"{self._cpp_type(function.return_type)} {function.symbol}({parameters})"
@@ -222,6 +235,13 @@ class _CppGenerator:
         self.temporary = 0
         self._line(self._function_signature(function) + " {")
         self.indent += 1
+        self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope({_location_args(function.location)});")
+        for parameter in function.parameters:
+            keyword = "auto" if _ir_contains_resource(parameter.type) else "const auto"
+            self._line(
+                f"{keyword} tyv_local_{parameter.identifier} = "
+                f"std::move(tyv_argument_{parameter.identifier});"
+            )
         for statement in function.body:
             self._statement(statement)
         self.indent -= 1
@@ -247,6 +267,7 @@ class _CppGenerator:
         elif isinstance(statement, IRBlock):
             self._line("{")
             self.indent += 1
+            self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(statement.location)});")
             for nested in statement.statements:
                 self._statement(nested)
             self.indent -= 1
@@ -254,12 +275,14 @@ class _CppGenerator:
         elif isinstance(statement, IRIf):
             self._line(f"if ({self._expression(statement.condition)}) {{")
             self.indent += 1
+            self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(statement.location)});")
             for nested in statement.then_body:
                 self._statement(nested)
             self.indent -= 1
             if statement.else_body:
                 self._line("} else {")
                 self.indent += 1
+                self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(statement.location)});")
                 for nested in statement.else_body:
                     self._statement(nested)
                 self.indent -= 1
@@ -267,6 +290,7 @@ class _CppGenerator:
         elif isinstance(statement, IRWhile):
             self._line(f"while ({self._expression(statement.condition)}) {{")
             self.indent += 1
+            self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(statement.location)});")
             for nested in statement.body:
                 self._statement(nested)
             self.indent -= 1
@@ -281,6 +305,7 @@ class _CppGenerator:
                 self._line(f"const auto {snapshot} = tyvera_runtime::map_keys_snapshot({collection});")
             self._line(f"for (const auto& {snapshot}_item : {snapshot}) {{")
             self.indent += 1
+            self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(statement.location)});")
             self._line(f"const auto tyv_local_{statement.variable.identifier} = {snapshot}_item;")
             for nested in statement.body:
                 self._statement(nested)
@@ -288,12 +313,13 @@ class _CppGenerator:
             self._line("}")
         elif isinstance(statement, IRMatch):
             subject = self._new_temporary()
-            self._line(f"const auto {subject} = {self._expression(statement.value)};")
+            self._line(f"auto {subject} = {self._expression(statement.value)};")
             for index, arm in enumerate(statement.arms):
                 prefix = "if" if index == 0 else "else if"
                 condition = self._pattern_condition(arm.pattern, subject)
                 self._line(f"{prefix} ({condition}) {{")
                 self.indent += 1
+                self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(arm.location)});")
                 self._pattern_bindings(arm.pattern, subject)
                 for nested in arm.body:
                     self._statement(nested)
@@ -308,6 +334,38 @@ class _CppGenerator:
                 )
                 self.indent -= 1
                 self._line("}")
+        elif isinstance(statement, IRUsing):
+            acquired = self._new_temporary()
+            self._line(f"auto {acquired} = {self._expression(statement.acquisition)};")
+            self._line(f"if ({acquired}.index() == 1) {{")
+            self.indent += 1
+            if statement.error_variable is None:
+                self._line(
+                    f"tyvera_runtime::fail({_location_args(statement.location)}, std::get<1>({acquired}));"
+                )
+            else:
+                self._line(f"const auto tyv_local_{statement.error_variable.identifier} = std::get<1>({acquired});")
+                for nested in statement.else_body:
+                    self._statement(nested)
+            self.indent -= 1
+            self._line("} else {")
+            self.indent += 1
+            self._line("{")
+            self.indent += 1
+            self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(statement.location)});")
+            self._line(
+                f"auto tyv_local_{statement.resource.identifier} = std::move(std::get<0>({acquired}));"
+            )
+            self._line(
+                f"tyvera_runtime::set_resource_location(tyv_local_{statement.resource.identifier}, "
+                f"{_location_args(statement.location)});"
+            )
+            for nested in statement.body:
+                self._statement(nested)
+            self.indent -= 1
+            self._line("}")
+            self.indent -= 1
+            self._line("}")
         elif isinstance(statement, IRLoopControl):
             self._line(f"{statement.kind};")
         else:
@@ -336,7 +394,9 @@ class _CppGenerator:
 
     def _pattern_bindings(self, pattern, value: str) -> None:
         if isinstance(pattern, IRBindingPattern):
-            self._line(f"const auto tyv_local_{pattern.variable.identifier} = {value};")
+            transfer = f"std::move({value})" if _ir_contains_resource(pattern.variable.type) else value
+            keyword = "auto" if _ir_contains_resource(pattern.variable.type) else "const auto"
+            self._line(f"{keyword} tyv_local_{pattern.variable.identifier} = {transfer};")
         elif isinstance(pattern, IRVariantPattern) and pattern.payload is not None:
             if pattern.variant == "Some":
                 self._pattern_bindings(pattern.payload, f"({value}).value()")
@@ -379,6 +439,8 @@ class _CppGenerator:
             return f"(static_cast<std::int64_t>({expression.value}LL))"
         if isinstance(expression, IRLocalRef):
             return f"tyv_local_{expression.variable_id}"
+        if isinstance(expression, IRMove):
+            return f"std::move({self._expression(expression.operand)})"
         if isinstance(expression, IRCall):
             arguments = [self._expression(argument) for argument in expression.arguments]
             if not arguments:
@@ -386,8 +448,15 @@ class _CppGenerator:
             temporary_names = [self._new_temporary() for _ in arguments]
             result_type = self._cpp_type(expression.type)
             lines = ["([&]() -> " + result_type + " {"]
-            lines.extend(f"    const auto {name} = {argument};" for name, argument in zip(temporary_names, arguments))
-            call = f"{expression.function}({', '.join(temporary_names)})"
+            lines.extend(
+                f"    {'auto' if _ir_contains_resource(argument_ir.type) else 'const auto'} {name} = {argument};"
+                for name, argument, argument_ir in zip(temporary_names, arguments, expression.arguments)
+            )
+            call_arguments = [
+                f"std::move({name})" if _ir_contains_resource(argument.type) else name
+                for name, argument in zip(temporary_names, expression.arguments)
+            ]
+            call = f"{expression.function}({', '.join(call_arguments)})"
             if expression.type == IRType.VOID:
                 lines.append(f"    {call};")
             else:
@@ -408,12 +477,44 @@ class _CppGenerator:
                 return f"{result_type}{{std::in_place_index<{index}>, {self._expression(expression.payload)}}}"
             raise ValueError(f"unsupported variant constructor for {ir_type_name(expression.type)}")
         if isinstance(expression, IRBuiltinCall):
-            argument = self._expression(expression.arguments[0])
-            if expression.builtin == "byteFromInt":
-                return f"tyvera_runtime::byte_from_int({argument}, {_location_args(expression.location)})"
-            if expression.builtin == "bytesFromString":
-                return f"tyvera_runtime::bytes_from_string({argument})"
-            raise ValueError(f"unknown native builtin: {expression.builtin}")
+            runtime_functions = {
+                "byteFromInt": "byte_from_int",
+                "bytesFromString": "bytes_from_string",
+                "byteBuffer": "byte_buffer",
+                "readText": "read_text",
+                "writeText": "write_text",
+                "readBytes": "read_bytes",
+                "writeBytes": "write_bytes",
+                "pathJoin": "path_join",
+                "pathExists": "path_exists",
+                "openText": "open_text",
+                "openTextReader": "open_text_reader",
+                "openTextWriter": "open_text_writer",
+            }
+            function = runtime_functions.get(expression.builtin)
+            if function is None:
+                raise ValueError(f"unknown native builtin: {expression.builtin}")
+            temporaries = [self._new_temporary() for _ in expression.arguments]
+            result_type = self._cpp_type(expression.type)
+            lines = ["([&]() -> " + result_type + " {"]
+            for name, argument in zip(temporaries, expression.arguments):
+                keyword = "auto" if _ir_contains_resource(argument.type) else "const auto"
+                lines.append(f"    {keyword} {name} = {self._expression(argument)};")
+            values = list(temporaries)
+            if expression.builtin in {"byteFromInt", "byteBuffer"}:
+                values.append(_location_args(expression.location))
+            elif expression.builtin == "openText":
+                values.extend([_cpp_string_literal("TextFile"), _location_args(expression.location)])
+            elif expression.builtin == "openTextReader":
+                values.append(_location_args(expression.location))
+            elif expression.builtin == "openTextWriter":
+                values.extend([_location_args(expression.location)])
+            elif expression.builtin == "pathJoin":
+                values.append(_location_args(expression.location))
+            call = f"tyvera_runtime::{function}({', '.join(values)})"
+            lines.append(f"    return {call};")
+            lines.append("}())")
+            return "\n".join(lines)
         if isinstance(expression, IRCollectionCreate):
             if not isinstance(expression.type, IRAppliedType):
                 raise ValueError("validated collection constructor has no applied type")
@@ -497,7 +598,8 @@ class _CppGenerator:
         arguments = [self._new_temporary() for _ in expression.arguments]
         result_type = self._cpp_type(expression.type)
         lines = ["([&]() -> " + result_type + " {"]
-        lines.append(f"    const auto {receiver} = {self._expression(expression.receiver)};")
+        receiver_keyword = "auto" if _ir_contains_resource(expression.receiver.type) or expression.receiver.type == IRType.BYTE_BUFFER else "const auto"
+        lines.append(f"    {receiver_keyword} {receiver} = {self._expression(expression.receiver)};")
         for name, argument in zip(arguments, expression.arguments):
             lines.append(f"    const auto {name} = {self._expression(argument)};")
         call = self._method_call_expression(expression, receiver, arguments)
@@ -522,6 +624,23 @@ class _CppGenerator:
                 return f"tyvera_runtime::bytes_get({receiver}, {arguments[0]})"
             if method == "slice":
                 return f"tyvera_runtime::bytes_slice({receiver}, {arguments[0]}, {arguments[1]})"
+        if expression.receiver.type == IRType.BYTE_BUFFER:
+            functions = {
+                "length": "byte_buffer_length", "get": "byte_buffer_get",
+                "set": "byte_buffer_set", "toBytes": "byte_buffer_to_bytes",
+            }
+            values = [receiver, *arguments]
+            if method != "length":
+                values.append(_location_args(expression.location))
+            return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
+        if expression.receiver.type in {IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER}:
+            values = [receiver, *arguments]
+            values.append(_location_args(expression.location))
+            functions = {
+                "readAll": "text_read_all", "write": "text_write", "append": "text_append",
+                "flush": "text_flush", "close": "text_close", "isOpen": "text_is_open",
+            }
+            return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
         if isinstance(expression.receiver.type, IRAppliedType) and expression.receiver.type.name == "List":
             element_type = _CppGenerator._cpp_type(expression.receiver.type.arguments[0])
             functions = {
@@ -565,16 +684,33 @@ def _location_args(location: Location) -> str:
     return f"{_cpp_byte_string(encoded)}, {location.line}, {location.column}"
 
 
+def _cpp_string_literal(value: str) -> str:
+    encoded = value.encode("utf-8")
+    return f"std::string({_cpp_byte_string(encoded)}, {len(encoded)})"
+
+
+def _ir_contains_resource(type_ref: IRTypeRef) -> bool:
+    if type_ref in {IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER}:
+        return True
+    return isinstance(type_ref, IRAppliedType) and any(_ir_contains_resource(item) for item in type_ref.arguments)
+
+
 _RUNTIME = r'''#include <charconv>
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <new>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -582,6 +718,11 @@ _RUNTIME = r'''#include <charconv>
 #include <vector>
 
 namespace tyvera_runtime {
+/*TYVERA_PROJECT_ROOT*/
+inline std::filesystem::path project_root() {
+    return std::filesystem::u8path(project_root_text);
+}
+
 struct Failure final : std::exception {
     std::string file;
     int line;
@@ -592,7 +733,64 @@ struct Failure final : std::exception {
     const char* what() const noexcept override { return message.c_str(); }
 };
 
+struct CleanupFailure { std::string file; int line; int column; std::string message; };
+inline std::vector<CleanupFailure>& cleanup_failures() {
+    static thread_local std::vector<CleanupFailure> errors;
+    return errors;
+}
+inline void record_cleanup_failure(const std::string& file, int line, int column, const std::string& message) noexcept {
+    try { cleanup_failures().push_back({file, line, column, message}); } catch (...) {}
+}
+inline std::string cleanup_failure_suffix() {
+    auto& errors = cleanup_failures();
+    if (errors.empty()) return {};
+    std::string result = "; resource cleanup also failed: ";
+    for (std::size_t index = 0; index < errors.size(); ++index) {
+        if (index) result += "; ";
+        const auto& error = errors[index];
+        result += error.file + ":" + std::to_string(error.line) + ":" + std::to_string(error.column) + ": " + error.message;
+    }
+    errors.clear();
+    return result;
+}
+class CleanupScope {
+    std::size_t start_;
+    int exceptions_;
+    std::string file_;
+    int line_;
+    int column_;
+public:
+    CleanupScope(std::string file, int line, int column)
+        : start_(cleanup_failures().size()), exceptions_(std::uncaught_exceptions()),
+          file_(std::move(file)), line_(line), column_(column) {}
+    ~CleanupScope() noexcept(false) {
+        auto& errors = cleanup_failures();
+        if (std::uncaught_exceptions() > exceptions_ || errors.size() <= start_) return;
+        const auto first = errors[start_];
+        std::string message = "resource cleanup failed: " + first.message;
+        for (std::size_t index = start_ + 1; index < errors.size(); ++index)
+            message += "; additional cleanup failures: " + errors[index].message;
+        errors.erase(errors.begin() + static_cast<std::ptrdiff_t>(start_), errors.end());
+        throw Failure(first.file.empty() ? file_ : first.file, first.line ? first.line : line_,
+                      first.column ? first.column : column_, std::move(message));
+    }
+};
+inline bool report_cleanup_failures() {
+    auto& errors = cleanup_failures();
+    if (errors.empty()) return false;
+    for (std::size_t index = 0; index < errors.size(); ++index) {
+        const auto& error = errors[index];
+        std::cerr << error.file << ':' << error.line << ':' << error.column
+                  << ": runtime error: resource cleanup failed: " << error.message << '\n';
+    }
+    errors.clear();
+    return true;
+}
+
 [[noreturn]] inline void fail(const std::string& file, int line, int column, const char* message) {
+    throw Failure(file, line, column, message);
+}
+[[noreturn]] inline void fail(const std::string& file, int line, int column, const std::string& message) {
     throw Failure(file, line, column, message);
 }
 
@@ -889,6 +1087,316 @@ inline std::variant<std::vector<std::uint8_t>, std::string> bytes_slice(
     } catch (const std::bad_alloc&) {
         return std::variant<std::vector<std::uint8_t>, std::string>{std::in_place_index<1>, "cannot allocate Bytes slice"};
     }
+}
+
+constexpr std::uint64_t MAX_BYTE_BUFFER_LENGTH = 67108864;
+template <typename T> using StringResult = std::variant<T, std::string>;
+template <typename T> inline StringResult<T> result_ok(T value) {
+    return StringResult<T>{std::in_place_index<0>, std::move(value)};
+}
+template <typename T> inline StringResult<T> result_error(std::string message) {
+    return StringResult<T>{std::in_place_index<1>, std::move(message)};
+}
+
+struct ByteBuffer { std::vector<std::uint8_t> values; };
+inline StringResult<std::shared_ptr<ByteBuffer>> byte_buffer(
+    std::int64_t length, const std::string&, int, int) {
+    if (length < 0 || static_cast<std::uint64_t>(length) > MAX_BYTE_BUFFER_LENGTH)
+        return result_error<std::shared_ptr<ByteBuffer>>(
+            "ByteBuffer length must be between 0 and 67108864 bytes");
+    try {
+        auto buffer = std::make_shared<ByteBuffer>();
+        buffer->values.assign(static_cast<std::size_t>(length), 0);
+        return result_ok<std::shared_ptr<ByteBuffer>>(std::move(buffer));
+    } catch (const std::bad_alloc&) {
+        return result_error<std::shared_ptr<ByteBuffer>>("cannot allocate ByteBuffer");
+    } catch (const std::length_error&) {
+        return result_error<std::shared_ptr<ByteBuffer>>("cannot allocate ByteBuffer");
+    }
+}
+inline std::int64_t byte_buffer_length(const std::shared_ptr<ByteBuffer>& buffer) {
+    return buffer ? static_cast<std::int64_t>(buffer->values.size()) : 0;
+}
+inline StringResult<std::uint8_t> byte_buffer_get(
+    const std::shared_ptr<ByteBuffer>& buffer, std::int64_t index,
+    const std::string&, int, int) {
+    if (!buffer || index < 0 || static_cast<std::uint64_t>(index) >= buffer->values.size())
+        return result_error<std::uint8_t>("ByteBuffer index is out of bounds");
+    return result_ok<std::uint8_t>(buffer->values[static_cast<std::size_t>(index)]);
+}
+inline StringResult<bool> byte_buffer_set(
+    const std::shared_ptr<ByteBuffer>& buffer, std::int64_t index, std::uint8_t value,
+    const std::string&, int, int) {
+    if (!buffer || index < 0 || static_cast<std::uint64_t>(index) >= buffer->values.size())
+        return result_error<bool>("ByteBuffer index is out of bounds");
+    buffer->values[static_cast<std::size_t>(index)] = value;
+    return result_ok<bool>(true);
+}
+inline StringResult<std::vector<std::uint8_t>> byte_buffer_to_bytes(
+    const std::shared_ptr<ByteBuffer>& buffer, const std::string&, int, int) {
+    if (!buffer) return result_error<std::vector<std::uint8_t>>("cannot allocate Bytes snapshot");
+    try { return result_ok<std::vector<std::uint8_t>>(buffer->values); }
+    catch (const std::bad_alloc&) { return result_error<std::vector<std::uint8_t>>("cannot allocate Bytes snapshot"); }
+}
+
+inline std::filesystem::path tyvera_path(const std::string& value) {
+    auto path = std::filesystem::u8path(value);
+    return path.is_absolute() ? path : (project_root() / path);
+}
+inline std::filesystem::path normalized_path(const std::filesystem::path& path, std::error_code& error) {
+    auto result = std::filesystem::weakly_canonical(path, error);
+    return error ? path.lexically_normal() : result;
+}
+inline std::string path_comparison_key(const std::filesystem::path& path) {
+    auto key = path.generic_u8string();
+#ifdef _WIN32
+    for (auto& character : key) {
+        if (character >= 'A' && character <= 'Z') character = static_cast<char>(character - 'A' + 'a');
+    }
+    // Win32 path lookup ignores trailing spaces and dots in ordinary path components.
+    std::string normalized;
+    std::size_t start = 0;
+    while (start < key.size()) {
+        const auto end = key.find('/', start);
+        auto component = key.substr(start, end == std::string::npos ? end : end - start);
+        while (!component.empty() && (component.back() == '.' || component.back() == ' ')) component.pop_back();
+        normalized += component;
+        if (end == std::string::npos) break;
+        normalized.push_back('/');
+        start = end + 1;
+    }
+    return normalized;
+#else
+    return key;
+#endif
+}
+inline bool is_secret_storage_path(const std::filesystem::path& path) noexcept {
+    try {
+        std::error_code path_error, secret_error;
+        const auto candidate = normalized_path(path, path_error);
+        const auto secret = normalized_path(project_root() / ".tyvera.secrets", secret_error);
+        // Fail closed if canonicalization is inconclusive: I/O must never become a
+        // way to bypass the provider-only boundary for local secrets.
+        if (path_error || secret_error) return true;
+        const auto candidate_key = path_comparison_key(candidate);
+        const auto secret_key = path_comparison_key(secret);
+        if (candidate_key == secret_key) return true;
+        return candidate_key.size() > secret_key.size()
+            && candidate_key.compare(0, secret_key.size(), secret_key) == 0
+            && candidate_key[secret_key.size()] == '/';
+    } catch (...) { return true; }
+}
+inline std::string path_join(const std::string& left, const std::string& right,
+                             const std::string& file, int line, int column) {
+    try { return (std::filesystem::u8path(left) / std::filesystem::u8path(right)).generic_u8string(); }
+    catch (...) { fail(file, line, column, "invalid path"); }
+}
+inline bool path_exists(const std::string& value) {
+    try {
+        std::error_code error;
+        return std::filesystem::exists(tyvera_path(value), error) && !error;
+    } catch (...) { return false; }
+}
+
+inline bool valid_utf8_string(const std::string& value) {
+    std::vector<std::uint8_t> bytes;
+    try {
+        bytes.reserve(value.size());
+        for (unsigned char byte : value) bytes.push_back(byte);
+    } catch (...) { return false; }
+    return valid_utf8(bytes);
+}
+inline std::string universal_newlines(std::string value) {
+    std::string result;
+    result.reserve(value.size());
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        if (value[index] == '\r') {
+            if (index + 1 < value.size() && value[index + 1] == '\n') ++index;
+            result.push_back('\n');
+        } else result.push_back(value[index]);
+    }
+    return result;
+}
+inline StringResult<std::string> read_text(const std::string& name) {
+    try {
+        const auto path = tyvera_path(name);
+        if (is_secret_storage_path(path))
+            return result_error<std::string>("secret file can only be read through the secrets provider");
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream) return result_error<std::string>("cannot read text file");
+        std::string value((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+        if (stream.bad()) return result_error<std::string>("cannot read text file");
+        if (!valid_utf8_string(value)) return result_error<std::string>("text file is not valid UTF-8");
+        return result_ok<std::string>(universal_newlines(std::move(value)));
+    } catch (...) { return result_error<std::string>("cannot read text file"); }
+}
+inline StringResult<bool> write_text(const std::string& name, const std::string& value) {
+    try {
+        const auto path = tyvera_path(name);
+        if (is_secret_storage_path(path))
+            return result_error<bool>("secret file cannot be changed by the text-file API");
+        std::ofstream stream(path, std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!stream) return result_error<bool>("cannot write text file");
+        stream.write(value.data(), static_cast<std::streamsize>(value.size()));
+        stream.close();
+        return stream ? result_ok<bool>(true) : result_error<bool>("cannot write text file");
+    } catch (...) { return result_error<bool>("cannot write text file"); }
+}
+inline StringResult<std::vector<std::uint8_t>> read_bytes(const std::string& name) {
+    try {
+        const auto path = tyvera_path(name);
+        if (is_secret_storage_path(path))
+            return result_error<std::vector<std::uint8_t>>("secret file can only be read through the secrets provider");
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream) return result_error<std::vector<std::uint8_t>>("cannot read binary file");
+        std::vector<std::uint8_t> bytes;
+        std::array<char, 8192> buffer{};
+        while (stream) {
+            stream.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            const auto count = static_cast<std::size_t>(stream.gcount());
+            if (count > MAX_BYTE_BUFFER_LENGTH - bytes.size())
+                return result_error<std::vector<std::uint8_t>>(
+                    "binary file exceeds the 67108864-byte limit");
+            for (std::size_t index = 0; index < count; ++index)
+                bytes.push_back(static_cast<std::uint8_t>(static_cast<unsigned char>(buffer[index])));
+            if (stream.bad()) return result_error<std::vector<std::uint8_t>>("cannot read binary file");
+            if (stream.fail() && !stream.eof())
+                return result_error<std::vector<std::uint8_t>>("cannot read binary file");
+        }
+        return result_ok<std::vector<std::uint8_t>>(std::move(bytes));
+    } catch (...) { return result_error<std::vector<std::uint8_t>>("cannot read binary file"); }
+}
+inline StringResult<bool> write_bytes(const std::string& name, const std::vector<std::uint8_t>& bytes) {
+    if (bytes.size() > MAX_BYTE_BUFFER_LENGTH)
+        return result_error<bool>("binary data exceeds the 67108864-byte limit");
+    try {
+        const auto path = tyvera_path(name);
+        if (is_secret_storage_path(path))
+            return result_error<bool>("secret file cannot be changed by the binary-file API");
+        std::ofstream stream(path, std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!stream) return result_error<bool>("cannot write binary file");
+        if (!bytes.empty())
+            stream.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        stream.close();
+        return stream ? result_ok<bool>(true) : result_error<bool>("cannot write binary file");
+    } catch (...) { return result_error<bool>("cannot write binary file"); }
+}
+
+struct TextFile {
+    std::fstream stream;
+    std::string mode;
+    std::string resource_type;
+    std::string source_file;
+    int source_line = 1;
+    int source_column = 1;
+    bool closed = false;
+    bool close_now() noexcept {
+        if (closed) return false;
+        closed = true;
+        bool ok = true;
+        if (mode != "read") { stream.flush(); if (!stream) ok = false; }
+        stream.close();
+        if (stream.fail()) ok = false;
+        return ok;
+    }
+    ~TextFile() noexcept {
+        if (!closed && !close_now())
+            record_cleanup_failure(source_file, source_line, source_column, "cannot close text file");
+    }
+};
+inline StringResult<std::shared_ptr<TextFile>> open_text_resource(
+    const std::string& path_text, const std::string& mode, const std::string& resource_type,
+    const std::string& file, int line, int column) {
+    const auto invalid_mode = resource_type == "TextWriter"
+        ? "openTextWriter mode must be 'write' or 'append'"
+        : "openText mode must be 'read', 'write', or 'append'";
+    if ((resource_type == "TextReader" && mode != "read")
+        || (resource_type == "TextWriter" && mode != "write" && mode != "append")
+        || (resource_type == "TextFile" && mode != "read" && mode != "write" && mode != "append"))
+        return result_error<std::shared_ptr<TextFile>>(invalid_mode);
+    try {
+        const auto path = tyvera_path(path_text);
+        if (is_secret_storage_path(path))
+            return result_error<std::shared_ptr<TextFile>>("secret file can only be accessed through the secrets provider");
+        auto resource = std::make_shared<TextFile>();
+        resource->mode = mode;
+        resource->resource_type = resource_type;
+        resource->source_file = file;
+        resource->source_line = line;
+        resource->source_column = column;
+        auto flags = std::ios::binary;
+        if (mode == "read") flags |= std::ios::in;
+        else if (mode == "write") flags |= std::ios::out | std::ios::trunc;
+        else flags |= std::ios::out | std::ios::app;
+        resource->stream.open(path, flags);
+        if (!resource->stream) return result_error<std::shared_ptr<TextFile>>("cannot open text file");
+        return result_ok<std::shared_ptr<TextFile>>(std::move(resource));
+    } catch (...) { return result_error<std::shared_ptr<TextFile>>("cannot open text file"); }
+}
+inline StringResult<std::shared_ptr<TextFile>> open_text(
+    const std::string& path, const std::string& mode, const std::string& resource_type,
+    const std::string& file, int line, int column) {
+    return open_text_resource(path, mode, resource_type, file, line, column);
+}
+inline StringResult<std::shared_ptr<TextFile>> open_text_reader(
+    const std::string& path, const std::string& file, int line, int column) {
+    return open_text_resource(path, "read", "TextReader", file, line, column);
+}
+inline StringResult<std::shared_ptr<TextFile>> open_text_writer(
+    const std::string& path, const std::string& mode, const std::string& file, int line, int column) {
+    return open_text_resource(path, mode, "TextWriter", file, line, column);
+}
+inline bool text_is_open(const std::shared_ptr<TextFile>& resource, const std::string&, int, int) {
+    return resource && !resource->closed && resource->stream.is_open();
+}
+inline void set_resource_location(const std::shared_ptr<TextFile>& resource,
+                                  const std::string& file, int line, int column) {
+    if (resource) {
+        resource->source_file = file;
+        resource->source_line = line;
+        resource->source_column = column;
+    }
+}
+inline bool text_close(const std::shared_ptr<TextFile>& resource, const std::string&, int, int) {
+    return resource && resource->close_now();
+}
+inline void require_open_text(const std::shared_ptr<TextFile>& resource,
+                              const std::string& file, int line, int column) {
+    if (!resource || resource->closed || !resource->stream.is_open())
+        fail(file, line, column, resource ? resource->resource_type + " is closed" : "text resource is unavailable");
+}
+inline StringResult<std::string> text_read_all(
+    const std::shared_ptr<TextFile>& resource, const std::string& file, int line, int column) {
+    require_open_text(resource, file, line, column);
+    if (resource->mode != "read") return result_error<std::string>("text file is not open for reading");
+    try {
+        std::string value((std::istreambuf_iterator<char>(resource->stream)), std::istreambuf_iterator<char>());
+        if (resource->stream.bad() || !valid_utf8_string(value))
+            return result_error<std::string>("cannot read text file");
+        return result_ok<std::string>(std::move(value));
+    } catch (...) { return result_error<std::string>("cannot read text file"); }
+}
+inline StringResult<bool> text_write(
+    const std::shared_ptr<TextFile>& resource, const std::string& value,
+    const std::string& file, int line, int column) {
+    require_open_text(resource, file, line, column);
+    if (resource->mode == "read") return result_error<bool>("text file is not open for writing");
+    resource->stream.write(value.data(), static_cast<std::streamsize>(value.size()));
+    return resource->stream ? result_ok<bool>(true) : result_error<bool>("cannot write text file");
+}
+inline StringResult<bool> text_append(
+    const std::shared_ptr<TextFile>& resource, const std::string& value,
+    const std::string& file, int line, int column) {
+    require_open_text(resource, file, line, column);
+    if (resource->mode != "append") return result_error<bool>("text file is not open for appending");
+    resource->stream.write(value.data(), static_cast<std::streamsize>(value.size()));
+    return resource->stream ? result_ok<bool>(true) : result_error<bool>("cannot append to text file");
+}
+inline StringResult<bool> text_flush(
+    const std::shared_ptr<TextFile>& resource, const std::string& file, int line, int column) {
+    require_open_text(resource, file, line, column);
+    resource->stream.flush();
+    return resource->stream ? result_ok<bool>(true) : result_error<bool>("cannot flush text file");
 }
 
 inline int compare_int_float(std::int64_t integer, double floating) {

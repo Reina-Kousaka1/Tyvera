@@ -166,9 +166,10 @@ patterns, collection operations, source locations, and structured control
 flow. The first backend emits C++17 with checked
 arithmetic and diagnostics, then invokes a host compiler. Linux x86-64 is the
 CI-tested target. Generated executables do not require Python. `Option`/
-`Result` matching, typed `List`/`Map`, `Byte`, and immutable `Bytes` are now
-part of the native subset. Binary file I/O, `ByteBuffer`, classes, generic
-functions, resources, Tasks, Actors, networking, and HTTP remain
+`Result` matching, typed `List`/`Map`, `Byte`, immutable `Bytes`, bounded
+`ByteBuffer`, synchronous text/binary file and path operations, and owned
+text-file resources are now part of the native subset. Classes, generic
+functions, Tasks, Actors, async I/O, networking, and HTTP remain
 interpreter-only. The full boundary and backend evaluation are in
 [Backend Architecture](backend-architecture.md); Tyvera's value and resource
 rules are in the [Memory Model](memory-model.md).

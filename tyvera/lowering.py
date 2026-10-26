@@ -26,6 +26,7 @@ from .ast import (
     ReturnStatement,
     Statement,
     Unary,
+    UsingStatement,
     VariantPattern,
     WhileStatement,
     WildcardPattern,
@@ -54,11 +55,13 @@ from .ir import (
     IRMatch,
     IRMatchArm,
     IRMethodCall,
+    IRMove,
     IRModule,
     IROutput,
     IRVariant,
     IRVariantPattern,
     IRReturn,
+    IRUsing,
     IRType,
     IRTypeRef,
     IRUnary,
@@ -79,6 +82,10 @@ _TYPE_MAP = {
     "String": IRType.STRING,
     "Byte": IRType.BYTE,
     "Bytes": IRType.BYTES,
+    "ByteBuffer": IRType.BYTE_BUFFER,
+    "TextFile": IRType.TEXT_FILE,
+    "TextReader": IRType.TEXT_READER,
+    "TextWriter": IRType.TEXT_WRITER,
     "Void": IRType.VOID,
     "Unit": IRType.VOID,
 }
@@ -238,6 +245,39 @@ class _FunctionLowerer:
             )
         if isinstance(statement, Block):
             return IRBlock(self._statements(statement.body, nested_scope=True), statement.location)
+        if isinstance(statement, UsingStatement):
+            acquisition = self._expression(statement.resource)
+            if not isinstance(acquisition.type, IRAppliedType) or acquisition.type.name != "Result":
+                raise Diagnostic(statement.location, "backend", "native using requires a checked Result acquisition")
+            resource_type = acquisition.type.arguments[0]
+            if resource_type not in {IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER}:
+                raise Diagnostic(statement.location, "backend", "native using supports TextFile, TextReader, and TextWriter")
+            if self.checked.ownership_transfers.get(statement.location) != (
+                f"{ir_type_name(resource_type)} to scoped owner {statement.name}"
+            ):
+                raise Diagnostic(statement.location, "backend", "native using is missing checked ownership-transfer metadata")
+            self.scopes.append({})
+            try:
+                resource = self._new_variable(
+                    statement.name, ir_type_name(resource_type), mutable=False, location=statement.location,
+                )
+                body = self._statements(statement.body)
+            finally:
+                self.scopes.pop()
+            error_variable = None
+            else_body = ()
+            if statement.error_name is not None:
+                self.scopes.append({})
+                try:
+                    error_variable = self._new_variable(
+                        statement.error_name, "String", mutable=False, location=statement.location,
+                    )
+                    else_body = self._statements(statement.else_body)
+                finally:
+                    self.scopes.pop()
+            elif statement.else_body:
+                raise Diagnostic(statement.location, "backend", "native using else body requires an error binding")
+            return IRUsing(resource, acquisition, body, error_variable, else_body, statement.location)
         if isinstance(statement, IfStatement):
             condition = self._expression(statement.condition)
             then_body = self._statements(statement.then_body, nested_scope=True)
@@ -355,15 +395,24 @@ class _FunctionLowerer:
         raise Diagnostic(pattern.location, "backend", f"native backend does not yet support {type(pattern).__name__} patterns")
 
     def _expression(self, expression: Expression) -> IRExpression:
+        if isinstance(expression, Unary) and expression.operator == "move":
+            if not isinstance(expression.operand, Name):
+                raise Diagnostic(expression.location, "backend", "native move requires a local resource binding")
+            source = self._lookup(expression.operand.identifier, expression.operand.location)
+            if self.checked.move_sites.get(expression.location) != expression.operand.identifier:
+                raise Diagnostic(expression.location, "backend", "native move is missing checked ownership metadata")
+            return IRMove(
+                IRLocalRef(source.identifier, source.type, expression.operand.location),
+                source.type,
+                expression.location,
+            )
+        if isinstance(expression, Name):
+            variable = self._lookup(expression.identifier, expression.location)
+            return IRLocalRef(variable.identifier, variable.type, expression.location)
         expression_type = self._expression_type(expression)
         if isinstance(expression, Literal):
             return IRLiteral(expression.value, expression_type, expression.location)
-        if isinstance(expression, Name):
-            variable = self._lookup(expression.identifier, expression.location)
-            return IRLocalRef(variable.identifier, expression_type, expression.location)
         if isinstance(expression, Unary):
-            if expression.operator == "move":
-                raise Diagnostic(expression.location, "backend", "native backend does not yet support Resource ownership")
             if (expression.operator == "-" and isinstance(expression.operand, Literal)
                     and expression.operand.type_name == "Int" and expression.operand.value == 1 << 63):
                 return IRLiteral(-(1 << 63), expression_type, expression.location)
@@ -393,7 +442,10 @@ class _FunctionLowerer:
                 raise Diagnostic(expression.location, "backend", "native backend does not yet support generic method calls")
             if not (
                 isinstance(receiver.type, IRAppliedType) and receiver.type.name in {"List", "Map"}
-                or receiver.type in {IRType.BYTE, IRType.BYTES}
+                or receiver.type in {
+                    IRType.BYTE, IRType.BYTES, IRType.BYTE_BUFFER,
+                    IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
+                }
             ):
                 raise Diagnostic(expression.location, "backend", f"native backend does not yet support methods on {ir_type_name(receiver.type)}")
             arguments = tuple(self._expression(argument) for argument in expression.arguments)
@@ -406,7 +458,11 @@ class _FunctionLowerer:
                 return IRVariant(expression.callee, payload, expression_type, expression.location)
             if expression.callee in {"List", "Map"}:
                 return IRCollectionCreate(expression_type, expression.location)
-            if expression.callee in {"byteFromInt", "bytesFromString"}:
+            if expression.callee in {
+                "byteFromInt", "bytesFromString", "byteBuffer", "readText", "writeText",
+                "readBytes", "writeBytes", "pathJoin", "pathExists", "openText",
+                "openTextReader", "openTextWriter",
+            }:
                 return IRBuiltinCall(
                     expression.callee,
                     tuple(self._expression(argument) for argument in expression.arguments),

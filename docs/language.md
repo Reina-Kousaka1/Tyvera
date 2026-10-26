@@ -830,6 +830,16 @@ spans, ownership and lifetime rules, mutation access, error conversion, and
 resource release. Native faults such as segmentation violations cannot be
 recovered as ordinary Tyvera `Result` values.
 
+The experimental C++17 backend implements this synchronous slice directly:
+`ByteBuffer` construction/access/snapshots, `readText`, `writeText`,
+`readBytes`, `writeBytes`, `pathJoin`, `pathExists`, and all synchronous
+`TextFile`/`TextReader`/`TextWriter` operations. It preserves the 64 MiB
+buffer/binary limit, project-root-relative file paths, checked `Result`
+errors, secret-path protection, move-only resource transfers, and LIFO cleanup.
+The generated executable uses private C++ runtime storage and does not invoke
+Python. Async file operations and all tasks, networking, HTTP, actors, and
+native FFI remain interpreter-only or planned.
+
 `resolveHost`, `tcpConnect`, and `tcpListen` return tasks. TCP listener
 and connection handles are move-only resources; `accept`, `read`, `write`, and
 `writeAll` suspend through the task scheduler. Address values expose host, port,

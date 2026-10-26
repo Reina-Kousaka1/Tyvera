@@ -46,16 +46,21 @@ relative paths from the project root and refuse direct access to
 
 The experimental native path supports the synchronous core and selected
 standard-library values: `Option<T>`, `Result<T,E>`, typed matching for their
-variants, `List<T>`, `Map<K,V>`, `Byte`, and immutable `Bytes`. These work only
-when their nested types are part of the native backend support matrix in
-[Backend Architecture](backend-architecture.md). List/Map references preserve
-shared mutation; `Bytes` preserves immutable value semantics. Native `Bytes`
-supports construction from `String`, `length`, checked `get` and `slice`, and
-UTF-8-checked `toString`. Binary file operations, `ByteBuffer`, all resource
-APIs, networking, HTTP, Tasks, and Actors remain interpreter-only. Generic
-user-defined functions and other types are also not part of the native slice.
-`tyvera build` reports unsupported calls or types; it never routes a native
-program through Python. The private C++ representation is not a public ABI.
+variants, `List<T>`, `Map<K,V>`, `Byte`, immutable `Bytes`, `ByteBuffer`,
+synchronous file/path operations, and synchronous `TextFile`, `TextReader`,
+and `TextWriter` resources. These work only when nested types are part of the
+native backend matrix in [Backend Architecture](backend-architecture.md).
+List/Map and `ByteBuffer` preserve shared mutation; `Bytes` preserves immutable
+value semantics. Native `ByteBuffer` supports checked allocation, length,
+`get`, `set`, and immutable `toBytes` snapshots, capped at 67,108,864 bytes.
+Native file operations include UTF-8 text, exact binary data, project-root
+relative paths, and protection for `.tyvera.secrets`. Synchronous text handles
+use the existing move-only ownership rules and deterministic LIFO cleanup.
+Async file operations, networking, HTTP, Tasks, Actors, generic user-defined
+functions, and other unsupported types remain interpreter-only. `tyvera
+build` reports unsupported calls or types; it never routes a native program
+through Python. The private C++ representation is not a public ABI. This
+native I/O subset is experimental and CI-tested on Linux x86-64 only.
 
 ## Planned namespaces
 

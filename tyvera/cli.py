@@ -89,7 +89,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if output == entry.resolve():
                 raise Diagnostic(Location(str(entry), 1, 1), "backend", "native output cannot replace the Tyvera source file")
             native_ir = lower_checked_program(checked)
-            built = CppNativeBackend().build(native_ir, output)
+            built = CppNativeBackend().build(native_ir, output, project_root=root)
             print(f"built {built}")
         else:
             print(f"checked {label}")

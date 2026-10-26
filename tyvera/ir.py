@@ -23,6 +23,10 @@ class IRType(str, Enum):
     STRING = "String"
     BYTE = "Byte"
     BYTES = "Bytes"
+    BYTE_BUFFER = "ByteBuffer"
+    TEXT_FILE = "TextFile"
+    TEXT_READER = "TextReader"
+    TEXT_WRITER = "TextWriter"
     VOID = "Void"
 
 
@@ -91,6 +95,15 @@ class IRCall(IRExpression):
 class IRUnary(IRExpression):
     operator: str
     operand: IRExpression
+    type: IRTypeRef
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
+class IRMove(IRExpression):
+    """An ownership transfer already approved by Tyvera's checked program."""
+
+    operand: IRLocalRef
     type: IRTypeRef
     location: Location
 
@@ -186,6 +199,18 @@ class IRBlock(IRStatement):
 
 
 @dataclass(frozen=True, slots=True)
+class IRUsing(IRStatement):
+    """Acquire a Result<Resource,String>, bind it for a lexical scope, then close it."""
+
+    resource: IRVariable
+    acquisition: IRExpression
+    body: tuple[IRStatement, ...]
+    error_variable: IRVariable | None
+    else_body: tuple[IRStatement, ...]
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
 class IRIf(IRStatement):
     condition: IRExpression
     then_body: tuple[IRStatement, ...]
@@ -260,11 +285,11 @@ class IRForEach(IRStatement):
 
 IRStatementLike: TypeAlias = (
     IRLet | IRAssign | IRExpressionStatement | IROutput | IRReturn | IRBlock
-    | IRIf | IRWhile | IRLoopControl | IRMatch | IRForEach
+    | IRUsing | IRIf | IRWhile | IRLoopControl | IRMatch | IRForEach
 )
 IRExpressionLike: TypeAlias = (
     IRLiteral | IRLocalRef | IRCall | IRUnary | IRBinary | IRVariant | IRBuiltinCall
-    | IRCollectionCreate | IRCollectionLength | IRMethodCall
+    | IRMove | IRCollectionCreate | IRCollectionLength | IRMethodCall
 )
 
 
@@ -314,6 +339,13 @@ def _hashable_key_type(type_ref: IRTypeRef) -> bool:
     return False
 
 
+def _contains_resource(type_ref: IRTypeRef) -> bool:
+    resources = {IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER}
+    if type_ref in resources:
+        return True
+    return isinstance(type_ref, IRAppliedType) and any(_contains_resource(item) for item in type_ref.arguments)
+
+
 def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef, ...], IRTypeRef] | None:
     if isinstance(receiver, IRType) and receiver == IRType.BYTE:
         return ((), IRType.INT) if method == "toInt" else None
@@ -324,6 +356,29 @@ def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef
             "get": ((IRType.INT,), _applied("Result", IRType.BYTE, IRType.STRING)),
             "slice": ((IRType.INT, IRType.INT), _applied("Result", IRType.BYTES, IRType.STRING)),
         }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.BYTE_BUFFER:
+        signatures = {
+            "length": ((), IRType.INT),
+            "get": ((IRType.INT,), _applied("Result", IRType.BYTE, IRType.STRING)),
+            "set": ((IRType.INT, IRType.BYTE), _applied("Result", IRType.BOOL, IRType.STRING)),
+            "toBytes": ((), _applied("Result", IRType.BYTES, IRType.STRING)),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver in {IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER}:
+        read_all = _applied("Result", IRType.STRING, IRType.STRING)
+        write = _applied("Result", IRType.BOOL, IRType.STRING)
+        signatures: dict[str, tuple[tuple[IRTypeRef, ...], IRTypeRef]] = {
+            "close": ((), IRType.BOOL), "isOpen": ((), IRType.BOOL),
+        }
+        if receiver in {IRType.TEXT_FILE, IRType.TEXT_READER}:
+            signatures["readAll"] = ((), read_all)
+        if receiver in {IRType.TEXT_FILE, IRType.TEXT_WRITER}:
+            signatures.update({
+                "write": ((IRType.STRING,), write),
+                "append": ((IRType.STRING,), write),
+                "flush": ((), write),
+            })
         return signatures.get(method)
     if isinstance(receiver, IRAppliedType) and receiver.name == "List":
         item = receiver.arguments[0]
@@ -409,6 +464,11 @@ def _statement_outcomes(statement: IRStatement) -> set[str]:
         return {statement.kind}
     if isinstance(statement, IRBlock):
         return _flow_outcomes(statement.statements)
+    if isinstance(statement, IRUsing):
+        body = _flow_outcomes(statement.body)
+        if statement.error_variable is None:
+            return body
+        return body | _flow_outcomes(statement.else_body)
     if isinstance(statement, IRIf):
         then_outcomes = _flow_outcomes(statement.then_body)
         else_outcomes = _flow_outcomes(statement.else_body) if statement.else_body else {"next"}
@@ -465,6 +525,11 @@ def _validate_expression(
             raise _invalid(expression.location, "IR references a local outside its scope")
         if variable.type != expression.type:
             raise _invalid(expression.location, "IR local reference type does not match its binding")
+        return expression.type
+    if isinstance(expression, IRMove):
+        operand_type = _validate_expression(expression.operand, functions, scopes)
+        if expression.type != operand_type or not _contains_resource(operand_type):
+            raise _invalid(expression.location, "IR move must transfer a Resource-containing local value")
         return expression.type
     if isinstance(expression, IRCall):
         function = functions.get(expression.function)
@@ -536,14 +601,24 @@ def _validate_expression(
         return expression.type
     if isinstance(expression, IRBuiltinCall):
         argument_types = tuple(_validate_expression(argument, functions, scopes) for argument in expression.arguments)
-        if expression.builtin == "byteFromInt":
-            expected = (IRType.INT,)
-            result: IRTypeRef = _applied("Result", IRType.BYTE, IRType.STRING)
-        elif expression.builtin == "bytesFromString":
-            expected = (IRType.STRING,)
-            result = IRType.BYTES
-        else:
+        signatures: dict[str, tuple[tuple[IRTypeRef, ...], IRTypeRef]] = {
+            "byteFromInt": ((IRType.INT,), _applied("Result", IRType.BYTE, IRType.STRING)),
+            "bytesFromString": ((IRType.STRING,), IRType.BYTES),
+            "byteBuffer": ((IRType.INT,), _applied("Result", IRType.BYTE_BUFFER, IRType.STRING)),
+            "readText": ((IRType.STRING,), _applied("Result", IRType.STRING, IRType.STRING)),
+            "writeText": ((IRType.STRING, IRType.STRING), _applied("Result", IRType.BOOL, IRType.STRING)),
+            "readBytes": ((IRType.STRING,), _applied("Result", IRType.BYTES, IRType.STRING)),
+            "writeBytes": ((IRType.STRING, IRType.BYTES), _applied("Result", IRType.BOOL, IRType.STRING)),
+            "pathJoin": ((IRType.STRING, IRType.STRING), IRType.STRING),
+            "pathExists": ((IRType.STRING,), IRType.BOOL),
+            "openText": ((IRType.STRING, IRType.STRING), _applied("Result", IRType.TEXT_FILE, IRType.STRING)),
+            "openTextReader": ((IRType.STRING,), _applied("Result", IRType.TEXT_READER, IRType.STRING)),
+            "openTextWriter": ((IRType.STRING, IRType.STRING), _applied("Result", IRType.TEXT_WRITER, IRType.STRING)),
+        }
+        signature = signatures.get(expression.builtin)
+        if signature is None:
             raise _invalid(expression.location, f"unknown native IR builtin '{expression.builtin}'")
+        expected, result = signature
         if argument_types != expected or expression.type != result:
             raise _invalid(expression.location, f"invalid typed IR builtin '{expression.builtin}'")
         return expression.type
@@ -622,6 +697,30 @@ def _validate_statements(
             scopes.append({})
             _validate_statements(statement.statements, return_type, functions, scopes, seen_ids, loop_depth)
             scopes.pop()
+        elif isinstance(statement, IRUsing):
+            acquisition_type = _validate_expression(statement.acquisition, functions, scopes)
+            expected_result = _applied("Result", statement.resource.type, IRType.STRING)
+            if (statement.resource.type not in {
+                    IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
+                } or acquisition_type != expected_result):
+                raise _invalid(statement.location, "IR using requires a checked Result<TextResource,String> acquisition")
+            if statement.resource.identifier in seen_ids:
+                raise _invalid(statement.location, "IR reuses a local identifier")
+            scopes.append({statement.resource.identifier: statement.resource})
+            seen_ids.add(statement.resource.identifier)
+            _validate_statements(statement.body, return_type, functions, scopes, seen_ids, loop_depth)
+            scopes.pop()
+            if statement.error_variable is None:
+                if statement.else_body:
+                    raise _invalid(statement.location, "IR using without an error binding cannot have an else body")
+            else:
+                error = statement.error_variable
+                if error.type != IRType.STRING or error.identifier in seen_ids:
+                    raise _invalid(statement.location, "IR using error binding must be a fresh String local")
+                scopes.append({error.identifier: error})
+                seen_ids.add(error.identifier)
+                _validate_statements(statement.else_body, return_type, functions, scopes, seen_ids, loop_depth)
+                scopes.pop()
         elif isinstance(statement, IRIf):
             if _validate_expression(statement.condition, functions, scopes) != IRType.BOOL:
                 raise _invalid(statement.location, "IR if condition must be Bool")

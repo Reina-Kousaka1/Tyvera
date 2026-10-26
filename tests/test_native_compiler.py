@@ -20,15 +20,19 @@ from tyvera.ir import (
     IRAppliedType,
     IRCall,
     IRCollectionLength,
+    IRBuiltinCall,
     IRForEach,
     IRFunction,
     IRIf,
+    IRLet,
     IRLiteral,
     IRMatch,
     IRMethodCall,
+    IRMove,
     IRModule,
     IROutput,
     IRType,
+    IRUsing,
     IRVariant,
     validate_ir,
 )
@@ -141,17 +145,69 @@ fn main() { println(increment(4)) }
         self.assertIn("does not yet support actors", caught.exception.message)
         self.assertEqual(caught.exception.location.filename, "actor.tyv")
 
-    def test_binary_file_io_and_mutable_byte_buffer_remain_interpreter_only(self) -> None:
-        for source, message in [
-            ('fn main() { let result = readBytes("file.bin") }', "call 'readBytes'"),
-            ('fn main() { let buffer = byteBuffer(4) }', "type 'ByteBuffer'"),
-        ]:
+    def test_native_byte_buffer_and_binary_io_lower_to_typed_ir(self) -> None:
+        module = self.lower('''fn main() {
+    let buffer = byteBuffer(4)
+    let read_result = readBytes("input.bin")
+    let write_result = writeBytes("output.bin", bytesFromString("data"))
+    let text_result = readText("input.txt")
+    let joined = pathJoin("folder", "file.txt")
+    let exists = pathExists(joined)
+}
+''')
+        builtins = [statement.value.builtin for statement in module.functions[0].body if isinstance(statement, IRLet)]
+        self.assertEqual(builtins, ["byteBuffer", "readBytes", "writeBytes", "readText", "pathJoin", "pathExists"])
+        self.assertEqual(module.functions[0].body[0].value.type, IRAppliedType("Result", (IRType.BYTE_BUFFER, IRType.STRING)))
+
+    def test_native_using_lowers_checked_resource_transfer_and_move(self) -> None:
+        module = self.lower('''fn relay(opened: Result<TextFile,String>) -> Result<TextFile,String> {
+    return move opened
+}
+fn main() {
+    using file = openText("out.txt", "write") {
+        file.write("text")
+    } else error {
+        println(error)
+    }
+}
+''')
+        relay_move = module.functions[0].body[0].value
+        self.assertIsInstance(relay_move, IRMove)
+        using = module.functions[1].body[0]
+        self.assertIsInstance(using, IRUsing)
+        self.assertEqual(using.resource.type, IRType.TEXT_FILE)
+        self.assertEqual(using.acquisition.type, IRAppliedType("Result", (IRType.TEXT_FILE, IRType.STRING)))
+        self.assertEqual(using.error_variable.type, IRType.STRING)
+
+    def test_native_byte_buffer_and_io_signatures_reject_wrong_types(self) -> None:
+        invalid_sources = (
+            '''fn main() {
+    match byteBuffer(1) {
+        Err(_) => {}
+        Ok(buffer) => buffer.set(0, "not a Byte")
+    }
+}''',
+            'fn main() { writeBytes("out.bin", "not Bytes") }',
+            'fn main() { pathJoin(1, "file") }',
+            'fn main() { byteBuffer("not a length") }',
+        )
+        for source in invalid_sources:
             with self.subTest(source=source):
-                checked = compile_checked_source(source, "runtime_only.tyv")
                 with self.assertRaises(Diagnostic) as caught:
-                    lower_checked_program(checked)
-                self.assertEqual(caught.exception.stage, "backend")
-                self.assertIn(message, caught.exception.message)
+                    compile_checked_source(source, "native-io-types.tyv")
+                self.assertEqual(caught.exception.stage, "type")
+
+    def test_ir_validator_rejects_mistyped_native_byte_buffer_builtin(self) -> None:
+        from tyvera.ir import IRExpressionStatement
+
+        location = Location("bad_buffer_ir.tyv", 1, 1)
+        call = IRBuiltinCall(
+            "byteBuffer", (IRLiteral(1, IRType.INT, location),), IRType.BYTE_BUFFER, location,
+        )
+        main = IRFunction("main", "tyv_fn_main", (), IRType.VOID,
+                          (IRExpressionStatement(call, location),), location)
+        with self.assertRaisesRegex(Diagnostic, "invalid typed IR builtin 'byteBuffer'"):
+            validate_ir(IRModule((main,), "tyv_fn_main"))
 
     def test_sum_types_and_recursive_patterns_lower_with_checked_types(self) -> None:
         module = self.lower('''fn main() {
@@ -250,7 +306,9 @@ fn main() { println(add(1, 2)); println("Tyvera") }
         self.assertNotIn("PyObject", source)
 
     def test_new_native_examples_lower_and_emit_cpp_without_python_bridge(self) -> None:
-        for name in ("native_sum_types.tyv", "native_collections.tyv", "native_bytes.tyv"):
+        for name in (
+            "native_sum_types.tyv", "native_collections.tyv", "native_bytes.tyv", "byte_buffers.tyv",
+        ):
             with self.subTest(example=name):
                 checked = compile_checked_project(REPOSITORY / "examples" / name, REPOSITORY)
                 module = lower_checked_program(checked)
@@ -328,10 +386,13 @@ fn main() { println(add(1, 2)); println("Tyvera") }
 
 @unittest.skipUnless(HAS_CPP_COMPILER, "native end-to-end checks require a C++17 compiler")
 class NativeExecutionTests(unittest.TestCase):
-    def _build_and_run(self, source_file: Path, output: Path) -> subprocess.CompletedProcess[str]:
-        checked = compile_checked_project(source_file, REPOSITORY)
+    def _build_and_run(
+        self, source_file: Path, output: Path, *, project_root: Path = REPOSITORY,
+        cwd: Path = REPOSITORY,
+    ) -> subprocess.CompletedProcess[str]:
+        checked = compile_checked_project(source_file, project_root)
         module = lower_checked_program(checked)
-        CppNativeBackend().build(module, output)
+        CppNativeBackend().build(module, output, project_root=project_root)
         environment = os.environ.copy()
         environment.pop("PYTHONPATH", None)
         environment.pop("PYTHONHOME", None)
@@ -339,13 +400,380 @@ class NativeExecutionTests(unittest.TestCase):
             # The absolute executable must not depend on Python being on PATH.
             environment["PATH"] = ""
         return subprocess.run(
-            [str(output)], capture_output=True, text=True, encoding="utf-8", env=environment, check=False,
+            [str(output)], cwd=cwd, capture_output=True, text=True, encoding="utf-8", env=environment, check=False,
         )
+
+    @staticmethod
+    def _reference_result(source: str, project_root: Path) -> tuple[int, str, str]:
+        checked = compile_checked_source(source, "native-io.tyv")
+        output = io.StringIO()
+        errors = io.StringIO()
+        try:
+            ReferenceInterpreterBackend().execute(
+                checked, output=output, error_output=errors, project_root=project_root,
+            )
+        except Diagnostic as error:
+            return 1, output.getvalue(), error.render() + "\n"
+        return 0, output.getvalue(), errors.getvalue()
+
+    def _native_source_result(
+        self, source: str, project_root: Path, output: Path, cwd: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        checked = compile_checked_source(source, "native-io.tyv")
+        CppNativeBackend().build(lower_checked_program(checked), output, project_root=project_root)
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        environment.pop("PYTHONHOME", None)
+        if os.name != "nt":
+            environment["PATH"] = ""
+        return subprocess.run(
+            [str(output)], cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8", env=environment, check=False,
+        )
+
+    @staticmethod
+    def _tyvera_string(value: str) -> str:
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+
+    def test_native_byte_buffer_binary_and_text_io_match_reference(self) -> None:
+        source = '''
+fn mutate(buffer: ByteBuffer, value: Byte) {
+    let alias = buffer
+    match alias.set(1, value) {
+        Ok(_) => println("mutated")
+        Err(error) => eprintln(error)
+    }
+}
+fn relay(opened: Result<TextFile,String>) -> Result<TextFile,String> {
+    return move opened
+}
+fn main() {
+    match byteFromInt(255) {
+        Err(error) => eprintln(error)
+        Ok(value) => match byteBuffer(3) {
+            Err(error) => eprintln(error)
+            Ok(buffer) => {
+                let alias = buffer
+                mutate(alias, value)
+                match buffer.get(1) {
+                    Err(error) => eprintln(error)
+                    Ok(changed) => println(changed.toInt())
+                }
+                match buffer.toBytes() {
+                    Err(error) => eprintln(error)
+                    Ok(snapshot) => {
+                        match writeBytes("payload.bin", snapshot) {
+                            Err(error) => eprintln(error)
+                            Ok(_) => match readBytes("payload.bin") {
+                                Err(error) => eprintln(error)
+                                Ok(contents) => println(contents.length())
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match readBytes("input.bin") {
+        Err(error) => eprintln(error)
+        Ok(contents) => {
+            println(contents.length())
+            match writeBytes(pathJoin("nested", "copy.bin"), contents) {
+                Err(error) => eprintln(error)
+                Ok(_) => println(pathExists("nested/copy.bin"))
+            }
+        }
+    }
+    match readText("seed.txt") {
+        Err(error) => eprintln(error)
+        Ok(contents) => println(contents)
+    }
+    match writeText("written.txt", "written") {
+        Err(error) => eprintln(error)
+        Ok(_) => match readText("written.txt") {
+            Err(error) => eprintln(error)
+            Ok(contents) => println(contents)
+        }
+    }
+    let transferred = relay(openText("resource.txt", "write"))
+    match move transferred {
+        Err(error) => eprintln(error)
+        Ok(file) => {
+            match file.write("resource") {
+                Err(error) => eprintln(error)
+                Ok(_) => match file.readAll() {
+                    Err(error) => println(error)
+                    Ok(_) => println("unexpected")
+                }
+            }
+            println(file.close())
+            println(file.isOpen())
+        }
+    }
+    using writer = openTextWriter("scoped.txt", "write") {
+        match writer.write("scoped") {
+            Err(error) => eprintln(error)
+            Ok(_) => match writer.flush() {
+                Err(error) => eprintln(error)
+                Ok(_) => println("flushed")
+            }
+        }
+    } else error {
+        eprintln(error)
+    }
+    using reader = openTextReader("scoped.txt") {
+        match reader.readAll() {
+            Err(error) => eprintln(error)
+            Ok(contents) => println(contents)
+        }
+    } else error {
+        eprintln(error)
+    }
+    using appender = openTextWriter("scoped.txt", "append") {
+        match appender.append("-more") {
+            Err(error) => eprintln(error)
+            Ok(_) => println("appended")
+        }
+    } else error {
+        eprintln(error)
+    }
+    match readText("scoped.txt") {
+        Err(error) => eprintln(error)
+        Ok(contents) => println(contents)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-io-") as temporary:
+            workspace = Path(temporary)
+            roots = (workspace / "reference", workspace / "native")
+            for root in roots:
+                (root / "nested").mkdir(parents=True)
+                (root / "input.bin").write_bytes(b"\x00\xff\x2a")
+                (root / "seed.txt").write_bytes(b"first\r\nsecond\r\n")
+            expected = self._reference_result(source, roots[0])
+            native = self._native_source_result(source, roots[1], workspace / "native-app", workspace)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            self.assertEqual((roots[0] / "payload.bin").read_bytes(), (roots[1] / "payload.bin").read_bytes())
+            self.assertEqual((roots[1] / "payload.bin").read_bytes(), b"\x00\xff\x00")
+            self.assertEqual((roots[0] / "nested" / "copy.bin").read_bytes(), (roots[1] / "nested" / "copy.bin").read_bytes())
+            for name in ("written.txt", "resource.txt", "scoped.txt"):
+                self.assertEqual((roots[0] / name).read_bytes(), (roots[1] / name).read_bytes())
+            self.assertEqual((roots[1] / "scoped.txt").read_text(encoding="utf-8"), "scoped-more")
+
+    def test_native_io_errors_buffer_bounds_and_secret_paths_match_reference(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-io-errors-") as temporary:
+            workspace = Path(temporary)
+            roots = (workspace / "reference", workspace / "native")
+            for root in roots:
+                root.mkdir()
+                (root / "bad-utf8.txt").write_bytes(b"\xff")
+                (root / ".tyvera.secrets").write_text("TOKEN = \"must-not-appear\"\n", encoding="utf-8")
+                (root / "directory").mkdir()
+                (root / "nested").mkdir()
+            error_source = '''fn main() {
+    match byteBuffer(-1) {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected")
+    }
+    match byteBuffer(67108865) {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected")
+    }
+    match byteFromInt(256) {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected")
+    }
+    match byteBuffer(1) {
+        Err(error) => println(error)
+        Ok(buffer) => {
+            match byteFromInt(0) {
+                Err(error) => println(error)
+                Ok(zero) => {
+                    match buffer.get(-1) {
+                        Err(error) => println(error)
+                        Ok(_) => println("unexpected")
+                    }
+                    match buffer.get(1) {
+                        Err(error) => println(error)
+                        Ok(_) => println("unexpected")
+                    }
+                    match buffer.set(1, zero) {
+                        Err(error) => println(error)
+                        Ok(_) => println("unexpected")
+                    }
+                }
+            }
+        }
+    }
+    match readBytes("missing.bin") {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected")
+    }
+    using reader = openTextReader("missing.txt") {
+        println("unexpected")
+    } else error {
+        println(error)
+    }
+    using writer = openTextWriter("missing-parent/out.txt", "write") {
+        println("unexpected")
+    } else error {
+        println(error)
+    }
+    using invalidMode = openTextWriter("ignored.txt", "read") {
+        println("unexpected")
+    } else error {
+        println(error)
+    }
+    match readText("bad-utf8.txt") {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected")
+    }
+    match readText("directory") {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected")
+    }
+    match writeBytes("directory", bytesFromString("x")) {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected")
+    }
+    match readText(".tyvera.secrets") {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected")
+    }
+    match readText("./nested/../.tyvera.secrets") {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected")
+    }
+    match readText(@ABS_SECRET@) {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected")
+    }
+    match writeText(".tyvera.secrets", "overwritten") {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected")
+    }
+    match writeBytes(".tyvera.secrets", bytesFromString("overwritten")) {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected")
+    }
+}'''
+            source_for = lambda root: error_source.replace(
+                "@ABS_SECRET@", self._tyvera_string(str(root / ".tyvera.secrets")),
+            )
+            sources = (source_for(roots[0]), source_for(roots[1]))
+            expected = self._reference_result(sources[0], roots[0])
+            native = self._native_source_result(sources[1], roots[1], workspace / "native-errors", workspace)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            self.assertNotIn("must-not-appear", native.stdout + native.stderr)
+            for root in roots:
+                self.assertEqual((root / ".tyvera.secrets").read_text(encoding="utf-8"), 'TOKEN = "must-not-appear"\n')
+
+            if os.name != "nt":
+                for root in roots:
+                    try:
+                        (root / "secret-link").symlink_to(root / ".tyvera.secrets")
+                    except OSError:
+                        self.skipTest("test environment does not permit creating symlinks")
+                symlink_source = '''fn main() {
+    match readText("secret-link") {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected")
+    }
+}'''
+                expected_link = self._reference_result(symlink_source, roots[0])
+                native_link = self._native_source_result(
+                    symlink_source, roots[1], workspace / "native-link", workspace,
+                )
+                self.assertEqual((native_link.returncode, native_link.stdout, native_link.stderr), expected_link)
+
+    def test_native_byte_buffer_accepts_64_mib_and_rejects_the_next_byte(self) -> None:
+        source = '''fn main() {
+    match byteBuffer(67108864) {
+        Err(error) => println(error)
+        Ok(buffer) => println(buffer.length())
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-buffer-limit-") as temporary:
+            workspace = Path(temporary)
+            roots = (workspace / "reference", workspace / "native")
+            for root in roots:
+                root.mkdir()
+            expected = self._reference_result(source, roots[0])
+            native = self._native_source_result(source, roots[1], workspace / "native-limit", workspace)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+
+    def test_native_binary_read_rejects_file_over_64_mib_like_reference(self) -> None:
+        source = '''fn main() {
+    match readBytes("oversized.bin") {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected")
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-binary-limit-") as temporary:
+            workspace = Path(temporary)
+            roots = (workspace / "reference", workspace / "native")
+            for root in roots:
+                root.mkdir()
+                with (root / "oversized.bin").open("wb") as stream:
+                    stream.truncate(67_108_865)
+            expected = self._reference_result(source, roots[0])
+            native = self._native_source_result(source, roots[1], workspace / "native-binary-limit", workspace)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+
+    def test_native_permission_errors_match_reference_when_enforced(self) -> None:
+        if os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() == 0:
+            self.skipTest("permission-denied fixture requires a non-root POSIX user")
+        source = '''fn main() {
+    match readBytes("restricted/private.bin") {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected read")
+    }
+    match writeBytes("restricted/out.bin", bytesFromString("x")) {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected write")
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-permissions-") as temporary:
+            workspace = Path(temporary)
+            roots = (workspace / "reference", workspace / "native")
+            for root in roots:
+                restricted = root / "restricted"
+                restricted.mkdir(parents=True)
+                (restricted / "private.bin").write_bytes(b"private")
+                restricted.chmod(0)
+            try:
+                expected = self._reference_result(source, roots[0])
+                native = self._native_source_result(source, roots[1], workspace / "native-permissions", workspace)
+                self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            finally:
+                for root in roots:
+                    (root / "restricted").chmod(0o700)
+
+    def test_native_cleanup_failure_does_not_replace_primary_failure(self) -> None:
+        if not Path("/dev/full").exists():
+            self.skipTest("cleanup failure fixture requires /dev/full")
+        source = '''fn main() {
+    using writer = openTextWriter("/dev/full", "write") {
+        writer.write("buffered")
+        let invalid = 1 / 0
+    } else error {
+        eprintln(error)
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-cleanup-") as temporary:
+            workspace = Path(temporary)
+            root = workspace / "project"
+            root.mkdir()
+            expected = self._reference_result(source, root)
+            native = self._native_source_result(source, root, workspace / "native-cleanup", workspace)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
 
     def test_native_examples_match_reference_interpreter_without_python_path(self) -> None:
         examples = (
             "native_hello.tyv", "native_control_flow.tyv", "native_values.tyv",
             "native_sum_types.tyv", "native_collections.tyv", "native_bytes.tyv",
+            "byte_buffers.tyv",
         )
         with tempfile.TemporaryDirectory(prefix="tyvera-native-e2e-") as temporary:
             for name in examples:
@@ -357,6 +785,25 @@ class NativeExecutionTests(unittest.TestCase):
                         checked, output=expected, error_output=io.StringIO(), project_root=REPOSITORY,
                     )
                     result = self._build_and_run(source, Path(temporary) / Path(name).stem)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, expected.getvalue())
+                    self.assertEqual(result.stderr, "")
+
+    def test_native_sync_resource_examples_match_reference_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-resources-") as temporary:
+            root = Path(temporary)
+            for name in ("resource_scopes.tyv", "resource_ownership.tyv"):
+                with self.subTest(example=name):
+                    source = REPOSITORY / "examples" / name
+                    project_root = source.parent
+                    checked = compile_checked_project(source, project_root)
+                    expected = io.StringIO()
+                    ReferenceInterpreterBackend().execute(
+                        checked, output=expected, error_output=io.StringIO(), project_root=project_root,
+                    )
+                    result = self._build_and_run(
+                        source, root / Path(name).stem, project_root=project_root, cwd=root,
+                    )
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, expected.getvalue())
                     self.assertEqual(result.stderr, "")

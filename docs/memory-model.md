@@ -67,13 +67,13 @@ implements the supported subset noted below.
 | `Int`, `Float`, `Bool`, `Duration` | Immutable scalar values; assignment copies the value. | Implemented; signed 64-bit and finite binary64 rules are specified. |
 | `Byte` | Immutable unsigned 8-bit scalar, explicitly converted to/from `Int` with range checking. | Reference runtime and the native `byteFromInt`/`toInt`/equality/output slice are implemented. |
 | `String` | Immutable Unicode scalar sequence; equality compares exact sequence, without normalization. | Implemented for source and file I/O; indexing and grapheme APIs remain open. |
-| `Bytes` | Immutable byte value; equality compares contents. Assignment, calls, returns, and actor messages preserve value semantics. Binary slices and indexed reads return checked results. | Reference runtime implemented; native `bytesFromString`, equality, length, get, slice, and UTF-8 decoding are implemented. Binary file I/O remains interpreter-only. |
-| `ByteBuffer` | Shared mutable reference to zero-initialized, runtime-managed bytes; access is bounds checked and snapshots are immutable. | Reference runtime implemented with a 64 MiB cap; native backend V1 remains interpreter-only. Raw pointers, unchecked access, custom allocators, and manual deallocation are not exposed. |
+| `Bytes` | Immutable byte value; equality compares contents. Assignment, calls, returns, and actor messages preserve value semantics. Binary slices and indexed reads return checked results. | Reference runtime and native `bytesFromString`, equality, length, get, slice, UTF-8 decoding, and binary file I/O are implemented. |
+| `ByteBuffer` | Shared mutable reference to zero-initialized, runtime-managed bytes; access is bounds checked and snapshots are immutable. | Reference runtime and native allocation/access/snapshot are implemented with a 64 MiB cap. Raw pointers, unchecked access, custom allocators, and manual deallocation are not exposed. |
 | `Option<T>`, `Result<T,E>` | Immutable tagged values with structural equality; nested references retain their own identity/value behavior. | Implemented in the bootstrap and native backend for types in the native support subset. |
 | Enums, newtypes, tuples, records | Typed value types; records are immutable nominal values and fields compare structurally. | Implemented in the bootstrap; native backend remains interpreter-only. |
 | Class instances, lists, maps | Classes use stable identity; lists and maps compare by contents. Assignment copies references; collection contents remain shared. | Lists and maps are implemented natively for supported element types; classes remain interpreter-only. |
 | Actor references, tasks, reply handles, timers, supervisors | Opaque identity handles. Copying a handle does not copy the actor, task, or operation it names. | Implemented in the interpreter; public runtime ABI is planned. |
-| Resource handles | One live owner, explicit transfer, deterministic release. | Implemented for text files, TCP connections/listeners, and HTTP servers, including resource-bearing task results, path-sensitive moves, and task/scope cleanup. |
+| Resource handles | One live owner, explicit transfer, deterministic release. | Implemented for text files, TCP connections/listeners, and HTTP servers. Native `TextFile`/`TextReader`/`TextWriter` support uses checked moves and synchronous LIFO scope cleanup; task/network resources remain interpreter-only. |
 
 For mutable ordinary references, `==` compares identity. Value equality
 compares scalar and immutable tagged values structurally, recursively applying
@@ -159,9 +159,10 @@ deadline behavior, partial byte reads/writes, EOF, backpressure, ownership, and
 controlled `Result` errors. It does not expose Python sockets, asyncio,
 exceptions, file objects, or OS address structs. The current reference
 adapter uses a selector for TCP readiness and a bounded worker pool for DNS
-and file operations. Native Backend V1 does not compile these APIs. A future
-native I/O runtime must implement the same observable behavior with the
-platform's completion or readiness facilities.
+and file operations. Native Backend V1 implements synchronous text and binary
+file/path operations; async file operations, DNS, and TCP remain interpreter-
+only. A future native async runtime must implement the same observable behavior
+with the platform's completion or readiness facilities.
 
 ### Native executable subset
 
@@ -171,11 +172,16 @@ Native V1 compiles the synchronous scalar/control-flow subset described in
 `Map` support their typed core methods and snapshot iteration. Native `Byte`
 supports `byteFromInt`, `toInt`, equality, and output; immutable `Bytes`
 supports `bytesFromString`, equality, `length`, bounds-checked `get`/`slice`,
-and UTF-8-checked `toString`. The generated C++17 support code preserves
-checked numeric behavior and source-located runtime errors. Executables do not
-invoke or embed Python. Binary/text file I/O, `ByteBuffer`, resources and
-cleanup, user-defined types, generic functions, Tasks, Actors, networking, and
-HTTP remain reference-interpreter features; native build rejects them
+and UTF-8-checked `toString`. Native V1 also implements bounded `ByteBuffer`
+allocation/access/snapshots; `readText`, `writeText`, `readBytes`, `writeBytes`,
+`pathJoin`, `pathExists`; and synchronous `TextFile`, `TextReader`, and
+`TextWriter` operations with checked move transfer and LIFO cleanup. Relative
+I/O paths use the project root, and `.tyvera.secrets` is protected through
+canonical direct, traversal, absolute, and symlink paths. The generated C++17
+runtime preserves checked numeric behavior, controlled I/O results, and
+source-located runtime errors. Executables do not invoke or embed Python.
+User-defined types, generic functions, Tasks, Actors, async I/O, networking,
+and HTTP remain reference-interpreter features; native build rejects them
 explicitly. No public native ABI or FFI is implemented.
 
 `Bytes` is an immutable Tyvera value. Native values are represented internally
