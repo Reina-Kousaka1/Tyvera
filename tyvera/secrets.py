@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
+
+from .platform_runtime import environment_value
 
 
 _SECRET_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -26,7 +27,7 @@ class SecretProvider:
         local = self._read_local()
         if name in local:
             return local[name]
-        return os.environ.get(name)
+        return environment_value(name)
 
     def _read_local(self) -> dict[str, str]:
         try:

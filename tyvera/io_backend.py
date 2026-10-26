@@ -137,6 +137,15 @@ class IOBackend:
                 callback()
         self._drain_completions()
 
+    def wake(self) -> None:
+        """Wake a blocked selector so it can observe runtime shutdown."""
+        if self._closed:
+            return
+        try:
+            self._wake_writer.send(b"\0")
+        except (BlockingIOError, OSError):
+            pass
+
     def shutdown(self) -> None:
         if self._closed:
             return

@@ -6,7 +6,6 @@ import errno
 import selectors
 import socket
 import sys
-import time
 from collections import ChainMap, deque
 from dataclasses import dataclass, field as dataclass_field
 from itertools import count
@@ -53,6 +52,23 @@ from .ast import (
 from .source import Diagnostic, Location
 from .secrets import SecretProvider, SecretProviderError
 from .io_backend import IOBackend, IOBackendError
+from .platform_runtime import (
+    ShutdownController,
+    ShutdownDiagnostic,
+    detect_host_platform,
+    environment_value,
+    monotonic_seconds,
+    monotonic_sleep,
+)
+from .supervision import (
+    CrashKind,
+    CrashReason,
+    ExponentialBackoff,
+    RestartPolicy,
+    RestartStrategy,
+    RuntimeEvent,
+    RuntimeEventKind,
+)
 from .http_protocol import (
     HttpHeaders, HttpLimits, HttpMessageDecoder, HttpMethod, HttpProtocolError,
     HttpRequest, HttpResponse, HttpRouter, HttpUrl, encode_request, encode_response,
@@ -309,8 +325,12 @@ class _TyveraSupervisor:
     max_restarts: int
     window_milliseconds: int
     clock: Callable[[], float]
+    strategy: RestartStrategy = RestartStrategy.ONE_FOR_ONE
+    backoff: ExponentialBackoff | None = None
+    parent: _TyveraSupervisor | None = None
+    restart_policy: RestartPolicy = RestartPolicy.PERMANENT
     restart_times: deque[float] = dataclass_field(default_factory=deque)
-    children: list[_TyveraActor] = dataclass_field(default_factory=list)
+    children: list[_TyveraActor | _TyveraSupervisor] = dataclass_field(default_factory=list)
     status: str = "alive"
     identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
@@ -325,10 +345,22 @@ class _TyveraActor:
     mailbox: deque[_ActorMessage] = dataclass_field(default_factory=deque)
     queued: bool = False
     supervisor: _TyveraSupervisor | None = None
+    restart_policy: RestartPolicy = RestartPolicy.PERMANENT
     declaration: ActorDeclaration | None = None
     constructor_arguments: list[object] = dataclass_field(default_factory=list)
     pending_replies: set[_TyveraReplyCell] = dataclass_field(default_factory=set)
     identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
+
+
+@dataclass(slots=True)
+class _PendingSupervisorRestart:
+    supervisor: _TyveraSupervisor
+    children: tuple[_TyveraActor | _TyveraSupervisor, ...]
+    trigger: _TyveraActor | _TyveraSupervisor
+    failure: str
+    due_at: float
+    location: Location
+    depth: int
 
 
 @dataclass(slots=True, eq=False, repr=False)
@@ -626,6 +658,8 @@ class Interpreter:
         project_root: str | Path | None = None, error_output: TextIO | None = None,
         clock: Callable[[], float] | None = None,
         sleeper: Callable[[float], None] | None = None,
+        shutdown_controller: ShutdownController | None = None,
+        runtime_event_sink: Callable[[RuntimeEvent], None] | None = None,
     ) -> None:
         self.functions = {function.name: function for function in program.functions}
         self.classes: dict[str, ClassDeclaration] = {declaration.name: declaration for declaration in program.classes}
@@ -636,6 +670,7 @@ class Interpreter:
         self._ready_actors: deque[_TyveraActor] = deque()
         self._actors: list[_TyveraActor] = []
         self._supervisors: list[_TyveraSupervisor] = []
+        self._pending_supervisor_restarts: list[_PendingSupervisorRestart] = []
         self._scheduled_timers: list[_TyveraTimer] = []
         self._ready_tasks: deque[_TyveraTask] = deque()
         self._tasks: list[_TyveraTask] = []
@@ -650,9 +685,16 @@ class Interpreter:
         self.max_call_depth = max_call_depth
         self.project_root = Path.cwd() if project_root is None else Path(project_root)
         self.secret_provider = SecretProvider(self.project_root)
-        self._clock = time.monotonic if clock is None else clock
-        self._sleep = time.sleep if sleeper is None else sleeper
+        self._clock = monotonic_seconds if clock is None else clock
+        self._sleep = monotonic_sleep if sleeper is None else sleeper
         self._io_backend: IOBackend | None = None
+        self._shutdown_controller = shutdown_controller
+        self._runtime_event_sink = runtime_event_sink
+        self._dead_letters: deque[RuntimeEvent] = deque(maxlen=1024)
+        if shutdown_controller is not None:
+            shutdown_controller.set_waker(
+                lambda: self._io_backend.wake() if self._io_backend is not None else None,
+            )
 
     def run(self) -> None:
         main = self.functions["main"]
@@ -661,8 +703,21 @@ class Interpreter:
         self._runtime_state = "running"
         try:
             self._call(main, [], main.location, 0)
+            self._check_shutdown(main.location)
         finally:
             self._shutdown_runtime()
+
+    def _check_shutdown(self, location: Location) -> None:
+        if self._shutdown_controller is not None:
+            self._shutdown_controller.raise_if_requested(location)
+
+    def _emit_runtime_event(self, event: RuntimeEvent) -> None:
+        if self._runtime_event_sink is not None:
+            try:
+                self._runtime_event_sink(event)
+            except Exception:
+                # Observability must never change application behavior.
+                pass
 
     def _shutdown_runtime(self) -> None:
         if self._runtime_state == "closed":
@@ -670,11 +725,13 @@ class Interpreter:
         self._runtime_state = "shutting_down"
         for task in self._tasks:
             self._cancel_task(task)
-        for actor in self._actors:
-            self._stop_actor(actor, "runtime shut down before actor replied")
-        for supervisor in self._supervisors:
-            if supervisor.status == "alive":
-                supervisor.status = "stopped"
+        self._pending_supervisor_restarts.clear()
+        for supervisor in reversed(self._supervisors):
+            if supervisor.parent is None and supervisor.status in {"alive", "restarting"}:
+                self._stop_supervisor_tree(supervisor, "runtime shut down")
+        for actor in reversed(self._actors):
+            if actor.status in {"alive", "starting", "restarting"}:
+                self._stop_actor(actor, "runtime shut down before actor replied")
         self._ready_tasks.clear()
         self._ready_actors.clear()
         for timer in self._scheduled_timers:
@@ -687,6 +744,7 @@ class Interpreter:
             self._io_backend.shutdown()
         self._scheduler_state = "closed"
         self._runtime_state = "closed"
+        self._emit_runtime_event(RuntimeEvent(RuntimeEventKind.RUNTIME_SHUTDOWN, "runtime"))
 
     def _call(self, function: Function, arguments: list[object], call_location: Location, depth: int) -> object:
         if depth >= self.max_call_depth:
@@ -714,6 +772,8 @@ class Interpreter:
                 for location, message in errors
             )
             if isinstance(primary, Diagnostic):
+                if isinstance(primary, ShutdownDiagnostic):
+                    raise primary.with_cleanup_failure(cleanup_message) from primary
                 raise Diagnostic(primary.location, primary.stage,
                                  f"{primary.message}; resource cleanup also failed: {cleanup_message}") from primary
             location, message = errors[0]
@@ -727,6 +787,7 @@ class Interpreter:
 
     def _execute_block_inner(self, body: list[Statement], variables: ChainMap[str, object], depth: int) -> None:
         for statement in body:
+            self._check_shutdown(statement.location)
             if isinstance(statement, LetStatement):
                 variables[statement.name] = self._evaluate(statement.value, variables, depth)
             elif isinstance(statement, Assignment):
@@ -775,6 +836,8 @@ class Interpreter:
                         if cleanup_error is None:
                             raise
                         if isinstance(primary, Diagnostic):
+                            if isinstance(primary, ShutdownDiagnostic):
+                                raise primary.with_cleanup_failure(cleanup_error) from primary
                             raise Diagnostic(primary.location, primary.stage,
                                              f"{primary.message}; resource cleanup also failed: {cleanup_error}") from primary
                         raise Diagnostic(statement.location, "runtime",
@@ -788,7 +851,10 @@ class Interpreter:
                 body = statement.then_body if self._evaluate(statement.condition, variables, depth) else statement.else_body
                 self._execute_block(body, variables.new_child(), depth)
             elif isinstance(statement, WhileStatement):
-                while self._evaluate(statement.condition, variables, depth):
+                while True:
+                    self._check_shutdown(statement.location)
+                    if not self._evaluate(statement.condition, variables, depth):
+                        break
                     try:
                         self._execute_block(statement.body, variables.new_child(), depth)
                     except _LoopSignal as signal:
@@ -872,6 +938,16 @@ class Interpreter:
                 group = _TyveraTaskGroup(self._current_task)
                 self._task_groups.append(group)
                 return group
+            if expression.callee in {"hostOS", "hostArchitecture"}:
+                platform = detect_host_platform()
+                return (platform.operating_system.value if expression.callee == "hostOS"
+                        else platform.architecture.value)
+            if expression.callee == "environment":
+                name = self._evaluate(expression.arguments[0], variables, depth)
+                value = environment_value(name)
+                if value is None:
+                    return _TyveraVariant("None", None, "Option", 1)
+                return _TyveraVariant("Some", _TyveraSecret(value), "Option", 1)
             if expression.callee == "spawn":
                 construction = expression.arguments[0]
                 if not isinstance(construction, Call):
@@ -879,18 +955,39 @@ class Interpreter:
                 declaration = self.actors[construction.callee]
                 arguments = self._evaluate_arguments(construction.arguments, variables, depth)
                 return self._spawn_actor(declaration, arguments, expression.location, depth + 1)
-            if expression.callee == "oneForOne":
+            if expression.callee in {"oneForOne", "oneForAll", "restForOne"}:
                 arguments = self._evaluate_arguments(expression.arguments, variables, depth)
-                max_restarts, window_milliseconds = arguments
+                max_restarts, window_milliseconds = arguments[:2]
+                strategy = {
+                    "oneForOne": RestartStrategy.ONE_FOR_ONE,
+                    "oneForAll": RestartStrategy.ONE_FOR_ALL,
+                    "restForOne": RestartStrategy.REST_FOR_ONE,
+                }[expression.callee]
                 if max_restarts < 0:
-                    raise Diagnostic(expression.location, "runtime", "oneForOne maxRestarts must be zero or greater")
+                    raise Diagnostic(expression.location, "runtime", f"{expression.callee} maxRestarts must be zero or greater")
                 if max_restarts > _MAX_SUPERVISOR_RESTARTS:
-                    raise Diagnostic(expression.location, "runtime", f"oneForOne maxRestarts cannot exceed {_MAX_SUPERVISOR_RESTARTS}")
+                    raise Diagnostic(expression.location, "runtime", f"{expression.callee} maxRestarts cannot exceed {_MAX_SUPERVISOR_RESTARTS}")
                 if window_milliseconds <= 0:
-                    raise Diagnostic(expression.location, "runtime", "oneForOne windowMilliseconds must be greater than zero")
-                supervisor = _TyveraSupervisor(max_restarts, window_milliseconds, self._clock)
+                    raise Diagnostic(expression.location, "runtime", f"{expression.callee} windowMilliseconds must be greater than zero")
+                backoff = arguments[2] if len(arguments) == 3 else None
+                supervisor = _TyveraSupervisor(max_restarts, window_milliseconds, self._clock, strategy, backoff)
                 self._supervisors.append(supervisor)
+                self._emit_runtime_event(RuntimeEvent(
+                    RuntimeEventKind.SUPERVISOR_STARTED,
+                    f"Supervisor#{supervisor.identity}", strategy,
+                ))
                 return supervisor
+            if expression.callee in {"permanentChildPolicy", "transientChildPolicy", "temporaryChildPolicy"}:
+                return {
+                    "permanentChildPolicy": RestartPolicy.PERMANENT,
+                    "transientChildPolicy": RestartPolicy.TRANSIENT,
+                    "temporaryChildPolicy": RestartPolicy.TEMPORARY,
+                }[expression.callee]
+            if expression.callee == "exponentialBackoff":
+                base, maximum = self._evaluate_arguments(expression.arguments, variables, depth)
+                if base <= 0 or maximum < base:
+                    raise Diagnostic(expression.location, "runtime", "exponentialBackoff requires 0 < baseMilliseconds <= maximumMilliseconds")
+                return ExponentialBackoff(base, maximum)
             if expression.callee == "runActors":
                 return self._run_actors(expression.location, depth)
             if expression.callee == "runTasks":
@@ -1523,19 +1620,33 @@ class Interpreter:
                 if expression.method == "start":
                     if receiver.status != "alive":
                         raise Diagnostic(expression.location, "runtime", f"cannot start a child on a {receiver.status} supervisor")
-                    construction = expression.arguments[0]
-                    if not isinstance(construction, Call):
-                        raise AssertionError("checked supervisor.start argument is not an actor construction")
-                    declaration = self.actors[construction.callee]
-                    arguments = self._evaluate_arguments(construction.arguments, variables, depth)
-                    return self._spawn_actor(declaration, arguments, expression.location, depth + 1, receiver)
+                    child_expression = expression.arguments[0]
+                    policy = (RestartPolicy.PERMANENT if len(expression.arguments) == 1
+                              else self._evaluate(expression.arguments[1], variables, depth))
+                    if not isinstance(policy, RestartPolicy):
+                        raise AssertionError("checked supervisor child policy has an invalid runtime value")
+                    if isinstance(child_expression, Call) and child_expression.callee in self.actors:
+                        declaration = self.actors[child_expression.callee]
+                        arguments = self._evaluate_arguments(child_expression.arguments, variables, depth)
+                        return self._spawn_actor(
+                            declaration, arguments, expression.location, depth + 1, receiver, policy,
+                        )
+                    nested = self._evaluate(child_expression, variables, depth)
+                    if not isinstance(nested, _TyveraSupervisor):
+                        raise AssertionError("checked supervisor child is not an actor or supervisor")
+                    if nested is receiver or nested.parent is not None:
+                        raise Diagnostic(expression.location, "runtime", "a Supervisor child must be a distinct, unowned supervisor")
+                    nested.parent = receiver
+                    nested.restart_policy = policy
+                    receiver.children.append(nested)
+                    self._emit_runtime_event(RuntimeEvent(
+                        RuntimeEventKind.SUPERVISOR_STARTED, f"Supervisor#{nested.identity}", nested.strategy,
+                    ))
+                    return nested
                 if expression.method == "isAlive":
                     return receiver.status == "alive"
                 if expression.method == "stop":
-                    if receiver.status == "alive":
-                        receiver.status = "stopped"
-                        for child in receiver.children:
-                            self._stop_actor(child)
+                    self._stop_supervised_supervisor(receiver, expression.location, depth + 1)
                     return None
             if isinstance(receiver, _TyveraActorRef) and expression.method in {"request", "requestWithin", "sendAfter"}:
                 actor = receiver.actor
@@ -1601,7 +1712,7 @@ class Interpreter:
                 if expression.method == "isAlive":
                     return actor.status == "alive"
                 if expression.method == "stop":
-                    self._stop_actor(actor)
+                    self._stop_supervised_actor(actor, expression.location, depth + 1)
                     return None
                 self._enqueue_actor_message(actor, expression.method, arguments, expression.location)
                 return None
@@ -2177,11 +2288,13 @@ class Interpreter:
     def _spawn_actor(
         self, declaration: ActorDeclaration, arguments: list[object], call_location: Location, depth: int,
         supervisor: _TyveraSupervisor | None = None,
+        restart_policy: RestartPolicy = RestartPolicy.PERMANENT,
     ) -> _TyveraActorRef:
         instance = _TyveraInstance(declaration.name, {})
         actor = _TyveraActor(
             instance,
             supervisor=supervisor,
+            restart_policy=restart_policy,
             declaration=declaration,
             constructor_arguments=[self._copy_actor_value(value) for value in arguments],
         )
@@ -2194,6 +2307,13 @@ class Interpreter:
         except Diagnostic as error:
             actor.status = "crashed"
             actor.mailbox.clear()
+            self._emit_runtime_event(RuntimeEvent(
+                RuntimeEventKind.ACTOR_CRASHED,
+                f"{declaration.name}#{actor.identity}",
+                None if supervisor is None else supervisor.strategy,
+                reason=CrashReason.runtime_error(error.message, error.location.filename,
+                                                 error.location.line, error.location.column),
+            ))
             if supervisor is None:
                 raise
             failure = self._restart_supervised_actor(
@@ -2220,6 +2340,10 @@ class Interpreter:
         finally:
             self._current_actor = previous_actor
         actor.status = "alive"
+        self._emit_runtime_event(RuntimeEvent(
+            RuntimeEventKind.ACTOR_STARTED, f"{declaration.name}#{actor.identity}",
+            None if actor.supervisor is None else actor.supervisor.strategy,
+        ))
 
     @staticmethod
     def _copy_actor_value(value: object) -> object:
@@ -2258,9 +2382,10 @@ class Interpreter:
         actor.pending_replies.clear()
 
     def _stop_actor(self, actor: _TyveraActor, reply_error: str = "actor stopped before replying") -> None:
+        was_live = actor.status in {"alive", "starting", "restarting"}
         self._cancel_actor_timers(actor)
         self._cancel_actor_tasks(actor)
-        if actor.status in {"alive", "starting"}:
+        if actor.status in {"alive", "starting", "restarting"}:
             actor.status = "stopped"
         for cell in actor.pending_replies:
             self._refresh_reply(cell)
@@ -2269,6 +2394,13 @@ class Interpreter:
                 cell.error = reply_error
         actor.pending_replies.clear()
         actor.mailbox.clear()
+        if was_live:
+            name = actor.declaration.name if actor.declaration is not None else actor.instance.class_name
+            self._emit_runtime_event(RuntimeEvent(
+                RuntimeEventKind.ACTOR_STOPPED, f"{name}#{actor.identity}",
+                None if actor.supervisor is None else actor.supervisor.strategy,
+                reason=CrashReason.normal_stop(),
+            ))
 
     def _cancel_actor_tasks(self, actor: _TyveraActor) -> None:
         for task in self._tasks:
@@ -2286,10 +2418,226 @@ class Interpreter:
             timer for timer in self._scheduled_timers if not timer.cancelled and not timer.delivered
         ]
 
-    def _fail_supervisor(self, supervisor: _TyveraSupervisor) -> None:
+    def _fail_supervisor(
+        self, supervisor: _TyveraSupervisor, failure: str,
+        call_location: Location, depth: int,
+    ) -> str | None:
         supervisor.status = "failed"
+        for child in reversed(supervisor.children):
+            self._stop_supervised_child(child, "supervisor escalation")
+        reason = CrashReason.escalation("restart intensity exceeded")
+        self._emit_runtime_event(RuntimeEvent(
+            RuntimeEventKind.SUPERVISOR_ESCALATED,
+            f"Supervisor#{supervisor.identity}", supervisor.strategy,
+            len(supervisor.restart_times), reason,
+        ))
+        if supervisor.parent is not None:
+            return self._restart_supervised_supervisor(supervisor, failure, call_location, depth)
+        return failure
+
+    def _stop_supervised_child(self, child: _TyveraActor | _TyveraSupervisor, reason: str) -> None:
+        if isinstance(child, _TyveraActor):
+            self._stop_actor(child, reason)
+        else:
+            self._stop_supervisor_tree(child, reason)
+
+    def _stop_supervisor_tree(self, supervisor: _TyveraSupervisor, reason: str) -> None:
+        was_alive = supervisor.status == "alive"
+        for child in reversed(supervisor.children):
+            self._stop_supervised_child(child, reason)
+        if supervisor.status in {"alive", "restarting"}:
+            supervisor.status = "stopped"
+        if was_alive:
+            self._emit_runtime_event(RuntimeEvent(
+                RuntimeEventKind.SUPERVISOR_STOPPED, f"Supervisor#{supervisor.identity}",
+                supervisor.strategy, reason=CrashReason.normal_stop(),
+            ))
+
+    def _restart_targets(
+        self, supervisor: _TyveraSupervisor, child: _TyveraActor | _TyveraSupervisor,
+    ) -> tuple[_TyveraActor | _TyveraSupervisor, ...]:
+        try:
+            index = supervisor.children.index(child)
+        except ValueError as error:
+            raise AssertionError("supervised child is missing from its parent") from error
+        if supervisor.strategy is RestartStrategy.ONE_FOR_ONE:
+            indexes = (index,)
+        elif supervisor.strategy is RestartStrategy.ONE_FOR_ALL:
+            indexes = tuple(range(len(supervisor.children)))
+        else:
+            indexes = tuple(range(index, len(supervisor.children)))
+        return tuple(supervisor.children[item] for item in indexes)
+
+    def _schedule_supervisor_restart(
+        self,
+        supervisor: _TyveraSupervisor,
+        trigger: _TyveraActor | _TyveraSupervisor,
+        failure: str,
+        call_location: Location,
+        depth: int,
+    ) -> str | None:
+        if supervisor.status != "alive":
+            return failure
+        affected = self._restart_targets(supervisor, trigger)
+        for child in reversed(affected):
+            self._stop_supervised_child(child, "supervisor restart strategy")
+            if isinstance(child, _TyveraActor):
+                child.status = "restarting"
+            else:
+                child.status = "restarting"
+
+        now = self._clock()
+        window_seconds = supervisor.window_milliseconds / 1000.0
+        while supervisor.restart_times and now - supervisor.restart_times[0] > window_seconds:
+            supervisor.restart_times.popleft()
+        if len(supervisor.restart_times) >= supervisor.max_restarts:
+            label = (trigger.declaration.name if isinstance(trigger, _TyveraActor)
+                     and trigger.declaration is not None else f"Supervisor#{trigger.identity}")
+            limit_failure = (
+                f"supervisor restart limit exceeded for actor '{label}' "
+                f"within {supervisor.window_milliseconds}ms: {failure}"
+            )
+            return self._fail_supervisor(supervisor, limit_failure, call_location, depth)
+
+        supervisor.restart_times.append(now)
+        delay_ms = (0 if supervisor.backoff is None
+                    else supervisor.backoff.delay_for(len(supervisor.restart_times)))
+        self._pending_supervisor_restarts.append(_PendingSupervisorRestart(
+            supervisor, affected, trigger, failure,
+            now + delay_ms / 1000.0, call_location, depth,
+        ))
+        return self._settle_supervisor_restarts(wait=False)
+
+    def _settle_supervisor_restarts(self, *, wait: bool) -> str | None:
+        first_failure: str | None = None
+        while self._pending_supervisor_restarts:
+            self._pending_supervisor_restarts.sort(key=lambda pending: pending.due_at)
+            pending = self._pending_supervisor_restarts[0]
+            now = self._clock()
+            if pending.due_at > now:
+                if not wait:
+                    break
+                self._sleep(pending.due_at - now)
+                continue
+            self._pending_supervisor_restarts.pop(0)
+            supervisor = pending.supervisor
+            if supervisor.status != "alive":
+                continue
+            restart_failed: str | None = None
+            for child in pending.children:
+                if child.restart_policy is RestartPolicy.TEMPORARY:
+                    if isinstance(child, _TyveraActor):
+                        child.status = "stopped"
+                    else:
+                        child.status = "stopped"
+                    continue
+                try:
+                    if isinstance(child, _TyveraActor):
+                        declaration = child.declaration
+                        if declaration is None:
+                            raise AssertionError("supervised actor has no declaration")
+                        self._initialize_actor(
+                            child,
+                            [self._copy_actor_value(value) for value in child.constructor_arguments],
+                            pending.location,
+                            pending.depth + 1,
+                        )
+                    else:
+                        restart_failed = self._restart_supervisor_tree(
+                            child, pending.location, pending.depth + 1,
+                        )
+                        if restart_failed is not None:
+                            break
+                except Diagnostic as error:
+                    if isinstance(child, _TyveraActor):
+                        child.status = "crashed"
+                        declaration = child.declaration
+                        label = declaration.name if declaration is not None else child.instance.class_name
+                        restart_failed = f"actor '{label}' crashed at {error.location.filename}:{error.location.line}:{error.location.column}: {error.message}"
+                        self._emit_runtime_event(RuntimeEvent(
+                            RuntimeEventKind.ACTOR_CRASHED, f"{label}#{child.identity}",
+                            supervisor.strategy,
+                            reason=CrashReason.runtime_error(error.message, error.location.filename,
+                                                             error.location.line, error.location.column),
+                        ))
+                    else:
+                        restart_failed = f"nested supervisor failed to restart: {error.message}"
+                    break
+            if restart_failed is not None:
+                trigger = pending.trigger
+                if isinstance(trigger, _TyveraActor):
+                    first_failure = self._restart_supervised_actor(
+                        trigger, restart_failed, pending.location, pending.depth + 1,
+                    ) or first_failure
+                else:
+                    first_failure = self._restart_supervised_supervisor(
+                        trigger, restart_failed, pending.location, pending.depth + 1,
+                    ) or first_failure
+                continue
+            reason = (
+                CrashReason.normal_stop()
+                if pending.failure.endswith("stopped normally")
+                else CrashReason.runtime_error(
+                    pending.failure, pending.location.filename,
+                    pending.location.line, pending.location.column,
+                )
+            )
+            for child in pending.children:
+                if child.restart_policy is RestartPolicy.TEMPORARY:
+                    continue
+                if isinstance(child, _TyveraActor):
+                    name = (child.declaration.name if child.declaration is not None
+                            else child.instance.class_name)
+                    entity = f"{name}#{child.identity}"
+                    kind = RuntimeEventKind.ACTOR_RESTARTED
+                else:
+                    entity = f"Supervisor#{child.identity}"
+                    kind = RuntimeEventKind.SUPERVISOR_RESTARTED
+                self._emit_runtime_event(RuntimeEvent(
+                    kind, entity, supervisor.strategy,
+                    len(supervisor.restart_times), reason,
+                ))
+        return first_failure
+
+    def _restart_supervisor_tree(
+        self, supervisor: _TyveraSupervisor, call_location: Location, depth: int,
+    ) -> str | None:
+        supervisor.status = "alive"
+        supervisor.restart_times.clear()
+        self._emit_runtime_event(RuntimeEvent(
+            RuntimeEventKind.SUPERVISOR_RESTARTED, f"Supervisor#{supervisor.identity}", supervisor.strategy,
+        ))
+        for child in reversed(supervisor.children):
+            self._stop_supervised_child(child, "parent supervisor restart")
+            if isinstance(child, _TyveraActor):
+                child.status = "restarting"
+            else:
+                child.status = "restarting"
         for child in supervisor.children:
-            self._stop_actor(child)
+            if child.restart_policy is RestartPolicy.TEMPORARY:
+                child.status = "stopped"
+                continue
+            if isinstance(child, _TyveraActor):
+                declaration = child.declaration
+                if declaration is None:
+                    raise AssertionError("supervised actor has no declaration")
+                try:
+                    self._initialize_actor(
+                        child, [self._copy_actor_value(value) for value in child.constructor_arguments],
+                        call_location, depth + 1,
+                    )
+                except Diagnostic as error:
+                    child.status = "crashed"
+                    return self._restart_supervised_actor(
+                        child,
+                        f"actor '{declaration.name}' crashed at {error.location.filename}:{error.location.line}:{error.location.column}: {error.message}",
+                        call_location, depth + 1,
+                    )
+            else:
+                failure = self._restart_supervisor_tree(child, call_location, depth + 1)
+                if failure is not None:
+                    return failure
+        return None
 
     def _create_async_task(
         self, function: Function, arguments: list[object], location: Location, depth: int,
@@ -3358,6 +3706,10 @@ class Interpreter:
         failure: str | None = None
         try:
             while True:
+                self._check_shutdown(location)
+                restart_failure = self._settle_supervisor_restarts(wait=False)
+                if restart_failure is not None:
+                    failure = failure or restart_failure
                 self._promote_sleeping_tasks()
                 self._settle_timed_tasks()
                 self._wake_waiting_tasks()
@@ -3383,6 +3735,8 @@ class Interpreter:
                     except _ReturnSignal as signal:
                         task.result = signal.value
                         self._complete_task(task)
+                    except ShutdownDiagnostic:
+                        raise
                     except Diagnostic as error:
                         self._fail_task(task, error.render())
                     except _LoopSignal as signal:
@@ -3824,6 +4178,7 @@ class Interpreter:
             cell = target.cell
             if cell.state == "pending" and cell.started_at is not None and cell.timeout_milliseconds is not None:
                 deadlines.append(cell.started_at + cell.timeout_milliseconds / 1000.0)
+        deadlines.extend(pending.due_at for pending in self._pending_supervisor_restarts)
         return min(deadlines) if deadlines else None
 
     def _restart_supervised_actor(
@@ -3837,45 +4192,68 @@ class Interpreter:
         if supervisor.status != "alive":
             actor.status = "stopped"
             return failure
+        if actor.restart_policy is RestartPolicy.TEMPORARY:
+            actor.status = "stopped"
+            return failure
+        return self._schedule_supervisor_restart(supervisor, actor, failure, call_location, depth)
 
-        declaration = actor.declaration
-        if declaration is None:
-            raise AssertionError("supervised actor has no declaration")
-        window_seconds = supervisor.window_milliseconds / 1000.0
-        while True:
-            now = self._clock()
-            while supervisor.restart_times and now - supervisor.restart_times[0] > window_seconds:
-                supervisor.restart_times.popleft()
-            if len(supervisor.restart_times) >= supervisor.max_restarts:
-                self._fail_supervisor(supervisor)
-                return (
-                    f"supervisor restart limit exceeded for actor '{declaration.name}' "
-                    f"within {supervisor.window_milliseconds}ms: {failure}"
-                )
+    def _restart_supervised_supervisor(
+        self, child: _TyveraSupervisor, failure: str, call_location: Location, depth: int,
+    ) -> str | None:
+        parent = child.parent
+        if parent is None:
+            return failure
+        if parent.status != "alive":
+            return failure
+        if child.restart_policy is RestartPolicy.TEMPORARY:
+            self._stop_supervisor_tree(child, "temporary supervisor failed")
+            return failure
+        return self._schedule_supervisor_restart(parent, child, failure, call_location, depth)
 
-            supervisor.restart_times.append(now)
-            actor.mailbox.clear()
-            try:
-                self._initialize_actor(
-                    actor,
-                    [self._copy_actor_value(value) for value in actor.constructor_arguments],
-                    call_location,
-                    depth + 1,
-                )
-            except Diagnostic as error:
-                actor.status = "crashed"
-                failure = self._format_actor_failure(declaration, error)
-                continue
-            except _LoopSignal as signal:
-                actor.status = "crashed"
-                failure = f"actor '{declaration.name}' crashed: '{signal.kind}' escaped its constructor"
-                continue
-            return None
+    def _stop_supervised_actor(self, actor: _TyveraActor, location: Location, depth: int) -> None:
+        if actor.status != "alive":
+            return
+        self._stop_actor(actor)
+        supervisor = actor.supervisor
+        if supervisor is None or supervisor.status != "alive":
+            return
+        if actor.restart_policy is RestartPolicy.PERMANENT:
+            failure = self._schedule_supervisor_restart(
+                supervisor, actor, "actor stopped normally", location, depth,
+            )
+            if failure is not None:
+                raise Diagnostic(location, "runtime", failure)
+
+    def _stop_supervised_supervisor(
+        self, supervisor: _TyveraSupervisor, location: Location, depth: int,
+    ) -> None:
+        if supervisor.status != "alive":
+            return
+        self._stop_supervisor_tree(supervisor, "supervisor stopped")
+        parent = supervisor.parent
+        if parent is None or parent.status != "alive":
+            return
+        if supervisor.restart_policy is RestartPolicy.PERMANENT:
+            failure = self._schedule_supervisor_restart(
+                parent, supervisor, "nested supervisor stopped normally", location, depth,
+            )
+            if failure is not None:
+                raise Diagnostic(location, "runtime", failure)
 
     def _enqueue_actor_message(
         self, actor: _TyveraActor, method: str, arguments: list[object], location: Location,
     ) -> None:
         if actor.status != "alive":
+            name = actor.declaration.name if actor.declaration is not None else actor.instance.class_name
+            dead_letter = RuntimeEvent(
+                RuntimeEventKind.DEAD_LETTER, f"{name}#{actor.identity}",
+                None if actor.supervisor is None else actor.supervisor.strategy,
+                reason=CrashReason(CrashKind.CHILD_FAILURE,
+                                   f"message '{method}' rejected while actor was {actor.status}",
+                                   location.filename, location.line, location.column),
+            )
+            self._dead_letters.append(dead_letter)
+            self._emit_runtime_event(dead_letter)
             raise Diagnostic(location, "runtime", f"cannot send a message to a {actor.status} actor")
         if len(actor.mailbox) >= _MAX_ACTOR_MAILBOX:
             raise Diagnostic(location, "runtime", f"actor mailbox capacity ({_MAX_ACTOR_MAILBOX}) exceeded")
@@ -3896,7 +4274,19 @@ class Interpreter:
         processed = 0
         first_crash: str | None = None
         self._promote_due_timers()
-        while self._ready_actors and processed < delivery_limit:
+        while processed < delivery_limit:
+            self._check_shutdown(location)
+            pending_failure = self._settle_supervisor_restarts(wait=False)
+            if pending_failure is not None and first_crash is None:
+                first_crash = pending_failure
+            if not self._ready_actors:
+                if fail_on_limit and self._pending_supervisor_restarts:
+                    pending_failure = self._settle_supervisor_restarts(wait=True)
+                    if pending_failure is not None and first_crash is None:
+                        first_crash = pending_failure
+                    if self._ready_actors:
+                        continue
+                break
             actor = self._ready_actors.popleft()
             actor.queued = False
             if actor.status != "alive" or not actor.mailbox:
@@ -3908,8 +4298,16 @@ class Interpreter:
             self._current_actor = actor
             try:
                 self._call_method(method, actor.instance, message.arguments, message.location, depth + 1)
+            except ShutdownDiagnostic:
+                raise
             except Diagnostic as error:
                 actor.status = "crashed"
+                self._emit_runtime_event(RuntimeEvent(
+                    RuntimeEventKind.ACTOR_CRASHED, f"{declaration.name}#{actor.identity}",
+                    None if actor.supervisor is None else actor.supervisor.strategy,
+                    reason=CrashReason.runtime_error(error.message, error.location.filename,
+                                                     error.location.line, error.location.column),
+                ))
                 failure = self._restart_supervised_actor(
                     actor, self._format_actor_failure(declaration, error), message.location, depth + 1,
                 )
@@ -3917,6 +4315,14 @@ class Interpreter:
                     first_crash = failure
             except _LoopSignal as signal:
                 actor.status = "crashed"
+                self._emit_runtime_event(RuntimeEvent(
+                    RuntimeEventKind.ACTOR_CRASHED, f"{declaration.name}#{actor.identity}",
+                    None if actor.supervisor is None else actor.supervisor.strategy,
+                    reason=CrashReason(CrashKind.RUNTIME_ERROR,
+                                       f"'{signal.kind}' escaped actor loop",
+                                       message.location.filename, message.location.line,
+                                       message.location.column),
+                ))
                 failure = self._restart_supervised_actor(
                     actor, f"actor '{declaration.name}' crashed: '{signal.kind}' escaped its loop",
                     message.location, depth + 1,
@@ -3927,6 +4333,9 @@ class Interpreter:
                 self._current_actor = None
             actor.pending_replies = {cell for cell in actor.pending_replies if cell.state == "pending"}
             self._promote_due_timers()
+            pending_failure = self._settle_supervisor_restarts(wait=False)
+            if pending_failure is not None and first_crash is None:
+                first_crash = pending_failure
             if actor.status == "alive" and actor.mailbox and not actor.queued:
                 actor.queued = True
                 self._ready_actors.append(actor)

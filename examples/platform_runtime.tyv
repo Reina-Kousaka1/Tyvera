@@ -1,0 +1,8 @@
+fn main() {
+    println(hostOS())
+    println(hostArchitecture())
+    match environment("TYVERA_PLATFORM_SMOKE") {
+        Some(_) => println("platform environment is set")
+        None => println("platform environment is unset")
+    }
+}

@@ -53,13 +53,14 @@ from .type_names import make_type, split_type, substitute_type
 
 _BUILTIN_TYPES = {
     "Int", "Float", "Bool", "String", "Byte", "Void", "Unit", "List", "Map", "Option", "Result",
-    "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile", "TextReader", "TextWriter", "Bytes", "ByteBuffer", "SocketAddress", "TcpConnection", "TcpListener",
+    "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "RestartPolicy", "SupervisorBackoff", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile", "TextReader", "TextWriter", "Bytes", "ByteBuffer", "SocketAddress", "TcpConnection", "TcpListener",
     "HttpMethod", "HttpUrl", "HttpLimits", "HttpHeaders", "HttpRequest", "HttpResponse", "HttpDecoder", "HttpRouter", "HttpServer",
 }
 _BUILTIN_FUNCTIONS = {
     "println", "eprintln", "readText", "writeText", "readBytes", "writeBytes", "openText", "openTextReader", "openTextWriter", "openTextAsync", "bytesFromString", "byteFromInt", "byteBuffer", "resolveHost", "tcpConnect", "tcpListen", "pathJoin", "pathExists",
     "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool",
-    "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors", "oneForOne",
+    "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors", "oneForOne", "oneForAll", "restForOne",
+    "permanentChildPolicy", "transientChildPolicy", "temporaryChildPolicy", "exponentialBackoff", "hostOS", "hostArchitecture", "environment",
     "milliseconds", "seconds", "timerAfter", "sleepFor", "runTasks", "taskGroup",
     "httpMethod", "httpUrl", "httpLimits", "httpDefaultLimits", "httpHeaders", "httpRequest", "httpResponse",
     "httpTextResponse", "httpJsonResponse", "httpRouter", "httpRequestDecoder", "httpResponseDecoder", "httpEncodeRequest", "httpEncodeResponse", "httpServer", "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete",
@@ -1132,12 +1133,35 @@ class TypeChecker:
                     raise Diagnostic(expression.location, "type", "'taskGroup' expects no arguments")
                 return "TaskGroup"
             argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
-            if expression.callee == "oneForOne":
+            if expression.callee in {"oneForOne", "oneForAll", "restForOne"}:
                 if expression.type_arguments:
-                    raise Diagnostic(expression.location, "type", "'oneForOne' does not accept type arguments")
-                self._check_arguments(expression.arguments, argument_types, ("Int", "Int"),
-                                      expression.location, "oneForOne")
+                    raise Diagnostic(expression.location, "type", f"'{expression.callee}' does not accept type arguments")
+                if len(argument_types) not in {2, 3}:
+                    raise Diagnostic(expression.location, "type", f"'{expression.callee}' expects two arguments and an optional SupervisorBackoff")
+                expected = ("Int", "Int") if len(argument_types) == 2 else ("Int", "Int", "SupervisorBackoff")
+                self._check_arguments(expression.arguments, argument_types, expected,
+                                      expression.location, expression.callee)
                 return "Supervisor"
+            if expression.callee in {"permanentChildPolicy", "transientChildPolicy", "temporaryChildPolicy"}:
+                if expression.type_arguments or expression.arguments:
+                    raise Diagnostic(expression.location, "type", f"'{expression.callee}' expects no arguments")
+                return "RestartPolicy"
+            if expression.callee == "exponentialBackoff":
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'exponentialBackoff' does not accept type arguments")
+                self._check_arguments(expression.arguments, argument_types, ("Int", "Int"),
+                                      expression.location, "exponentialBackoff")
+                return "SupervisorBackoff"
+            if expression.callee in {"hostOS", "hostArchitecture"}:
+                if expression.type_arguments or expression.arguments:
+                    raise Diagnostic(expression.location, "type", f"'{expression.callee}' expects no arguments")
+                return "String"
+            if expression.callee == "environment":
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'environment' does not accept type arguments")
+                self._check_arguments(expression.arguments, argument_types, ("String",),
+                                      expression.location, "environment")
+                return "Option<Secret<String>>"
             if expression.callee in {"milliseconds", "seconds"}:
                 self._check_arguments(expression.arguments, argument_types, ("Int",),
                                       expression.location, expression.callee)
@@ -1398,21 +1422,30 @@ class TypeChecker:
                 if receiver_arguments:
                     raise Diagnostic(expression.location, "type", "Supervisor does not accept type arguments")
                 if expression.method == "start":
-                    if len(expression.arguments) != 1 or not isinstance(expression.arguments[0], Call):
-                        raise Diagnostic(expression.location, "type", "Supervisor.start expects one actor construction, for example supervisor.start(Counter(0))")
-                    construction = expression.arguments[0]
-                    actor = self.actors.get(construction.callee)
-                    if actor is None:
-                        raise Diagnostic(construction.location, "type", f"'{construction.callee}' is not an actor type")
-                    if construction.type_arguments:
-                        raise Diagnostic(construction.location, "type", "actor types do not accept type arguments")
-                    constructor = actor.methods.get("init")
-                    expected = () if constructor is None else constructor.parameter_types
-                    argument_types = [self._expression_type(argument, variables, owner)
-                                      for argument in construction.arguments]
-                    self._check_arguments(construction.arguments, argument_types, expected,
-                                          construction.location, f"{construction.callee} actor constructor")
-                    return f"ActorRef<{construction.callee}>"
+                    if len(expression.arguments) not in {1, 2}:
+                        raise Diagnostic(expression.location, "type", "Supervisor.start expects a child and an optional RestartPolicy")
+                    if len(expression.arguments) == 2:
+                        policy_type = self._expression_type(expression.arguments[1], variables, owner)
+                        self._check_arguments(expression.arguments[1:2], [policy_type], ("RestartPolicy",),
+                                              expression.location, "Supervisor.start restart policy")
+                    child = expression.arguments[0]
+                    if isinstance(child, Call) and child.callee in self.actors:
+                        actor = self.actors[child.callee]
+                        if child.type_arguments:
+                            raise Diagnostic(child.location, "type", "actor types do not accept type arguments")
+                        constructor = actor.methods.get("init")
+                        expected = () if constructor is None else constructor.parameter_types
+                        child_argument_types = [self._expression_type(argument, variables, owner)
+                                                for argument in child.arguments]
+                        self._check_arguments(child.arguments, child_argument_types, expected,
+                                              child.location, f"{child.callee} actor constructor")
+                        return f"ActorRef<{child.callee}>"
+                    if isinstance(child, Call) and child.callee in self.classes:
+                        raise Diagnostic(child.location, "type", f"'{child.callee}' is not an actor type")
+                    child_type = self._expression_type(child, variables, owner)
+                    if child_type == "Supervisor":
+                        return "Supervisor"
+                    raise Diagnostic(child.location, "type", "Supervisor.start expects an actor construction or a Supervisor child")
                 if expression.method in {"stop", "isAlive"}:
                     argument_types = [self._expression_type(argument, variables, owner)
                                       for argument in expression.arguments]

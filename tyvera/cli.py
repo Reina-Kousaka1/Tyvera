@@ -11,6 +11,7 @@ from .cpp_backend import CppNativeBackend
 from .compiler import compile_checked_project
 from .lowering import lower_checked_program
 from .project import create_project, find_manifest
+from .platform_runtime import ShutdownController
 from .source import Diagnostic, Location
 
 
@@ -79,9 +80,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         entry, root, label = _entry_and_root(arguments.path)
         checked = compile_checked_project(entry, root)
         if arguments.command == "run":
-            ReferenceInterpreterBackend().execute(
-                checked, output=sys.stdout, error_output=sys.stderr, project_root=root,
-            )
+            shutdown_controller = ShutdownController()
+            with shutdown_controller.installed():
+                ReferenceInterpreterBackend().execute(
+                    checked, output=sys.stdout, error_output=sys.stderr, project_root=root,
+                    shutdown_controller=shutdown_controller,
+                )
         elif arguments.command == "build":
             output = Path(arguments.output).expanduser().resolve() if arguments.output else _default_build_output(
                 arguments.path, entry, root,
@@ -95,7 +99,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"checked {label}")
     except Diagnostic as error:
         print(error.render(), file=sys.stderr)
-        return 1
+        return getattr(error, "exit_code", 1)
     return 0
 
 
