@@ -69,6 +69,7 @@ _MAX_ACTOR_DELIVERIES = 100_000
 _MAX_SUPERVISOR_RESTARTS = 1_000
 _MAX_TASK_STEPS = 100_000
 _MAX_NETWORK_READ = 1_048_576
+_MAX_BYTE_BUFFER_LENGTH = 64 * 1024 * 1024
 _IDENTITY_SEQUENCE = count(1)
 _HASH_MASK = (1 << 64) - 1
 
@@ -175,6 +176,22 @@ class _TyveraBytes:
 
     def __repr__(self) -> str:
         return "<Bytes>"
+
+
+@dataclass(slots=True, frozen=True, repr=False)
+class _TyveraByte:
+    value: int
+
+    def __repr__(self) -> str:
+        return f"Byte({self.value})"
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _TyveraByteBuffer:
+    value: bytearray
+
+    def __repr__(self) -> str:
+        return "<ByteBuffer>"
 
 
 @dataclass(slots=True, frozen=True, repr=False)
@@ -481,6 +498,8 @@ def _tyvera_equal(left: object, right: object, seen: set[tuple[int, int]] | None
         return left.identity == right.identity
     if isinstance(left, _TyveraBytes):
         return left.value == right.value
+    if isinstance(left, _TyveraByte):
+        return left.value == right.value
     if isinstance(left, _TyveraSocketAddress):
         return (left.host, left.port, left.family) == (right.host, right.port, right.family)
     if isinstance(left, _TyveraSecret):
@@ -575,6 +594,8 @@ def _tyvera_hash(value: object) -> int:
         return _hash_parts(b"resource-identity", value.identity)
     if isinstance(value, _TyveraBytes):
         return _hash_bytes(b"bytes\0" + value.value)
+    if isinstance(value, _TyveraByte):
+        return _hash_bytes(b"byte\0" + bytes((value.value,)))
     if isinstance(value, _TyveraSocketAddress):
         return _hash_bytes(b"socket-address\0" + value.host.encode("ascii", "strict")
                            + b"\0" + str(value.port).encode("ascii")
@@ -887,6 +908,23 @@ class Interpreter:
                 return _TyveraTimer(self._clock(), duration.milliseconds, self._clock)
             if expression.callee == "bytesFromString":
                 return _TyveraBytes(arguments[0].encode("utf-8"))
+            if expression.callee == "byteFromInt":
+                value = arguments[0]
+                if not 0 <= value <= 255:
+                    return _TyveraVariant("Err", "Byte value must be between 0 and 255", "Result", 1)
+                return _TyveraVariant("Ok", _TyveraByte(value), "Result", 1)
+            if expression.callee == "byteBuffer":
+                length = arguments[0]
+                if length < 0 or length > _MAX_BYTE_BUFFER_LENGTH:
+                    return _TyveraVariant(
+                        "Err", f"ByteBuffer length must be between 0 and {_MAX_BYTE_BUFFER_LENGTH} bytes",
+                        "Result", 1,
+                    )
+                try:
+                    buffer = _TyveraByteBuffer(bytearray(length))
+                except (MemoryError, OverflowError):
+                    return _TyveraVariant("Err", "cannot allocate ByteBuffer", "Result", 1)
+                return _TyveraVariant("Ok", buffer, "Result", 1)
             if expression.callee == "httpMethod":
                 try:
                     return _TyveraVariant("Ok", make_method(arguments[0]), "Result", 1)
@@ -1061,8 +1099,22 @@ class Interpreter:
                     return _TyveraVariant("Ok", path.read_text(encoding="utf-8"))
                 except UnicodeDecodeError:
                     return _TyveraVariant("Err", "text file is not valid UTF-8")
-                except OSError:
+                except (OSError, ValueError):
                     return _TyveraVariant("Err", "cannot read text file")
+            if expression.callee == "readBytes":
+                path = self._project_path(arguments[0])
+                if self._is_secret_storage_path(path):
+                    return _TyveraVariant("Err", "secret file can only be read through the secrets provider")
+                try:
+                    with path.open("rb") as stream:
+                        data = stream.read(_MAX_BYTE_BUFFER_LENGTH + 1)
+                    if len(data) > _MAX_BYTE_BUFFER_LENGTH:
+                        return _TyveraVariant(
+                            "Err", f"binary file exceeds the {_MAX_BYTE_BUFFER_LENGTH}-byte limit",
+                        )
+                    return _TyveraVariant("Ok", _TyveraBytes(data), "Result", 1)
+                except (MemoryError, OSError, OverflowError, ValueError):
+                    return _TyveraVariant("Err", "cannot read binary file")
             if expression.callee == "writeText":
                 path = self._project_path(arguments[0])
                 if self._is_secret_storage_path(path):
@@ -1070,8 +1122,21 @@ class Interpreter:
                 try:
                     path.write_text(arguments[1], encoding="utf-8")
                     return _TyveraVariant("Ok", True)
-                except OSError:
+                except (OSError, ValueError):
                     return _TyveraVariant("Err", "cannot write text file")
+            if expression.callee == "writeBytes":
+                path, payload = self._project_path(arguments[0]), arguments[1]
+                if self._is_secret_storage_path(path):
+                    return _TyveraVariant("Err", "secret file cannot be changed by the binary-file API")
+                if len(payload.value) > _MAX_BYTE_BUFFER_LENGTH:
+                    return _TyveraVariant(
+                        "Err", f"binary data exceeds the {_MAX_BYTE_BUFFER_LENGTH}-byte limit",
+                    )
+                try:
+                    path.write_bytes(payload.value)
+                    return _TyveraVariant("Ok", True, "Result", 1)
+                except (OSError, ValueError):
+                    return _TyveraVariant("Err", "cannot write binary file")
             if expression.callee == "pathJoin":
                 return (Path(arguments[0]) / arguments[1]).as_posix()
             if expression.callee == "pathExists":
@@ -1271,6 +1336,47 @@ class Interpreter:
                         return _TyveraVariant("Ok", receiver.value.decode("utf-8"), "Result", 1)
                     except UnicodeDecodeError:
                         return _TyveraVariant("Err", "bytes are not valid UTF-8", "Result", 1)
+                arguments = self._evaluate_arguments(expression.arguments, variables, depth)
+                if expression.method == "get":
+                    index = arguments[0]
+                    if index < 0 or index >= len(receiver.value):
+                        return _TyveraVariant("Err", "Bytes index is out of bounds", "Result", 1)
+                    return _TyveraVariant("Ok", _TyveraByte(receiver.value[index]), "Result", 1)
+                if expression.method == "slice":
+                    start, length = arguments
+                    if start < 0 or length < 0 or start > len(receiver.value) or length > len(receiver.value) - start:
+                        return _TyveraVariant("Err", "Bytes slice is out of bounds", "Result", 1)
+                    try:
+                        value = _TyveraBytes(receiver.value[start:start + length])
+                    except MemoryError:
+                        return _TyveraVariant("Err", "cannot allocate Bytes slice", "Result", 1)
+                    return _TyveraVariant("Ok", value, "Result", 1)
+            if isinstance(receiver, _TyveraByte):
+                if expression.method == "toInt":
+                    return receiver.value
+            if isinstance(receiver, _TyveraByteBuffer):
+                if expression.method == "length":
+                    return len(receiver.value)
+                if expression.method == "toBytes":
+                    try:
+                        value = _TyveraBytes(bytes(receiver.value))
+                    except MemoryError:
+                        return _TyveraVariant("Err", "cannot allocate Bytes snapshot", "Result", 1)
+                    return _TyveraVariant("Ok", value, "Result", 1)
+                arguments = self._evaluate_arguments(expression.arguments, variables, depth)
+                if expression.method == "get":
+                    index = arguments[0]
+                    if index < 0 or index >= len(receiver.value):
+                        return _TyveraVariant("Err", "ByteBuffer index is out of bounds", "Result", 1)
+                    return _TyveraVariant("Ok", _TyveraByte(receiver.value[index]), "Result", 1)
+                if expression.method == "set":
+                    index, byte_value = arguments
+                    if index < 0 or index >= len(receiver.value):
+                        return _TyveraVariant("Err", "ByteBuffer index is out of bounds", "Result", 1)
+                    if not isinstance(byte_value, _TyveraByte):
+                        raise AssertionError("checked ByteBuffer.set value is not Byte")
+                    receiver.value[index] = byte_value.value
+                    return _TyveraVariant("Ok", True, "Result", 1)
             if isinstance(receiver, _TyveraSocketAddress):
                 if expression.method == "host":
                     return receiver.host
@@ -1809,7 +1915,7 @@ class Interpreter:
     def _is_secret_storage_path(self, path: Path) -> bool:
         try:
             return path.resolve() == (self.project_root / ".tyvera.secrets").resolve()
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     @staticmethod
@@ -2126,7 +2232,7 @@ class Interpreter:
         if isinstance(value, _TyveraVariant):
             return _TyveraVariant(value.variant, Interpreter._copy_actor_value(value.payload),
                                   value.enum_name, value.payload_arity)
-        if value is None or type(value) in {bool, int, float, str}:
+        if value is None or type(value) in {bool, int, float, str} or isinstance(value, _TyveraByte):
             return value
         raise AssertionError("checked actor constructor value is not transferable")
 
@@ -3945,5 +4051,7 @@ class Interpreter:
     def _display(value: object) -> str:
         if isinstance(value, bool):
             return "true" if value else "false"
+        if isinstance(value, _TyveraByte):
+            return str(value.value)
         return str(value)
 

@@ -113,6 +113,7 @@ the constructor.
 | `Int` | Signed 64-bit integers, −9223372036854775808 through 9223372036854775807. Out-of-range literals are static errors; arithmetic overflow is a located runtime error. |
 | `Float` | Finite IEEE binary64 values. Decimal literals round to binary64. Non-finite literals and arithmetic overflow are errors; ordinary binary64 rounding and underflow apply. |
 | `Bool` | Exactly `true` or `false`, printed in lowercase; no truthiness conversion. |
+| `Byte` | Unsigned 8-bit value from 0 through 255. `byteFromInt(Int)` performs an explicit checked conversion and returns `Result<Byte,String>`; values outside this range return `Err`. `toInt()` converts back explicitly. There is no implicit integer conversion or Byte arithmetic. |
 | `String` | Unicode scalar sequence decoded from UTF-8 source and text-file input; equality compares exact scalar sequence without normalization. Concatenation is supported; length, ordering, indexing, iteration, slicing, and implicit string conversion are not implemented. |
 | `Void` | No return value; not allowed for bindings or parameters. No literal. |
 
@@ -121,14 +122,15 @@ diagnostics use `Void`. Inference applies to initialized local bindings only.
 Assignment, initialization, arguments and returns require exact type matches,
 except that a class implementing an interface is assignable to that interface.
 An `Int` cannot silently be stored in a `Float` binding. Numeric promotion is
-limited to the explicit arithmetic rules below. No explicit numeric conversion
-functions are implemented.
+limited to the explicit arithmetic rules below. No implicit numeric conversion
+exists; the only explicit numeric conversions are the checked `Byte`
+conversions described above.
 
-`println(value)` accepts one `Int`, `Float`, `Bool` or `String` and returns
-`Void`. Booleans print in lowercase. Function names and local bindings occupy
-separate namespaces; global calls name declared functions directly, constructors
-use the class name, and instance methods use member-call syntax. `println` cannot
-be redeclared or shadowed.
+`println(value)` accepts one `Int`, `Float`, `Bool`, `Byte` or `String` and
+returns `Void`. Booleans print in lowercase. Function names and local bindings
+occupy separate namespaces; global calls name declared functions directly,
+constructors use the class name, and instance methods use member-call syntax.
+`println` cannot be redeclared or shadowed.
 
 ## Scope, bindings and mutation
 
@@ -780,9 +782,49 @@ move-only handles also support `openTextAsync`, `readAllAsync`, `writeAsync`,
 tasks and preserve the existing LIFO scope cleanup. Synchronous text operations
 remain available and can block the cooperative scheduler.
 
-`Bytes` is an immutable byte value built with `bytesFromString`. `Bytes.length()`
-reports its byte length and `Bytes.toString()` validates UTF-8 through a
-`Result`. `resolveHost`, `tcpConnect`, and `tcpListen` return tasks. TCP listener
+`Bytes` is an immutable byte value built with `bytesFromString`. `length()`
+reports its byte length, `get(index)` returns a bounds-checked
+`Result<Byte,String>`, `slice(start,length)` returns a checked immutable copy,
+and `toString()` validates UTF-8 through a `Result`. `byteBuffer(length)` creates
+a zero-filled mutable `ByteBuffer` in `Result<ByteBuffer,String>`; length must
+be between 0 and 67,108,864 bytes. Its `get(index)` and `set(index,byte)` reject
+negative or out-of-range indexes with `Err`. `let` does not freeze the buffer
+object, so aliases observe mutations. `toBytes()` creates an immutable
+snapshot through `Result<Bytes,String>` so allocation failure stays controlled.
+There are no mutable slices, raw pointers, or manual free operation.
+
+`readBytes(path) -> Result<Bytes,String>` reads binary data without decoding
+it; `writeBytes(path,bytes) -> Result<Bool,String>` writes the exact byte
+sequence. Both resolve relative paths from the project root, refuse direct
+access to `.tyvera.secrets`, and return controlled errors for missing files,
+permissions, other I/O failures, or data larger than 67,108,864 bytes. A binary
+value becomes text only through the explicit UTF-8-validating
+`Bytes.toString()` call.
+The [byte buffer example](../examples/byte_buffers.tyv) shows checked
+construction, mutation, and immutable snapshot reads.
+
+Binary file I/O uses the same `Bytes` type:
+
+```tyv
+fn main() {
+    match writeBytes("payload.bin", bytesFromString("Tyvera")) {
+        Err(error) => println(error)
+        Ok(_) => match readBytes("payload.bin") {
+            Err(error) => println(error)
+            Ok(data) => println(data.length())
+        }
+    }
+}
+```
+
+The reference runtime uses managed storage for `ByteBuffer`; Tyvera exposes no
+raw pointers, arbitrary addresses, unchecked access, or `unsafe` syntax.
+Native FFI is planned, not implemented. Its boundary must define borrowed byte
+spans, ownership and lifetime rules, mutation access, error conversion, and
+resource release. Native faults such as segmentation violations cannot be
+recovered as ordinary Tyvera `Result` values.
+
+`resolveHost`, `tcpConnect`, and `tcpListen` return tasks. TCP listener
 and connection handles are move-only resources; `accept`, `read`, `write`, and
 `writeAll` suspend through the task scheduler. Address values expose host, port,
 and address family without exposing host-platform socket structs. `read` may be

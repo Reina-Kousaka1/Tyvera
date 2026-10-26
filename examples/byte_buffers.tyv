@@ -1,0 +1,24 @@
+fn main() {
+    match byteFromInt(255) {
+        Err(error) => println(error)
+        Ok(maximum) => {
+            match byteBuffer(2) {
+                Err(error) => println(error)
+                Ok(buffer) => {
+                    match buffer.set(1, maximum) {
+                        Err(error) => println(error)
+                        Ok(_) => {
+                            match buffer.toBytes() {
+                                Err(error) => println(error)
+                                Ok(snapshot) => match snapshot.get(1) {
+                                    Err(error) => println(error)
+                                    Ok(value) => println(value.toInt())
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

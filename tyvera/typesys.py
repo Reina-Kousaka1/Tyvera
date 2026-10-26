@@ -52,19 +52,19 @@ from .type_names import make_type, split_type, substitute_type
 
 
 _BUILTIN_TYPES = {
-    "Int", "Float", "Bool", "String", "Void", "Unit", "List", "Map", "Option", "Result",
-    "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile", "TextReader", "TextWriter", "Bytes", "SocketAddress", "TcpConnection", "TcpListener",
+    "Int", "Float", "Bool", "String", "Byte", "Void", "Unit", "List", "Map", "Option", "Result",
+    "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile", "TextReader", "TextWriter", "Bytes", "ByteBuffer", "SocketAddress", "TcpConnection", "TcpListener",
     "HttpMethod", "HttpUrl", "HttpLimits", "HttpHeaders", "HttpRequest", "HttpResponse", "HttpDecoder", "HttpRouter", "HttpServer",
 }
 _BUILTIN_FUNCTIONS = {
-    "println", "eprintln", "readText", "writeText", "openText", "openTextReader", "openTextWriter", "openTextAsync", "bytesFromString", "resolveHost", "tcpConnect", "tcpListen", "pathJoin", "pathExists",
+    "println", "eprintln", "readText", "writeText", "readBytes", "writeBytes", "openText", "openTextReader", "openTextWriter", "openTextAsync", "bytesFromString", "byteFromInt", "byteBuffer", "resolveHost", "tcpConnect", "tcpListen", "pathJoin", "pathExists",
     "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool",
     "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors", "oneForOne",
     "milliseconds", "seconds", "timerAfter", "sleepFor", "runTasks", "taskGroup",
     "httpMethod", "httpUrl", "httpLimits", "httpDefaultLimits", "httpHeaders", "httpRequest", "httpResponse",
     "httpTextResponse", "httpJsonResponse", "httpRouter", "httpRequestDecoder", "httpResponseDecoder", "httpEncodeRequest", "httpEncodeResponse", "httpServer", "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete",
 }
-_DISPLAYABLE_TYPES = {"Int", "Float", "Bool", "String"}
+_DISPLAYABLE_TYPES = {"Int", "Float", "Bool", "String", "Byte"}
 _NUMERIC_TYPES = {"Int", "Float"}
 INT_MIN = -(1 << 63)
 INT_MAX = (1 << 63) - 1
@@ -431,7 +431,7 @@ class TypeChecker:
 
     def _is_actor_message_type(self, type_name: str) -> bool:
         base, arguments = split_type(type_name)
-        if base in {"Int", "Float", "Bool", "String", "Duration"} and not arguments:
+        if base in {"Int", "Float", "Bool", "String", "Byte", "Duration"} and not arguments:
             return True
         if base == "ActorRef" and len(arguments) == 1:
             actor_base, actor_arguments = split_type(arguments[0])
@@ -586,7 +586,7 @@ class TypeChecker:
             # hashable without expanding an unbounded family of types.
             return False
         nested = visiting | {key}
-        if base in {"Int", "Float", "Bool", "String", "Duration", "Json"}:
+        if base in {"Int", "Float", "Bool", "String", "Byte", "Duration", "Json"}:
             return not arguments
         if base == "ActorRef":
             return len(arguments) == 1
@@ -1019,6 +1019,18 @@ class TypeChecker:
                 argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
                 self._check_arguments(expression.arguments, argument_types, ("String",), expression.location, "bytesFromString")
                 return "Bytes"
+            if expression.callee == "byteFromInt":
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'byteFromInt' does not accept type arguments")
+                argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
+                self._check_arguments(expression.arguments, argument_types, ("Int",), expression.location, "byteFromInt")
+                return "Result<Byte,String>"
+            if expression.callee == "byteBuffer":
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'byteBuffer' does not accept type arguments")
+                argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
+                self._check_arguments(expression.arguments, argument_types, ("Int",), expression.location, "byteBuffer")
+                return "Result<ByteBuffer,String>"
             http_signatures = {
                 "httpMethod": (("String",), "Result<HttpMethod,String>"),
                 "httpUrl": (("String",), "Result<HttpUrl,String>"),
@@ -1150,17 +1162,19 @@ class TypeChecker:
                 if len(argument_types) != 1:
                     raise Diagnostic(expression.location, "type", "'println' expects exactly one argument")
                 if argument_types[0] not in _DISPLAYABLE_TYPES:
-                    raise Diagnostic(expression.arguments[0].location, "type", f"'println' accepts Int, Float, Bool, or String, found {argument_types[0]}")
+                    raise Diagnostic(expression.arguments[0].location, "type", f"'println' accepts Int, Float, Bool, String, or Byte, found {argument_types[0]}")
                 return "Void"
             if expression.callee == "eprintln":
                 self._check_output_call(expression, argument_types)
                 return "Void"
-            if expression.callee in {"readText", "writeText", "pathJoin", "pathExists"}:
+            if expression.callee in {"readText", "writeText", "readBytes", "writeBytes", "pathJoin", "pathExists"}:
                 if expression.type_arguments:
                     raise Diagnostic(expression.location, "type", f"'{expression.callee}' does not accept type arguments")
                 signatures = {
                     "readText": (("String",), "Result<String,String>"),
                     "writeText": (("String", "String"), "Result<Bool,String>"),
+                    "readBytes": (("String",), "Result<Bytes,String>"),
+                    "writeBytes": (("String", "Bytes"), "Result<Bool,String>"),
                     "pathJoin": (("String", "String"), "String"),
                     "pathExists": (("String",), "Bool"),
                 }
@@ -1507,13 +1521,38 @@ class TypeChecker:
                                       f"Task.{expression.method}")
                 return result_type
             if receiver_base == "Bytes":
-                methods = {"length": ((), "Int"), "toString": ((), "Result<String,String>")}
+                methods = {
+                    "length": ((), "Int"), "toString": ((), "Result<String,String>"),
+                    "get": (("Int",), "Result<Byte,String>"),
+                    "slice": (("Int", "Int"), "Result<Bytes,String>"),
+                }
                 method_signature = methods.get(expression.method)
                 if method_signature is None:
                     raise Diagnostic(expression.location, "type", f"Bytes has no method '{expression.method}'")
                 expected_types, result_type = method_signature
                 self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
                                       f"Bytes.{expression.method}")
+                return result_type
+            if receiver_base == "Byte":
+                methods = {"toInt": ((), "Int")}
+                method_signature = methods.get(expression.method)
+                if method_signature is None:
+                    raise Diagnostic(expression.location, "type", f"Byte has no method '{expression.method}'")
+                expected_types, result_type = method_signature
+                self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
+                                      f"Byte.{expression.method}")
+                return result_type
+            if receiver_base == "ByteBuffer":
+                methods = {
+                    "length": ((), "Int"), "get": (("Int",), "Result<Byte,String>"),
+                    "set": (("Int", "Byte"), "Result<Bool,String>"), "toBytes": ((), "Result<Bytes,String>"),
+                }
+                method_signature = methods.get(expression.method)
+                if method_signature is None:
+                    raise Diagnostic(expression.location, "type", f"ByteBuffer has no method '{expression.method}'")
+                expected_types, result_type = method_signature
+                self._check_arguments(expression.arguments, argument_types, expected_types, expression.location,
+                                      f"ByteBuffer.{expression.method}")
                 return result_type
             if receiver_base == "SocketAddress":
                 methods = {"host": ((), "String"), "port": ((), "Int"),
@@ -1776,7 +1815,7 @@ class TypeChecker:
         if len(argument_types) != 1:
             raise Diagnostic(expression.location, "type", f"'{expression.callee}' expects exactly one argument")
         if argument_types[0] not in _DISPLAYABLE_TYPES:
-            raise Diagnostic(expression.arguments[0].location, "type", f"'{expression.callee}' accepts Int, Float, Bool, or String, found {argument_types[0]}")
+            raise Diagnostic(expression.arguments[0].location, "type", f"'{expression.callee}' accepts Int, Float, Bool, String, or Byte, found {argument_types[0]}")
 
     def _resolve_type_arguments(
         self, type_parameters: tuple[str, ...], explicit: list[str], formal_types: tuple[str, ...],

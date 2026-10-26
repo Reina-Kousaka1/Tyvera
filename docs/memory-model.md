@@ -5,7 +5,7 @@ remaining design work for later backends.
 
 ## Implemented reference behavior
 
-- `Int`, `Float`, `Bool`, `String`, and `Duration` are immutable values.
+- `Int`, `Float`, `Bool`, `Byte`, `String`, and `Duration` are immutable values.
 - Classes, `List<T>`, and `Map<K,V>` are mutable reference values. Passing one
   through a function or storing it in another binding shares the same object.
   `let` prevents rebinding; it does not freeze the referenced object.
@@ -22,10 +22,16 @@ remaining design work for later backends.
   mutable collections and values containing them cannot be keys.
 - Actor state is isolated. Actor messages accept the types described in the
   [language reference](language.md#actors). Transferable value payloads are
-  copied; an `ActorRef` continues to identify the same actor.
+  copied; an `ActorRef` continues to identify the same actor. `Byte` is a
+  transferable scalar; mutable `ByteBuffer` is not an actor message type.
 - Tasks share references captured in their arguments. Tasks are serial and
   cooperative, so they do not race in parallel, but their interleaving can
   make shared mutation order observable.
+- `ByteBuffer` is a shared mutable, runtime-managed reference with a 64 MiB
+  maximum allocation. Allocation and snapshot failures, and all indexed
+  failures, return `Result`; `toBytes()` creates an immutable copy.
+  `ByteBuffer` is not transferable as an
+  actor message. `Bytes` remains an immutable value and owns no external resource.
 - `TextFile`, `TextReader`, `TextWriter`, `TcpConnection`, `TcpListener`, and
   `HttpServer`
   are identity resources with one move-only owner. `Option`, `Result`, and the
@@ -50,7 +56,10 @@ ownership. It does not require a general borrow checker.
 | Category | V1 direction | Status |
 | --- | --- | --- |
 | `Int`, `Float`, `Bool`, `Duration` | Immutable scalar values; assignment copies the value. | Implemented; signed 64-bit and finite binary64 rules are specified. |
+| `Byte` | Immutable unsigned 8-bit scalar, explicitly converted to/from `Int` with range checking. | Implemented; values outside 0..255 return `Err`, with no implicit conversion. |
 | `String` | Immutable Unicode scalar sequence; equality compares exact sequence, without normalization. | Implemented for source and file I/O; indexing and grapheme APIs remain open. |
+| `Bytes` | Immutable byte value; equality compares contents. Binary slices and indexed reads return checked results. | Implemented; UTF-8 decoding remains explicit through `toString()`. |
+| `ByteBuffer` | Shared mutable reference to zero-initialized, runtime-managed bytes; access is bounds checked and snapshots are immutable. | Implemented with a 64 MiB length cap; raw pointers, unchecked access, custom allocators, and manual deallocation are not exposed. |
 | `Json`, `Option<T>`, `Result<T,E>`, enums, newtypes, tuples | Immutable tagged values with structural equality; nested references retain their own identity/value behavior. | Implemented in the bootstrap; native representation remains planned. |
 | Records | Immutable nominal value records; fields compare structurally. Nested mutable references remain shared. | Implemented, including generic types, destructuring, and safe derived map keys. |
 | Class instances, lists, maps | Classes use stable identity; lists and maps compare by contents. Assignment copies references; collection contents remain shared. | Implemented in the bootstrap. |
@@ -144,7 +153,11 @@ adapter uses a selector for TCP readiness and a bounded worker pool for DNS
 and file operations. A future native backend must implement the same
 observable behavior with the platform's completion or readiness facilities.
 
-`Bytes` is immutable and does not own an external resource. `SocketAddress`
+`Bytes` is immutable and does not own an external resource. Binary file
+operations and `ByteBuffer` allocation/access are bounded to 67,108,864 bytes;
+file, allocation, snapshot, and index failures are reported through `Result`. `ByteBuffer` uses
+runtime-managed storage and exposes neither pointers nor unchecked slices.
+`SocketAddress`
 is a portable value containing a host string, a 16-bit port, and `IPv4` or
 `IPv6` family. `TcpConnection`, `TcpListener`, and `HttpServer` are move-only.
 An HTTP server owns its listener and the connection tasks it accepts.
@@ -166,6 +179,15 @@ over owned TCP connections. HTTP request/response values are ordinary values;
 `HttpServer` and its listener/connections remain move-only resources. TLS can
 later adapt the owned byte-stream boundary using a vetted platform
 cryptography library. TLS and protocols beyond HTTP/1.1 remain planned.
+
+Native FFI is not implemented. A future ABI may pass `Byte` as an unsigned
+8-bit scalar and immutable `Bytes` as a borrowed pointer/length span valid only
+for the call. Mutable `ByteBuffer` may cross only through an explicit mutable
+borrow with exclusive access and may not be retained after the call. Owned
+resources require explicit transfer and release rules. Foreign status/errors
+must be translated at the boundary; process faults such as segmentation
+violations are not recoverable as Tyvera `Result` values. The safe language
+currently defines no raw pointer or `unsafe` syntax.
 
 ### Lifetimes and runtime ownership
 

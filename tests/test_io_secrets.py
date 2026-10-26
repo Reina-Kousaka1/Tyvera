@@ -53,7 +53,7 @@ fn main() {
             ('fn main() { readText(1) }', "expects String, found Int"),
             ('fn main() { writeText("x", false) }', "expects String, found Bool"),
             ('fn main() { pathJoin("x", 1) }', "expects String, found Int"),
-            ('fn main() { println(readText("x")) }', "accepts Int, Float, Bool, or String, found Result<String,String>"),
+            ('fn main() { println(readText("x")) }', "accepts Int, Float, Bool, String, or Byte, found Result<String,String>"),
         ]:
             with self.subTest(message=message), self.assertRaisesRegex(Diagnostic, message):
                 compile_source(source, "bad-io.tyv")

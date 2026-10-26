@@ -75,10 +75,12 @@ The Tyvera-facing contract is typed tasks plus move-only resource handles,
 partial byte operations, EOF, cancellation, deadlines, normalized errors,
 bounded pending operations, and deterministic cleanup. The current adapter
 uses `selectors.DefaultSelector` for TCP and a bounded worker pool for DNS and
-file work. A future runtime may use completion ports, `epoll`, `kqueue`, or
-another OS facility as long as the observable Tyvera scheduling and ownership
-rules stay the same. Native code generation and a native I/O backend are not
-implemented in this branch.
+file work. Binary file operations use immutable `Bytes` and bounded,
+bounds-checked managed `ByteBuffer` values; neither interface exposes host
+file objects or memory addresses. A future runtime may use completion ports,
+`epoll`, `kqueue`, or another OS facility as long as the observable Tyvera
+scheduling, byte and ownership rules stay the same. Native code generation
+and a native I/O backend are not implemented in this branch.
 
 The networking layer has no user-defined general Stream interface. TCP
 establishes a byte-stream contract; text files retain their UTF-8 resource
@@ -103,6 +105,10 @@ The ABI is not selected or implemented. Before committing to one, specify:
 
 - Stable layouts and ownership rules for scalar, string, collection, object,
   actor, task, error, and resource handles.
+- `Byte` should have an unsigned 8-bit ABI representation. `Bytes` should cross
+  a call as a borrowed pointer/length pair valid for that call only; a mutable
+  `ByteBuffer` requires an explicit exclusive borrow and cannot be retained by
+  foreign code. These mappings are design constraints, not implemented FFI.
 - Allocation/deallocation responsibilities and how out-of-memory is reported.
 - String encoding, length, and lifetime rules.
 - Collection operations and iteration order without exposing host hash-table
@@ -117,7 +123,10 @@ The first ABI should be internal and versioned with the runtime. Safe Tyvera
 must not expose raw allocation pointers. A future native/unsafe boundary must
 make ownership and foreign error conversion explicit. The language-level
 value and resource rules are in the [Memory Model](memory-model.md); the native
-resource ABI remains planned.
+resource ABI remains planned. There is no `unsafe` syntax or FFI declaration
+syntax today. A foreign status may become a controlled Tyvera result only at a
+defined boundary; a native crash or memory fault cannot be turned into a
+recoverable `Result`.
 
 ## Native backend options
 
