@@ -260,6 +260,19 @@ fn main() { println(add(1, 2)); println("Tyvera") }
                 self.assertIn("tyvera_generated", source)
                 self.assertNotIn("PyObject", source)
                 self.assertNotIn("python", source.lower())
+                if name == "native_collections.tyv":
+                    self.assertIn(
+                        "tyvera_runtime::map_put<std::optional<std::int64_t>, std::string>", source,
+                    )
+                    self.assertIn(
+                        "tyvera_runtime::map_get<std::optional<std::int64_t>, std::string>", source,
+                    )
+                    self.assertIn(
+                        "tyvera_runtime::list_append<std::optional<std::int64_t>>", source,
+                    )
+                    self.assertIn(
+                        "tyvera_runtime::map_put<std::string, std::optional<std::int64_t>>", source,
+                    )
 
     def test_build_cli_reports_unsupported_native_construct_without_artifact(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tyvera-cli-build-") as temporary:

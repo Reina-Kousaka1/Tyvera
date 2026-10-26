@@ -523,6 +523,7 @@ class _CppGenerator:
             if method == "slice":
                 return f"tyvera_runtime::bytes_slice({receiver}, {arguments[0]}, {arguments[1]})"
         if isinstance(expression.receiver.type, IRAppliedType) and expression.receiver.type.name == "List":
+            element_type = _CppGenerator._cpp_type(expression.receiver.type.arguments[0])
             functions = {
                 "append": "list_append", "insert": "list_insert", "get": "list_get",
                 "set": "list_set", "removeAt": "list_remove_at", "contains": "list_contains",
@@ -531,14 +532,20 @@ class _CppGenerator:
             values = [receiver, *arguments]
             if method in {"insert", "set"}:
                 values.append(_location_args(expression.location))
-            return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
+            return f"tyvera_runtime::{functions[method]}<{element_type}>({', '.join(values)})"
         if isinstance(expression.receiver.type, IRAppliedType) and expression.receiver.type.name == "Map":
+            key_type, value_type = (
+                _CppGenerator._cpp_type(argument) for argument in expression.receiver.type.arguments
+            )
             functions = {
                 "put": "map_put", "get": "map_get", "remove": "map_remove",
                 "containsKey": "map_contains_key", "keys": "map_keys", "values": "map_values",
                 "clear": "map_clear",
             }
-            return f"tyvera_runtime::{functions[method]}({', '.join([receiver, *arguments])})"
+            return (
+                f"tyvera_runtime::{functions[method]}<{key_type}, {value_type}>"
+                f"({', '.join([receiver, *arguments])})"
+            )
         raise ValueError(f"unhandled validated IR method '{method}'")
 
 

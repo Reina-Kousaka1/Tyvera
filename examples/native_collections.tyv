@@ -36,6 +36,14 @@ fn main() {
     }
     println(values.contains(3))
 
+    let optionalValues: List<Option<Int>> = List<Option<Int>>()
+    optionalValues.append(None<Int>())
+    match optionalValues.get(0) {
+        Some(None) => println("none list item")
+        Some(Some(value)) => println(value)
+        None => println("missing list item")
+    }
+
     let snapshot: List<Int> = List<Int>()
     snapshot.append(1)
     snapshot.append(2)
@@ -90,7 +98,15 @@ fn main() {
         Some(value) => println(value)
         None => println("missing none key")
     }
+    let optionalScores: Map<String, Option<Int>> = Map<String, Option<Int>>()
+    optionalScores.put("unknown", None<Int>())
+    match optionalScores.get("unknown") {
+        Some(None) => println("none map value")
+        Some(Some(value)) => println(value)
+        None => println("missing map value")
+    }
     optionKeys.clear()
+    optionalScores.clear()
     scores.clear()
     values.clear()
     println(optionKeys.length)
