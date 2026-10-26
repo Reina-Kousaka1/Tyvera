@@ -1,0 +1,82 @@
+fn asInt(value: Byte) -> Int {
+    return value.toInt()
+}
+
+fn sameBytes(value: Bytes) -> Bytes {
+    return value
+}
+
+fn sameByte(left: Byte, right: Byte) -> Bool {
+    return left == right
+}
+
+fn main() {
+    match byteFromInt(0) {
+        Ok(value) => {
+            println(asInt(value))
+            println(sameByte(value, value))
+        }
+        Err(reason) => println(reason)
+    }
+    match byteFromInt(1) {
+        Ok(value) => println(asInt(value))
+        Err(reason) => println(reason)
+    }
+    match byteFromInt(254) {
+        Ok(value) => println(asInt(value))
+        Err(reason) => println(reason)
+    }
+    match byteFromInt(255) {
+        Ok(value) => println(asInt(value))
+        Err(reason) => println(reason)
+    }
+    match byteFromInt(256) {
+        Ok(value) => println(asInt(value))
+        Err(reason) => println(reason)
+    }
+    match byteFromInt(-1) {
+        Ok(value) => println(asInt(value))
+        Err(reason) => println(reason)
+    }
+
+    let bytes: Bytes = bytesFromString("hé")
+    let copy = sameBytes(bytes)
+    println(copy.length())
+    println(bytes == copy)
+    match copy.get(1) {
+        Ok(value) => println(asInt(value))
+        Err(reason) => println(reason)
+    }
+    match copy.slice(1, 2) {
+        Ok(slice) => match slice.toString() {
+            Ok(text) => println(text)
+            Err(reason) => println(reason)
+        }
+        Err(reason) => println(reason)
+    }
+    match copy.slice(1, 1) {
+        Ok(slice) => match slice.toString() {
+            Ok(text) => println(text)
+            Err(reason) => println(reason)
+        }
+        Err(reason) => println(reason)
+    }
+    match copy.slice(-1, 1) {
+        Ok(_) => println("unexpected")
+        Err(reason) => println(reason)
+    }
+    match copy.get(copy.length()) {
+        Ok(_) => println("unexpected")
+        Err(reason) => println(reason)
+    }
+    match copy.toString() {
+        Ok(text) => println(text)
+        Err(reason) => println(reason)
+    }
+    let empty: Bytes = bytesFromString("")
+    println(empty.length())
+    match empty.slice(0, 0) {
+        Ok(value) => println(value.length())
+        Err(reason) => println(reason)
+    }
+}

@@ -18,7 +18,7 @@ implemented.
 | 6. Supervisors | First slice implemented | Child lifecycle, crash detection, bounded restart intensity and deterministic `one_for_one` restarts. `one_for_all` and `rest_for_one` remain planned. |
 | 7. Async I/O & TCP | V1 implemented | Selector-backed TCP connect/listen/accept/read/write, worker-backed DNS and async text-file I/O, cancellation, deadlines, move-only network resources, address/error values, and bounded write behavior. TLS and protocols beyond HTTP/1.1 remain planned. |
 | 8. HTTP & Web Backend Foundation | V1 implemented; experimental | Bounded HTTP/1.1 codec, typed request/response values, TCP client and concurrent server, keep-alive, static routing, query/path parameters, JSON core integration, deadlines, and ownership cleanup. Streaming, dynamic handlers, TLS, and HTTP/2/3 remain planned. |
-| 9. Native backend | V1 implemented; experimental | Typed IR and C++17 host compilation support a synchronous scalar/control-flow subset. Linux x86-64 is CI-tested; Actors, Tasks, resources, I/O, `Byte`/`Bytes`, collections, objects, and FFI remain interpreter-only or planned. |
+| 9. Native backend | V1 expanded; experimental | Typed IR and C++17 host compilation support the synchronous scalar/control-flow core, `Option`/`Result` matching, typed `List`/`Map`, `Byte`, and immutable `Bytes`. Linux x86-64 is CI-tested; binary/text I/O, resources, objects, generic functions, Actors, Tasks, networking, and FFI remain interpreter-only or planned. |
 | 10. Package system | Planned | Reproducible package metadata, dependency resolution and versioning after modules and the standard library stabilize. |
 | 11. Application library ecosystem | Planned | Build general-purpose libraries and use larger applications as later conformance and load tests; application protocols stay outside compiler semantics. |
 
@@ -63,8 +63,9 @@ deterministic cleanup. Async text-file operations, DNS, selector-backed TCP,
 backpressure, and cancellation are implemented in the reference runtime.
 True parallelism, TLS, HTTP streaming, WebSockets, non-network resource families,
 standard-library modules, and a native runtime for the full language remain
-planned. The synchronous scalar native backend V1 is implemented. HTTP/1.1 V1 is
-experimental and implemented. Resource scopes
+planned. The native backend's synchronous core and selected `Option`/`Result`,
+collection, `Byte`, and `Bytes` paths are implemented experimentally. HTTP/1.1
+V1 is experimental and implemented. Resource scopes
 close on normal exit, return, errors, task cancellation, loop control, actor
 failure, and supervisor restart. Runtime ownership, shutdown, detached task
 failures, timed wrappers, and actor reply fairness have explicit semantics and

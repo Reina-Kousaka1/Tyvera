@@ -1,0 +1,34 @@
+fn optionValue(value: Option<Int>) -> Int {
+    match value {
+        Some(number) => return number
+        None => return 0
+    }
+}
+
+fn main() {
+    let present: Option<Int> = Some(7)
+    let absent: Option<Int> = None<Int>()
+    println(optionValue(present))
+    println(optionValue(absent))
+    println(present == Some(7))
+    let successful: Result<Int, String> = Ok<Int, String>(9)
+    println(successful == Ok<Int, String>(9))
+    match present {
+        Some(7) => println("matched literal")
+        Some(value) => println(value)
+        None => println("empty")
+    }
+
+    let nested: Result<Option<Int>, String> = Ok<Option<Int>, String>(Some(12))
+    match nested {
+        Ok(Some(number)) => println(number)
+        Ok(None) => println("no value")
+        Err(message) => println(message)
+    }
+
+    let failure: Result<Int, String> = Err<Int, String>("problem")
+    match failure {
+        Ok(number) => println(number)
+        Err(message) => println(message)
+    }
+}

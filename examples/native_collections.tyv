@@ -1,0 +1,99 @@
+fn main() {
+    let values: List<Int> = List<Int>()
+    values.append(1)
+    values.append(2)
+    let alias = values
+    values.insert(1, 3)
+    values.set(0, 4)
+    match values.get(1) {
+        Some(value) => println(value)
+        None => println(-1)
+    }
+    println(values.length)
+    println(values == alias)
+    let expectedValues: List<Int> = List<Int>()
+    expectedValues.append(4)
+    expectedValues.append(3)
+    expectedValues.append(2)
+    println(values == expectedValues)
+
+    var sum = 0
+    for value in values {
+        sum = sum + value
+    }
+    println(sum)
+    match values.removeAt(2) {
+        Some(value) => println(value)
+        None => println(-1)
+    }
+    match values.get(20) {
+        Some(value) => println(value)
+        None => println("missing list value")
+    }
+    match values.get(-1) {
+        Some(value) => println(value)
+        None => println("negative list index")
+    }
+    println(values.contains(3))
+
+    let snapshot: List<Int> = List<Int>()
+    snapshot.append(1)
+    snapshot.append(2)
+    var snapshotSum = 0
+    for item in snapshot {
+        snapshotSum = snapshotSum + item
+        snapshot.append(100)
+    }
+    println(snapshotSum)
+    println(snapshot.length)
+
+    let scores: Map<String, Int> = Map<String, Int>()
+    scores.put("Mira", 9)
+    scores.put("Kai", 2)
+    scores.put("Mira", 11)
+    println(scores.length)
+    match scores.get("Mira") {
+        Some(value) => println(value)
+        None => println(-1)
+    }
+    let sameScores: Map<String, Int> = Map<String, Int>()
+    sameScores.put("Kai", 2)
+    sameScores.put("Mira", 11)
+    println(scores == sameScores)
+    for key in scores {
+        println(key)
+        scores.put("Later", 4)
+    }
+    println(scores.length)
+    match scores.remove("Kai") {
+        Some(value) => println(value)
+        None => println(-1)
+    }
+    match scores.get("missing") {
+        Some(value) => println(value)
+        None => println("missing map value")
+    }
+    println(scores.containsKey("Mira"))
+    let scoreKeys = scores.keys()
+    let scoreValues = scores.values()
+    println(scoreKeys.length)
+    println(scoreValues.length)
+
+    let optionKeys: Map<Option<Int>, String> = Map<Option<Int>, String>()
+    optionKeys.put(Some(4), "present")
+    optionKeys.put(None<Int>(), "absent")
+    match optionKeys.get(Some(4)) {
+        Some(value) => println(value)
+        None => println("missing option key")
+    }
+    match optionKeys.get(None<Int>()) {
+        Some(value) => println(value)
+        None => println("missing none key")
+    }
+    optionKeys.clear()
+    scores.clear()
+    values.clear()
+    println(optionKeys.length)
+    println(scores.length)
+    println(values.length)
+}

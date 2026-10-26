@@ -16,7 +16,22 @@ from tyvera.backend import ReferenceInterpreterBackend
 from tyvera.cli import main as cli_main
 from tyvera.compiler import compile_checked_project, compile_checked_source
 from tyvera.cpp_backend import CppNativeBackend, emit_cpp
-from tyvera.ir import IRCall, IRFunction, IRIf, IRLiteral, IRModule, IRType, validate_ir
+from tyvera.ir import (
+    IRAppliedType,
+    IRCall,
+    IRCollectionLength,
+    IRForEach,
+    IRFunction,
+    IRIf,
+    IRLiteral,
+    IRMatch,
+    IRMethodCall,
+    IRModule,
+    IROutput,
+    IRType,
+    IRVariant,
+    validate_ir,
+)
 from tyvera.lowering import lower_checked_program
 from tyvera.source import Diagnostic, Location
 
@@ -126,11 +141,10 @@ fn main() { println(increment(4)) }
         self.assertIn("does not yet support actors", caught.exception.message)
         self.assertEqual(caught.exception.location.filename, "actor.tyv")
 
-    def test_byte_binary_io_and_result_paths_are_explicitly_interpreter_only(self) -> None:
+    def test_binary_file_io_and_mutable_byte_buffer_remain_interpreter_only(self) -> None:
         for source, message in [
-            ('fn main() { let byte = byteFromInt(1) }', "type 'Result<Byte,String>'"),
-            ('fn main() { let bytes = bytesFromString("x") }', "type 'Bytes'"),
-            ('fn main() { let result = readBytes("file.bin") }', "type 'Result<Bytes,String>'"),
+            ('fn main() { let result = readBytes("file.bin") }', "call 'readBytes'"),
+            ('fn main() { let buffer = byteBuffer(4) }', "type 'ByteBuffer'"),
         ]:
             with self.subTest(source=source):
                 checked = compile_checked_source(source, "runtime_only.tyv")
@@ -138,6 +152,64 @@ fn main() { println(increment(4)) }
                     lower_checked_program(checked)
                 self.assertEqual(caught.exception.stage, "backend")
                 self.assertIn(message, caught.exception.message)
+
+    def test_sum_types_and_recursive_patterns_lower_with_checked_types(self) -> None:
+        module = self.lower('''fn main() {
+    let option: Option<Int> = Some(3)
+    match option {
+        Some(value) => println(value)
+        None => println(0)
+    }
+    let result: Result<Option<Int>, String> = Ok<Option<Int>, String>(Some(5))
+    match result {
+        Ok(Some(value)) => println(value)
+        Ok(None) => println(0)
+        Err(reason) => println(reason)
+    }
+}
+''')
+        function = module.functions[0]
+        self.assertIsInstance(function.body[0].value, IRVariant)
+        self.assertEqual(function.body[0].variable.type, IRAppliedType("Option", (IRType.INT,)))
+        option_match = function.body[1]
+        result_match = function.body[3]
+        self.assertIsInstance(option_match, IRMatch)
+        self.assertIsInstance(result_match, IRMatch)
+        self.assertTrue(option_match.exhaustive)
+        self.assertTrue(result_match.exhaustive)
+        self.assertEqual(option_match.covered_cases, frozenset({"Some", "None"}))
+
+    def test_list_map_and_immutable_bytes_lower_to_typed_ir(self) -> None:
+        module = self.lower('''fn main() {
+    let values: List<Int> = List<Int>()
+    values.append(2)
+    println(values.length)
+    for value in values { println(value) }
+    let entries: Map<String, Int> = Map<String, Int>()
+    entries.put("key", 3)
+    for key in entries { println(key) }
+    let bytes: Bytes = bytesFromString("a")
+    println(bytes.length())
+}
+''')
+        body = module.functions[0].body
+        self.assertEqual(body[0].variable.type, IRAppliedType("List", (IRType.INT,)))
+        self.assertIsInstance(body[1].expression, IRMethodCall)
+        self.assertIsInstance(body[2].value, IRCollectionLength)
+        self.assertIsInstance(body[3], IRForEach)
+        self.assertEqual(body[3].iterable.type.name, "List")
+        self.assertIsInstance(body[6], IRForEach)
+        self.assertEqual(body[6].iterable.type.name, "Map")
+        self.assertEqual(body[7].variable.type, IRType.BYTES)
+
+    def test_ir_validator_rejects_out_of_range_byte_literal(self) -> None:
+        location = Location("bad_byte_ir.tyv", 1, 1)
+        main = IRFunction(
+            "main", "tyv_fn_main", (), IRType.VOID,
+            (IROutput("stdout", IRLiteral(256, IRType.BYTE, location), location),), location,
+        )
+        with self.assertRaisesRegex(Diagnostic, "invalid Byte literal"):
+            validate_ir(IRModule((main,), "tyv_fn_main"))
 
     def test_ir_validator_rejects_untyped_control_flow(self) -> None:
         location = Location("bad_ir.tyv", 1, 1)
@@ -176,6 +248,18 @@ fn main() { println(add(1, 2)); println("Tyvera") }
         self.assertIn("tyvera_runtime::Failure", source)
         self.assertNotIn("python", source.lower())
         self.assertNotIn("PyObject", source)
+
+    def test_new_native_examples_lower_and_emit_cpp_without_python_bridge(self) -> None:
+        for name in ("native_sum_types.tyv", "native_collections.tyv", "native_bytes.tyv"):
+            with self.subTest(example=name):
+                checked = compile_checked_project(REPOSITORY / "examples" / name, REPOSITORY)
+                module = lower_checked_program(checked)
+                source = emit_cpp(module)
+                self.assertIn("std::optional", source)
+                self.assertIn("exhaustive match had no matching pattern", source)
+                self.assertIn("tyvera_generated", source)
+                self.assertNotIn("PyObject", source)
+                self.assertNotIn("python", source.lower())
 
     def test_build_cli_reports_unsupported_native_construct_without_artifact(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tyvera-cli-build-") as temporary:
@@ -241,10 +325,15 @@ class NativeExecutionTests(unittest.TestCase):
         if os.name != "nt":
             # The absolute executable must not depend on Python being on PATH.
             environment["PATH"] = ""
-        return subprocess.run([str(output)], capture_output=True, text=True, env=environment, check=False)
+        return subprocess.run(
+            [str(output)], capture_output=True, text=True, encoding="utf-8", env=environment, check=False,
+        )
 
     def test_native_examples_match_reference_interpreter_without_python_path(self) -> None:
-        examples = ("native_hello.tyv", "native_control_flow.tyv", "native_values.tyv")
+        examples = (
+            "native_hello.tyv", "native_control_flow.tyv", "native_values.tyv",
+            "native_sum_types.tyv", "native_collections.tyv", "native_bytes.tyv",
+        )
         with tempfile.TemporaryDirectory(prefix="tyvera-native-e2e-") as temporary:
             for name in examples:
                 with self.subTest(example=name):
@@ -304,6 +393,31 @@ class NativeExecutionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("divide.tyv:1:", result.stderr)
         self.assertIn("division by zero", result.stderr)
+
+    def test_list_bounds_failure_matches_reference_diagnostic(self) -> None:
+        for operation in ("values.insert(-1, 8)", "values.set(1, 8)", "values.set(4, 8)"):
+            with self.subTest(operation=operation):
+                source_text = f'''fn main() {{
+    let values: List<Int> = List<Int>()
+    values.append(1)
+    {operation}
+}}
+'''
+                checked = compile_checked_source(source_text, "list_bounds.tyv")
+                with self.assertRaises(Diagnostic) as caught:
+                    ReferenceInterpreterBackend().execute(
+                        checked, output=io.StringIO(), error_output=io.StringIO(), project_root=REPOSITORY,
+                    )
+                diagnostic = caught.exception.render()
+                with tempfile.TemporaryDirectory(prefix="tyvera-native-list-bounds-") as temporary:
+                    executable = Path(temporary) / "list_bounds"
+                    CppNativeBackend().build(lower_checked_program(checked), executable)
+                    result = subprocess.run(
+                        [str(executable)], capture_output=True, text=True, encoding="utf-8", check=False,
+                    )
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stderr.strip(), diagnostic)
+                self.assertEqual(result.stdout, "")
 
 
 if __name__ == "__main__":

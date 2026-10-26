@@ -110,16 +110,24 @@ generated-code representation is:
   become Tyvera runtime diagnostics.
 - `Bool`: C++ `bool`; `String`: `std::string` containing UTF-8 bytes; `Void`:
   C++ `void`.
+- `Byte`: `std::uint8_t`; `Bytes`: an immutable Tyvera byte value represented
+  privately as `std::vector<std::uint8_t>`.
+- `Option<T>` and `Result<T,E>` use `std::optional<T>` and an indexed
+  `std::variant<T,E>` in generated code. `List<T>` and `Map<K,V>` use private
+  shared runtime storage so assignment and calls preserve Tyvera's shared
+  collection-reference semantics.
 - Direct generated functions pass these scalar values by value. The
   executable links the platform C++ runtime and small generated support code.
 - Runtime failures retain source file, line, and column and become a controlled
   stderr diagnostic plus a nonzero process exit.
 
 This is a private V1 code-generation contract, not a stable public C ABI or an
-FFI. Generated executables do not embed or invoke Python. `Byte`, `Bytes`,
-`ByteBuffer`, `Option`, `Result`, binary/text I/O, collections, classes,
-resources, Tasks, Actors, and Supervisors remain interpreter-only. No native
-object, resource, task, actor, or error ABI is implemented. There is no
+FFI. These representations are private compiler details, not a public ABI.
+Generated executables do not embed or invoke Python. Binary/text file I/O,
+`ByteBuffer`, classes, records, user-defined enums, tuples, generic functions,
+resources, Tasks, Actors, Supervisors, networking, and HTTP remain
+interpreter-only. No native object, resource, task, actor, or error ABI is
+implemented. There is no
 `unsafe` or FFI declaration syntax. Any later FFI must define ownership,
 lifetimes, mutability, and error conversion explicitly; a native crash cannot
 become a recoverable Tyvera `Result`. See the [Memory Model](memory-model.md)
@@ -177,9 +185,13 @@ does not make C++ part of Tyvera's language.
 | Synchronous functions, calls, returns, recursion | Implemented. |
 | Arithmetic, numeric comparisons, exact mixed `Int`/`Float` comparison, boolean short-circuiting | Implemented with Tyvera overflow, finite-Float, division, and remainder rules. |
 | `if`/`else`, `while`, lexical scopes, `break`, `continue` | Implemented. |
-| `println`, `eprintln` | Implemented for Int, Float, Bool, String. |
-| Byte/Bytes/ByteBuffer, binary/text I/O, resources and cleanup | Interpreter-only; native build reports an unsupported type or operation. |
-| `Option`, `Result`, pattern matching, collections, records, tuples, enums, classes, interfaces, generics | Interpreter-only. |
+| `println`, `eprintln` | Implemented for Int, Float, Bool, String, and Byte. |
+| `Option<T>`, `Result<T,E>` | Implemented for native-supported payload types, including constructors, typed calls/returns, equality, and nested values. |
+| Pattern matching | Implemented for scalar literal patterns and nested Option/Result constructor patterns with binding/wildcard cases; source exhaustiveness rules remain enforced by the checker. |
+| `List<T>`, `Map<K,V>` | Implemented for native-supported element/key/value types, including mutation, lookup, removal, equality, length, and snapshot iteration. Map lookup preserves Tyvera equality and insertion-order iteration semantics. |
+| `Byte`, immutable `Bytes` | `byteFromInt`, `Byte.toInt`, Byte equality/output, `bytesFromString`, Bytes equality, length, bounds-checked `get`/`slice`, and UTF-8-checked `toString` are implemented. |
+| Binary/text file I/O, `ByteBuffer`, resources and cleanup | Interpreter-only; native build reports an unsupported call or type. |
+| Records, tuples, user-defined enums, classes, interfaces, generic functions | Interpreter-only. |
 | Actors, Supervisors, Tasks, async I/O, TCP, DNS, HTTP | Interpreter-only. |
 | Native FFI, stable public ABI, cross-compilation | Planned; no syntax or runtime contract is exposed. |
 
@@ -196,11 +208,11 @@ compiler succeeds. Missing toolchains and unsupported source constructs
 produce controlled diagnostics. CI builds and runs the native examples on
 Linux x86-64 with Python removed from the executable's `PATH`.
 
-End-to-end tests compare stdout and exit behavior for the native examples
-against `ReferenceInterpreterBackend`; they also cover located integer
-overflow failures, IR validation, unsupported-feature diagnostics, and the
-CLI. This is a focused V1 corpus, not full-language differential testing.
-Addresses, host tracebacks, and timing are not semantic outputs.
+End-to-end tests compare stdout, stderr, and exit status for native examples
+against `ReferenceInterpreterBackend`; they also cover located runtime
+failures, IR validation, unsupported-feature diagnostics, and the CLI. This is
+a focused compiler corpus, not full-language differential testing. Addresses,
+host tracebacks, and timing are not semantic outputs.
 
 ## Upstream references
 

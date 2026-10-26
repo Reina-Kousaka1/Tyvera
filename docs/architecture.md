@@ -161,14 +161,17 @@ atomic. Full lifecycle rules are in the [Runtime documentation](runtime.md).
 ## Native backend V1
 
 `CheckedProgram` feeds both the interpreter and `lower_checked_program()`.
-Typed IR records scalar types, binding IDs, calls, operators, source locations
-and structured control flow. The first backend emits C++17 with checked
+Typed IR records primitive and applied types, binding IDs, calls, operators,
+patterns, collection operations, source locations, and structured control
+flow. The first backend emits C++17 with checked
 arithmetic and diagnostics, then invokes a host compiler. Linux x86-64 is the
-CI-tested target. Generated executables do not require Python. Byte/Bytes,
-binary I/O, collections, classes, generics, resources, Tasks, Actors, networking
-and HTTP remain interpreter-only. The full boundary and backend evaluation are
-in [Backend Architecture](backend-architecture.md); Tyvera's value and
-resource rules are in the [Memory Model](memory-model.md).
+CI-tested target. Generated executables do not require Python. `Option`/
+`Result` matching, typed `List`/`Map`, `Byte`, and immutable `Bytes` are now
+part of the native subset. Binary file I/O, `ByteBuffer`, classes, generic
+functions, resources, Tasks, Actors, networking, and HTTP remain
+interpreter-only. The full boundary and backend evaluation are in
+[Backend Architecture](backend-architecture.md); Tyvera's value and resource
+rules are in the [Memory Model](memory-model.md).
 
 ## Local bootstrap benchmarks
 

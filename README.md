@@ -18,9 +18,10 @@ newer. An experimental C++17 native backend compiles a documented core subset
 to executables that run without Python. The interpreter remains the complete
 reference path for language features outside that compiler subset.
 
-The implemented language includes `Int`, `Float`, `Bool`, `String`, `Void`,
-interface-constrained generic functions, classes, records, enums and newtypes, transparent type
-aliases, typed tuples, `List<T>` and `Map<K,V>`, `Option<T>` and `Result<T,E>`,
+The implemented language includes `Int`, `Float`, `Bool`, `Byte`, `String`,
+`Bytes`, `Void`, interface-constrained generic functions, classes, records,
+enums and newtypes, transparent type aliases, typed tuples, `List<T>` and
+`Map<K,V>`, `Option<T>` and `Result<T,E>`,
 nested statement-level pattern matching, checked equality and map keyability,
 `for`, checked text I/O and path helpers, move-only `TextFile`, `TextReader`, and
 `TextWriter` resources with explicit ownership transfer and deterministic cleanup,
@@ -36,7 +37,8 @@ experimental HTTP/1.1 codec, bounded concurrent server, static router, and
 typed HTTP client build on those same TCP tasks and resource rules. See
 [`examples/tcp_echo.tyv`](examples/tcp_echo.tyv) and
 [`examples/http_server.tyv`](examples/http_server.tyv) for local examples.
-The native compiler currently targets synchronous scalar programs; see the
+The experimental native compiler supports the synchronous core plus selected
+`Option`/`Result`, collection, `Byte`, and immutable `Bytes` operations; see the
 [Backend Architecture](docs/backend-architecture.md) support table. TLS and
 WebSockets remain planned.
 
@@ -96,6 +98,10 @@ interpreter-only runtime areas are listed in
 ```sh
 tyvera build examples/native_hello.tyv
 ./native_hello
+tyvera check examples/native_sum_types.tyv
+tyvera build examples/native_sum_types.tyv
+tyvera build examples/native_collections.tyv
+tyvera build examples/native_bytes.tyv
 ```
 
 On Windows, run `native_hello.exe` from the current directory.
@@ -206,12 +212,12 @@ implicit child joining, owner-local task groups, explicit child detachment,
 and task deadlines are implemented. Async text-file I/O, DNS, and TCP V1 are
 implemented. HTTP/1.1 V1 is implemented as an experimental codec, client,
 bounded server, and static router. The experimental native compiler supports
-only the typed synchronous scalar/control-flow subset documented in
-[Backend Architecture](docs/backend-architecture.md); Actors, Tasks, resources,
-collections and I/O remain interpreter-only. True parallel execution, TLS,
-WebSockets, separate standard-library modules, external secret stores, and
-broader native runtime support remain planned. See the
-[roadmap](docs/roadmap.md) for sequence and
-scope, and [release/versioning notes](docs/release-process.md) for the
+the typed synchronous core plus selected value and collection features
+documented in [Backend Architecture](docs/backend-architecture.md); Actors,
+Tasks, resources, file I/O, networking, and HTTP remain interpreter-only. True
+parallel execution, TLS, WebSockets, separate standard-library modules,
+external secret stores, and broader native runtime support remain planned. See
+the [roadmap](docs/roadmap.md) for sequence and scope, and
+[release/versioning notes](docs/release-process.md) for the
 pre-1.0 release approach.
 

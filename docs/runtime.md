@@ -157,12 +157,15 @@ limits and client lifecycle.
 
 ## Native runtime boundary
 
-The experimental native compiler executes only synchronous scalar programs;
-it does not include the task scheduler, actor runtime, resource cleanup, async
-I/O, networking, or HTTP services described above. Those features continue to
-run through the reference interpreter and native build rejects them instead
-of falling back. The native subset and its internal runtime helpers are
-documented in [Backend Architecture](backend-architecture.md).
+The experimental native compiler executes a checked synchronous core plus
+selected value features: `Option`/`Result` and matching, `List`/`Map`, `Byte`,
+and immutable `Bytes`. Its private C++ runtime implements Tyvera's checked
+operations without exposing a public ABI. It does not include the task
+scheduler, actor runtime, resource cleanup, file I/O, async I/O, networking, or
+HTTP services described above. Those features continue to run through the
+reference interpreter and native build rejects them instead of falling back.
+The native subset and its internal runtime helpers are documented in
+[Backend Architecture](backend-architecture.md).
 
 ## Not implemented
 

@@ -34,10 +34,14 @@ need Python at runtime. The host must have `clang++`, `g++`, `c++`, or `cl`
 available, or the `CXX` environment variable must name a C++17 compiler.
 
 The native subset currently includes synchronous functions over `Int`,
-`Float`, `Bool`, and `String`; local `let`/`var`, assignments, calls, returns,
-arithmetic, comparisons, boolean short-circuiting, `if`/`else`, `while`,
-`break`/`continue`, `println`, and `eprintln`. A source program that type-checks
-but uses a feature outside that subset fails with a source-located backend
+`Float`, `Bool`, `String`, `Byte`, `Bytes`, `Option`, `Result`, `List`, and
+`Map`, with typed matching for `Option`/`Result`; local `let`/`var`,
+assignments, calls, returns, arithmetic, comparisons, boolean short-circuiting,
+`if`/`else`, `while`, `for` over collection snapshots, `break`/`continue`,
+`println`, and `eprintln`. Binary file I/O, `ByteBuffer`, resources, generic
+functions, Tasks, Actors, networking, HTTP, and user-defined object/value types
+remain unsupported by native builds. A source program that type-checks but
+uses a feature outside the subset fails with a source-located backend
 diagnostic and produces no executable. The full support table and runtime
 boundary are in [Backend Architecture](backend-architecture.md).
 

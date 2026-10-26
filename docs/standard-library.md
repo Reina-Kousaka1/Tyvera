@@ -42,15 +42,20 @@ relative paths from the project root and refuse direct access to
 `.tyvera.secrets`. Secret values are redacted in diagnostics, and
 `println`/`eprintln` reject `Secret<T>`.
 
-## Native compiler V1 support
+## Native compiler support
 
-The native build path directly supports `Int`, `Float`, `Bool`, `String`,
-`Void`, synchronous functions, locals, arithmetic, comparisons, conditionals,
-loops, and scalar output. The standard-library APIs in this document—including
-`Byte`, `Bytes`, `ByteBuffer`, `Option`, `Result`, collections, file I/O,
-networking, HTTP, Tasks, Actors, and resource handles—are currently supported
-by the reference interpreter only. `tyvera build` reports unsupported calls
-or types; it never routes a native program through Python.
+The experimental native path supports the synchronous core and selected
+standard-library values: `Option<T>`, `Result<T,E>`, typed matching for their
+variants, `List<T>`, `Map<K,V>`, `Byte`, and immutable `Bytes`. These work only
+when their nested types are part of the native backend support matrix in
+[Backend Architecture](backend-architecture.md). List/Map references preserve
+shared mutation; `Bytes` preserves immutable value semantics. Native `Bytes`
+supports construction from `String`, `length`, checked `get` and `slice`, and
+UTF-8-checked `toString`. Binary file operations, `ByteBuffer`, all resource
+APIs, networking, HTTP, Tasks, and Actors remain interpreter-only. Generic
+user-defined functions and other types are also not part of the native slice.
+`tyvera build` reports unsupported calls or types; it never routes a native
+program through Python. The private C++ representation is not a public ABI.
 
 ## Planned namespaces
 

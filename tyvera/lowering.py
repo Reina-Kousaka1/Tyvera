@@ -4,47 +4,72 @@ from __future__ import annotations
 
 from .ast import (
     Assignment,
+    BindingPattern,
     Binary,
     Block,
     Call,
+    EnumPattern,
     Expression,
     ExpressionStatement,
     Function,
+    ForStatement,
     IfStatement,
     LetStatement,
     Literal,
+    LiteralPattern,
     LoopControl,
+    MatchStatement,
+    MemberAccess,
+    MemberCall,
     Name,
     Program,
     ReturnStatement,
     Statement,
     Unary,
+    VariantPattern,
     WhileStatement,
+    WildcardPattern,
 )
 from .compiler import CheckedProgram
 from .ir import (
+    IRAppliedType,
     IRAssign,
     IRBinary,
     IRBlock,
+    IRBindingPattern,
+    IRBuiltinCall,
     IRCall,
+    IRCollectionCreate,
+    IRCollectionLength,
     IRExpression,
     IRExpressionStatement,
+    IRForEach,
     IRFunction,
     IRIf,
     IRLet,
     IRLiteral,
+    IRLiteralPattern,
     IRLocalRef,
     IRLoopControl,
+    IRMatch,
+    IRMatchArm,
+    IRMethodCall,
     IRModule,
     IROutput,
+    IRVariant,
+    IRVariantPattern,
     IRReturn,
     IRType,
+    IRTypeRef,
     IRUnary,
     IRVariable,
     IRWhile,
+    IRWildcardPattern,
+    ir_type_name,
     validate_ir,
 )
 from .source import Diagnostic, Location
+from .type_names import split_type
 
 
 _TYPE_MAP = {
@@ -52,9 +77,12 @@ _TYPE_MAP = {
     "Float": IRType.FLOAT,
     "Bool": IRType.BOOL,
     "String": IRType.STRING,
+    "Byte": IRType.BYTE,
+    "Bytes": IRType.BYTES,
     "Void": IRType.VOID,
     "Unit": IRType.VOID,
 }
+_APPLIED_TYPES = {"Option": 1, "Result": 2, "List": 1, "Map": 2}
 
 
 def lower_checked_program(checked: CheckedProgram) -> IRModule:
@@ -125,23 +153,37 @@ class _FunctionLowerer:
             function.location,
         )
 
-    def _type(self, type_name: str, location: Location) -> IRType:
+    def _type(self, type_name: str, location: Location) -> IRTypeRef:
         seen: set[str] = set()
-        while type_name in self.checked.type_alias_targets:
-            if type_name in seen:
-                raise Diagnostic(location, "backend", f"native backend found a recursive type alias '{type_name}'")
-            seen.add(type_name)
-            type_name = self.checked.type_alias_targets[type_name]
-        result = _TYPE_MAP.get(type_name)
-        if result is None:
+        while True:
+            base, arguments = split_type(type_name)
+            target = self.checked.type_alias_targets.get(base)
+            if target is None or arguments:
+                break
+            if base in seen:
+                raise Diagnostic(location, "backend", f"native backend found a recursive type alias '{base}'")
+            seen.add(base)
+            type_name = target
+        base, arguments = split_type(type_name)
+        result = _TYPE_MAP.get(base) if not arguments else None
+        if result is not None:
+            return result
+        expected_arity = _APPLIED_TYPES.get(base)
+        if expected_arity is not None and len(arguments) == expected_arity:
+            return IRAppliedType(base, tuple(self._type(argument, location) for argument in arguments))
+        if expected_arity is not None:
             raise Diagnostic(
                 location,
                 "backend",
-                f"native backend does not yet support Tyvera type '{type_name}'",
+                f"native backend cannot lower malformed Tyvera type '{type_name}'",
             )
-        return result
+        raise Diagnostic(
+            location,
+            "backend",
+            f"native backend does not yet support Tyvera type '{type_name}'",
+        )
 
-    def _expression_type(self, expression: Expression) -> IRType:
+    def _expression_type(self, expression: Expression) -> IRTypeRef:
         type_name = self.checked.expression_types.get(expression.location)
         if type_name is None:
             raise Diagnostic(expression.location, "backend", "native backend is missing checked expression type information")
@@ -209,6 +251,38 @@ class _FunctionLowerer:
             finally:
                 self.loop_depth -= 1
             return IRWhile(condition, body, statement.location)
+        if isinstance(statement, ForStatement):
+            iterable = self._expression(statement.iterable)
+            if not isinstance(iterable.type, IRAppliedType) or iterable.type.name not in {"List", "Map"}:
+                raise Diagnostic(statement.location, "backend", "native for loops currently require List or Map")
+            element_type = iterable.type.arguments[0]
+            self.scopes.append({})
+            self.loop_depth += 1
+            try:
+                variable = self._new_variable(
+                    statement.name, ir_type_name(element_type), mutable=False, location=statement.location,
+                )
+                body = self._statements(statement.body)
+            finally:
+                self.loop_depth -= 1
+                self.scopes.pop()
+            return IRForEach(variable, iterable, body, statement.location)
+        if isinstance(statement, MatchStatement):
+            value = self._expression(statement.value)
+            arms: list[IRMatchArm] = []
+            for arm in statement.arms:
+                self.scopes.append({})
+                try:
+                    pattern = self._pattern(arm.pattern, value.type)
+                    body = self._statements(arm.body)
+                    arms.append(IRMatchArm(pattern, body, arm.location))
+                finally:
+                    self.scopes.pop()
+            exhaustive = self.checked.match_exhaustiveness.get(statement.location)
+            coverage = self.checked.match_coverage.get(statement.location)
+            if exhaustive is None or coverage is None:
+                raise Diagnostic(statement.location, "backend", "native backend is missing checked match coverage metadata")
+            return IRMatch(value, tuple(arms), exhaustive, coverage, statement.location)
         if isinstance(statement, LoopControl):
             if self.loop_depth == 0:
                 raise Diagnostic(statement.location, "backend", "native backend found loop control outside a loop")
@@ -226,12 +300,59 @@ class _FunctionLowerer:
             return IRExpressionStatement(self._expression(expression), statement.location)
 
         unsupported = {
-            "ForStatement": "for loops and collection iteration",
-            "MatchStatement": "pattern matching and Option/Result values",
             "AwaitStatement": "Tasks and await",
             "UsingStatement": "owned resources and deterministic cleanup",
         }.get(type(statement).__name__, type(statement).__name__)
         raise Diagnostic(statement.location, "backend", f"native backend does not yet support {unsupported}")
+
+    def _pattern(self, pattern, expected_type: IRTypeRef):
+        if isinstance(pattern, WildcardPattern):
+            return IRWildcardPattern(pattern.location)
+        if isinstance(pattern, BindingPattern):
+            variable = self._new_variable(
+                pattern.name, ir_type_name(expected_type), mutable=False, location=pattern.location,
+            )
+            return IRBindingPattern(variable, pattern.location)
+        if isinstance(pattern, LiteralPattern):
+            literal_type = self._type(pattern.type_name, pattern.location)
+            if literal_type != expected_type:
+                raise Diagnostic(pattern.location, "backend", "native pattern type does not match the checked match value")
+            return IRLiteralPattern(IRLiteral(pattern.value, literal_type, pattern.location), pattern.location)
+        if isinstance(pattern, VariantPattern):
+            if not isinstance(expected_type, IRAppliedType):
+                raise Diagnostic(pattern.location, "backend", "native variant matching requires Option or Result")
+            if expected_type.name == "Option":
+                if pattern.variant == "None":
+                    if pattern.binding is not None or pattern.payload_pattern is not None:
+                        raise Diagnostic(pattern.location, "backend", "invalid checked None pattern")
+                    return IRVariantPattern("None", None, pattern.location)
+                if pattern.variant != "Some":
+                    raise Diagnostic(pattern.location, "backend", f"Option has no native pattern '{pattern.variant}'")
+                payload_type = expected_type.arguments[0]
+            elif expected_type.name == "Result":
+                if pattern.variant == "Ok":
+                    payload_type = expected_type.arguments[0]
+                elif pattern.variant == "Err":
+                    payload_type = expected_type.arguments[1]
+                else:
+                    raise Diagnostic(pattern.location, "backend", f"Result has no native pattern '{pattern.variant}'")
+            else:
+                raise Diagnostic(pattern.location, "backend", "native variant matching requires Option or Result")
+            payload = pattern.payload_pattern
+            if payload is None:
+                if pattern.binding is None:
+                    raise Diagnostic(pattern.location, "backend", f"native {pattern.variant} pattern requires a payload pattern")
+                lowered_payload = IRBindingPattern(
+                    self._new_variable(pattern.binding, ir_type_name(payload_type), mutable=False,
+                                       location=pattern.location),
+                    pattern.location,
+                )
+            else:
+                lowered_payload = self._pattern(payload, payload_type)
+            return IRVariantPattern(pattern.variant, lowered_payload, pattern.location)
+        if isinstance(pattern, EnumPattern):
+            raise Diagnostic(pattern.location, "backend", "native backend does not yet support user-defined enum patterns")
+        raise Diagnostic(pattern.location, "backend", f"native backend does not yet support {type(pattern).__name__} patterns")
 
     def _expression(self, expression: Expression) -> IRExpression:
         expression_type = self._expression_type(expression)
@@ -260,9 +381,38 @@ class _FunctionLowerer:
                 expression_type,
                 expression.location,
             )
+        if isinstance(expression, MemberAccess):
+            receiver = self._expression(expression.receiver)
+            if (expression.member == "length" and isinstance(receiver.type, IRAppliedType)
+                    and receiver.type.name in {"List", "Map"}):
+                return IRCollectionLength(receiver, expression_type, expression.location)
+            raise Diagnostic(expression.location, "backend", "native backend does not yet support this field access")
+        if isinstance(expression, MemberCall):
+            receiver = self._expression(expression.receiver)
+            if expression.type_arguments:
+                raise Diagnostic(expression.location, "backend", "native backend does not yet support generic method calls")
+            if not (
+                isinstance(receiver.type, IRAppliedType) and receiver.type.name in {"List", "Map"}
+                or receiver.type in {IRType.BYTE, IRType.BYTES}
+            ):
+                raise Diagnostic(expression.location, "backend", f"native backend does not yet support methods on {ir_type_name(receiver.type)}")
+            arguments = tuple(self._expression(argument) for argument in expression.arguments)
+            return IRMethodCall(receiver, expression.method, arguments, expression_type, expression.location)
         if isinstance(expression, Call):
             if expression.callee in {"println", "eprintln"}:
                 raise Diagnostic(expression.location, "backend", "output functions are supported only as statements")
+            if expression.callee in {"Some", "None", "Ok", "Err"}:
+                payload = None if expression.callee == "None" else self._expression(expression.arguments[0])
+                return IRVariant(expression.callee, payload, expression_type, expression.location)
+            if expression.callee in {"List", "Map"}:
+                return IRCollectionCreate(expression_type, expression.location)
+            if expression.callee in {"byteFromInt", "bytesFromString"}:
+                return IRBuiltinCall(
+                    expression.callee,
+                    tuple(self._expression(argument) for argument in expression.arguments),
+                    expression_type,
+                    expression.location,
+                )
             if expression.type_arguments:
                 raise Diagnostic(expression.location, "backend", "native backend does not yet support generic calls")
             symbol = self.symbols.get(expression.callee)
@@ -278,10 +428,6 @@ class _FunctionLowerer:
                 expression_type,
                 expression.location,
             )
-        if type(expression).__name__ == "MemberCall":
-            raise Diagnostic(expression.location, "backend", "native backend does not yet support methods")
-        if type(expression).__name__ == "MemberAccess":
-            raise Diagnostic(expression.location, "backend", "native backend does not yet support fields or tuple access")
         if type(expression).__name__ == "TupleExpression":
             raise Diagnostic(expression.location, "backend", "native backend does not yet support tuples")
         raise Diagnostic(expression.location, "backend", f"native backend does not yet support {type(expression).__name__}")
