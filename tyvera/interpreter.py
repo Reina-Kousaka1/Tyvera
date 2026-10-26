@@ -2229,6 +2229,10 @@ class Interpreter:
             return value
         if isinstance(value, _TyveraReplySender):
             return _TyveraReplySender(value.cell)
+        if isinstance(value, _TyveraBytes):
+            # Bytes is an immutable value, so an actor receives an independent
+            # Tyvera wrapper without sharing any mutable payload state.
+            return _TyveraBytes(value.value)
         if isinstance(value, _TyveraVariant):
             return _TyveraVariant(value.variant, Interpreter._copy_actor_value(value.payload),
                                   value.enum_name, value.payload_arity)

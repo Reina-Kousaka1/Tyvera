@@ -431,7 +431,7 @@ class TypeChecker:
 
     def _is_actor_message_type(self, type_name: str) -> bool:
         base, arguments = split_type(type_name)
-        if base in {"Int", "Float", "Bool", "String", "Byte", "Duration"} and not arguments:
+        if base in {"Int", "Float", "Bool", "String", "Byte", "Bytes", "Duration"} and not arguments:
             return True
         if base == "ActorRef" and len(arguments) == 1:
             actor_base, actor_arguments = split_type(arguments[0])

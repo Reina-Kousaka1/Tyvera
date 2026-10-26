@@ -80,6 +80,118 @@ fn main() {
 ''', Path(temporary))
             self.assertEqual(output, "maximum\n255\n")
 
+    def test_bytes_keep_value_semantics_across_calls_returns_and_actor_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output, errors = self._run('''actor Collector {
+    on receive(value: Bytes) {
+        println(value.length())
+        match value.get(0) {
+            Ok(byte) => println(byte)
+            Err(_) => println("empty")
+        }
+    }
+}
+fn passThrough(value: Bytes) -> Bytes { return value }
+fn main() {
+    let original = bytesFromString("payload")
+    let returned = passThrough(original)
+    println(returned == original)
+    match returned.slice(1, 1) {
+        Ok(part) => println(part == bytesFromString("a"))
+        Err(_) => println("slice failed")
+    }
+    let collector = spawn(Collector())
+    collector.receive(returned)
+    runActors()
+}
+''', Path(temporary))
+            self.assertEqual(output, "true\ntrue\n7\n112\n")
+            self.assertEqual(errors, "")
+
+    def test_byte_buffer_snapshots_do_not_share_mutable_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output, errors = self._run('''fn main() {
+    match byteBuffer(1) {
+        Err(_) => println("allocation failed")
+        Ok(buffer) => match buffer.toBytes() {
+            Err(_) => println("snapshot failed")
+            Ok(snapshot) => match byteFromInt(255) {
+                Err(_) => println("conversion failed")
+                Ok(value) => {
+                    buffer.set(0, value)
+                    match snapshot.get(0) {
+                        Ok(byte) => println(byte)
+                        Err(_) => println("snapshot read failed")
+                    }
+                    match buffer.get(0) {
+                        Ok(byte) => println(byte)
+                        Err(_) => println("buffer read failed")
+                    }
+                }
+            }
+        }
+    }
+}
+''', Path(temporary))
+            self.assertEqual(output, "0\n255\n")
+            self.assertEqual(errors, "")
+
+    def test_byte_buffer_aliasing_is_shared_across_bindings_functions_and_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output, errors = self._run('''fn returnBuffer(buffer: ByteBuffer) -> ByteBuffer {
+    return buffer
+}
+fn writeBuffer(buffer: ByteBuffer, value: Byte) {
+    match buffer.set(0, value) {
+        Ok(_) => {}
+        Err(_) => println("write failed")
+    }
+}
+async fn writeInTask(buffer: ByteBuffer, value: Byte) {
+    match buffer.set(0, value) {
+        Ok(_) => {}
+        Err(_) => println("task write failed")
+    }
+}
+fn main() {
+    match byteBuffer(1) {
+        Err(_) => println("allocation failed")
+        Ok(original) => {
+            let alias = original
+            let returned = returnBuffer(alias)
+            match byteFromInt(1) {
+                Err(_) => println("conversion failed")
+                Ok(one) => writeBuffer(returned, one)
+            }
+            match original.get(0) {
+                Ok(value) => println(value)
+                Err(_) => println("read failed")
+            }
+            match byteFromInt(255) {
+                Err(_) => println("conversion failed")
+                Ok(maximum) => {
+                    let task = writeInTask(original, maximum)
+                    runTasks()
+                    println(task.isDone())
+                    match alias.get(0) {
+                        Ok(value) => println(value)
+                        Err(_) => println("task read failed")
+                    }
+                }
+            }
+        }
+    }
+}
+''', Path(temporary))
+            self.assertEqual(output, "1\ntrue\n255\n")
+            self.assertEqual(errors, "")
+
+    def test_mutable_byte_buffers_remain_forbidden_actor_messages(self) -> None:
+        message = "actor message cannot carry mutable or process-local value type 'ByteBuffer'"
+        with self.assertRaisesRegex(Diagnostic, message):
+            compile_source('''actor Collector { on receive(value: ByteBuffer) {} }
+fn main() {}''', "invalid-buffer-message.tyv")
+
     def test_byte_has_no_implicit_integer_or_string_conversion(self) -> None:
         cases = [
             ('fn main() { let value: Byte = 255 }', "expected Byte, found Int"),
