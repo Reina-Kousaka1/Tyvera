@@ -440,14 +440,15 @@ parallel and does not preempt a running handler. Handlers cannot recursively
 drive `runActors()`.
 
 Constructor arguments and ordinary message arguments are transferable Tyvera
-values of type `Int`, `Float`, `Bool`, `String`, `Duration`, `Option<T>`,
-`Result<T,E>`, or `ActorRef<A>` when the nested types are also transferable.
-Mutable collections, ordinary class instances and secrets cannot cross a
-mailbox. Request messages additionally carry a `ReplySender<T>` as their final
-parameter; `T` must itself be transferable. A runtime diagnostic in a handler
-marks that actor crashed, discards its queued messages, and lets other actors
-continue; an unsupervised crash is returned as `Err`. Ordinary `Result`
-failures remain application values, separate from actor crashes.
+values of type `Int`, `Float`, `Bool`, `Byte`, `Bytes`, `String`, `Duration`,
+`Option<T>`, `Result<T,E>`, or `ActorRef<A>` when the nested types are also
+transferable. `Bytes` is transferred as an immutable value; mutable
+`ByteBuffer` values, collections, ordinary class instances and secrets cannot
+cross a mailbox. Request messages additionally carry a `ReplySender<T>` as
+their final parameter; `T` must itself be transferable. A runtime diagnostic
+in a handler marks that actor crashed, discards its queued messages, and lets
+other actors continue; an unsupervised crash is returned as `Err`. Ordinary
+`Result` failures remain application values, separate from actor crashes.
 
 `oneForOne(maxRestarts, windowMilliseconds) -> Supervisor` creates a
 supervisor. `maxRestarts` must be from 0 through 1,000 and the time window must
@@ -782,16 +783,21 @@ move-only handles also support `openTextAsync`, `readAllAsync`, `writeAsync`,
 tasks and preserve the existing LIFO scope cleanup. Synchronous text operations
 remain available and can block the cooperative scheduler.
 
-`Bytes` is an immutable byte value built with `bytesFromString`. `length()`
-reports its byte length, `get(index)` returns a bounds-checked
+`Bytes` is an immutable byte value built with `bytesFromString`. Assignment,
+function arguments, and returns preserve its value; no mutation or move is
+observable. Tasks may share it safely, and actor messages transfer it as a
+value. `length()` reports its byte length, `get(index)` returns a bounds-checked
 `Result<Byte,String>`, `slice(start,length)` returns a checked immutable copy,
 and `toString()` validates UTF-8 through a `Result`. `byteBuffer(length)` creates
 a zero-filled mutable `ByteBuffer` in `Result<ByteBuffer,String>`; length must
 be between 0 and 67,108,864 bytes. Its `get(index)` and `set(index,byte)` reject
-negative or out-of-range indexes with `Err`. `let` does not freeze the buffer
-object, so aliases observe mutations. `toBytes()` creates an immutable
-snapshot through `Result<Bytes,String>` so allocation failure stays controlled.
-There are no mutable slices, raw pointers, or manual free operation.
+negative or out-of-range indexes with `Err`. Assignment, function arguments,
+returns, and task arguments share the same managed buffer; `let` does not freeze
+it, so aliases observe mutations. Actors cannot receive it because that would
+share mutable state across isolated mailboxes. `toBytes()` creates an immutable
+snapshot through `Result<Bytes,String>` so later buffer writes cannot change
+the snapshot. There are no mutable slices, raw pointers, or manual free
+operation.
 
 `readBytes(path) -> Result<Bytes,String>` reads binary data without decoding
 it; `writeBytes(path,bytes) -> Result<Bool,String>` writes the exact byte

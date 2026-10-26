@@ -5,7 +5,10 @@ remaining design work for later backends.
 
 ## Implemented reference behavior
 
-- `Int`, `Float`, `Bool`, `Byte`, `String`, and `Duration` are immutable values.
+- `Int`, `Float`, `Bool`, `Byte`, `Bytes`, `String`, and `Duration` are
+  immutable values. `Bytes` assignment, function arguments, and returns have
+  value semantics; slices and `ByteBuffer.toBytes()` produce independent
+  immutable values.
 - Classes, `List<T>`, and `Map<K,V>` are mutable reference values. Passing one
   through a function or storing it in another binding shares the same object.
   `let` prevents rebinding; it does not freeze the referenced object.
@@ -21,17 +24,21 @@ remaining design work for later backends.
   restricted to recursively hashable values and stable identity references;
   mutable collections and values containing them cannot be keys.
 - Actor state is isolated. Actor messages accept the types described in the
-  [language reference](language.md#actors). Transferable value payloads are
-  copied; an `ActorRef` continues to identify the same actor. `Byte` is a
-  transferable scalar; mutable `ByteBuffer` is not an actor message type.
+  [language reference](language.md#cooperative-actors). Transferable value
+  payloads are copied; an `ActorRef` continues to identify the same actor.
+  `Byte` and immutable `Bytes` are transferable values; mutable `ByteBuffer`
+  is not an actor message type.
 - Tasks share references captured in their arguments. Tasks are serial and
   cooperative, so they do not race in parallel, but their interleaving can
   make shared mutation order observable.
 - `ByteBuffer` is a shared mutable, runtime-managed reference with a 64 MiB
-  maximum allocation. Allocation and snapshot failures, and all indexed
-  failures, return `Result`; `toBytes()` creates an immutable copy.
-  `ByteBuffer` is not transferable as an
-  actor message. `Bytes` remains an immutable value and owns no external resource.
+  maximum allocation. Assignment, function arguments, returns, and task
+  arguments share that reference; mutations through an alias are visible.
+  Tasks are cooperative and serial, so this sharing is observable through
+  interleaving but does not execute in parallel. Actor boundaries reject
+  `ByteBuffer` to preserve actor state isolation. Allocation and snapshot
+  failures, and all indexed failures, return `Result`; `toBytes()` creates an
+  independent immutable value. `Bytes` owns no external resource.
 - `TextFile`, `TextReader`, `TextWriter`, `TcpConnection`, `TcpListener`, and
   `HttpServer`
   are identity resources with one move-only owner. `Option`, `Result`, and the
@@ -58,7 +65,7 @@ ownership. It does not require a general borrow checker.
 | `Int`, `Float`, `Bool`, `Duration` | Immutable scalar values; assignment copies the value. | Implemented; signed 64-bit and finite binary64 rules are specified. |
 | `Byte` | Immutable unsigned 8-bit scalar, explicitly converted to/from `Int` with range checking. | Implemented; values outside 0..255 return `Err`, with no implicit conversion. |
 | `String` | Immutable Unicode scalar sequence; equality compares exact sequence, without normalization. | Implemented for source and file I/O; indexing and grapheme APIs remain open. |
-| `Bytes` | Immutable byte value; equality compares contents. Binary slices and indexed reads return checked results. | Implemented; UTF-8 decoding remains explicit through `toString()`. |
+| `Bytes` | Immutable byte value; equality compares contents. Assignment, calls, returns, and actor messages preserve value semantics. Binary slices and indexed reads return checked results. | Implemented; UTF-8 decoding remains explicit through `toString()`. |
 | `ByteBuffer` | Shared mutable reference to zero-initialized, runtime-managed bytes; access is bounds checked and snapshots are immutable. | Implemented with a 64 MiB length cap; raw pointers, unchecked access, custom allocators, and manual deallocation are not exposed. |
 | `Json`, `Option<T>`, `Result<T,E>`, enums, newtypes, tuples | Immutable tagged values with structural equality; nested references retain their own identity/value behavior. | Implemented in the bootstrap; native representation remains planned. |
 | Records | Immutable nominal value records; fields compare structurally. Nested mutable references remain shared. | Implemented, including generic types, destructuring, and safe derived map keys. |
