@@ -1330,11 +1330,12 @@ inline StringResult<std::shared_ptr<TextFile>> open_text_resource(
         || (resource_type == "TextWriter" && mode != "write" && mode != "append")
         || (resource_type == "TextFile" && mode != "read" && mode != "write" && mode != "append"))
         return result_error<std::shared_ptr<TextFile>>(invalid_mode);
+    std::shared_ptr<TextFile> resource;
     try {
         const auto path = tyvera_path(path_text);
         if (is_secret_storage_path(path))
             return result_error<std::shared_ptr<TextFile>>("secret file can only be accessed through the secrets provider");
-        auto resource = std::make_shared<TextFile>();
+        resource = std::make_shared<TextFile>();
         resource->mode = mode;
         resource->resource_type = resource_type;
         resource->source_file = file;
@@ -1345,9 +1346,17 @@ inline StringResult<std::shared_ptr<TextFile>> open_text_resource(
         else if (mode == "write") flags |= std::ios::out | std::ios::trunc;
         else flags |= std::ios::out | std::ios::app;
         resource->stream.open(path, flags);
-        if (!resource->stream) return result_error<std::shared_ptr<TextFile>>("cannot open text file");
-        return result_ok<std::shared_ptr<TextFile>>(std::move(resource));
-    } catch (...) { return result_error<std::shared_ptr<TextFile>>("cannot open text file"); }
+        if (!resource->stream) {
+            resource->closed = true;
+            return result_error<std::shared_ptr<TextFile>>("cannot open text file");
+        }
+    } catch (...) {
+        // A failed open never acquired a Tyvera resource and must not produce a
+        // second, misleading cleanup failure while its temporary handle dies.
+        if (resource) resource->closed = true;
+        return result_error<std::shared_ptr<TextFile>>("cannot open text file");
+    }
+    return result_ok<std::shared_ptr<TextFile>>(std::move(resource));
 }
 inline StringResult<std::shared_ptr<TextFile>> open_text(
     const std::string& path, const std::string& mode, const std::string& resource_type,
