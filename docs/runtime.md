@@ -99,6 +99,60 @@ Stop, crash, restart, request cancellation, and request deadlines settle
 outstanding reply receivers. Request cancellation does not remove a queued
 message or interrupt a running handler.
 
+## Supervisor V2
+
+A supervisor owns its children in start order. Children may be actors or other
+supervisors; a nested supervisor can have only one parent. The implemented
+strategies choose the restart set as follows:
+
+| Strategy | A child fails | Stop order | Restart order |
+| --- | --- | --- | --- |
+| `oneForOne` | Failed child only | That child | That child |
+| `oneForAll` | Every child | Reverse start order | Start order |
+| `restForOne` | Failed child and all children started after it | Reverse start order within that suffix | Original start order within that suffix |
+
+`permanent` children restart after failures and normal stop; `transient`
+children restart after failures only; `temporary` children never restart. A
+temporary child affected by a sibling's restart is stopped and omitted from the
+new child set. A temporary actor crash is returned from `runActors()` as `Err`
+but does not fail its supervisor. A normal stop of a permanent child requests
+the configured restart strategy; a normal transient/temporary stop does not.
+
+Each supervisor has a shared sliding restart-intensity window across its
+children. The monotonic clock is sampled when a restart is scheduled, and
+entries strictly older than the window are discarded; an entry on the exact
+boundary still counts. If the restart limit is exceeded, that supervisor is
+marked failed, its live subtree stops in reverse order, and the failure is
+offered to its parent. A parent then applies its own child policy and strategy
+to the failed nested supervisor. A root escalation is reported by `runActors()`
+as `Err`.
+
+`exponentialBackoff(base, maximum)` uses deterministic doubling by restart
+number, capped at `maximum`. Delayed restarts are scheduler deadlines, not
+sleep loops. `runActors()` waits for a pending restart when asked to drain the
+actor system; `runTasks()` services the same deadlines while continuing other
+runnable work. The clock and sleeper are injectable for tests.
+
+The embedding API can receive structured `RuntimeEvent` values for actor and
+supervisor start, stop, crash, restart, escalation, dead letter, and runtime
+shutdown. Crash reasons have a typed kind and optional source location; event
+sink exceptions are ignored. Dead-letter diagnostics are retained in a bounded
+ring of 1,024 entries. A send to an inactive actor also returns a controlled
+runtime diagnostic. There is no Tyvera-level link/monitor API yet.
+
+## Host signal and process shutdown
+
+`tyvera run` converts SIGINT/SIGTERM into a cooperative shutdown request.
+Handlers only record the first signal and wake the I/O selector. The runtime
+observes the request at statement, loop, task, actor, and I/O safe points;
+it does not interrupt synchronous code mid-expression. Shutdown cancels tasks,
+stops root supervisor trees in reverse child order, stops remaining unsupervised
+actors, closes resources through normal scope cleanup, cancels timers, and
+waits for the bounded I/O worker pool. Resource cleanup failure is appended to
+the original shutdown diagnostic. Exit status is 130 for SIGINT and 143 for
+SIGTERM; ordinary Tyvera diagnostics remain status 1. See [host platform
+support](platform.md) for the host boundary and its limits.
+
 ## Resource cleanup
 
 `TextFile`, `TextReader`, `TextWriter`, `TcpConnection`, `TcpListener`, and

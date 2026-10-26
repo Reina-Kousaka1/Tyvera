@@ -83,6 +83,15 @@ future runtime may use completion ports, `epoll`, `kqueue`, or another OS
 facility as long as observable scheduling, byte, and ownership rules stay the
 same.
 
+The bootstrap also has a separate host-platform adapter for normalized OS and
+architecture detection, monotonic time, secret-wrapped environment lookup,
+cooperative signal shutdown, and argv-based child-process management. Ubuntu
+x86-64 is the explicit Linux CI reference and continues to run the native C++17
+tests. The platform adapter does not make Linux-specific details part of the
+language, and it is not linked into generated native programs. Linux AArch64
+is recognized by the bootstrap but is not independently CI-tested. See
+[Host platform foundation](platform.md).
+
 The networking layer has no user-defined general Stream interface. TCP
 establishes a byte-stream contract; text files retain their UTF-8 resource
 API. Experimental HTTP/1.1 codecs, a typed client, and a bounded concurrent

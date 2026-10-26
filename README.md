@@ -43,8 +43,9 @@ The experimental native compiler supports the synchronous core plus selected
 WebSockets remain planned.
 
 The deterministic actor runtime supports typed messages, isolated state, FIFO
-mailboxes, crash isolation, bounded `one_for_one` supervision, request/reply,
-cancellation, and delayed delivery. The cooperative task runtime supports
+mailboxes, crash isolation, nested supervisors, bounded restart intensity,
+`one_for_one`/`one_for_all`/`rest_for_one`, child policies, and monotonic
+exponential backoff. The cooperative task runtime supports
 `async fn`, typed `await`, `TaskGroup`, child detachment, timeouts, cancellation
 and explicit joins. Runtime shutdown, detached task failures, and fairness for
 tasks waiting on actor replies are specified and tested. `Unit`, `and`, and
@@ -54,6 +55,15 @@ Bootstrap requirements: Python 3.10 or newer. The bootstrap has no third-party
 runtime dependencies. `tyvera build` additionally requires a host C++17
 compiler; generated executables use the platform C++ runtime and do not require
 Python.
+
+Linux is the primary platform foundation in this development wave. Ubuntu
+x86-64 is explicitly checked in CI; Linux AArch64 is recognized by the runtime
+adapter but is not yet covered by a CI runner. Host services, cooperative
+SIGINT/SIGTERM shutdown, and the bootstrap's internal argv-based child-process
+adapter are described in [Platform support](docs/platform.md). A small experimental Tyvera Discord
+source package currently decodes typed Gateway dispatch JSON; it has no TLS,
+WebSocket, REST transport, bot-token handling, or live Discord connection yet
+([package status](docs/discord.md)).
 
 ## Dependency graphs
 

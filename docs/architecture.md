@@ -99,14 +99,16 @@ manifest and creates starter projects. `cli.py` provides `new`, `run`, `check`,
   support cancellation and deadlines, and are failed on actor crash or stop.
   Handler diagnostics crash only their actor and clear its mailbox. An
   unsupervised crash is reported with source location by `runActors()` as
-  `Result<Int,String>` while other actors continue. A `one_for_one` Supervisor
-  can restart only the failed child from its initial constructor arguments;
-  restart intensity is bounded by a monotonic time window and a maximum of
-  1,000 attempts. Exhaustion stops the supervisor's children and is reported as
-  `Err`. Successful recovery is returned as `Ok`; the child's old state and
-  queued messages are discarded. Mailboxes and each scheduler drain have a
-  100,000 message limit; a nonterminating handler can still block the
-  cooperative loop.
+  `Result<Int,String>` while other actors continue. Supervisors support
+  `one_for_one`, `one_for_all`, and `rest_for_one`, nest under a parent, and
+  apply permanent/transient/temporary child policies. A strategy stops the
+  affected children in reverse start order and restarts eligible children in
+  start order. Restart intensity uses a monotonic time window and is bounded at
+  1,000 attempts; configured exponential backoff is capped and deterministic.
+  Exhaustion stops the subtree and escalates to a parent. Successful recovery
+  is returned as `Ok`; old actor state and queued messages are discarded.
+  Mailboxes and each scheduler drain have a 100,000 message limit; a
+  nonterminating handler can still block the cooperative loop.
 - **Time is observable and injectable:** `Duration` uses checked signed 64-bit
   milliseconds. `Timer` stores a monotonic deadline and can be queried or
   cancelled. `ActorRef.sendAfter` uses it to schedule one typed actor message;
@@ -145,7 +147,8 @@ Actors participate in that linker and can be exported and imported. The
 manifest currently has only `name` and `entry`; dependencies are not yet
 supported. Ordinary functions and I/O execute synchronously; actor handlers
 run only when the cooperative scheduler is explicitly pumped. The supervisor
-API currently supports only `one_for_one`.
+API supports the three documented restart strategies; it still has no
+user-defined actor linking/monitoring primitive.
 
 The task scheduler uses explicit block and loop continuation frames rather
 than Python coroutines. It supports nested `await`, structured child ownership,

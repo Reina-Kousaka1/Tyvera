@@ -450,21 +450,42 @@ in a handler marks that actor crashed, discards its queued messages, and lets
 other actors continue; an unsupervised crash is returned as `Err`. Ordinary
 `Result` failures remain application values, separate from actor crashes.
 
-`oneForOne(maxRestarts, windowMilliseconds) -> Supervisor` creates a
-supervisor. `maxRestarts` must be from 0 through 1,000 and the time window must
-be positive. `supervisor.start(Actor(...))` starts a child and returns its
-`ActorRef`; the constructor arguments are retained as transferable values so a
-restart can rebuild fresh actor state. After a handler crash, the supervisor
-drops the failed actor's pending mailbox and restarts only that child. The
-reference remains valid and `isAlive()` becomes true after a successful
-restart. Restart attempts across all children share the configured limit and
-use a monotonic clock; events exactly on the window boundary still count.
-Exceeding the limit fails the supervisor, stops its children and makes
-`runActors()` return `Err`. A child's explicit `stop()` is graceful and does not
-trigger a restart. `supervisor.stop()` stops all children and
-`supervisor.isAlive()` reports the supervisor lifecycle. A stopped or failed
-supervisor cannot start new children. The current strategy is only
-`one_for_one`; `one_for_all` and `rest_for_one` are not implemented.
+`oneForOne`, `oneForAll`, and `restForOne` each accept
+`(maxRestarts: Int, windowMilliseconds: Int)` and an optional
+`SupervisorBackoff`, and return a `Supervisor`. `maxRestarts` is from 0 through
+1,000; the window must be positive. They select, respectively, the failed
+child, all children, or the failed child and every later-started child. Affected
+children stop in reverse start order and eligible children restart in original
+start order. `supervisor.start(Actor(...), policy?)` returns an `ActorRef`;
+`supervisor.start(nestedSupervisor, policy?)` places a distinct supervisor
+under this supervisor. Constructor arguments are retained as transferable
+values so actors can rebuild fresh state.
+
+`permanentChildPolicy()`, `transientChildPolicy()`, and
+`temporaryChildPolicy()` return a typed `RestartPolicy`.
+Permanent children restart after both crashes and explicit normal stop;
+transient children restart after crashes but not normal stop; temporary
+children never restart. Affected temporary children are stopped and skipped
+when their siblings restart. An unhandled temporary-child crash is still
+reported by `runActors()` as `Err` while the parent supervisor remains alive.
+
+`exponentialBackoff(baseMilliseconds, maximumMilliseconds)` returns a
+`SupervisorBackoff` with positive base and maximum at least the base. It
+applies deterministic, capped doubling to successive restart attempts. Backoff
+waits use the same injected monotonic clock/sleeper as task deadlines; no
+wall-clock time is used. Each supervisor shares a sliding restart-intensity
+window across its children. Exceeding the configured limit fails that
+supervisor, stops its children in reverse order, and escalates to its parent
+when one exists. Restarting a supervisor rebuilds its child tree. A stopped or
+failed supervisor cannot start new children.
+
+Each runtime can receive structured lifecycle events through the Python
+embedding API's event sink. Events carry actor/supervisor identity, strategy,
+restart count, and typed crash kind/source location; sink failures are ignored
+so diagnostics cannot affect program behavior. A bounded in-memory dead-letter
+ring records messages rejected because an actor is not alive. There is no
+user-defined monitor/link primitive in the Tyvera language yet; `isAlive()`
+and runtime events are the current lifecycle observation surface.
 
 Supervised restarts are recoveries: `runActors()` returns `Ok` when a crashing
 child was successfully restarted. An exhausted restart limit is a runtime
@@ -473,7 +494,8 @@ initial constructor arguments; it does not restore the state at the moment of
 the crash. A mailbox holds at most 100,000 pending messages and one
 `runActors()` call delivers at most 100,000. The round-robin scheduler is
 cooperative rather than parallel or preemptive; a handler that does not return
-can block every actor and the runtime.
+can block every actor and the runtime. See [Supervisor V2 runtime semantics](runtime.md#supervisor-v2)
+for escalation and shutdown order.
 
 ### Typed requests and replies
 
@@ -861,6 +883,16 @@ as `T`; applications should pass the wrapper to trusted APIs and only reveal
 it when needed. Secret values are redacted from the wrapper's representation
 and are never included in provider diagnostics. External secret stores are not
 implemented; the provider boundary is the extension point.
+
+The host-platform intrinsics are `hostOS() -> String`,
+`hostArchitecture() -> String`, and `environment(name: String) ->
+Option<Secret<String>>`. The normalized OS values are `linux`, `windows`,
+`macos`, and `other`; architecture values are `x86_64`, `aarch64`, `x86`, and
+`other`. These report the bootstrap runtime host, not the target of
+`tyvera build`. Invalid environment names and missing values return `None`;
+present values remain secret-wrapped. `environment` reads the process
+environment only; `secrets.NAME` keeps its separate project-file-first
+provider behavior. See [Host platform foundation](platform.md).
 
 ## Modules and projects
 
