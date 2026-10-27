@@ -330,6 +330,9 @@ class _TyveraTask:
     native_state: dict[str, object] = dataclass_field(default_factory=dict)
     native_wait_result: object = _MISSING
     native_wait_error: str | None = None
+    # I/O continuations convert awaited Task failures into Result values; consumed failures are not global runTasks failures.
+    native_wait_target: object | None = None
+    failure_observed: bool = False
     native_resources: list[object] = dataclass_field(default_factory=list)
     identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
@@ -2864,6 +2867,7 @@ class Interpreter:
             task.state = "waiting"
             return
         if state == "failed":
+            task.native_wait_target = target
             task.native_wait_error = error or "HTTP operation failed"
             return
         value = target.result
@@ -2876,8 +2880,18 @@ class Interpreter:
         if task.native_wait_result is _MISSING and task.native_wait_error is None:
             return False, None, None
         value, error = task.native_wait_result, task.native_wait_error
+        target = task.native_wait_target
         task.native_wait_result = _MISSING
         task.native_wait_error = None
+        task.native_wait_target = None
+        if error is not None:
+            # The native continuation now owns this failure and decides how to expose it.
+            if isinstance(target, _TyveraTask):
+                target.failure_observed = True
+            elif isinstance(target, _TyveraTaskGroup):
+                for member in target.tasks:
+                    if member.state == "failed":
+                        member.failure_observed = True
         return True, value, error
 
     def _timeout_task_for_native_wait(
@@ -4594,7 +4608,8 @@ class Interpreter:
 
             failed_task = next(
                 (task for task in self._tasks
-                 if task.state == "failed" and id(task) not in previously_failed),
+                 if task.state == "failed" and not task.failure_observed
+                 and id(task) not in previously_failed),
                 None,
             )
             if failed_task is not None:
@@ -4819,6 +4834,7 @@ class Interpreter:
                 continue
             task.wait_target = None
             if task.native_step is not None:
+                task.native_wait_target = target
                 if state == "failed":
                     task.native_wait_error = error or "HTTP operation failed"
                 else:
