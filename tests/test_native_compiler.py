@@ -1984,6 +1984,79 @@ fn main() {{
                 thread.join(timeout=1)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "native HTTP tests require Linux")
+    def test_native_http_response_body_limit_matches_reference(self) -> None:
+        handled = 0
+        lock = threading.Lock()
+        complete = threading.Event()
+        failures: list[str] = []
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                nonlocal handled
+                try:
+                    self.request.settimeout(5)
+                    request = bytearray()
+                    while b"\r\n\r\n" not in request:
+                        data = self.request.recv(4096)
+                        if not data:
+                            raise EOFError("request closed during headers")
+                        request.extend(data)
+                    self.request.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 1048577\r\n"
+                        b"Connection: close\r\n\r\n"
+                    )
+                except Exception as error:
+                    failures.append(f"{type(error).__name__}: {error}")
+                finally:
+                    with lock:
+                        handled += 1
+                        if handled == 2:  # reference and native requests
+                            complete.set()
+
+        class LoopbackServer(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-http-limit-") as temporary:
+            root = Path(temporary)
+            server = LoopbackServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True,
+            )
+            thread.start()
+            port = server.server_address[1]
+            source = f'''async fn client() {{
+    match httpUrl("http://127.0.0.1:${port}/") {{
+        Err(error) => println(error)
+        Ok(url) => {{
+            let response = await httpGet(url, milliseconds(2000))
+            match response {{
+                Err(error) => println(error)
+                Ok(_) => println("unexpected response")
+            }}
+        }}
+    }}
+}}
+fn main() {{
+    let task = client()
+    match runTasks() {{
+        Err(error) => eprintln(error)
+        Ok(_) => {{}}
+    }}
+}}'''
+            try:
+                expected = self._reference_result(source, root)
+                native = self._native_source_result(source, root, root / "http-limit", root)
+                self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+                self.assertEqual(native.stdout, "HTTP body exceeds configured size limit\n")
+                self.assertTrue(complete.wait(timeout=5), "loopback oversized-response handlers did not finish")
+                self.assertEqual(failures, [])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=1)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "native HTTP tests require Linux")
     def test_native_http_get_post_chunked_matches_reference(self) -> None:
         failures: list[str] = []
         handled = 0
