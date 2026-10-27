@@ -93,6 +93,9 @@ _TYPE_MAP = {
     "TcpConnection": IRType.TCP_CONNECTION,
     "TlsConnection": IRType.TLS_CONNECTION,
     "TcpListener": IRType.TCP_LISTENER,
+    "WebSocketUrl": IRType.WEBSOCKET_URL,
+    "WebSocket": IRType.WEBSOCKET,
+    "WebSocketMessage": IRType.WEBSOCKET_MESSAGE,
     "Void": IRType.VOID,
     "Unit": IRType.VOID,
 }
@@ -274,6 +277,7 @@ class _FunctionLowerer:
             if resource_type not in {
                 IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
                 IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER,
+                IRType.WEBSOCKET,
             }:
                 raise Diagnostic(statement.location, "backend", "native using supports file, TCP, and TLS resources")
             if self.checked.ownership_transfers.get(statement.location) != (
@@ -478,6 +482,7 @@ class _FunctionLowerer:
                     IRType.BYTE, IRType.DURATION, IRType.BYTES, IRType.BYTE_BUFFER,
                     IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
                     IRType.SOCKET_ADDRESS, IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER,
+                    IRType.WEBSOCKET, IRType.WEBSOCKET_URL, IRType.WEBSOCKET_MESSAGE,
                 }
             ):
                 raise Diagnostic(expression.location, "backend", f"native backend does not yet support methods on {ir_type_name(receiver.type)}")
@@ -509,6 +514,7 @@ class _FunctionLowerer:
                 "readBytes", "writeBytes", "pathJoin", "pathExists", "openText",
                 "openTextReader", "openTextWriter", "hostOS", "hostArchitecture",
                 "monotonicMilliseconds", "runTasks", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen",
+                "webSocketUrl", "webSocketConnect",
             }:
                 return IRBuiltinCall(
                     expression.callee,

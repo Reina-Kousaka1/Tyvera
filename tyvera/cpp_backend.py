@@ -62,7 +62,7 @@ class CppNativeBackend:
         validate_ir(module)
         native_tls = _module_uses_tls(module)
         if native_tls and not sys.platform.startswith("linux"):
-            raise Diagnostic(module.functions[0].location, "backend", "native TLS is currently supported only on Linux")
+            raise Diagnostic(module.functions[0].location, "backend", "native TLS and WebSocket are currently supported only on Linux")
         destination = Path(output).expanduser().resolve()
         if destination.exists() and destination.is_dir():
             raise Diagnostic(module.functions[0].location, "backend", "native output path names a directory")
@@ -242,6 +242,9 @@ class _CppGenerator:
             IRType.BOOL: "bool",
             IRType.STRING: "std::string",
             IRType.BYTE: "std::uint8_t",
+            IRType.WEBSOCKET_URL: "tyvera_runtime::WebSocketUrl",
+            IRType.WEBSOCKET: "std::shared_ptr<tyvera_runtime::WebSocket>",
+            IRType.WEBSOCKET_MESSAGE: "tyvera_runtime::WebSocketMessage",
             IRType.TLS_CONNECTION: "std::shared_ptr<tyvera_runtime::TlsConnection>",
             IRType.DURATION: "tyvera_runtime::Duration",
             IRType.BYTES: "std::vector<std::uint8_t>",
@@ -576,6 +579,8 @@ class _CppGenerator:
                 "tcpConnect": "tcp_connect",
                 "tlsConnect": "tls_connect",
                 "tcpListen": "tcp_listen",
+                "webSocketUrl": "websocket_url",
+                "webSocketConnect": "websocket_connect",
             }
             function = runtime_functions.get(expression.builtin)
             if function is None:
@@ -597,7 +602,7 @@ class _CppGenerator:
                 values.extend([_location_args(expression.location)])
             elif expression.builtin == "pathJoin":
                 values.append(_location_args(expression.location))
-            elif expression.builtin in {"runTasks", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen"}:
+            elif expression.builtin in {"runTasks", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen", "webSocketConnect"}:
                 values.append(_location_args(expression.location))
             call = f"tyvera_runtime::{function}({', '.join(values)})"
             lines.append(f"    return {call};")
@@ -743,6 +748,29 @@ class _CppGenerator:
                 "flush": "text_flush", "close": "text_close", "isOpen": "text_is_open",
             }
             return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
+        if expression.receiver.type == IRType.WEBSOCKET_URL:
+            functions = {
+                "scheme": "websocket_url_scheme", "host": "websocket_url_host",
+                "port": "websocket_url_port", "target": "websocket_url_target",
+                "hostEndsWith": "websocket_url_host_ends_with",
+            }
+            return f"tyvera_runtime::{functions[method]}({receiver}{', ' if arguments else ''}{', '.join(arguments)})"
+        if expression.receiver.type == IRType.WEBSOCKET_MESSAGE:
+            functions = {"kind": "websocket_message_kind", "bytes": "websocket_message_bytes",
+                         "text": "websocket_message_text"}
+            return f"tyvera_runtime::{functions[method]}({receiver})"
+        if expression.receiver.type == IRType.WEBSOCKET:
+            functions = {
+                "sendText": "websocket_send_text", "send": "websocket_send",
+                "receive": "websocket_receive", "receiveWithin": "websocket_receive_within",
+                "closeCode": "websocket_close_code", "closeReason": "websocket_close_reason",
+                "close": "websocket_close", "closeGracefully": "websocket_close_gracefully",
+                "isOpen": "websocket_is_open",
+            }
+            values = [receiver, *arguments]
+            if method not in {"closeCode", "closeReason", "close", "isOpen"}:
+                values.append(_location_args(expression.location))
+            return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
         if expression.receiver.type == IRType.SOCKET_ADDRESS:
             return f"tyvera_runtime::socket_address_{method}({receiver})"
         if expression.receiver.type == IRType.TCP_CONNECTION:
@@ -829,7 +857,7 @@ def _cpp_string_literal(value: str) -> str:
 def _ir_contains_resource(type_ref: IRTypeRef) -> bool:
     if type_ref in {
         IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
-        IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER,
+        IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER, IRType.WEBSOCKET,
     }:
         return True
     return isinstance(type_ref, IRAppliedType) and any(_ir_contains_resource(item) for item in type_ref.arguments)
@@ -840,7 +868,7 @@ def _module_uses_tls(module: IRModule) -> bool:
 
     def contains_tls(value) -> bool:
         if isinstance(value, IRType):
-            return value == IRType.TLS_CONNECTION
+            return value in {IRType.TLS_CONNECTION, IRType.WEBSOCKET}
         if isinstance(value, IRAppliedType):
             return any(contains_tls(argument) for argument in value.arguments)
         if isinstance(value, (tuple, list)):
@@ -857,6 +885,7 @@ def _module_uses_tls(module: IRModule) -> bool:
 
 
 _RUNTIME = r'''#include <charconv>
+#include <cctype>
 #include <cerrno>
 #include <algorithm>
 #include <array>
@@ -897,6 +926,9 @@ _RUNTIME = r'''#include <charconv>
 #include <sys/types.h>
 #include <unistd.h>
 #if defined(TYVERA_NATIVE_TLS)
+#include <openssl/crypto.h>
+#include <openssl/rand.h>
+#include <openssl/sha.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #endif
@@ -2010,6 +2042,16 @@ struct SocketAddress {
     std::int64_t port = 0;
     std::string family;
 };
+struct WebSocketUrl {
+    std::string scheme;
+    std::string host;
+    std::int64_t port = 0;
+    std::string target;
+};
+struct WebSocketMessage {
+    int opcode = 1;
+    std::vector<std::uint8_t> payload;
+};
 
 #if defined(__linux__)
 inline std::string network_error_from_errno(int code) {
@@ -2135,6 +2177,33 @@ struct TlsConnection {
             session->close();
     }
 };
+struct WebSocket {
+    std::shared_ptr<TcpConnection> tcp;
+    std::shared_ptr<TlsConnection> tls;
+    std::int64_t operation_timeout_milliseconds = 0;
+    std::vector<std::uint8_t> receive_buffer;
+    std::optional<int> fragment_opcode;
+    std::vector<std::uint8_t> fragment;
+    std::optional<std::int64_t> close_code;
+    std::optional<std::string> close_reason;
+    std::mutex receive_mutex;
+    std::mutex send_mutex;
+    std::mutex metadata_mutex;
+    std::string source_file;
+    int source_line = 1;
+    int source_column = 1;
+    bool is_open() const noexcept {
+        return tls ? tls->is_open() : (tcp && tcp->socket && tcp->socket->is_open());
+    }
+    bool close() noexcept {
+        if (tls) return tls->close();
+        return tcp && tcp->socket && tcp->socket->close();
+    }
+    ~WebSocket() noexcept {
+        if (is_open() && !close())
+            record_cleanup_failure(source_file, source_line, source_column, "cannot close WebSocket");
+    }
+};
 #endif
 
 inline void set_resource_location(const std::shared_ptr<TcpConnection>& resource,
@@ -2146,6 +2215,13 @@ inline void set_resource_location(const std::shared_ptr<TcpConnection>& resource
 }
 #if defined(__linux__) && defined(TYVERA_NATIVE_TLS)
 inline void set_resource_location(const std::shared_ptr<TlsConnection>& resource,
+                                  const std::string& file, int line, int column) {
+    if (!resource) return;
+    resource->source_file = file;
+    resource->source_line = line;
+    resource->source_column = column;
+}
+inline void set_resource_location(const std::shared_ptr<WebSocket>& resource,
                                   const std::string& file, int line, int column) {
     if (!resource) return;
     resource->source_file = file;
@@ -2883,6 +2959,784 @@ inline Task<StringResult<std::int64_t>> tcp_write_all(
     const std::string& file, int line, int column) {
     return tcp_write(connection, std::move(bytes), true, file, line, column);
 }
+
+
+inline std::string websocket_lower_ascii(std::string value) {
+    for (auto& character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (byte >= 'A' && byte <= 'Z') character = static_cast<char>(byte - 'A' + 'a');
+    }
+    return value;
+}
+inline std::string websocket_trim(std::string value) {
+    const auto first = value.find_first_not_of(" \t");
+    if (first == std::string::npos) return {};
+    const auto last = value.find_last_not_of(" \t");
+    return value.substr(first, last - first + 1);
+}
+inline bool websocket_ipv4_tail(const std::string& value) {
+    std::size_t start = 0;
+    int octets = 0;
+    while (start <= value.size()) {
+        const auto end = value.find('.', start);
+        const auto stop = end == std::string::npos ? value.size() : end;
+        const auto length = stop - start;
+        if (length == 0 || length > 3 || (length > 1 && value[start] == '0')) return false;
+        int octet = 0;
+        for (std::size_t index = start; index < stop; ++index) {
+            const auto byte = static_cast<unsigned char>(value[index]);
+            if (byte < '0' || byte > '9') return false;
+            octet = octet * 10 + (byte - '0');
+        }
+        if (octet > 255) return false;
+        ++octets;
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return octets == 4;
+}
+inline bool websocket_valid_ipv6(const std::string& value) {
+    if (value.empty() || value.find('%') != std::string::npos || value.find(":::") != std::string::npos)
+        return false;
+    const auto compression = value.find("::");
+    const bool compressed = compression != std::string::npos;
+    if (compressed && value.find("::", compression + 2) != std::string::npos) return false;
+    const std::string before = compressed ? value.substr(0, compression) : value;
+    const std::string after = compressed ? value.substr(compression + 2) : std::string();
+    std::size_t groups = 0;
+    auto count_side = [&groups](const std::string& side, bool allow_ipv4) {
+        if (side.empty()) return true;
+        std::size_t start = 0;
+        while (start <= side.size()) {
+            const auto end = side.find(':', start);
+            const auto stop = end == std::string::npos ? side.size() : end;
+            const auto part = side.substr(start, stop - start);
+            if (part.empty()) return false;
+            if (part.find('.') != std::string::npos) {
+                if (!allow_ipv4 || end != std::string::npos || !websocket_ipv4_tail(part)) return false;
+                groups += 2;
+            } else {
+                if (part.size() > 4) return false;
+                for (const auto character : part) {
+                    const auto byte = static_cast<unsigned char>(character);
+                    if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f')
+                          || (byte >= 'A' && byte <= 'F'))) return false;
+                }
+                ++groups;
+            }
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+        return true;
+    };
+    if (!count_side(before, !compressed) || !count_side(after, true) || groups > 8) return false;
+    return compressed ? groups < 8 : groups == 8;
+}
+inline bool websocket_valid_hostname(const std::string& host) {
+    if (host.empty() || host.size() > 253) return false;
+    const auto checked = host.back() == '.' ? host.substr(0, host.size() - 1) : host;
+    if (checked.empty()) return false;
+    std::size_t start = 0;
+    while (start < checked.size()) {
+        const auto end = checked.find('.', start);
+        const auto length = (end == std::string::npos ? checked.size() : end) - start;
+        if (length == 0 || length > 63 || checked[start] == '-' || checked[start + length - 1] == '-') return false;
+        for (std::size_t i = start; i < start + length; ++i) {
+            const auto c = static_cast<unsigned char>(checked[i]);
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                  || (c >= '0' && c <= '9') || c == '-')) return false;
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return true;
+}
+inline bool websocket_parse_port(const std::string& text, std::int64_t& port) {
+    if (text.empty()) return false;
+    for (const auto byte : text) if (byte < '0' || byte > '9') return false;
+    std::int64_t parsed = 0;
+    const auto conversion = std::from_chars(text.data(), text.data() + text.size(), parsed);
+    if (conversion.ec != std::errc{} || conversion.ptr != text.data() + text.size() || parsed < 1 || parsed > 65535)
+        return false;
+    port = parsed;
+    return true;
+}
+inline StringResult<WebSocketUrl> parse_websocket_url(const std::string& input) {
+    const auto separator = input.find("://");
+    if (separator == std::string::npos) return result_error<WebSocketUrl>("WebSocket URL scheme must be ws or wss");
+    const auto scheme = websocket_lower_ascii(input.substr(0, separator));
+    if (scheme != "ws" && scheme != "wss")
+        return result_error<WebSocketUrl>("WebSocket URL scheme must be ws or wss");
+    const auto remainder = input.substr(separator + 3);
+    if (remainder.find('#') != std::string::npos)
+        return result_error<WebSocketUrl>("HTTP request URL must not contain a fragment");
+    const auto first_path = remainder.find('/');
+    const auto first_query = remainder.find('?');
+    std::size_t authority_end = remainder.size();
+    if (first_path != std::string::npos) authority_end = std::min(authority_end, first_path);
+    if (first_query != std::string::npos) authority_end = std::min(authority_end, first_query);
+    const auto authority = remainder.substr(0, authority_end);
+    const auto suffix = remainder.substr(authority_end);
+    if (authority.empty() || authority.find('@') != std::string::npos)
+        return result_error<WebSocketUrl>("invalid HTTP URL authority");
+    WebSocketUrl output;
+    output.scheme = scheme;
+    output.port = scheme == "wss" ? 443 : 80;
+    if (authority.front() == '[') {
+        const auto closing = authority.find(']');
+        if (closing == std::string::npos) return result_error<WebSocketUrl>("invalid IPv6 URL authority");
+        output.host = authority.substr(1, closing - 1);
+        if (output.host.find('%') != std::string::npos)
+            return result_error<WebSocketUrl>("IPv6 URL scope identifiers are not supported");
+        if (!websocket_valid_ipv6(output.host))
+            return result_error<WebSocketUrl>("invalid IPv6 URL authority");
+        const auto rest = authority.substr(closing + 1);
+        if (!rest.empty()) {
+            if (rest.front() != ':' || !websocket_parse_port(rest.substr(1), output.port))
+                return result_error<WebSocketUrl>("invalid HTTP URL port");
+        }
+        output.host = websocket_lower_ascii(output.host);
+    } else {
+        if (std::count(authority.begin(), authority.end(), ':') > 1)
+            return result_error<WebSocketUrl>("IPv6 URL hosts must be enclosed in brackets");
+        const auto colon = authority.find(':');
+        output.host = authority.substr(0, colon);
+        if (colon != std::string::npos && !websocket_parse_port(authority.substr(colon + 1), output.port))
+            return result_error<WebSocketUrl>("invalid HTTP URL port");
+        if (!websocket_valid_hostname(output.host))
+            return result_error<WebSocketUrl>("invalid HTTP URL hostname");
+        output.host = websocket_lower_ascii(output.host);
+    }
+    if (suffix.empty()) output.target = "/";
+    else if (suffix.front() == '?') output.target = "/" + suffix;
+    else if (suffix.front() == '/') output.target = suffix;
+    else return result_error<WebSocketUrl>("invalid HTTP URL target");
+    if (output.target.find('#') != std::string::npos)
+        return result_error<WebSocketUrl>("HTTP request target must be origin-form without a fragment");
+    for (std::size_t index = 0; index < output.target.size(); ++index) {
+        const auto byte = static_cast<unsigned char>(output.target[index]);
+        if (byte < 33 || byte > 126)
+            return result_error<WebSocketUrl>("HTTP request target must be origin-form without a fragment");
+        if (byte == '%') {
+            if (index + 2 >= output.target.size() || !std::isxdigit(static_cast<unsigned char>(output.target[index + 1]))
+                || !std::isxdigit(static_cast<unsigned char>(output.target[index + 2])))
+                return result_error<WebSocketUrl>("invalid percent escape");
+            index += 2;
+        }
+    }
+    return result_ok<WebSocketUrl>(std::move(output));
+}
+inline StringResult<WebSocketUrl> websocket_url(const std::string& value) {
+    return parse_websocket_url(value);
+}
+inline std::string websocket_url_scheme(const WebSocketUrl& value) { return value.scheme; }
+inline std::string websocket_url_host(const WebSocketUrl& value) { return value.host; }
+inline std::int64_t websocket_url_port(const WebSocketUrl& value) { return value.port; }
+inline std::string websocket_url_target(const WebSocketUrl& value) { return value.target; }
+inline bool websocket_url_host_ends_with(const WebSocketUrl& value, const std::string& suffix) {
+    return suffix.size() <= value.host.size()
+        && value.host.compare(value.host.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+inline std::string websocket_message_kind(const WebSocketMessage& value) {
+    return value.opcode == 1 ? "text" : "binary";
+}
+inline std::vector<std::uint8_t> websocket_message_bytes(const WebSocketMessage& value) {
+    return value.payload;
+}
+inline StringResult<std::string> websocket_message_text(const WebSocketMessage& value) {
+    if (value.opcode != 1) return result_error<std::string>("WebSocket message is binary");
+    if (!valid_utf8(value.payload)) return result_error<std::string>("WebSocket text is not valid UTF-8");
+    std::string result;
+    if (!value.payload.empty())
+        result.assign(reinterpret_cast<const char*>(value.payload.data()), value.payload.size());
+    return result_ok<std::string>(std::move(result));
+}
+#if defined(__linux__) && defined(TYVERA_NATIVE_TLS)
+constexpr std::size_t MAX_NATIVE_WEBSOCKET_FRAME_BYTES = 1U * 1024U * 1024U;
+constexpr std::size_t MAX_NATIVE_WEBSOCKET_MESSAGE_BYTES = 4U * 1024U * 1024U;
+constexpr std::size_t MAX_NATIVE_WEBSOCKET_HANDSHAKE_BYTES = 32U * 1024U;
+constexpr char WEBSOCKET_GUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+inline std::string websocket_base64(const unsigned char* input, std::size_t length) {
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string output;
+    output.reserve(((length + 2) / 3) * 4);
+    for (std::size_t index = 0; index < length; index += 3) {
+        const auto remaining = length - index;
+        const std::uint32_t a = input[index];
+        const std::uint32_t b = remaining > 1 ? input[index + 1] : 0;
+        const std::uint32_t c = remaining > 2 ? input[index + 2] : 0;
+        output.push_back(alphabet[(a >> 2) & 0x3f]);
+        output.push_back(alphabet[((a << 4) | (b >> 4)) & 0x3f]);
+        output.push_back(remaining > 1 ? alphabet[((b << 2) | (c >> 6)) & 0x3f] : '=');
+        output.push_back(remaining > 2 ? alphabet[c & 0x3f] : '=');
+    }
+    return output;
+}
+inline StringResult<std::vector<std::uint8_t>> websocket_encode_client_frame(
+    int opcode, const std::vector<std::uint8_t>& payload) {
+    if (!(opcode == 0 || opcode == 1 || opcode == 2 || opcode == 8 || opcode == 9 || opcode == 10))
+        return result_error<std::vector<std::uint8_t>>("invalid WebSocket opcode");
+    const bool control = opcode >= 8;
+    if (control && payload.size() > 125)
+        return result_error<std::vector<std::uint8_t>>("invalid WebSocket control frame");
+    if (payload.size() > MAX_NATIVE_WEBSOCKET_FRAME_BYTES)
+        return result_error<std::vector<std::uint8_t>>("WebSocket frame exceeds size limit");
+    if (opcode == 1 && !valid_utf8(payload))
+        return result_error<std::vector<std::uint8_t>>("WebSocket text message is not valid UTF-8");
+    if (opcode == 8 && payload.size() == 1)
+        return result_error<std::vector<std::uint8_t>>("invalid WebSocket close payload");
+    if (opcode == 8 && payload.size() >= 2) {
+        const auto code = static_cast<int>((static_cast<unsigned int>(payload[0]) << 8) | payload[1]);
+        const bool valid_code = (code >= 1000 && code <= 1014 && code != 1004 && code != 1005 && code != 1006)
+            || (code >= 3000 && code <= 4999);
+        if (!valid_code) return result_error<std::vector<std::uint8_t>>("invalid WebSocket close code");
+        std::vector<std::uint8_t> reason(payload.begin() + 2, payload.end());
+        if (!valid_utf8(reason)) return result_error<std::vector<std::uint8_t>>("WebSocket close reason is not valid UTF-8");
+    }
+    std::array<unsigned char, 4> mask{};
+    if (RAND_bytes(mask.data(), static_cast<int>(mask.size())) != 1)
+        return result_error<std::vector<std::uint8_t>>("WebSocket secure random generation failed");
+    std::vector<std::uint8_t> frame;
+    frame.reserve(payload.size() + 14);
+    frame.push_back(static_cast<std::uint8_t>(0x80 | opcode));
+    const auto length = static_cast<std::uint64_t>(payload.size());
+    if (length < 126) frame.push_back(static_cast<std::uint8_t>(0x80 | length));
+    else if (length <= 0xffff) {
+        frame.push_back(0x80 | 126);
+        frame.push_back(static_cast<std::uint8_t>((length >> 8) & 0xff));
+        frame.push_back(static_cast<std::uint8_t>(length & 0xff));
+    } else {
+        frame.push_back(0x80 | 127);
+        for (int shift = 56; shift >= 0; shift -= 8)
+            frame.push_back(static_cast<std::uint8_t>((length >> shift) & 0xff));
+    }
+    frame.insert(frame.end(), mask.begin(), mask.end());
+    for (std::size_t index = 0; index < payload.size(); ++index)
+        frame.push_back(static_cast<std::uint8_t>(payload[index] ^ mask[index & 3]));
+    return result_ok<std::vector<std::uint8_t>>(std::move(frame));
+}
+inline std::string websocket_accept_value(const std::string& key) {
+    const auto source = key + WEBSOCKET_GUID;
+    std::array<unsigned char, SHA_DIGEST_LENGTH> digest{};
+    SHA1(reinterpret_cast<const unsigned char*>(source.data()), source.size(), digest.data());
+    return websocket_base64(digest.data(), digest.size());
+}
+inline std::string websocket_authority(const WebSocketUrl& url) {
+    std::string host = url.host.find(':') == std::string::npos ? url.host : "[" + url.host + "]";
+    const auto default_port = url.scheme == "wss" ? 443 : 80;
+    if (url.port != default_port) host += ":" + std::to_string(url.port);
+    return host;
+}
+inline std::vector<std::string> websocket_header_tokens(const std::vector<std::string>& values) {
+    std::vector<std::string> tokens;
+    for (const auto& value : values) {
+        std::size_t start = 0;
+        while (start <= value.size()) {
+            const auto end = value.find(',', start);
+            tokens.push_back(websocket_lower_ascii(websocket_trim(value.substr(
+                start, (end == std::string::npos ? value.size() : end) - start))));
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+    }
+    return tokens;
+}
+inline bool websocket_header_token(const std::vector<std::string>& values, const std::string& expected) {
+    const auto tokens = websocket_header_tokens(values);
+    return std::find(tokens.begin(), tokens.end(), expected) != tokens.end();
+}
+inline bool websocket_parse_handshake(
+    const std::vector<std::uint8_t>& buffer, const std::string& key, std::size_t& header_size,
+    std::string& error) {
+    const std::array<std::uint8_t, 4> terminator{{'\r', '\n', '\r', '\n'}};
+    const auto found = std::search(buffer.begin(), buffer.end(), terminator.begin(), terminator.end());
+    if (found == buffer.end()) return false;
+    header_size = static_cast<std::size_t>(found - buffer.begin()) + terminator.size();
+    const std::string text(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(header_size));
+    const auto first_end = text.find("\r\n");
+    if (first_end == std::string::npos) { error = "invalid HTTP status line"; return false; }
+    const auto status_line = text.substr(0, first_end);
+    if (!(status_line.rfind("HTTP/1.0 ", 0) == 0 || status_line.rfind("HTTP/1.1 ", 0) == 0)
+        || status_line.size() < 12 || status_line[9] < '0' || status_line[9] > '9'
+        || status_line[10] < '0' || status_line[10] > '9' || status_line[11] < '0' || status_line[11] > '9') {
+        error = "invalid HTTP status line"; return false;
+    }
+    const int status = (status_line[9] - '0') * 100 + (status_line[10] - '0') * 10 + status_line[11] - '0';
+    if (status != 101) { error = "WebSocket server did not accept the Upgrade request"; return false; }
+    std::vector<std::string> upgrades, connections, accepts;
+    bool has_extensions = false;
+    bool has_body = false;
+    std::size_t content_length_count = 0;
+    std::size_t line_start = first_end + 2;
+    while (line_start + 2 < header_size) {
+        const auto line_end = text.find("\r\n", line_start);
+        if (line_end == std::string::npos || line_end == line_start) break;
+        const auto line = text.substr(line_start, line_end - line_start);
+        const auto colon = line.find(':');
+        if (colon == std::string::npos || colon == 0) {
+            error = "invalid HTTP header"; return false;
+        }
+        const auto name = websocket_lower_ascii(line.substr(0, colon));
+        const auto value = websocket_trim(line.substr(colon + 1));
+        if (name == "upgrade") upgrades.push_back(value);
+        else if (name == "connection") connections.push_back(value);
+        else if (name == "sec-websocket-accept") accepts.push_back(value);
+        else if (name == "sec-websocket-extensions") has_extensions = true;
+        else if (name == "transfer-encoding") has_body = true;
+        else if (name == "content-length") {
+            if (++content_length_count > 1) { error = "duplicate HTTP Content-Length"; return false; }
+            if (value.empty()) { error = "invalid HTTP Content-Length"; return false; }
+            std::uint64_t length = 0;
+            for (const auto byte : value) {
+                if (byte < '0' || byte > '9' ||
+                    length > (std::numeric_limits<std::uint64_t>::max() - static_cast<unsigned int>(byte - '0')) / 10) {
+                    error = "invalid HTTP Content-Length"; return false;
+                }
+                length = length * 10 + static_cast<unsigned int>(byte - '0');
+            }
+            if (length != 0) has_body = true;
+        }
+        line_start = line_end + 2;
+    }
+    if (has_body) { error = "WebSocket Upgrade response must not contain a body"; return false; }
+    if (!websocket_header_token(upgrades, "websocket") || !websocket_header_token(connections, "upgrade")) {
+        error = "invalid WebSocket Upgrade headers"; return false;
+    }
+    const auto expected = websocket_accept_value(key);
+    if (accepts.size() != 1 || accepts.front().size() != expected.size()
+        || CRYPTO_memcmp(accepts.front().data(), expected.data(), expected.size()) != 0) {
+        error = "invalid WebSocket accept value"; return false;
+    }
+    if (has_extensions) { error = "WebSocket extensions are not negotiated"; return false; }
+    return true;
+}
+
+using WebSocketReadResult = StringResult<std::optional<std::vector<std::uint8_t>>>;
+using WebSocketWriteResult = StringResult<std::int64_t>;
+using WebSocketReceiveResult = StringResult<std::optional<WebSocketMessage>>;
+inline Task<WebSocketReadResult> websocket_transport_read(
+    const std::shared_ptr<WebSocket>& value, std::int64_t limit,
+    const std::string& file, int line, int column) {
+    if (value->tls) return tls_read(value->tls, limit, file, line, column);
+    return tcp_read(value->tcp, limit, file, line, column);
+}
+inline Task<WebSocketWriteResult> websocket_transport_write(
+    const std::shared_ptr<WebSocket>& value, std::vector<std::uint8_t> bytes,
+    const std::string& file, int line, int column) {
+    if (value->tls) return tls_write_all(value->tls, std::move(bytes), file, line, column);
+    return tcp_write_all(value->tcp, std::move(bytes), file, line, column);
+}
+template <typename T>
+inline bool websocket_await_timed(
+    Task<T> operation, std::int64_t milliseconds, const std::string& file, int line, int column,
+    std::optional<T>& output) {
+    auto timed = task_with_timeout(std::move(operation), Duration{milliseconds}, true, file, line, column);
+    try {
+        output.emplace(timed.await_move(file, line, column));
+        return true;
+    } catch (const Failure& failure) {
+        if (std::string(failure.what()) == "task timed out") return false;
+        throw;
+    }
+}
+inline StringResult<std::int64_t> websocket_write_frame(
+    const std::shared_ptr<WebSocket>& value, int opcode, const std::vector<std::uint8_t>& payload,
+    const std::string& file, int line, int column, const std::string& operation_name = "write") {
+    if (!value || !value->is_open()) fail(file, line, column, "WebSocket is closed");
+    std::unique_lock<std::mutex> lock(value->send_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return result_error<std::int64_t>("WebSocket already has a pending write");
+    auto encoded = websocket_encode_client_frame(opcode, payload);
+    if (std::holds_alternative<std::string>(encoded))
+        return result_error<std::int64_t>(std::get<1>(std::move(encoded)));
+    auto operation = websocket_transport_write(value, std::get<0>(std::move(encoded)), file, line, column);
+    std::optional<WebSocketWriteResult> completed;
+    if (!websocket_await_timed(std::move(operation), value->operation_timeout_milliseconds,
+                               file, line, column, completed))
+        return result_error<std::int64_t>("WebSocket " + operation_name + " timed out");
+    if (!completed || std::holds_alternative<std::string>(*completed))
+        return result_error<std::int64_t>("WebSocket " + operation_name + " failed: "
+            + (completed ? std::get<1>(*completed) : std::string("invalid completion")));
+    return result_ok<std::int64_t>(static_cast<std::int64_t>(payload.size()));
+}
+inline Task<StringResult<std::shared_ptr<WebSocket>>> websocket_connect(
+    WebSocketUrl url, Duration timeout, const std::string& file, int line, int column) {
+    using Output = StringResult<std::shared_ptr<WebSocket>>;
+    if (timeout.milliseconds <= 0)
+        return make_io_task<Output>([]() -> Output {
+            return result_error<std::shared_ptr<WebSocket>>("WebSocket timeout must be greater than zero");
+        }, file, line, column);
+    auto work = make_io_task<Output>([url = std::move(url), timeout, file, line, column]() mutable -> Output {
+        try {
+            const bool secure = url.scheme == "wss";
+            std::shared_ptr<WebSocket> socket = std::make_shared<WebSocket>();
+            socket->operation_timeout_milliseconds = timeout.milliseconds;
+            if (secure) {
+                auto opened = tls_connect(url.host, url.port, file, line, column).await_move(file, line, column);
+                if (std::holds_alternative<std::string>(opened))
+                    return result_error<std::shared_ptr<WebSocket>>("WebSocket connect failed: " + std::get<1>(std::move(opened)));
+                socket->tls = std::get<0>(std::move(opened));
+            } else {
+                auto opened = tcp_connect(url.host, url.port, file, line, column).await_move(file, line, column);
+                if (std::holds_alternative<std::string>(opened))
+                    return result_error<std::shared_ptr<WebSocket>>("WebSocket connect failed: " + std::get<1>(std::move(opened)));
+                socket->tcp = std::get<0>(std::move(opened));
+            }
+            set_resource_location(socket, file, line, column);
+            std::array<unsigned char, 16> random_key{};
+            if (RAND_bytes(random_key.data(), static_cast<int>(random_key.size())) != 1) {
+                socket->close();
+                return result_error<std::shared_ptr<WebSocket>>("invalid WebSocket key");
+            }
+            const auto key = websocket_base64(random_key.data(), random_key.size());
+            const auto request = std::string("GET ") + url.target + " HTTP/1.1\r\nHost: "
+                + websocket_authority(url)
+                + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: "
+                + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
+            auto sent = websocket_transport_write(socket, bytes_from_string(request), file, line, column);
+            std::optional<WebSocketWriteResult> write_result;
+            if (!websocket_await_timed(std::move(sent), timeout.milliseconds, file, line, column, write_result)) {
+                socket->close();
+                return result_error<std::shared_ptr<WebSocket>>("WebSocket handshake-write failed: timed out");
+            }
+            if (!write_result || std::holds_alternative<std::string>(*write_result)) {
+                const auto detail = write_result ? std::get<1>(*write_result) : std::string("invalid write completion");
+                socket->close();
+                return result_error<std::shared_ptr<WebSocket>>("WebSocket handshake-write failed: " + detail);
+            }
+            std::size_t total = 0;
+            for (;;) {
+                auto reading = websocket_transport_read(socket, 65536, file, line, column);
+                std::optional<WebSocketReadResult> read_result;
+                if (!websocket_await_timed(std::move(reading), timeout.milliseconds, file, line, column, read_result)) {
+                    socket->close();
+                    return result_error<std::shared_ptr<WebSocket>>("WebSocket handshake-read failed: timed out");
+                }
+                if (!read_result || std::holds_alternative<std::string>(*read_result)) {
+                    const auto detail = read_result ? std::get<1>(*read_result) : std::string("invalid read completion");
+                    socket->close();
+                    return result_error<std::shared_ptr<WebSocket>>("WebSocket handshake-read failed: " + detail);
+                }
+                auto chunk = std::get<0>(*read_result);
+                if (!chunk) {
+                    socket->close();
+                    return result_error<std::shared_ptr<WebSocket>>("WebSocket server closed during handshake");
+                }
+                total += chunk->size();
+                if (total > MAX_NATIVE_WEBSOCKET_HANDSHAKE_BYTES) {
+                    socket->close();
+                    return result_error<std::shared_ptr<WebSocket>>("WebSocket handshake exceeds size limit");
+                }
+                socket->receive_buffer.insert(socket->receive_buffer.end(), chunk->begin(), chunk->end());
+                std::size_t header_size = 0;
+                std::string error;
+                const bool valid = websocket_parse_handshake(socket->receive_buffer, key, header_size, error);
+                if (!error.empty()) {
+                    socket->close();
+                    return result_error<std::shared_ptr<WebSocket>>(std::move(error));
+                }
+                if (valid) {
+                    socket->receive_buffer.erase(
+                        socket->receive_buffer.begin(),
+                        socket->receive_buffer.begin() + static_cast<std::ptrdiff_t>(header_size));
+                    if (socket->receive_buffer.size() > MAX_NATIVE_WEBSOCKET_MESSAGE_BYTES + 14) {
+                        socket->close();
+                        return result_error<std::shared_ptr<WebSocket>>("WebSocket receive buffer exceeds size limit");
+                    }
+                    return result_ok<std::shared_ptr<WebSocket>>(std::move(socket));
+                }
+            }
+        } catch (const TaskCancelled&) {
+            throw;
+        } catch (const Failure&) {
+            throw;
+        } catch (...) {
+            return result_error<std::shared_ptr<WebSocket>>("WebSocket connection failed");
+        }
+    }, file, line, column);
+    auto bounded = task_with_timeout(std::move(work), timeout, true, file, line, column);
+    return make_io_task<Output>([bounded = std::move(bounded), file, line, column]() mutable -> Output {
+        try {
+            return bounded.await_move(file, line, column);
+        } catch (const Failure& failure) {
+            if (std::string(failure.what()) == "task timed out")
+                return result_error<std::shared_ptr<WebSocket>>("WebSocket connection timed out");
+            throw;
+        }
+    }, file, line, column);
+}
+inline Task<StringResult<std::shared_ptr<WebSocket>>> websocket_connect(
+    const std::string& address, Duration timeout, const std::string& file, int line, int column) {
+    if (timeout.milliseconds <= 0)
+        return make_io_task<StringResult<std::shared_ptr<WebSocket>>>(
+            []() -> StringResult<std::shared_ptr<WebSocket>> {
+                return result_error<std::shared_ptr<WebSocket>>("WebSocket timeout must be greater than zero");
+            }, file, line, column);
+    auto parsed = parse_websocket_url(address);
+    if (std::holds_alternative<std::string>(parsed))
+        return make_io_task<StringResult<std::shared_ptr<WebSocket>>>(
+            [error = std::get<1>(std::move(parsed))]() -> StringResult<std::shared_ptr<WebSocket>> {
+                return result_error<std::shared_ptr<WebSocket>>(error);
+            }, file, line, column);
+    return websocket_connect(std::get<0>(std::move(parsed)), timeout, file, line, column);
+}
+inline bool websocket_is_open(const std::shared_ptr<WebSocket>& value) {
+    return value && value->is_open();
+}
+inline bool websocket_close(const std::shared_ptr<WebSocket>& value) {
+    return value && value->is_open() && value->close();
+}
+inline std::optional<std::int64_t> websocket_close_code(const std::shared_ptr<WebSocket>& value) {
+    if (!value) return std::nullopt;
+    std::lock_guard<std::mutex> lock(value->metadata_mutex);
+    return value->close_code;
+}
+inline std::optional<std::string> websocket_close_reason(const std::shared_ptr<WebSocket>& value) {
+    if (!value) return std::nullopt;
+    std::lock_guard<std::mutex> lock(value->metadata_mutex);
+    return value->close_reason;
+}
+inline Task<StringResult<std::int64_t>> websocket_send(
+    const std::shared_ptr<WebSocket>& value, std::vector<std::uint8_t> payload,
+    const std::string& file, int line, int column) {
+    if (!value || !value->is_open()) fail(file, line, column, "WebSocket is closed");
+    return make_io_task<StringResult<std::int64_t>>(
+        [value, payload = std::move(payload), file, line, column]() {
+            return websocket_write_frame(value, 2, payload, file, line, column);
+        }, file, line, column);
+}
+inline Task<StringResult<std::int64_t>> websocket_send_text(
+    const std::shared_ptr<WebSocket>& value, std::string text,
+    const std::string& file, int line, int column) {
+    if (!value || !value->is_open()) fail(file, line, column, "WebSocket is closed");
+    return make_io_task<StringResult<std::int64_t>>(
+        [value, payload = bytes_from_string(text), file, line, column]() {
+            return websocket_write_frame(value, 1, payload, file, line, column);
+        }, file, line, column);
+}
+
+struct NativeWebSocketFrame { int opcode = 0; bool final = true; std::vector<std::uint8_t> payload; };
+inline StringResult<std::optional<NativeWebSocketFrame>> websocket_next_frame(WebSocket& socket) {
+    auto& data = socket.receive_buffer;
+    if (data.size() < 2)
+        return result_ok<std::optional<NativeWebSocketFrame>>(std::nullopt);
+    const auto first = data[0], second = data[1];
+    const bool final = (first & 0x80) != 0;
+    if (first & 0x70)
+        return result_error<std::optional<NativeWebSocketFrame>>("WebSocket reserved bits are not supported");
+    const int opcode = first & 0x0f;
+    if (!(opcode == 0 || opcode == 1 || opcode == 2 || opcode == 8 || opcode == 9 || opcode == 10))
+        return result_error<std::optional<NativeWebSocketFrame>>("invalid WebSocket opcode");
+    if (second & 0x80)
+        return result_error<std::optional<NativeWebSocketFrame>>("server WebSocket frames must not be masked");
+    const auto length_code = second & 0x7f;
+    std::size_t offset = 2;
+    std::uint64_t length = length_code;
+    if (length_code == 126) {
+        if (data.size() < offset + 2) return result_ok<std::optional<NativeWebSocketFrame>>(std::nullopt);
+        length = (static_cast<std::uint64_t>(data[offset]) << 8) | data[offset + 1];
+        if (length < 126)
+            return result_error<std::optional<NativeWebSocketFrame>>("non-canonical WebSocket payload length");
+        offset += 2;
+    } else if (length_code == 127) {
+        if (data.size() < offset + 8) return result_ok<std::optional<NativeWebSocketFrame>>(std::nullopt);
+        length = 0;
+        for (int index = 0; index < 8; ++index) length = (length << 8) | data[offset + index];
+        if (length < 65536 || (length & (1ULL << 63)))
+            return result_error<std::optional<NativeWebSocketFrame>>("invalid WebSocket payload length");
+        offset += 8;
+    }
+    if (length > MAX_NATIVE_WEBSOCKET_FRAME_BYTES)
+        return result_error<std::optional<NativeWebSocketFrame>>("WebSocket frame exceeds size limit");
+    if (opcode >= 8 && (!final || length > 125))
+        return result_error<std::optional<NativeWebSocketFrame>>("invalid WebSocket control frame");
+    if (data.size() - offset < static_cast<std::size_t>(length))
+        return result_ok<std::optional<NativeWebSocketFrame>>(std::nullopt);
+    NativeWebSocketFrame frame;
+    frame.opcode = opcode;
+    frame.final = final;
+    frame.payload.assign(data.begin() + static_cast<std::ptrdiff_t>(offset),
+                         data.begin() + static_cast<std::ptrdiff_t>(offset + length));
+    data.erase(data.begin(), data.begin() + static_cast<std::ptrdiff_t>(offset + length));
+    return result_ok<std::optional<NativeWebSocketFrame>>(std::move(frame));
+}
+inline StringResult<std::optional<NativeWebSocketFrame>> websocket_next_event(WebSocket& socket) {
+    for (;;) {
+        auto decoded = websocket_next_frame(socket);
+        if (std::holds_alternative<std::string>(decoded))
+            return result_error<std::optional<NativeWebSocketFrame>>(std::get<1>(std::move(decoded)));
+        auto frame = std::get<0>(std::move(decoded));
+        if (!frame) return result_ok<std::optional<NativeWebSocketFrame>>(std::nullopt);
+        if (frame->opcode >= 8) {
+            if (frame->opcode == 8) {
+                if (frame->payload.size() == 1)
+                    return result_error<std::optional<NativeWebSocketFrame>>("invalid WebSocket close payload");
+                if (frame->payload.size() >= 2) {
+                    const int code = static_cast<int>((static_cast<unsigned int>(frame->payload[0]) << 8) | frame->payload[1]);
+                    const bool valid_code = (code >= 1000 && code <= 1014 && code != 1004 && code != 1005 && code != 1006)
+                        || (code >= 3000 && code <= 4999);
+                    if (!valid_code)
+                        return result_error<std::optional<NativeWebSocketFrame>>("invalid WebSocket close code");
+                    std::vector<std::uint8_t> reason(frame->payload.begin() + 2, frame->payload.end());
+                    if (!valid_utf8(reason))
+                        return result_error<std::optional<NativeWebSocketFrame>>("WebSocket close reason is not valid UTF-8");
+                }
+            }
+            return result_ok<std::optional<NativeWebSocketFrame>>(std::move(frame));
+        }
+        if (frame->opcode == 0) {
+            if (!socket.fragment_opcode)
+                return result_error<std::optional<NativeWebSocketFrame>>("unexpected WebSocket continuation frame");
+            if (socket.fragment.size() + frame->payload.size() > MAX_NATIVE_WEBSOCKET_MESSAGE_BYTES)
+                return result_error<std::optional<NativeWebSocketFrame>>("WebSocket message exceeds size limit");
+            socket.fragment.insert(socket.fragment.end(), frame->payload.begin(), frame->payload.end());
+            if (!frame->final) continue;
+            frame->opcode = *socket.fragment_opcode;
+            frame->payload = std::move(socket.fragment);
+            socket.fragment.clear();
+            socket.fragment_opcode.reset();
+            if (frame->opcode == 1 && !valid_utf8(frame->payload))
+                return result_error<std::optional<NativeWebSocketFrame>>("WebSocket text message is not valid UTF-8");
+            return result_ok<std::optional<NativeWebSocketFrame>>(std::move(frame));
+        }
+        if (socket.fragment_opcode)
+            return result_error<std::optional<NativeWebSocketFrame>>("new WebSocket data frame before fragmented message ended");
+        if (frame->final) {
+            if (frame->opcode == 1 && !valid_utf8(frame->payload))
+                return result_error<std::optional<NativeWebSocketFrame>>("WebSocket text message is not valid UTF-8");
+            return result_ok<std::optional<NativeWebSocketFrame>>(std::move(frame));
+        }
+        socket.fragment_opcode = frame->opcode;
+        socket.fragment.clear();
+        if (frame->payload.size() > MAX_NATIVE_WEBSOCKET_MESSAGE_BYTES)
+            return result_error<std::optional<NativeWebSocketFrame>>("WebSocket message exceeds size limit");
+        socket.fragment.insert(socket.fragment.end(), frame->payload.begin(), frame->payload.end());
+    }
+}
+inline StringResult<std::optional<WebSocketMessage>> websocket_receive_impl(
+    const std::shared_ptr<WebSocket>& value, std::int64_t timeout, bool keep_open_on_timeout,
+    const std::string& file, int line, int column) {
+    if (!value || !value->is_open()) fail(file, line, column, "WebSocket is closed");
+    if (timeout <= 0) return result_error<std::optional<WebSocketMessage>>(
+        keep_open_on_timeout ? "WebSocket receive timeout must be greater than zero"
+                             : "WebSocket operation timed out");
+    std::unique_lock<std::mutex> receive_lock(value->receive_mutex, std::try_to_lock);
+    if (!receive_lock.owns_lock())
+        return result_error<std::optional<WebSocketMessage>>("WebSocket already has a pending receive");
+    for (;;) {
+        auto event_result = websocket_next_event(*value);
+        if (std::holds_alternative<std::string>(event_result)) {
+            value->close();
+            return result_error<std::optional<WebSocketMessage>>(std::get<1>(std::move(event_result)));
+        }
+        auto event = std::get<0>(std::move(event_result));
+        if (event) {
+            if (event->opcode == 1 || event->opcode == 2) {
+                WebSocketMessage message{event->opcode, std::move(event->payload)};
+                return result_ok<std::optional<WebSocketMessage>>(std::optional<WebSocketMessage>{std::move(message)});
+            }
+            if (event->opcode == 10) continue;
+            if (event->opcode == 9) {
+                auto pong = websocket_write_frame(value, 10, event->payload, file, line, column, "control frame write");
+                if (std::holds_alternative<std::string>(pong)) {
+                    value->close();
+                    return result_error<std::optional<WebSocketMessage>>("WebSocket control frame write failed");
+                }
+                continue;
+            }
+            if (event->opcode == 8) {
+                std::optional<std::int64_t> code;
+                std::string reason;
+                if (event->payload.size() >= 2) {
+                    code = static_cast<std::int64_t>(
+                        (static_cast<unsigned int>(event->payload[0]) << 8) | event->payload[1]);
+                    std::vector<std::uint8_t> reason_bytes(event->payload.begin() + 2, event->payload.end());
+                    if (!reason_bytes.empty())
+                        reason.assign(reinterpret_cast<const char*>(reason_bytes.data()), reason_bytes.size());
+                }
+                {
+                    std::lock_guard<std::mutex> lock(value->metadata_mutex);
+                    value->close_code = code;
+                    value->close_reason = reason;
+                }
+                auto echoed = websocket_write_frame(value, 8, event->payload, file, line, column, "close handshake");
+                value->close();
+                if (std::holds_alternative<std::string>(echoed))
+                    return result_error<std::optional<WebSocketMessage>>("WebSocket close handshake failed");
+                return result_ok<std::optional<WebSocketMessage>>(std::nullopt);
+            }
+            continue;
+        }
+        auto reading = websocket_transport_read(value, 65536, file, line, column);
+        std::optional<WebSocketReadResult> completed;
+        if (!websocket_await_timed(std::move(reading), timeout, file, line, column, completed)) {
+            if (!keep_open_on_timeout) value->close();
+            return result_error<std::optional<WebSocketMessage>>(
+                keep_open_on_timeout ? "WebSocket receive timed out" : "WebSocket operation timed out");
+        }
+        if (!completed || std::holds_alternative<std::string>(*completed)) {
+            value->close();
+            return result_error<std::optional<WebSocketMessage>>(
+                "WebSocket operation failed: " +
+                (completed ? std::get<1>(*completed) : std::string("invalid read completion")));
+        }
+        auto bytes = std::get<0>(*completed);
+        if (!bytes) {
+            value->close();
+            return result_error<std::optional<WebSocketMessage>>("WebSocket connection closed without a close frame");
+        }
+        if (value->receive_buffer.size() + bytes->size() > MAX_NATIVE_WEBSOCKET_MESSAGE_BYTES + 14) {
+            value->close();
+            return result_error<std::optional<WebSocketMessage>>("WebSocket receive buffer exceeds size limit");
+        }
+        value->receive_buffer.insert(value->receive_buffer.end(), bytes->begin(), bytes->end());
+    }
+}
+inline Task<WebSocketReceiveResult> websocket_receive(
+    const std::shared_ptr<WebSocket>& value, const std::string& file, int line, int column) {
+    if (!value || !value->is_open()) fail(file, line, column, "WebSocket is closed");
+    return make_io_task<WebSocketReceiveResult>(
+        [value, file, line, column]() {
+            return websocket_receive_impl(value, value->operation_timeout_milliseconds, false, file, line, column);
+        }, file, line, column);
+}
+inline Task<WebSocketReceiveResult> websocket_receive_within(
+    const std::shared_ptr<WebSocket>& value, Duration timeout,
+    const std::string& file, int line, int column) {
+    if (!value || !value->is_open()) fail(file, line, column, "WebSocket is closed");
+    return make_io_task<WebSocketReceiveResult>(
+        [value, timeout, file, line, column]() {
+            return websocket_receive_impl(value, timeout.milliseconds, true, file, line, column);
+        }, file, line, column);
+}
+inline Task<StringResult<bool>> websocket_close_gracefully(
+    const std::shared_ptr<WebSocket>& value, const std::string& file, int line, int column) {
+    if (!value || !value->is_open()) fail(file, line, column, "WebSocket is closed");
+    return make_io_task<StringResult<bool>>([value, file, line, column]() -> StringResult<bool> {
+        std::vector<std::uint8_t> close_payload{0x03, 0xe8};
+        auto sent = websocket_write_frame(value, 8, close_payload, file, line, column, "close");
+        if (std::holds_alternative<std::string>(sent)) {
+            value->close();
+            const auto error = std::get<1>(std::move(sent));
+            return result_error<bool>(error == "WebSocket close timed out"
+                ? "WebSocket close timed out" : "WebSocket close failed: " + error);
+        }
+        for (;;) {
+            auto received = websocket_receive_impl(
+                value, value->operation_timeout_milliseconds, false, file, line, column);
+            if (std::holds_alternative<std::string>(received)) {
+                value->close();
+                const auto error = std::get<1>(std::move(received));
+                if (error == "WebSocket operation timed out")
+                    return result_error<bool>("WebSocket close timed out");
+                return result_error<bool>("WebSocket close failed: " + error);
+            }
+            if (!std::get<0>(received)) return result_ok<bool>(true);
+        }
+    }, file, line, column);
+}
+#endif
 
 inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, int column) {
     auto& scheduler = native_scheduler();

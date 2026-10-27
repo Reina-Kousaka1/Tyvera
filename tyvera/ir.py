@@ -32,6 +32,9 @@ class IRType(str, Enum):
     TCP_CONNECTION = "TcpConnection"
     TLS_CONNECTION = "TlsConnection"
     TCP_LISTENER = "TcpListener"
+    WEBSOCKET_URL = "WebSocketUrl"
+    WEBSOCKET = "WebSocket"
+    WEBSOCKET_MESSAGE = "WebSocketMessage"
     VOID = "Void"
 
 
@@ -355,7 +358,7 @@ def _hashable_key_type(type_ref: IRTypeRef) -> bool:
 def _contains_resource(type_ref: IRTypeRef) -> bool:
     resources = {
         IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
-        IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER,
+        IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER, IRType.WEBSOCKET,
     }
     if type_ref in resources:
         return True
@@ -426,6 +429,32 @@ def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef
             "accept": ((), _applied("Task", _applied("Result", IRType.TCP_CONNECTION, IRType.STRING))),
             "localAddress": ((), _applied("Result", IRType.SOCKET_ADDRESS, IRType.STRING)),
             "close": ((), IRType.BOOL),
+            "isOpen": ((), IRType.BOOL),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.WEBSOCKET_URL:
+        signatures = {
+            "scheme": ((), IRType.STRING), "host": ((), IRType.STRING),
+            "port": ((), IRType.INT), "target": ((), IRType.STRING),
+            "hostEndsWith": ((IRType.STRING,), IRType.BOOL),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.WEBSOCKET_MESSAGE:
+        signatures = {
+            "kind": ((), IRType.STRING), "bytes": ((), IRType.BYTES),
+            "text": ((), _applied("Result", IRType.STRING, IRType.STRING)),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.WEBSOCKET:
+        signatures = {
+            "sendText": ((IRType.STRING,), _applied("Task", _applied("Result", IRType.INT, IRType.STRING))),
+            "send": ((IRType.BYTES,), _applied("Task", _applied("Result", IRType.INT, IRType.STRING))),
+            "receive": ((), _applied("Task", _applied("Result", _applied("Option", IRType.WEBSOCKET_MESSAGE), IRType.STRING))),
+            "receiveWithin": ((IRType.DURATION,), _applied("Task", _applied("Result", _applied("Option", IRType.WEBSOCKET_MESSAGE), IRType.STRING))),
+            "closeCode": ((), _applied("Option", IRType.INT)),
+            "closeReason": ((), _applied("Option", IRType.STRING)),
+            "close": ((), IRType.BOOL),
+            "closeGracefully": ((), _applied("Task", _applied("Result", IRType.BOOL, IRType.STRING))),
             "isOpen": ((), IRType.BOOL),
         }
         return signatures.get(method)
@@ -695,7 +724,14 @@ def _validate_expression(
             "tcpConnect": ((IRType.STRING, IRType.INT), _applied("Task", _applied("Result", IRType.TCP_CONNECTION, IRType.STRING))),
             "tlsConnect": ((IRType.STRING, IRType.INT), _applied("Task", _applied("Result", IRType.TLS_CONNECTION, IRType.STRING))),
             "tcpListen": ((IRType.STRING, IRType.INT, IRType.INT), _applied("Task", _applied("Result", IRType.TCP_LISTENER, IRType.STRING))),
+            "webSocketUrl": ((IRType.STRING,), _applied("Result", IRType.WEBSOCKET_URL, IRType.STRING)),
         }
+        if expression.builtin == "webSocketConnect":
+            expected_result = _applied("Task", _applied("Result", IRType.WEBSOCKET, IRType.STRING))
+            if (len(argument_types) != 2 or argument_types[0] not in {IRType.STRING, IRType.WEBSOCKET_URL}
+                    or argument_types[1] != IRType.DURATION or expression.type != expected_result):
+                raise _invalid(expression.location, "invalid typed IR builtin 'webSocketConnect'")
+            return expression.type
         signature = signatures.get(expression.builtin)
         if signature is None:
             raise _invalid(expression.location, f"unknown native IR builtin '{expression.builtin}'")
@@ -785,6 +821,7 @@ def _validate_statements(
             if (statement.resource.type not in {
                     IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
                     IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER,
+                    IRType.WEBSOCKET,
                 } or acquisition_type != expected_result):
                 raise _invalid(statement.location, "IR using requires a checked file or network Result acquisition")
             if statement.resource.identifier in seen_ids:

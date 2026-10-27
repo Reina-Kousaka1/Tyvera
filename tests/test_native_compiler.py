@@ -44,6 +44,7 @@ from tyvera.ir import (
 )
 from tyvera.lowering import lower_checked_program
 from tyvera.source import Diagnostic, Location
+from tyvera.websocket_protocol import make_accept_value
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -1721,6 +1722,324 @@ fn main() {
                 self.assertEqual(result.stderr.strip(), diagnostic)
                 self.assertEqual(result.stdout, "")
 
+
+
+
+    def test_native_websocket_url_values_match_reference(self) -> None:
+        source = '''fn main() {
+    match webSocketUrl("WSS://example.test:8443/gateway?v=10") {
+        Err(error) => println(error)
+        Ok(url) => {
+            println(url.scheme())
+            println(url.host())
+            println(url.port())
+            println(url.target())
+            println(url.hostEndsWith(".test"))
+        }
+    }
+    match webSocketUrl("ftp://example.test/") {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected URL")
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-websocket-url-") as temporary:
+            root = Path(temporary)
+            expected = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "websocket-url", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            self.assertEqual(
+                native.stdout,
+                "wss\nexample.test\n8443\n/gateway?v=10\ntrue\n"
+                "WebSocket URL scheme must be ws or wss\n",
+            )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "native WebSocket tests require Linux")
+    def test_native_websocket_echo_and_close_match_reference(self) -> None:
+        failures: list[str] = []
+        handlers_finished = 0
+        handlers_lock = threading.Lock()
+        handlers_done = threading.Event()
+
+        def receive_exact(stream: socket.socket, length: int) -> bytes:
+            data = bytearray()
+            while len(data) < length:
+                chunk = stream.recv(length - len(data))
+                if not chunk:
+                    raise EOFError("WebSocket peer closed early")
+                data.extend(chunk)
+            return bytes(data)
+
+        def receive_client_frame(stream: socket.socket) -> tuple[int, bytes]:
+            first, second = receive_exact(stream, 2)
+            length = second & 0x7f
+            if length == 126:
+                length = int.from_bytes(receive_exact(stream, 2), "big")
+            elif length == 127:
+                length = int.from_bytes(receive_exact(stream, 8), "big")
+            if not second & 0x80:
+                raise AssertionError("client WebSocket frame was not masked")
+            mask = receive_exact(stream, 4)
+            payload = receive_exact(stream, length)
+            return first & 0x0f, bytes(value ^ mask[index & 3] for index, value in enumerate(payload))
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                try:
+                    self.request.settimeout(5)
+                    request = bytearray()
+                    while b"\r\n\r\n" not in request:
+                        request.extend(self.request.recv(1024))
+                        if len(request) > 32768:
+                            raise AssertionError("oversized handshake")
+                    headers = {}
+                    for line in bytes(request).decode("ascii").split("\r\n")[1:]:
+                        if not line:
+                            break
+                        name, value = line.split(":", 1)
+                        headers[name.strip().lower()] = value.strip()
+                    key = headers["sec-websocket-key"]
+                    response = (
+                        "HTTP/1.1 101 Switching Protocols\r\n"
+                        "Upgrade: websocket\r\n"
+                        "Connection: Upgrade\r\n"
+                        f"Sec-WebSocket-Accept: {make_accept_value(key)}\r\n\r\n"
+                    ).encode("ascii")
+                    self.request.sendall(response)
+                    opcode, message = receive_client_frame(self.request)
+                    if opcode != 1 or message != b"ping":
+                        raise AssertionError("unexpected client WebSocket message")
+                    response_message = message + b"!"
+                    self.request.sendall(bytes((0x81, len(response_message))) + response_message)
+                    opcode, close_payload = receive_client_frame(self.request)
+                    if opcode != 8:
+                        raise AssertionError("client did not start the close handshake")
+                    self.request.sendall(bytes((0x88, len(close_payload))) + close_payload)
+                except Exception as error:
+                    failures.append(f"{type(error).__name__}: {error}")
+                finally:
+                    nonlocal handlers_finished
+                    with handlers_lock:
+                        handlers_finished += 1
+                        if handlers_finished == 2:  # interpreter and native runs
+                            handlers_done.set()
+
+        class LoopbackServer(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-websocket-") as temporary:
+            root = Path(temporary)
+            server = LoopbackServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True,
+            )
+            thread.start()
+            port = server.server_address[1]
+            source = f'''async fn client() {{
+    let opened = await webSocketConnect("ws://127.0.0.1:{port}/echo?mode=test", milliseconds(2000))
+    using connection = move opened {{
+        println(connection.isOpen())
+        let sent = await connection.sendText("ping")
+        match sent {{
+            Err(error) => println(error)
+            Ok(count) => println(count)
+        }}
+        let received = await connection.receive()
+        match received {{
+            Err(error) => println(error)
+            Ok(None) => println("unexpected WebSocket EOF")
+            Ok(Some(message)) => {{
+                println(message.kind())
+                match message.text() {{
+                    Err(error) => println(error)
+                    Ok(text) => println(text)
+                }}
+            }}
+        }}
+        let closed = await connection.closeGracefully()
+        match closed {{
+            Err(error) => println(error)
+            Ok(true) => println("closed cleanly")
+            Ok(false) => println("close failed")
+        }}
+    }} else error {{
+        println(error)
+    }}
+}}
+fn main() {{
+    let task = client()
+    match runTasks() {{
+        Ok(_) => {{}}
+        Err(error) => eprintln(error)
+    }}
+}}'''
+            try:
+                expected = self._reference_result(source, root)
+                native = self._native_source_result(source, root, root / "websocket-client", root)
+                self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+                self.assertEqual(
+                    native.stdout,
+                    "true\n4\ntext\nping!\nclosed cleanly\n",
+                )
+                self.assertTrue(handlers_done.wait(timeout=5), "loopback WebSocket handlers did not finish")
+                self.assertEqual(failures, [])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=1)
+
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "native WSS tests require Linux and OpenSSL",
+    )
+    def test_native_wss_echo_uses_verified_tls_and_matches_reference(self) -> None:
+        openssl = shutil.which("openssl")
+        if openssl is None:
+            self.skipTest("OpenSSL command line tools are unavailable")
+        errors: list[str] = []
+        handlers_finished = 0
+        handlers_lock = threading.Lock()
+        handlers_done = threading.Event()
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-wss-") as temporary:
+            root = Path(temporary)
+            certificate, private_key = root / "cert.pem", root / "key.pem"
+            subprocess.run(
+                [
+                    openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", str(private_key), "-out", str(certificate), "-days", "2",
+                    "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
+                ],
+                capture_output=True, text=True, check=True,
+            )
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certificate, private_key)
+
+            def exact(stream: socket.socket, length: int) -> bytes:
+                data = bytearray()
+                while len(data) < length:
+                    chunk = stream.recv(length - len(data))
+                    if not chunk:
+                        raise EOFError("peer closed early")
+                    data.extend(chunk)
+                return bytes(data)
+
+            def client_frame(stream: socket.socket) -> tuple[int, bytes]:
+                first, second = exact(stream, 2)
+                length = second & 0x7f
+                if length == 126:
+                    length = int.from_bytes(exact(stream, 2), "big")
+                elif length == 127:
+                    length = int.from_bytes(exact(stream, 8), "big")
+                if not second & 0x80:
+                    raise AssertionError("client WebSocket frame was not masked")
+                mask = exact(stream, 4)
+                payload = exact(stream, length)
+                return first & 0x0f, bytes(value ^ mask[index & 3] for index, value in enumerate(payload))
+
+            class Handler(socketserver.BaseRequestHandler):
+                def handle(self) -> None:
+                    try:
+                        self.request.settimeout(5)
+                        request = bytearray()
+                        while b"\r\n\r\n" not in request:
+                            request.extend(self.request.recv(1024))
+                        headers = {}
+                        for line in bytes(request).decode("ascii").split("\r\n")[1:]:
+                            if not line:
+                                break
+                            name, value = line.split(":", 1)
+                            headers[name.strip().lower()] = value.strip()
+                        key = headers["sec-websocket-key"]
+                        self.request.sendall((
+                            "HTTP/1.1 101 Switching Protocols\r\n"
+                            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                            f"Sec-WebSocket-Accept: {make_accept_value(key)}\r\n\r\n"
+                        ).encode("ascii"))
+                        opcode, message = client_frame(self.request)
+                        if opcode != 1 or message != b"secure":
+                            raise AssertionError("unexpected secure WebSocket payload")
+                        response = b"secure!"
+                        self.request.sendall(bytes((0x81, len(response))) + response)
+                        opcode, close_payload = client_frame(self.request)
+                        if opcode != 8:
+                            raise AssertionError("client did not close the WebSocket")
+                        self.request.sendall(bytes((0x88, len(close_payload))) + close_payload)
+                    except Exception as error:
+                        errors.append(f"{type(error).__name__}: {error}")
+                    finally:
+                        nonlocal handlers_finished
+                        with handlers_lock:
+                            handlers_finished += 1  # interpreter and native runs
+                            if handlers_finished == 2:
+                                handlers_done.set()
+
+            class LoopbackTlsServer(socketserver.ThreadingTCPServer):
+                allow_reuse_address = True
+                daemon_threads = True
+
+                def get_request(self):
+                    raw, address = super().get_request()
+                    try:
+                        return context.wrap_socket(raw, server_side=True), address
+                    except OSError:
+                        raw.close()
+                        raise
+
+                def handle_error(self, request, client_address) -> None:
+                    return
+
+            server = LoopbackTlsServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True,
+            )
+            thread.start()
+            port = server.server_address[1]
+            source = f'''async fn client() {{
+    let opened = await webSocketConnect("wss://localhost:{port}/gateway", milliseconds(3000))
+    using connection = move opened {{
+        let sent = await connection.sendText("secure")
+        match sent {{
+            Err(error) => println(error)
+            Ok(count) => println(count)
+        }}
+        let received = await connection.receive()
+        match received {{
+            Err(error) => println(error)
+            Ok(None) => println("unexpected WebSocket EOF")
+            Ok(Some(message)) => match message.text() {{
+                Err(error) => println(error)
+                Ok(text) => println(text)
+            }}
+        }}
+        let closed = await connection.closeGracefully()
+        match closed {{
+            Err(error) => println(error)
+            Ok(true) => println("secure close complete")
+            Ok(false) => println("secure close failed")
+        }}
+    }} else error {{
+        println(error)
+    }}
+}}
+fn main() {{
+    let task = client()
+    match runTasks() {{
+        Ok(_) => {{}}
+        Err(error) => eprintln(error)
+    }}
+}}'''
+            try:
+                with patch.dict(os.environ, {"SSL_CERT_FILE": str(certificate)}):
+                    expected = self._reference_result(source, root)
+                    native = self._native_source_result(source, root, root / "wss-client", root)
+                self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+                self.assertEqual(native.stdout, "6\nsecure!\nsecure close complete\n")
+                self.assertTrue(handlers_done.wait(timeout=5), "loopback WSS handlers did not finish")
+                self.assertEqual(errors, [])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=1)
 
 if __name__ == "__main__":
     unittest.main()
