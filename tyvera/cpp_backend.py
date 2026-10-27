@@ -249,6 +249,8 @@ class _CppGenerator:
     def _cpp_type(type_name: IRTypeRef) -> str:
         if isinstance(type_name, IRActorRefType):
             return "std::shared_ptr<tyvera_runtime::ActorBase>"
+        if type_name == IRType.SUPERVISOR:
+            return "std::shared_ptr<tyvera_runtime::Supervisor>"
         if isinstance(type_name, IRAppliedType):
             arguments = [_CppGenerator._cpp_type(argument) for argument in type_name.arguments]
             if type_name.name == "Option":
@@ -276,6 +278,9 @@ class _CppGenerator:
             IRType.HTTP_HEADERS: "std::shared_ptr<tyvera_runtime::HttpHeaders>",
             IRType.HTTP_REQUEST: "std::shared_ptr<tyvera_runtime::HttpRequest>",
             IRType.HTTP_RESPONSE: "std::shared_ptr<tyvera_runtime::HttpResponse>",
+            IRType.RESTART_POLICY: "tyvera_runtime::RestartPolicy",
+            IRType.SUPERVISOR_BACKOFF: "tyvera_runtime::SupervisorBackoff",
+            IRType.SUPERVISOR: "std::shared_ptr<tyvera_runtime::Supervisor>",
             IRType.TLS_CONNECTION: "std::shared_ptr<tyvera_runtime::TlsConnection>",
             IRType.DURATION: "tyvera_runtime::Duration",
             IRType.BYTES: "std::vector<std::uint8_t>",
@@ -625,6 +630,13 @@ class _CppGenerator:
             raise ValueError(f"unsupported variant constructor for {ir_type_name(expression.type)}")
         if isinstance(expression, IRBuiltinCall):
             runtime_functions = {
+                "oneForOne": "supervisor_one_for_one",
+                "oneForAll": "supervisor_one_for_all",
+                "restForOne": "supervisor_rest_for_one",
+                "permanentChildPolicy": "permanent_child_policy",
+                "transientChildPolicy": "transient_child_policy",
+                "temporaryChildPolicy": "temporary_child_policy",
+                "exponentialBackoff": "exponential_backoff",
                 "hostOS": "host_os",
                 "hostArchitecture": "host_architecture",
                 "monotonicMilliseconds": "monotonic_milliseconds",
@@ -671,7 +683,10 @@ class _CppGenerator:
                 keyword = "auto" if _ir_contains_resource(argument.type) else "const auto"
                 lines.append(f"    {keyword} {name} = {self._expression(argument)};")
             values = list(temporaries)
-            if expression.builtin in {"byteFromInt", "byteBuffer", "seconds"}:
+            if expression.builtin in {
+                "byteFromInt", "byteBuffer", "seconds", "oneForOne", "oneForAll",
+                "restForOne", "exponentialBackoff",
+            }:
                 values.append(_location_args(expression.location))
             elif expression.builtin == "openText":
                 values.extend([_cpp_string_literal("TextFile"), _location_args(expression.location)])
@@ -708,6 +723,17 @@ class _CppGenerator:
                 lines.append("        tyvera_runtime::actor_initialization_failed(tyv_actor);")
                 lines.append("        throw;")
                 lines.append("    }")
+            if expression.restartable:
+                weak_actor = self._new_temporary()
+                lines.append(f"    const std::weak_ptr<{actor_type}> {weak_actor} = tyv_actor;")
+                captures = [weak_actor, *temporaries]
+                capture_list = ", ".join(captures)
+                lines.append(f"    tyv_actor->tyv_restart = [{capture_list}]() {{")
+                lines.append(f"        auto target = {weak_actor}.lock();")
+                lines.append("        if (!target) throw std::runtime_error(\"supervised actor expired\");")
+                if expression.initializer_symbol is not None:
+                    lines.append(f"        target->{expression.initializer_symbol}({', '.join(temporaries)});")
+                lines.append("    };")
             lines.append("    tyvera_runtime::actor_started(tyv_actor);")
             lines.append("    return std::static_pointer_cast<tyvera_runtime::ActorBase>(std::move(tyv_actor));")
             lines.append("}())")
@@ -842,7 +868,21 @@ class _CppGenerator:
             if method == "isAlive":
                 return f"tyvera_runtime::actor_is_alive({receiver})"
             if method == "stop":
-                return f"tyvera_runtime::actor_stop({receiver})"
+                return f"tyvera_runtime::actor_stop({receiver}, {_location_args(expression.location)})"
+        if expression.receiver.type == IRType.SUPERVISOR:
+            if method == "isAlive":
+                return f"tyvera_runtime::supervisor_is_alive({receiver})"
+            if method == "stop":
+                return f"tyvera_runtime::supervisor_stop({receiver}, {_location_args(expression.location)})"
+            if method == "start":
+                child_type = expression.arguments[0].type
+                policy = (arguments[1] if len(arguments) == 2
+                          else "tyvera_runtime::RestartPolicy::permanent")
+                if isinstance(child_type, IRActorRefType):
+                    return (f"tyvera_runtime::supervisor_start_actor({receiver}, {arguments[0]}, {policy}, "
+                            f"{_location_args(expression.location)})")
+                return (f"tyvera_runtime::supervisor_start_nested({receiver}, {arguments[0]}, {policy}, "
+                        f"{_location_args(expression.location)})")
         if isinstance(expression.receiver.type, IRAppliedType) and expression.receiver.type.name == "Task":
             if method == "withTimeout":
                 move_result = "true" if _ir_contains_resource(expression.type) else "false"
@@ -2197,18 +2237,59 @@ template <typename T> inline StringResult<T> result_ok(T value) {
 template <typename T> inline StringResult<T> result_error(std::string message) {
     return StringResult<T>{std::in_place_index<1>, std::move(message)};
 }
+enum class RestartStrategy { one_for_one, one_for_all, rest_for_one };
+enum class RestartPolicy { permanent, transient, temporary };
+struct SupervisorBackoff {
+    std::int64_t base_milliseconds = 0;
+    std::int64_t maximum_milliseconds = 0;
+};
+struct Supervisor;
 struct ActorBase : std::enable_shared_from_this<ActorBase> {
     std::string actor_name;
     std::string status = "starting";
     std::deque<std::function<void()>> mailbox;
     bool queued = false;
+    std::function<void()> tyv_restart;
+    std::weak_ptr<Supervisor> supervisor;
+    RestartPolicy restart_policy = RestartPolicy::permanent;
     virtual void tyv_clear_state() noexcept {}
     virtual ~ActorBase() = default;
 };
+struct SupervisorChild {
+    std::shared_ptr<ActorBase> actor;
+    std::shared_ptr<Supervisor> supervisor;
+    RestartPolicy policy = RestartPolicy::permanent;
+};
+struct Supervisor : std::enable_shared_from_this<Supervisor> {
+    RestartStrategy strategy = RestartStrategy::one_for_one;
+    std::int64_t max_restarts = 0;
+    std::int64_t window_milliseconds = 0;
+    std::optional<SupervisorBackoff> backoff;
+    std::string status = "alive";
+    std::weak_ptr<Supervisor> parent;
+    RestartPolicy restart_policy = RestartPolicy::permanent;
+    std::vector<SupervisorChild> children;
+    std::deque<std::chrono::steady_clock::time_point> restart_times;
+};
+struct PendingSupervisorRestart {
+    std::shared_ptr<Supervisor> owner;
+    std::vector<SupervisorChild> children;
+    std::shared_ptr<ActorBase> trigger_actor;
+    std::shared_ptr<Supervisor> trigger_supervisor;
+    std::string failure;
+    std::string file;
+    int line = 1;
+    int column = 1;
+    std::chrono::steady_clock::time_point due;
+};
 struct ActorRuntimeState {
     std::mutex mutex;
+    std::recursive_mutex supervision_mutex;
+    std::condition_variable changed;
     std::deque<std::shared_ptr<ActorBase>> ready;
     std::vector<std::shared_ptr<ActorBase>> actors;
+    std::vector<std::shared_ptr<Supervisor>> supervisors;
+    std::vector<PendingSupervisorRestart> pending_restarts;
 };
 inline ActorRuntimeState& actor_runtime_state() {
     static ActorRuntimeState state;
@@ -2229,6 +2310,382 @@ inline void remove_ready_actor_locked(ActorRuntimeState& state, const ActorBase*
     state.ready.erase(std::remove_if(state.ready.begin(), state.ready.end(), [actor](const auto& candidate) {
         return candidate.get() == actor;
     }), state.ready.end());
+}
+inline SupervisorBackoff exponential_backoff(
+    std::int64_t base, std::int64_t maximum, const std::string& file, int line, int column) {
+    if (base <= 0 || maximum < base)
+        fail(file, line, column, "exponentialBackoff requires 0 < baseMilliseconds <= maximumMilliseconds");
+    return SupervisorBackoff{base, maximum};
+}
+inline RestartPolicy permanent_child_policy() noexcept { return RestartPolicy::permanent; }
+inline RestartPolicy transient_child_policy() noexcept { return RestartPolicy::transient; }
+inline RestartPolicy temporary_child_policy() noexcept { return RestartPolicy::temporary; }
+inline std::shared_ptr<Supervisor> supervisor_create(
+    RestartStrategy strategy, std::int64_t max_restarts, std::int64_t window_milliseconds,
+    std::optional<SupervisorBackoff> backoff, const std::string& file, int line, int column) {
+    if (max_restarts < 0 || max_restarts > 1000)
+        fail(file, line, column, "supervisor maxRestarts must be between zero and 1000");
+    if (window_milliseconds <= 0)
+        fail(file, line, column, "supervisor windowMilliseconds must be greater than zero");
+    try {
+        auto supervisor = std::make_shared<Supervisor>();
+        supervisor->strategy = strategy;
+        supervisor->max_restarts = max_restarts;
+        supervisor->window_milliseconds = window_milliseconds;
+        supervisor->backoff = backoff;
+        auto& state = actor_runtime_state();
+        std::lock_guard<std::recursive_mutex> supervision_lock(state.supervision_mutex);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.supervisors.push_back(supervisor);
+        return supervisor;
+    } catch (const std::bad_alloc&) {
+        fail(file, line, column, "cannot allocate Supervisor state");
+    }
+    return {};
+}
+inline std::shared_ptr<Supervisor> supervisor_one_for_one(
+    std::int64_t maximum, std::int64_t window, const std::string& file, int line, int column) {
+    return supervisor_create(RestartStrategy::one_for_one, maximum, window, {}, file, line, column);
+}
+inline std::shared_ptr<Supervisor> supervisor_one_for_one(
+    std::int64_t maximum, std::int64_t window, SupervisorBackoff backoff,
+    const std::string& file, int line, int column) {
+    return supervisor_create(RestartStrategy::one_for_one, maximum, window, backoff, file, line, column);
+}
+inline std::shared_ptr<Supervisor> supervisor_one_for_all(
+    std::int64_t maximum, std::int64_t window, const std::string& file, int line, int column) {
+    return supervisor_create(RestartStrategy::one_for_all, maximum, window, {}, file, line, column);
+}
+inline std::shared_ptr<Supervisor> supervisor_one_for_all(
+    std::int64_t maximum, std::int64_t window, SupervisorBackoff backoff,
+    const std::string& file, int line, int column) {
+    return supervisor_create(RestartStrategy::one_for_all, maximum, window, backoff, file, line, column);
+}
+inline std::shared_ptr<Supervisor> supervisor_rest_for_one(
+    std::int64_t maximum, std::int64_t window, const std::string& file, int line, int column) {
+    return supervisor_create(RestartStrategy::rest_for_one, maximum, window, {}, file, line, column);
+}
+inline std::shared_ptr<Supervisor> supervisor_rest_for_one(
+    std::int64_t maximum, std::int64_t window, SupervisorBackoff backoff,
+    const std::string& file, int line, int column) {
+    return supervisor_create(RestartStrategy::rest_for_one, maximum, window, backoff, file, line, column);
+}
+inline bool supervisor_is_alive(const std::shared_ptr<Supervisor>& supervisor) noexcept {
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::recursive_mutex> lock(state.supervision_mutex);
+    return supervisor && supervisor->status == "alive";
+}
+inline void stop_actor_for_supervisor(const std::shared_ptr<ActorBase>& actor) noexcept {
+    if (!actor) return;
+    {
+        auto& state = actor_runtime_state();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        actor->status = "stopped";
+        actor->mailbox.clear();
+        actor->queued = false;
+        remove_ready_actor_locked(state, actor.get());
+    }
+    actor->tyv_clear_state();
+    actor_runtime_state().changed.notify_all();
+}
+inline void stop_supervisor_children(const std::shared_ptr<Supervisor>& supervisor) noexcept;
+inline void stop_supervisor_tree(const std::shared_ptr<Supervisor>& supervisor) noexcept {
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::recursive_mutex> lock(state.supervision_mutex);
+    if (!supervisor || supervisor->status == "stopped") return;
+    state.pending_restarts.erase(std::remove_if(
+        state.pending_restarts.begin(), state.pending_restarts.end(),
+        [&supervisor](const PendingSupervisorRestart& pending) { return pending.owner == supervisor; }),
+        state.pending_restarts.end());
+    stop_supervisor_children(supervisor);
+    supervisor->status = "stopped";
+}
+inline void stop_supervisor_children(const std::shared_ptr<Supervisor>& supervisor) noexcept {
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::recursive_mutex> lock(state.supervision_mutex);
+    if (!supervisor) return;
+    for (auto child = supervisor->children.rbegin(); child != supervisor->children.rend(); ++child) {
+        if (child->actor) stop_actor_for_supervisor(child->actor);
+        else stop_supervisor_tree(child->supervisor);
+    }
+}
+inline std::string restart_actor_for_supervisor(
+    const std::shared_ptr<ActorBase>& actor, const std::string& file, int line, int column) {
+    auto& actor_state = actor_runtime_state();
+    std::lock_guard<std::recursive_mutex> supervision_lock(actor_state.supervision_mutex);
+    if (!actor || !actor->tyv_restart)
+        return "native supervised actor has no restart initializer";
+    {
+        auto& state = actor_runtime_state();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        actor->status = "restarting";
+        actor->mailbox.clear();
+        actor->queued = false;
+        remove_ready_actor_locked(state, actor.get());
+    }
+    actor->tyv_clear_state();
+    try {
+        check_shutdown(file, line, column);
+        actor->tyv_restart();
+        auto& state = actor_runtime_state();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        actor->status = "alive";
+        return {};
+    } catch (const SignalShutdown&) {
+        throw;
+    } catch (const Failure& error) {
+        auto& state = actor_runtime_state();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        actor->status = "crashed";
+        return "actor '" + actor->actor_name + "' crashed at " + error.file + ":" +
+            std::to_string(error.line) + ":" + std::to_string(error.column) + ": " + error.message;
+    } catch (...) {
+        auto& state = actor_runtime_state();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        actor->status = "crashed";
+        return "actor '" + actor->actor_name + "' crashed: native runtime failure";
+    }
+}
+inline std::string restart_supervisor_tree(
+    const std::shared_ptr<Supervisor>& supervisor, const std::string& file, int line, int column) {
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::recursive_mutex> lock(state.supervision_mutex);
+    if (!supervisor) return "native nested Supervisor is unavailable";
+    supervisor->status = "alive";
+    supervisor->restart_times.clear();
+    stop_supervisor_children(supervisor);
+    for (const auto& child : supervisor->children) {
+        if (child.policy == RestartPolicy::temporary) continue;
+        std::string failure;
+        if (child.actor) failure = restart_actor_for_supervisor(child.actor, file, line, column);
+        else if (child.supervisor) failure = restart_supervisor_tree(child.supervisor, file, line, column);
+        if (!failure.empty()) return failure;
+    }
+    return {};
+}
+inline std::string supervisor_handle_failure(
+    const std::shared_ptr<Supervisor>& supervisor, const std::shared_ptr<ActorBase>& actor,
+    const std::shared_ptr<Supervisor>& nested, const std::string& failure, bool normal_stop,
+    const std::string& file, int line, int column) {
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::recursive_mutex> lock(state.supervision_mutex);
+    if (!supervisor || supervisor->status != "alive") return failure;
+    const auto found = std::find_if(supervisor->children.begin(), supervisor->children.end(),
+        [&actor, &nested](const SupervisorChild& child) {
+            return actor ? child.actor == actor : child.supervisor == nested;
+        });
+    if (found == supervisor->children.end()) return failure;
+    const auto policy = found->policy;
+    if (normal_stop && policy != RestartPolicy::permanent) return {};
+    if (!normal_stop && policy == RestartPolicy::temporary) return failure;
+    const auto index = static_cast<std::size_t>(std::distance(supervisor->children.begin(), found));
+    std::size_t begin = index;
+    std::size_t end = index + 1;
+    if (supervisor->strategy == RestartStrategy::one_for_all) {
+        begin = 0;
+        end = supervisor->children.size();
+    } else if (supervisor->strategy == RestartStrategy::rest_for_one) {
+        end = supervisor->children.size();
+    }
+    for (std::size_t current = end; current > begin; --current) {
+        const auto& child = supervisor->children[current - 1];
+        if (child.actor) stop_actor_for_supervisor(child.actor);
+        else stop_supervisor_tree(child.supervisor);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto window = std::chrono::milliseconds(supervisor->window_milliseconds);
+    while (!supervisor->restart_times.empty() && now - supervisor->restart_times.front() > window)
+        supervisor->restart_times.pop_front();
+    if (static_cast<std::int64_t>(supervisor->restart_times.size()) >= supervisor->max_restarts) {
+        const std::string label = actor ? actor->actor_name : "Supervisor";
+        const std::string escalation = "supervisor restart limit exceeded for actor '" + label +
+            "' within " + std::to_string(supervisor->window_milliseconds) + "ms: " + failure;
+        supervisor->status = "failed";
+        state.pending_restarts.erase(std::remove_if(
+            state.pending_restarts.begin(), state.pending_restarts.end(),
+            [&supervisor](const PendingSupervisorRestart& pending) { return pending.owner == supervisor; }),
+            state.pending_restarts.end());
+        stop_supervisor_children(supervisor);
+        const auto parent = supervisor->parent.lock();
+        if (parent) return supervisor_handle_failure(parent, {}, supervisor, escalation, false, file, line, column);
+        return escalation;
+    }
+    supervisor->restart_times.push_back(now);
+    if (supervisor->backoff) {
+        std::int64_t delay = supervisor->backoff->base_milliseconds;
+        for (std::size_t count = 1; count < supervisor->restart_times.size(); ++count) {
+            if (delay >= supervisor->backoff->maximum_milliseconds - delay) {
+                delay = supervisor->backoff->maximum_milliseconds;
+                break;
+            }
+            delay *= 2;
+        }
+        delay = std::min(delay, supervisor->backoff->maximum_milliseconds);
+        if (delay > 0) {
+            std::vector<SupervisorChild> affected(
+                supervisor->children.begin() + static_cast<std::ptrdiff_t>(begin),
+                supervisor->children.begin() + static_cast<std::ptrdiff_t>(end));
+            for (const auto& child : affected) {
+                if (child.supervisor) child.supervisor->status = "restarting";
+            }
+            {
+                std::lock_guard<std::mutex> actor_lock(state.mutex);
+                for (const auto& child : affected)
+                    if (child.actor) child.actor->status = "restarting";
+            }
+            state.pending_restarts.push_back(PendingSupervisorRestart{
+                supervisor, std::move(affected), actor, nested, failure, file, line, column,
+                now + std::chrono::milliseconds(delay),
+            });
+            state.changed.notify_all();
+            return {};
+        }
+    }
+    for (std::size_t current = begin; current < end; ++current) {
+        const auto& child = supervisor->children[current];
+        if (child.policy == RestartPolicy::temporary) continue;
+        std::string restart_failure;
+        if (child.actor) restart_failure = restart_actor_for_supervisor(child.actor, file, line, column);
+        else if (child.supervisor)
+            restart_failure = restart_supervisor_tree(child.supervisor, file, line, column);
+        if (!restart_failure.empty())
+            return supervisor_handle_failure(supervisor, actor, nested, restart_failure, false, file, line, column);
+    }
+    return {};
+}
+inline std::optional<std::string> settle_due_supervisor_restarts() {
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::recursive_mutex> lock(state.supervision_mutex);
+    bool settled_any = false;
+    while (!state.pending_restarts.empty()) {
+        const auto next = std::min_element(state.pending_restarts.begin(), state.pending_restarts.end(),
+            [](const auto& left, const auto& right) { return left.due < right.due; });
+        if (next->due > std::chrono::steady_clock::now()) break;
+        PendingSupervisorRestart pending = std::move(*next);
+        state.pending_restarts.erase(next);
+        settled_any = true;
+        if (!pending.owner || pending.owner->status != "alive") continue;
+        std::string restart_failure;
+        for (const auto& child : pending.children) {
+            if (child.policy == RestartPolicy::temporary) continue;
+            if (child.actor)
+                restart_failure = restart_actor_for_supervisor(
+                    child.actor, pending.file, pending.line, pending.column);
+            else if (child.supervisor)
+                restart_failure = restart_supervisor_tree(
+                    child.supervisor, pending.file, pending.line, pending.column);
+            if (!restart_failure.empty()) break;
+        }
+        if (!restart_failure.empty()) {
+            const auto error = supervisor_handle_failure(
+                pending.owner, pending.trigger_actor, pending.trigger_supervisor,
+                restart_failure, false, pending.file, pending.line, pending.column);
+            if (!error.empty()) return error;
+        }
+    }
+    if (settled_any) return std::string{};
+    return std::nullopt;
+}
+inline bool wait_for_actor_or_restart(
+    const std::string& file, int line, int column, bool wait_for_pending = true) {
+    auto& state = actor_runtime_state();
+    std::unique_lock<std::recursive_mutex> supervision_lock(state.supervision_mutex);
+    if (!state.pending_restarts.empty()) {
+        if (!wait_for_pending) {
+            std::lock_guard<std::mutex> actor_lock(state.mutex);
+            return !state.ready.empty();
+        }
+        const auto next = std::min_element(state.pending_restarts.begin(), state.pending_restarts.end(),
+            [](const auto& left, const auto& right) { return left.due < right.due; });
+        auto wake_at = std::min(next->due, std::chrono::steady_clock::now() + std::chrono::milliseconds(100));
+        std::unique_lock<std::mutex> actor_lock(state.mutex);
+        if (state.ready.empty()) {
+            state.changed.wait_until(actor_lock, wake_at, [&state]() {
+                return !state.ready.empty() || requested_shutdown_signal != 0;
+            });
+        }
+        actor_lock.unlock();
+        supervision_lock.unlock();
+        check_shutdown(file, line, column);
+        return true;
+    }
+    std::lock_guard<std::mutex> actor_lock(state.mutex);
+    return !state.ready.empty();
+}
+inline bool actor_messages_ready() {
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return !state.ready.empty();
+}
+inline std::optional<std::chrono::steady_clock::time_point> next_supervisor_restart_deadline() {
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::recursive_mutex> lock(state.supervision_mutex);
+    if (state.pending_restarts.empty()) return std::nullopt;
+    const auto next = std::min_element(state.pending_restarts.begin(), state.pending_restarts.end(),
+        [](const auto& left, const auto& right) { return left.due < right.due; });
+    return next->due;
+}
+inline std::shared_ptr<ActorBase> supervisor_start_actor(
+    const std::shared_ptr<Supervisor>& supervisor, const std::shared_ptr<ActorBase>& actor,
+    RestartPolicy policy, const std::string& file, int line, int column) {
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::recursive_mutex> supervision_lock(state.supervision_mutex);
+    if (!supervisor || supervisor->status != "alive")
+        fail(file, line, column, "cannot start a child on an inactive supervisor");
+    std::lock_guard<std::mutex> actor_lock(state.mutex);
+    if (!actor || actor->status != "alive" || actor->supervisor.lock() || !actor->tyv_restart)
+        fail(file, line, column, "native Supervisor.start requires a fresh restartable actor");
+    actor->supervisor = supervisor;
+    actor->restart_policy = policy;
+    supervisor->children.push_back(SupervisorChild{actor, {}, policy});
+    return actor;
+}
+inline std::shared_ptr<Supervisor> supervisor_start_nested(
+    const std::shared_ptr<Supervisor>& supervisor, const std::shared_ptr<Supervisor>& child,
+    RestartPolicy policy, const std::string& file, int line, int column) {
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::recursive_mutex> lock(state.supervision_mutex);
+    if (!supervisor || supervisor->status != "alive")
+        fail(file, line, column, "cannot start a child on an inactive supervisor");
+    if (!child || child == supervisor || child->status != "alive" || !child->parent.expired())
+        fail(file, line, column, "a Supervisor child must be a distinct, unowned supervisor");
+    for (auto ancestor = supervisor; ancestor; ancestor = ancestor->parent.lock())
+        if (ancestor == child) fail(file, line, column, "Supervisor trees cannot contain cycles");
+    child->parent = supervisor;
+    child->restart_policy = policy;
+    supervisor->children.push_back(SupervisorChild{{}, child, policy});
+    return child;
+}
+inline std::string supervisor_actor_stopped(
+    const std::shared_ptr<ActorBase>& actor, const std::string& file, int line, int column) {
+    if (!actor) return {};
+    const auto supervisor = actor->supervisor.lock();
+    if (!supervisor) return {};
+    return supervisor_handle_failure(supervisor, actor, {}, "actor stopped normally", true, file, line, column);
+}
+inline std::string supervisor_actor_failed(
+    const std::shared_ptr<ActorBase>& actor, const std::string& failure,
+    const std::string& file, int line, int column) {
+    if (!actor) return failure;
+    const auto supervisor = actor->supervisor.lock();
+    if (!supervisor) return failure;
+    return supervisor_handle_failure(supervisor, actor, {}, failure, false, file, line, column);
+}
+inline std::string supervisor_stopped(
+    const std::shared_ptr<Supervisor>& child, const std::string& file, int line, int column) {
+    if (!child) return {};
+    const auto parent = child->parent.lock();
+    if (!parent) return {};
+    return supervisor_handle_failure(parent, {}, child, "nested supervisor stopped normally", true, file, line, column);
+}
+inline void supervisor_stop(
+    const std::shared_ptr<Supervisor>& supervisor, const std::string& file, int line, int column) {
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::recursive_mutex> lock(state.supervision_mutex);
+    if (!supervisor || supervisor->status != "alive") return;
+    stop_supervisor_tree(supervisor);
+    const auto failure = supervisor_stopped(supervisor, file, line, column);
+    if (!failure.empty()) fail(file, line, column, failure);
 }
 template <typename T> inline std::shared_ptr<T> spawn_actor(
     std::string actor_name, const std::string& file, int line, int column) {
@@ -2287,6 +2744,7 @@ inline void enqueue_actor(
         }
     }
     native_scheduler().changed.notify_all();
+    actor_runtime_state().changed.notify_all();
 }
 inline bool actor_is_alive(const std::shared_ptr<ActorBase>& actor) noexcept {
     if (!actor) return false;
@@ -2294,42 +2752,83 @@ inline bool actor_is_alive(const std::shared_ptr<ActorBase>& actor) noexcept {
     std::lock_guard<std::mutex> lock(state.mutex);
     return actor->status == "alive";
 }
-inline bool actor_stop(const std::shared_ptr<ActorBase>& actor) noexcept {
+inline bool actor_stop(
+    const std::shared_ptr<ActorBase>& actor, const std::string& file, int line, int column) {
     if (!actor) return false;
-    auto& state = actor_runtime_state();
-    std::lock_guard<std::mutex> lock(state.mutex);
-    if (actor->status != "alive") return false;
-    actor->status = "stopped";
-    actor->mailbox.clear();
-    actor->queued = false;
-    remove_ready_actor_locked(state, actor.get());
+    {
+        auto& state = actor_runtime_state();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (actor->status != "alive") return false;
+        actor->status = "stopped";
+        actor->mailbox.clear();
+        actor->queued = false;
+        remove_ready_actor_locked(state, actor.get());
+    }
+    actor_runtime_state().changed.notify_all();
+    actor->tyv_clear_state();
+    const auto failure = supervisor_actor_stopped(actor, file, line, column);
+    if (!failure.empty()) fail(file, line, column, failure);
     return true;
 }
 inline std::string actor_crash_message(const ActorBase& actor, const Failure& error) {
     return "actor '" + actor.actor_name + "' crashed at " + error.file + ":" +
         std::to_string(error.line) + ":" + std::to_string(error.column) + ": " + error.message;
 }
-inline StringResult<std::int64_t> run_actors(
+inline void mark_actor_crashed(const std::shared_ptr<ActorBase>& actor) noexcept {
+    if (!actor) return;
+    {
+        auto& state = actor_runtime_state();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (actor->status != "alive") return;
+        actor->status = "crashed";
+        actor->mailbox.clear();
+        actor->queued = false;
+        remove_ready_actor_locked(state, actor.get());
+    }
+    actor->tyv_clear_state();
+}
+inline std::string apply_actor_failure(
+    const std::shared_ptr<ActorBase>& actor, const std::string& failure,
     const std::string& file, int line, int column) {
+    if (!actor) return failure;
+    const auto supervisor = actor->supervisor.lock();
+    if (!supervisor) return failure;
+    return supervisor_handle_failure(supervisor, actor, {}, failure, false, file, line, column);
+}
+inline StringResult<std::int64_t> run_actors(
+    const std::string& file, int line, int column, bool wait_for_pending = true) {
     if (actor_handler_active())
         throw Failure(file, line, column, "runActors cannot be called from an actor message handler");
     std::int64_t processed = 0;
     std::string first_crash;
     while (processed < MAX_ACTOR_DELIVERIES) {
         check_shutdown(file, line, column);
+        const auto settled = settle_due_supervisor_restarts();
+        if (settled && !settled->empty() && first_crash.empty()) first_crash = *settled;
         std::shared_ptr<ActorBase> actor;
         std::function<void()> message;
-        {
+        for (;;) {
             auto& state = actor_runtime_state();
-            std::lock_guard<std::mutex> lock(state.mutex);
-            if (state.ready.empty()) break;
-            actor = std::move(state.ready.front());
-            state.ready.pop_front();
-            actor->queued = false;
-            if (actor->status != "alive" || actor->mailbox.empty()) continue;
-            message = std::move(actor->mailbox.front());
-            actor->mailbox.pop_front();
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                if (!state.ready.empty()) {
+                    actor = std::move(state.ready.front());
+                    state.ready.pop_front();
+                    actor->queued = false;
+                    if (actor->status == "alive" && !actor->mailbox.empty()) {
+                        message = std::move(actor->mailbox.front());
+                        actor->mailbox.pop_front();
+                    }
+                }
+            }
+            if (actor) {
+                if (message) break;
+                actor.reset();
+                continue;
+            }
+            if (!wait_for_actor_or_restart(file, line, column, wait_for_pending)) break;
         }
+        if (!actor) break;
         ++processed;
         try {
             ActorHandlerScope handler_scope;
@@ -2337,36 +2836,45 @@ inline StringResult<std::int64_t> run_actors(
         } catch (const SignalShutdown&) {
             throw;
         } catch (const Failure& error) {
-            auto& state = actor_runtime_state();
-            std::lock_guard<std::mutex> lock(state.mutex);
-            if (actor->status == "alive") {
-                actor->status = "crashed";
-                actor->mailbox.clear();
-                actor->queued = false;
-                remove_ready_actor_locked(state, actor.get());
-                if (first_crash.empty()) first_crash = actor_crash_message(*actor, error);
+            bool was_alive = false;
+            {
+                auto& state = actor_runtime_state();
+                std::lock_guard<std::mutex> lock(state.mutex);
+                was_alive = actor->status == "alive";
+            }
+            if (was_alive) {
+                mark_actor_crashed(actor);
+                const auto failure = apply_actor_failure(
+                    actor, actor_crash_message(*actor, error), error.file, error.line, error.column);
+                if (first_crash.empty() && !failure.empty()) first_crash = failure;
             }
         } catch (const std::exception&) {
-            auto& state = actor_runtime_state();
-            std::lock_guard<std::mutex> lock(state.mutex);
-            if (actor->status == "alive") {
-                actor->status = "crashed";
-                actor->mailbox.clear();
-                actor->queued = false;
-                remove_ready_actor_locked(state, actor.get());
-                if (first_crash.empty())
-                    first_crash = "actor '" + actor->actor_name + "' crashed: native runtime failure";
+            bool was_alive = false;
+            {
+                auto& state = actor_runtime_state();
+                std::lock_guard<std::mutex> lock(state.mutex);
+                was_alive = actor->status == "alive";
+            }
+            if (was_alive) {
+                mark_actor_crashed(actor);
+                const auto failure = apply_actor_failure(
+                    actor, "actor '" + actor->actor_name + "' crashed: native runtime failure",
+                    "<native>", 1, 1);
+                if (first_crash.empty() && !failure.empty()) first_crash = failure;
             }
         } catch (...) {
-            auto& state = actor_runtime_state();
-            std::lock_guard<std::mutex> lock(state.mutex);
-            if (actor->status == "alive") {
-                actor->status = "crashed";
-                actor->mailbox.clear();
-                actor->queued = false;
-                remove_ready_actor_locked(state, actor.get());
-                if (first_crash.empty())
-                    first_crash = "actor '" + actor->actor_name + "' crashed: native runtime failure";
+            bool was_alive = false;
+            {
+                auto& state = actor_runtime_state();
+                std::lock_guard<std::mutex> lock(state.mutex);
+                was_alive = actor->status == "alive";
+            }
+            if (was_alive) {
+                mark_actor_crashed(actor);
+                const auto failure = apply_actor_failure(
+                    actor, "actor '" + actor->actor_name + "' crashed: native runtime failure",
+                    "<native>", 1, 1);
+                if (first_crash.empty() && !failure.empty()) first_crash = failure;
             }
         }
         {
@@ -2396,15 +2904,24 @@ inline StringResult<std::int64_t> run_actors(
 }
 inline void shutdown_actors() noexcept {
     auto& state = actor_runtime_state();
+    std::lock_guard<std::recursive_mutex> supervision_lock(state.supervision_mutex);
     std::lock_guard<std::mutex> lock(state.mutex);
+    for (auto supervisor = state.supervisors.rbegin(); supervisor != state.supervisors.rend(); ++supervisor) {
+        (*supervisor)->status = "stopped";
+        (*supervisor)->children.clear();
+    }
     for (auto actor = state.actors.rbegin(); actor != state.actors.rend(); ++actor) {
         (*actor)->status = "stopped";
         (*actor)->mailbox.clear();
         (*actor)->queued = false;
+        (*actor)->tyv_restart = {};
     }
-    for (const auto& actor : state.actors) actor->tyv_clear_state();
+    for (auto actor = state.actors.rbegin(); actor != state.actors.rend(); ++actor)
+        (*actor)->tyv_clear_state();
     state.ready.clear();
+    state.pending_restarts.clear();
     state.actors.clear();
+    state.supervisors.clear();
 }
 struct ActorRuntimeScope {
     ~ActorRuntimeScope() { shutdown_actors(); }

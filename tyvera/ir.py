@@ -41,6 +41,9 @@ class IRType(str, Enum):
     HTTP_REQUEST = "HttpRequest"
     HTTP_RESPONSE = "HttpResponse"
     ACTOR_REF = "ActorRef"
+    SUPERVISOR = "Supervisor"
+    RESTART_POLICY = "RestartPolicy"
+    SUPERVISOR_BACKOFF = "SupervisorBackoff"
     VOID = "Void"
 
 
@@ -195,6 +198,7 @@ class IRActorSpawn(IRExpression):
     arguments: tuple[IRExpression, ...]
     type: IRTypeRef
     location: Location
+    restartable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,8 +430,16 @@ def _contains_resource(type_ref: IRTypeRef) -> bool:
     return isinstance(type_ref, IRAppliedType) and any(_contains_resource(item) for item in type_ref.arguments)
 
 
+def _contains_task(type_ref: IRTypeRef) -> bool:
+    if isinstance(type_ref, IRAppliedType):
+        return type_ref.name == "Task" or any(_contains_task(item) for item in type_ref.arguments)
+    return False
+
+
 def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef, ...], IRTypeRef] | None:
     if isinstance(receiver, IRActorRefType):
+        return {"isAlive": ((), IRType.BOOL), "stop": ((), IRType.VOID)}.get(method)
+    if receiver == IRType.SUPERVISOR:
         return {"isAlive": ((), IRType.BOOL), "stop": ((), IRType.VOID)}.get(method)
     if isinstance(receiver, IRAppliedType) and receiver.name == "Task":
         signatures = {
@@ -668,6 +680,12 @@ def validate_ir(module: IRModule) -> None:
                 actor = actors.get(node.actor_name)
                 if actor is None or node.initializer_symbol != actor.initializer_symbol:
                     raise _invalid(node.location, f"IR spawn refers to unknown actor '{node.actor_name}'")
+                if node.restartable and any(
+                    _contains_resource(field.type)
+                    or _contains_task(field.type)
+                    for field in actor.fields
+                ):
+                    raise _invalid(node.location, "native supervised actors cannot own Resources or Tasks")
             if isinstance(node, IRActorSend):
                 actor = actors.get(node.actor_name)
                 if actor is None or (node.handler_symbol not in dict(actor.handler_symbols).values()):
@@ -814,6 +832,7 @@ def _validate_expression(
     if isinstance(expression, IRActorSpawn):
         if not isinstance(expression.type, IRActorRefType) or expression.type.actor_name != expression.actor_name:
             raise _invalid(expression.location, "IR actor spawn result type does not match its actor")
+        actual = tuple(_validate_expression(argument, functions, scopes) for argument in expression.arguments)
         if expression.initializer_symbol is None:
             if expression.arguments:
                 raise _invalid(expression.location, "IR actor without an initializer cannot receive constructor arguments")
@@ -823,9 +842,13 @@ def _validate_expression(
                     or not initializer.actor_initializer):
                 raise _invalid(expression.location, "IR actor spawn has no matching initializer")
             expected = tuple(parameter.type for parameter in initializer.parameters)
-            actual = tuple(_validate_expression(argument, functions, scopes) for argument in expression.arguments)
             if actual != expected:
                 raise _invalid(expression.location, "IR actor constructor arguments do not match its initializer")
+        if expression.restartable and any(
+            _contains_resource(argument_type) or _contains_task(argument_type)
+            for argument_type in actual
+        ):
+            raise _invalid(expression.location, "native supervised actors cannot receive Resources or Tasks")
         return expression.type
     if isinstance(expression, IRActorSend):
         receiver_type = _validate_expression(expression.receiver, functions, scopes)
@@ -903,6 +926,12 @@ def _validate_expression(
         return expression.type
     if isinstance(expression, IRBuiltinCall):
         argument_types = tuple(_validate_expression(argument, functions, scopes) for argument in expression.arguments)
+        if expression.builtin in {"oneForOne", "oneForAll", "restForOne"}:
+            expected = ((IRType.INT, IRType.INT) if len(argument_types) == 2 else
+                        (IRType.INT, IRType.INT, IRType.SUPERVISOR_BACKOFF))
+            if argument_types != expected or expression.type != IRType.SUPERVISOR:
+                raise _invalid(expression.location, "invalid native Supervisor strategy constructor")
+            return expression.type
         signatures: dict[str, tuple[tuple[IRTypeRef, ...], IRTypeRef]] = {
             "hostOS": ((), IRType.STRING),
             "hostArchitecture": ((), IRType.STRING),
@@ -924,6 +953,13 @@ def _validate_expression(
             "openTextWriter": ((IRType.STRING, IRType.STRING), _applied("Result", IRType.TEXT_WRITER, IRType.STRING)),
             "runTasks": ((), _applied("Result", IRType.INT, IRType.STRING)),
             "runActors": ((), _applied("Result", IRType.INT, IRType.STRING)),
+            "oneForOne": ((IRType.INT, IRType.INT), IRType.SUPERVISOR),
+            "oneForAll": ((IRType.INT, IRType.INT), IRType.SUPERVISOR),
+            "restForOne": ((IRType.INT, IRType.INT), IRType.SUPERVISOR),
+            "permanentChildPolicy": ((), IRType.RESTART_POLICY),
+            "transientChildPolicy": ((), IRType.RESTART_POLICY),
+            "temporaryChildPolicy": ((), IRType.RESTART_POLICY),
+            "exponentialBackoff": ((IRType.INT, IRType.INT), IRType.SUPERVISOR_BACKOFF),
             "resolveHost": ((IRType.STRING, IRType.INT), _applied("Task", _applied("Result", _applied("List", IRType.SOCKET_ADDRESS), IRType.STRING))),
             "tcpConnect": ((IRType.STRING, IRType.INT), _applied("Task", _applied("Result", IRType.TCP_CONNECTION, IRType.STRING))),
             "tlsConnect": ((IRType.STRING, IRType.INT), _applied("Task", _applied("Result", IRType.TLS_CONNECTION, IRType.STRING))),
@@ -974,6 +1010,22 @@ def _validate_expression(
         return expression.type
     if isinstance(expression, IRMethodCall):
         receiver_type = _validate_expression(expression.receiver, functions, scopes)
+        if receiver_type == IRType.SUPERVISOR and expression.method == "start":
+            if len(expression.arguments) not in {1, 2}:
+                raise _invalid(expression.location, "IR Supervisor.start has the wrong number of arguments")
+            child_type = _validate_expression(expression.arguments[0], functions, scopes)
+            if isinstance(child_type, IRActorRefType):
+                expected_result = child_type
+            elif child_type == IRType.SUPERVISOR:
+                expected_result = IRType.SUPERVISOR
+            else:
+                raise _invalid(expression.arguments[0].location, "IR Supervisor.start child must be an ActorRef or Supervisor")
+            if len(expression.arguments) == 2 and _validate_expression(
+                    expression.arguments[1], functions, scopes) != IRType.RESTART_POLICY:
+                raise _invalid(expression.arguments[1].location, "IR Supervisor.start policy must be RestartPolicy")
+            if expression.type != expected_result:
+                raise _invalid(expression.location, "IR Supervisor.start result type does not match its child")
+            return expression.type
         expected = _method_signature(receiver_type, expression.method)
         if expected is None:
             raise _invalid(expression.location, f"unsupported IR method '{expression.method}' on {ir_type_name(receiver_type)}")

@@ -147,6 +147,33 @@ fn main() { println(increment(4)) }
             self.assertEqual(call.type, IRType.INT)
             self.assertIn(call.function, {function.symbol for function in module.functions})
 
+    def test_linked_module_actor_lowers_without_discord_specific_handling(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-module-actor-") as temporary:
+            root = Path(temporary)
+            (root / "counter.tyv").write_text(
+                "pub actor Counter {\n"
+                "    var value: Int\n"
+                "    init(start: Int) { self.value = start }\n"
+                "    on report() { println(self.value) }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            entry = root / "main.tyv"
+            entry.write_text(
+                'import "counter.tyv" as counters\n'
+                'fn main() {\n'
+                '    let counter: ActorRef<counters.Counter> = spawn(counters.Counter(7))\n'
+                '    counter.report()\n'
+                '    let result = runActors()\n'
+                '}\n',
+                encoding="utf-8",
+            )
+            module = lower_checked_program(compile_checked_project(entry, root))
+            generated = emit_cpp(module)
+            self.assertEqual(module.actors[0].name, "counter.Counter")
+            self.assertIn("class tyv_actor_counter_x2e_Counter", generated)
+            self.assertIn("tyv_actor_counter_x2e_Counter", generated)
+
     def test_actor_spawn_state_and_mailbox_sends_lower_to_typed_ir(self) -> None:
         module = self.lower('''actor Counter {
     var value: Int
@@ -182,17 +209,19 @@ fn main() {
         self.assertEqual(caught.exception.stage, "backend")
         self.assertIn("request/reply and timers", caught.exception.message)
 
-    def test_supervisor_runtime_is_reported_as_an_explicit_native_boundary(self) -> None:
-        checked = compile_checked_source('''actor Worker { on work() {} }
+    def test_supervisor_strategy_and_child_start_lower_to_typed_ir(self) -> None:
+        module = self.lower('''actor Worker { on work() {} }
 fn main() {
-    let supervisor = oneForOne(2, 1000)
+    let supervisor = restForOne(2, 1000)
     let worker = supervisor.start(Worker())
 }
-''', "native_supervisor.tyv")
-        with self.assertRaises(Diagnostic) as caught:
-            lower_checked_program(checked)
-        self.assertEqual(caught.exception.stage, "backend")
-        self.assertIn("native Supervisor V2 runtime is not yet supported", caught.exception.message)
+''')
+        self.assertEqual(module.functions[0].body[0].value.type, IRType.SUPERVISOR)
+        start = module.functions[0].body[1].value
+        self.assertIsInstance(start, IRMethodCall)
+        self.assertEqual(start.receiver.type, IRType.SUPERVISOR)
+        self.assertIsInstance(start.arguments[0], IRActorSpawn)
+        self.assertTrue(start.arguments[0].restartable)
 
     def test_actor_owned_tasks_are_reported_as_an_explicit_native_boundary(self) -> None:
         checked = compile_checked_source('''async fn background() {}
@@ -656,6 +685,245 @@ fn main() {
             root = Path(temporary)
             reference = self._reference_result(source, root)
             native = self._native_source_result(source, root, root / "actors", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+
+    def test_native_imported_actor_matches_reference(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-imported-actor-") as temporary:
+            root = Path(temporary)
+            (root / "counter.tyv").write_text(
+                "pub actor Counter {\n"
+                "    var value: Int\n"
+                "    init(start: Int) { self.value = start }\n"
+                "    on report() { println(self.value) }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            source = root / "main.tyv"
+            source.write_text(
+                'import "counter.tyv" as counters\n'
+                'fn main() {\n'
+                '    let counter: ActorRef<counters.Counter> = spawn(counters.Counter(7))\n'
+                '    counter.report()\n'
+                '    match runActors() {\n'
+                '        Ok(count) => println(count)\n'
+                '        Err(reason) => println(reason)\n'
+                '    }\n'
+                '}\n',
+                encoding="utf-8",
+            )
+            checked = compile_checked_project(source, root)
+            reference_output = io.StringIO()
+            reference_errors = io.StringIO()
+            ReferenceInterpreterBackend().execute(
+                checked, output=reference_output, error_output=reference_errors,
+                project_root=root,
+            )
+            CppNativeBackend().build(
+                lower_checked_program(checked), root / "imported-actor", project_root=root,
+            )
+            environment = os.environ.copy()
+            environment.pop("PYTHONPATH", None)
+            environment.pop("PYTHONHOME", None)
+            if os.name != "nt":
+                environment["PATH"] = ""
+            native = subprocess.run(
+                [str(root / "imported-actor")], cwd=root, capture_output=True,
+                text=True, encoding="utf-8", env=environment, check=False,
+            )
+            self.assertEqual(
+                (native.returncode, native.stdout, native.stderr),
+                (0, reference_output.getvalue(), reference_errors.getvalue()),
+            )
+            self.assertEqual(native.stdout, "7\n1\n")
+
+    def test_native_supervisor_restart_strategies_match_reference(self) -> None:
+        worker = '''actor Worker {
+    var value: Int
+    init(start: Int) { self.value = start }
+    on bump() { self.value = self.value + 1 }
+    on fail() { let failure: Float = 1 / 0 }
+    on report() { println(self.value) }
+}
+'''
+        programs = [
+            worker + '''fn main() {
+    let supervisor = oneForOne(3, 1000)
+    let first = supervisor.start(Worker(10))
+    let second = supervisor.start(Worker(20))
+    first.bump()
+    second.bump()
+    first.fail()
+    match runActors() { Ok(_) => println("recovered") Err(error) => println(error) }
+    first.report()
+    second.report()
+    runActors()
+}
+''',
+            worker + '''fn main() {
+    let supervisor = oneForAll(3, 1000)
+    let first = supervisor.start(Worker(10))
+    let second = supervisor.start(Worker(20))
+    first.bump()
+    second.bump()
+    first.fail()
+    runActors()
+    first.report()
+    second.report()
+    runActors()
+}
+''',
+            worker + '''fn main() {
+    let supervisor = restForOne(3, 1000)
+    let first = supervisor.start(Worker(10))
+    let second = supervisor.start(Worker(20))
+    let third = supervisor.start(Worker(30))
+    first.bump()
+    second.fail()
+    third.bump()
+    runActors()
+    first.report()
+    second.report()
+    third.report()
+    runActors()
+}
+''',
+        ]
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-supervisor-") as temporary:
+            root = Path(temporary)
+            for index, source in enumerate(programs):
+                with self.subTest(strategy=index):
+                    reference = self._reference_result(source, root)
+                    native = self._native_source_result(source, root, root / f"supervisor-{index}", root)
+                    self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+
+    def test_native_supervisor_policies_and_nested_restart_match_reference(self) -> None:
+        source = '''actor Worker {
+    var value: Int
+    init(start: Int) { self.value = start }
+    on fail() { let failure: Float = 1 / 0 }
+    on report() { println(self.value) }
+}
+fn main() {
+    let root = oneForOne(3, 1000)
+    let nested = oneForOne(0, 1000)
+    let child = nested.start(Worker(17), transientChildPolicy())
+    root.start(nested)
+    child.fail()
+    match runActors() { Ok(_) => println("recovered") Err(error) => println(error) }
+    println(nested.isAlive())
+    println(child.isAlive())
+    child.report()
+    runActors()
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-supervisor-tree-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "supervisor-tree", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+
+    def test_native_supervisor_restart_intensity_matches_reference(self) -> None:
+        source = '''actor Worker { on fail() { let failure: Float = 1 / 0 } }
+fn main() {
+    let supervisor = oneForOne(0, 1000)
+    let child = supervisor.start(Worker())
+    child.fail()
+    match runActors() {
+        Ok(_) => println("unexpected")
+        Err(error) => println(error)
+    }
+    println(supervisor.isAlive())
+    println(child.isAlive())
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-supervisor-limit-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "supervisor-limit", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+
+    def test_native_supervisor_restart_window_expires_during_backoff(self) -> None:
+        source = '''actor Worker {
+    var value: Int
+    init(start: Int) { self.value = start }
+    on fail() { let failure: Float = 1 / 0 }
+    on report() { println(self.value) }
+}
+fn main() {
+    let supervisor = oneForOne(1, 2, exponentialBackoff(10, 10))
+    let child = supervisor.start(Worker(31))
+    child.fail()
+    runActors()
+    child.fail()
+    match runActors() { Ok(_) => println("recovered") Err(error) => println(error) }
+    child.report()
+    runActors()
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-supervisor-window-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "supervisor-window", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+
+    @unittest.skipIf(os.name == "nt", "native signal shutdown requires POSIX signals")
+    def test_native_sigterm_cancels_supervisor_backoff_and_shuts_down(self) -> None:
+        source = '''actor Worker { on work() {} }
+fn main() {
+    let supervisor = oneForOne(2, 1000, exponentialBackoff(2000, 2000))
+    let child = supervisor.start(Worker())
+    child.stop()
+    eprintln("waiting for restart")
+    runActors()
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-supervisor-signal-") as temporary:
+            root = Path(temporary)
+            checked = compile_checked_source(source, "native-supervisor-signal.tyv")
+            output = root / "supervisor-signal"
+            CppNativeBackend().build(lower_checked_program(checked), output, project_root=root)
+            environment = os.environ.copy()
+            environment.pop("PYTHONPATH", None)
+            environment.pop("PYTHONHOME", None)
+            environment["PATH"] = ""
+            process = subprocess.Popen(
+                [str(output)], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", env=environment,
+            )
+            try:
+                assert process.stderr is not None
+                self.assertEqual(process.stderr.readline().strip(), "waiting for restart")
+                process.send_signal(signal.SIGTERM)
+                stdout, stderr = process.communicate(timeout=4)
+                self.assertEqual(process.returncode, 143)
+                self.assertEqual(stdout, "")
+                self.assertIn("runtime shutdown", stderr)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=4)
+
+    def test_native_supervisor_backoff_is_monotonic_and_deferred_until_dispatch(self) -> None:
+        source = '''actor Worker {
+    var value: Int
+    init(start: Int) { self.value = start }
+    on report() { println(self.value) }
+}
+fn main() {
+    let supervisor = oneForOne(2, 1000, exponentialBackoff(1, 4))
+    let child = supervisor.start(Worker(23))
+    child.stop()
+    println(child.isAlive())
+    runActors()
+    println(child.isAlive())
+    child.report()
+    runActors()
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-supervisor-backoff-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "supervisor-backoff", root)
             self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
 
     def test_native_actor_crash_is_isolated_and_reported_like_reference(self) -> None:

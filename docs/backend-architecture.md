@@ -182,11 +182,17 @@ FFI. These representations are private compiler details, not a public ABI.
 Generated executables do not embed or invoke Python. Synchronous file and
 binary I/O, `ByteBuffer`, text-file resources, and experimental Linux async
 TCP/DNS/TLS, HTTP-client, and WebSocket-client paths are supported. The
-experimental native actor subset supports stateful actor declarations,
-`spawn`, typed fire-and-forget messages, `stop`, `isAlive`, and `runActors()`.
-Classes, records, user-defined enums, tuples, generic functions, Supervisors,
-actor request/reply and timers, monitoring/links, HTTP servers/routers/decoders,
-and WebSocket servers remain interpreter-only. There is no
+experimental native actor/supervisor subset supports stateful actor
+declarations, `spawn`, typed fire-and-forget messages, `stop`, `isAlive`,
+`runActors()`, nested supervisors, all three restart strategies and child
+policies, restart-intensity windows, and monotonic exponential backoff.
+Supervised actors that own Resources or Tasks are rejected because their
+reconstruction contract is not yet defined. Classes, records, user-defined
+enums, tuples, generic functions, actor request/reply and timers, monitoring/
+links, HTTP servers/routers/decoders, and WebSocket servers remain
+interpreter-only. Native actor turns and delayed restarts are driven by
+`runActors()`; actor-owned Tasks and full actor/task scheduling parity are not
+supported. There is no
 `unsafe` or FFI declaration syntax. Any later FFI must define ownership,
 lifetimes, mutability, and error conversion explicitly; a native crash cannot
 become a recoverable Tyvera `Result`. See the [Memory Model](memory-model.md)
@@ -256,8 +262,9 @@ does not make C++ part of Tyvera's language.
 | `Task<T>`, async functions, `await`, `runTasks()` | Experimental native subset; task bodies are serialized and I/O waits use bounded worker threads. Cooperative task/child cancellation and monotonic `withTimeout(Duration)` deadlines are supported; `tryResult()`, task groups, and actor ownership remain unsupported. |
 | DNS, TCP, and TLS client | Experimental on native Linux: `resolveHost`, `tcpConnect`, `tcpListen`, `accept`, connection read/write, and verified `tlsConnect` with hostname/IP checks, all as typed `Task<Result<...,String>>` operations. RAII handles close sockets and TLS sessions. |
 | HTTP/WebSocket client | Experimental native Linux subset: typed HTTP values and GET/POST/PUT/DELETE/custom request client; bounded HTTP/1.1 responses; bounded `ws`/verified `wss` client. Native HTTP server/router/general codec and WebSocket server remain interpreter-only. |
-| Actors and `ActorRef<T>` | Experimental native C++17 subset: actor declarations and state, `spawn`, typed fire-and-forget messages, `stop`, `isAlive`, and `runActors()`. Per-actor FIFO mailboxes and round-robin turns are bounded; handler failures are isolated and reported through the existing `Result`. Native support remains Linux-CI-gated until the C++ runner validates this change. |
-| Supervisors, request/reply, actor timers, monitor/link, actor-owned Tasks | Interpreter-only. Native lowering reports a source diagnostic; no fallback occurs. |
+| Actors and `ActorRef<T>` | Experimental native C++17 subset: actor declarations/state, `spawn`, typed fire-and-forget messages, `stop`, `isAlive`, and bounded `runActors()`. Per-actor FIFO mailboxes use round-robin turns; unsupervised handler failures are returned through `Result`. |
+| Supervisors | Experimental native support for nested trees, `oneForOne`/`oneForAll`/`restForOne`, permanent/transient/temporary policies, monotonic restart windows, deterministic exponential backoff, reverse stop order, and start-order restart. Backoff deadlines progress in `runActors()`; supervised actor state cannot own Resources or Tasks. |
+| Actor request/reply, actor timers, monitor/link, actor-owned Tasks | Interpreter-only. Native lowering reports a source diagnostic; no fallback occurs. Native tasks do not await actors or pump actor work. |
 | `hostOS()`, `hostArchitecture()`, `monotonicMilliseconds()` | Native C++17 runtime and reference implementations; OS/architecture names are normalized and elapsed time is monotonic. |
 | Native SIGINT/SIGTERM shutdown | Generated C++17 records the first signal and unwinds at statement/loop safe points; scope resources use RAII cleanup. |
 | Native FFI, stable public ABI, cross-compilation | Planned; no syntax or runtime contract is exposed. |

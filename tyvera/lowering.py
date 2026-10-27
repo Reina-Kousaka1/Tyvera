@@ -107,6 +107,9 @@ _TYPE_MAP = {
     "HttpHeaders": IRType.HTTP_HEADERS,
     "HttpRequest": IRType.HTTP_REQUEST,
     "HttpResponse": IRType.HTTP_RESPONSE,
+    "Supervisor": IRType.SUPERVISOR,
+    "RestartPolicy": IRType.RESTART_POLICY,
+    "SupervisorBackoff": IRType.SUPERVISOR_BACKOFF,
     "Void": IRType.VOID,
     "Unit": IRType.VOID,
 }
@@ -506,14 +509,6 @@ class _FunctionLowerer:
         raise Diagnostic(pattern.location, "backend", f"native backend does not yet support {type(pattern).__name__} patterns")
 
     def _expression(self, expression: Expression) -> IRExpression:
-        if isinstance(expression, Call) and expression.callee in {
-            "oneForOne", "oneForAll", "restForOne", "permanentChildPolicy",
-            "transientChildPolicy", "temporaryChildPolicy", "exponentialBackoff",
-        }:
-            raise Diagnostic(
-                expression.location, "backend",
-                "native Supervisor V2 runtime is not yet supported",
-            )
         if isinstance(expression, Unary) and expression.operator == "move":
             if not isinstance(expression.operand, Name):
                 raise Diagnostic(expression.location, "backend", "native move requires a local resource binding")
@@ -578,6 +573,26 @@ class _FunctionLowerer:
         if isinstance(expression, MemberCall):
             checked_receiver_type = self.checked.expression_types.get(expression.receiver.location, "")
             receiver_base, receiver_arguments = split_type(checked_receiver_type)
+            if receiver_base == "Supervisor" and expression.method == "start":
+                child = expression.arguments[0]
+                if isinstance(child, Call) and child.callee in self.actor_symbols:
+                    if len(expression.arguments) == 2 and self._expression_type(expression.arguments[1]) != IRType.RESTART_POLICY:
+                        raise Diagnostic(expression.arguments[1].location, "backend", "native Supervisor.start requires a RestartPolicy")
+                    actor_name = child.callee
+                    symbols = self.actor_symbols[actor_name]
+                    child_ir = IRActorSpawn(
+                        actor_name, symbols.get("init"),
+                        tuple(self._expression(argument) for argument in child.arguments),
+                        IRActorRefType(actor_name), child.location, True,
+                    )
+                else:
+                    child_ir = self._expression(child)
+                arguments = [child_ir]
+                arguments.extend(self._expression(argument) for argument in expression.arguments[1:])
+                return IRMethodCall(
+                    self._expression(expression.receiver), expression.method,
+                    tuple(arguments), self._expression_type(expression), expression.location,
+                )
             actor_name = (
                 self.actor_name if isinstance(expression.receiver, Name)
                 and expression.receiver.identifier == "self" else
@@ -617,7 +632,7 @@ class _FunctionLowerer:
                     IRType.SOCKET_ADDRESS, IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER,
                     IRType.WEBSOCKET, IRType.WEBSOCKET_URL, IRType.WEBSOCKET_MESSAGE,
                     IRType.HTTP_METHOD, IRType.HTTP_URL, IRType.HTTP_HEADERS,
-                    IRType.HTTP_REQUEST, IRType.HTTP_RESPONSE,
+                    IRType.HTTP_REQUEST, IRType.HTTP_RESPONSE, IRType.SUPERVISOR,
                 }
             ):
                 raise Diagnostic(expression.location, "backend", f"native backend does not yet support methods on {ir_type_name(receiver.type)}")
@@ -664,6 +679,8 @@ class _FunctionLowerer:
                 "monotonicMilliseconds", "runTasks", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen",
                 "webSocketUrl", "webSocketConnect", "httpMethod", "httpUrl", "httpHeaders",
                 "httpRequest", "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete",
+                "oneForOne", "oneForAll", "restForOne", "permanentChildPolicy",
+                "transientChildPolicy", "temporaryChildPolicy", "exponentialBackoff",
             }:
                 return IRBuiltinCall(
                     expression.callee,
