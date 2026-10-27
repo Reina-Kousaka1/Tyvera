@@ -13,10 +13,11 @@ who invoke `tyvera build`; it is not required to run the bootstrap interpreter.
   binary/source packages and exercises install/upgrade/reinstall/remove using
   two revisions. Debian's staged pybuild tree lacks repository-only test
   fixtures, so `debian/rules` leaves the full suite to the Python matrix. The
-  latest run passed the repeated-build hash check, then failed because the
-  installed CLI was invoked before `apt install`. The workflow now installs
-  first and creates the project with the installed `tyvera new`; upgrade,
-  remove/purge, and source-package checks still need a CI rerun.
+  latest run passed the repeated-build hash check, install, project creation,
+  CLI check/run, upgrade, and reinstall. The remove/purge assertions used the
+  wrong generated source path (`main.tyv` rather than `src/main.tyv`); those
+  checks are corrected, while remove/purge and source-package validation still
+  need a CI rerun.
 - **Experimental:** the package job is configured for Ubuntu 24.04 x86-64 only.
   The package is `Architecture: all`; that metadata describes its Python
   payload, not native backend support on every architecture.
