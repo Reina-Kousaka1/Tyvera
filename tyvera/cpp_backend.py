@@ -2680,6 +2680,11 @@ template <typename T> struct ReplyCell final : ReplyCellBase {
                 // with the waiter's lifecycle mutex so a reply cannot notify between
                 // the predicate check and the condition-variable sleep.
                 std::lock_guard<std::mutex> lock(waiter->lifecycle_mutex);
+                // Once the cell leaves pending, this Task no longer blocks on an
+                // unresolved actor reply. Clear the scheduler hint before waking it,
+                // so runTasks cannot mistake a ready reply for a deadlock.
+                waiter->waiting_for_actor_reply.store(false, std::memory_order_release);
+                waiter->actor_reply_wait_has_deadline.store(false, std::memory_order_release);
                 waiter->lifecycle_changed.notify_all();
             } catch (...) {}
         }
