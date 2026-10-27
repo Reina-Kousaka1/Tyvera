@@ -131,8 +131,8 @@ def server_frame(payload: bytes) -> bytes:
     return header + payload
 
 
-def server_close_frame() -> bytes:
-    payload = (1000).to_bytes(2, "big")
+def server_close_frame(code: int = 1000) -> bytes:
+    payload = code.to_bytes(2, "big")
     return bytes((0x88, len(payload))) + payload
 
 
@@ -447,17 +447,19 @@ fn main() {{
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind(("127.0.0.1", 0))
             connection_count = 2 if native_available else 1
-            listener.listen(3 * connection_count)
+            listener.listen(4 * connection_count)
             listener.settimeout(60)
             port = listener.getsockname()[1]
             captured: list[dict[str, object]] = []
+            attempts: list[int] = []
             failures: list[BaseException] = []
 
             def serve() -> None:
                 try:
                     for _ in range(connection_count):
-                        for index in range(3):
+                        for index in range(4):
                             raw, _ = listener.accept()
+                            attempts.append(index)
                             raw.settimeout(10)
                             secure = server_context.wrap_socket(raw, server_side=True)
                             secure.settimeout(10)
@@ -477,16 +479,21 @@ fn main() {{
                                  "Upgrade: websocket\r\n"
                                  f"Sec-WebSocket-Accept: {make_accept_value(key)}\r\n\r\n").encode("ascii")
                             )
+                            if index == 0:
+                                secure.sendall(server_close_frame(1001))
+                                secure.close()
+                                continue
+                            session_index = index - 1
                             secure.sendall(server_frame(b'{"op":10,"d":{"heartbeat_interval":5000}}'))
                             opcode, payload = read_client_frame(secure)
                             captured.append({"opcode": opcode, "payload": json.loads(payload.decode("utf-8"))})
-                            if index == 0:
+                            if session_index == 0:
                                 secure.sendall(server_frame(
                                     b'{"op":0,"s":41,"t":"READY","d":{"session_id":"resume-session",'
                                     b'"resume_gateway_url":"wss://gateway-us-east1-b.discord.gg"}}'
                                 ))
                                 secure.sendall(server_frame(b'{"op":7,"d":null}'))
-                            elif index == 1:
+                            elif session_index == 1:
                                 secure.sendall(server_frame(b'{"op":9,"d":false}'))
                             else:
                                 secure.sendall(server_frame(
@@ -514,7 +521,7 @@ async fn run() {
     match environment("TYVERA_FAKE_DISCORD_TOKEN") {
         None => eprintln("missing fake token")
         Some(token) => {
-            let result = await discord.runGatewayReliable(token, discord.defaultIntents(), 2, seconds(4), 2, 0, 0)
+            let result = await discord.runGatewayReliable(token, discord.defaultIntents(), 2, seconds(4), 3, 0, 0)
             match result {
                 Err(error) => eprintln(error)
                 Ok(summary) => {
@@ -603,6 +610,7 @@ fn main() {
                 f"native Discord output mismatch: stdout={native_stdout!r}, stderr={native_stderr!r}, peer_failures={failures!r}",
             )
         self.assertEqual(failures, [])
+        self.assertEqual(attempts, [0, 1, 2, 3] * connection_count)
         self.assertEqual(output.getvalue(), "true\ntrue\ntrue\n2\n2\nresume-session\ntrue\n")
         self.assertEqual(errors.getvalue(), "")
         per_run = 4
@@ -1239,7 +1247,7 @@ fn main() {
             server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             server_context.load_cert_chain(str(certificate), str(private_key))
             lock = threading.Lock()
-            state = {"count": 0, "active": 0, "maximum_active": 0, "arrivals": []}
+            state = {"count": 0, "active": 0, "maximum_active": 0, "arrivals": [], "paths": []}
 
             class Handler(BaseHTTPRequestHandler):
                 protocol_version = "HTTP/1.1"
@@ -1252,6 +1260,7 @@ fn main() {
                         index = state["count"]
                         state["count"] += 1
                         state["arrivals"].append(time.monotonic())
+                        state["paths"].append(self.path)
                         state["active"] += 1
                         state["maximum_active"] = max(state["maximum_active"], state["active"])
                     released = False
@@ -1336,8 +1345,8 @@ async fn run() {
                 Err(_) => println("bucket request failed")
                 Ok(response) => println(response.status)
             }
-            let first = rest.requestBotCoordinated(coordinator, "channels/:channel_id/messages", "channel:12", token, "GET", "channels/12/messages", bytesFromString(""), seconds(3))
-            let second = rest.requestBotCoordinated(coordinator, "channels/:channel_id/messages", "channel:12", token, "GET", "channels/12/messages", bytesFromString(""), seconds(3))
+            let first = rest.requestBotCoordinated(coordinator, "channels/:channel_id/messages", "channel:12", token, "GET", "channels/12/messages/first", bytesFromString(""), seconds(3))
+            let second = rest.requestBotCoordinated(coordinator, "channels/:channel_id/messages", "channel:12", token, "GET", "channels/12/messages/second", bytesFromString(""), seconds(3))
             let firstResult = await first
             match firstResult {
                 Err(_) => println("first queued request failed")
@@ -1410,6 +1419,7 @@ fn main() {
             self.assertEqual((0, output.getvalue(), errors.getvalue()), (0, expected, ""))
             with lock:
                 arrivals = list(state["arrivals"])
+                request_paths = list(state["paths"])
                 maximum_active = state["maximum_active"]
             self.assertEqual(len(arrivals), 5 * (2 if native_result is not None else 1))
             self.assertEqual(maximum_active, 1)
@@ -1417,6 +1427,10 @@ fn main() {
                 group = arrivals[offset:offset + 5]
                 self.assertGreaterEqual(group[1] - group[0], 0.20)
                 self.assertGreaterEqual(min(group[3], group[4]) - group[2], 0.20)
+                self.assertEqual(
+                    request_paths[offset + 3:offset + 5],
+                    ["/api/v10/channels/12/messages/first", "/api/v10/channels/12/messages/second"],
+                )
             if native_result is not None:
                 self.assertEqual(
                     (native_result.returncode, native_result.stdout, native_result.stderr),
