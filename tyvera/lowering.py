@@ -273,9 +273,9 @@ class _FunctionLowerer:
             resource_type = acquisition.type.arguments[0]
             if resource_type not in {
                 IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
-                IRType.TCP_CONNECTION, IRType.TCP_LISTENER,
+                IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER,
             }:
-                raise Diagnostic(statement.location, "backend", "native using supports synchronous file and TCP resources")
+                raise Diagnostic(statement.location, "backend", "native using supports file, TCP, and TLS resources")
             if self.checked.ownership_transfers.get(statement.location) != (
                 f"{ir_type_name(resource_type)} to scoped owner {statement.name}"
             ):

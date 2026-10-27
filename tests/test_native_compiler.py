@@ -620,13 +620,13 @@ class NativeExecutionTests(unittest.TestCase):
     using connection = move opened {{
         if echo {{
             let writing = connection.writeAll(bytesFromString("ping"))
-            let written = await move writing
+            let written = await writing
             match move written {{
                 Ok(count) => println(count)
                 Err(error) => println(error)
             }}
             let reading = connection.read(16)
-            let received = await move reading
+            let received = await reading
             match move received {{
                 Ok(Some(bytes)) => match bytes.toString() {{
                     Ok(text) => println(text)
