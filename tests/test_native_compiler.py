@@ -913,6 +913,52 @@ fn main() {
             self.assertEqual(native.stdout, "73\nfinished\n")
 
 
+    def test_native_concurrent_actor_reply_waiters_share_task_scheduler(self) -> None:
+        source = '''actor Counter {
+    var value: Int
+    init(start: Int) { self.value = start }
+    on increment(reply: ReplySender<Int>) {
+        self.value = self.value + 1
+        println("handled")
+        reply.send(self.value)
+    }
+}
+async fn query(counter: ActorRef<Counter>) {
+    let answer: Int = await counter.request(increment)
+    println(answer)
+}
+async fn spin() {
+    var index: Int = 0
+    while index < 8 {
+        println("tick")
+        index = index + 1
+    }
+}
+fn main() {
+    let counter = spawn(Counter(0))
+    let first = query(counter)
+    let second = query(counter)
+    let spinner = spin()
+    match runTasks() {
+        Ok(_) => println("complete")
+        Err(error) => eprintln(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-concurrent-replies-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "concurrent-replies", root)
+            self.assertEqual((native.returncode, native.stderr), (reference[0], reference[2]))
+            reference_lines = reference[1].splitlines()
+            native_lines = native.stdout.splitlines()
+            self.assertEqual(sorted(native_lines), sorted(reference_lines))
+            for lines in (reference_lines, native_lines):
+                self.assertEqual(lines.count("handled"), 2)
+                self.assertEqual(lines.count("tick"), 8)
+                self.assertEqual(sorted(line for line in lines if line in {"1", "2"}), ["1", "2"])
+                self.assertEqual(lines[-1], "complete")
+
     def test_native_actor_reply_waiter_is_not_starved_by_ready_tasks(self) -> None:
         source = '''async fn spin() {
     var index: Int = 0
@@ -962,6 +1008,7 @@ fn main() {
                 self.assertEqual(lines.count("complete"), 1)
                 self.assertLess(lines.index("handled"), lines.index("reply delivered"))
                 self.assertLess(lines.index("reply delivered"), lines.index("19"))
+                self.assertGreater(lines.index("complete"), lines.index("19"))
             self.assertEqual(
                 [line for line in reference_lines if line in {"handled", "reply delivered", "complete"}],
                 [line for line in native_lines if line in {"handled", "reply delivered", "complete"}],
