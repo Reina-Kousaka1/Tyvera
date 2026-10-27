@@ -68,10 +68,14 @@ fake token. They do not access a Discord account or public service.
 ## Experimental limits
 
 The reliable Gateway client is still experimental. Reconnect backoff is
-deterministic and has no jitter, the retry budget is supplied by the caller,
-and DNS/connect/Hello failures before a session is established return a
-controlled error rather than being retried. There is no automatic resume after
-process restart or durable session store. The typed event decoder recognizes
+deterministic and has no jitter, and the retry budget is supplied by the caller.
+It retries a bounded set of transient DNS/connect/WebSocket transport failures
+and policy-allowed closes before Hello. Malformed handshakes or payloads, TLS
+certificate/handshake failures, and fatal Gateway close codes remain terminal.
+After a transient transport failure in an established session, it retains
+collected dispatches and returns a Resume or Identify action for the bounded
+reconnect loop. There is no automatic resume after process restart or durable
+session store. The typed event decoder recognizes
 READY and MESSAGE_CREATE and returns these typed values in the run summary;
 there is no general callback/subscription API, reusable Actor/Supervisor client
 tree, cache, or shard coordinator. The bot example is a composition example,
