@@ -247,15 +247,17 @@ serializes Tyvera task bodies so shared mutable values are not accessed in
 parallel. Native task cancellation is cooperative at statement/loop and socket
 poll checkpoints; owned children are cancelled on owner cancellation/failure
 and joined before owner completion. A blocking native DNS lookup cannot be
-interrupted mid-call. Native task groups remain unsupported. The experimental native C++17 actor subset supports typed
-fire-and-forget messages, FIFO delivery per actor, round-robin actor turns,
-`stop`, `isAlive`, bounded mailboxes, and `runActors()` error results. The
-native supervisor subset supports nested trees, `oneForOne`, `oneForAll`,
+interrupted mid-call. Native task groups remain unsupported. The experimental
+native C++17 actor subset supports typed fire-and-forget and request/reply
+messages, FIFO delivery per actor,
+round-robin actor turns, `stop`, `isAlive`, bounded mailboxes, and
+`runActors()` error results. The native supervisor subset supports nested trees, `oneForOne`, `oneForAll`,
 `restForOne`, all child restart policies, restart-intensity windows, and
 monotonic exponential backoff. Restarts stop affected children in reverse
-start order and reconstruct them in start order. Backoff deadlines and general actor turns are serviced by `runActors()`;
-while a native task waits for a reply, `runTasks()` pumps one actor turn. It
-does not independently settle delayed supervisor restarts. Native `request` and `requestWithin` produce typed ReplyReceivers. Readiness,
+start order and reconstruct them in start order. Backoff deadlines and general
+actor turns are serviced by `runActors()`;
+while a native task waits for a reply, `runTasks()` pumps one actor turn. It does not independently settle delayed supervisor restarts. Native `request`
+and `requestWithin` produce typed ReplyReceivers. Readiness,
 cancellation, timeout observation, and `tryReceive()` work directly. A native
 async task may await a ReplyReceiver; `runTasks()` pumps one queued actor turn
 while a reply is pending, and the task releases serialized execution until the
@@ -276,8 +278,7 @@ reference runtime. The Linux native backend also has experimental HTTP and
 WebSocket client subsets; native HTTP server, router/general codec, and
 WebSocket server remain unsupported. Native Linux TLS client operations use
 the same task cancellation and monotonic-deadline behavior as the supported
-TCP operations.
-Native `runTasks()` reports completed task values; the reference runtime
+TCP operations. Native `runTasks()` reports completed task values; the reference runtime
 reports continuation steps, so that progress count is not portable. The
 reference runtime provides TCP, verified TLS/HTTPS, bounded WebSockets, async
 text-file operations, and experimental HTTP/1.1. See the

@@ -25,8 +25,11 @@ five retries and a maximum accepted wait of 120 seconds. It honors the
 `Retry-After` delta-seconds header only when that body value is unavailable or malformed.
 Both forms are capped at 120 seconds; HTTP-date headers are not parsed. Transport errors,
 other statuses, and missing, malformed, negative, or over-limit delays are returned
-without retry. This avoids replay after an ambiguous side-effecting request,
-but does not coordinate concurrent requests across buckets or global limits.
+without retry. This avoids replay after an ambiguous side-effecting request.
+
+`newRestRateLimitCoordinator()` creates a bounded actor whose reference must be shared by the calls for one bot client. `requestBotCoordinated(coordinator, routeTemplate, majorScope, ...)` waits on monotonic deadlines and includes permit waiting in its request timeout. It stores returned bucket IDs per normalized route template and tracks remaining counts and reset deadlines at major-scope granularity, plus global 429 deadlines. A global 429 blocks every call using that coordinator; route exhaustion blocks calls using the same major scope. `requestBotWithRetriesCoordinated` opts into the same bounded 429 retry policy while reacquiring a permit for every attempt.
+
+The route template should be normalized (for example, `channels/:channel_id/messages`) and the major scope should be a stable, non-secret identifier shared by requests that may consume the same Discord limits (for example, `channel:123`). Never include a bot token, webhook token, authorization header, or request body in either value. The coordinator currently serializes and applies remaining/reset counts at the caller-provided major-scope granularity. It records returned bucket IDs by route but does not merge different routes automatically from matching bucket IDs. Create one coordinator per bot client and share it across that client's REST tasks; separate coordinator actors do not share global limits.
 
 `src/client.tyv` provides typed `GatewayIntent` values and a bounded
 `runGateway` session pinned to `wss://gateway.discord.gg/`. It performs TLS
@@ -75,11 +78,7 @@ tree, cache, or shard coordinator. The bot example is a composition example,
 not a reusable Gateway service API; REST remains a direct async client. Gateway
 compression is not negotiated.
 
-REST has one-request transport and rate-limit metadata parsing plus the
-explicit bounded 429 retry function. There is no bucket/global coordinator,
-concurrent request queue, automatic retry by default, API model coverage, or
-REST client Actor. Side-effect requests are only retried after an explicit
-429 rejection, never after a transport failure.
+The coordinator caps retained route mappings and major-scope states at 512 each and expires idle entries after ten minutes. It allows at most 512 active major scopes, serializes requests within one major scope, and conservatively applies the latest remaining/reset state to that whole scope; independent Discord buckets under one major scope can therefore be over-throttled. It does not create a FIFO queue: waiting tasks recheck at most every 50 ms, with task count and actor mailboxes bounded by the existing runtime. There is no fairness guarantee. Cancellation while waiting owns no coordinator lease; cancellation during transport leaves a bounded lease until its request timeout plus five seconds. Coordinated requests accept timeouts from 1 ms through 10 minutes. Malformed 429 delays use a one-second local block; no request is automatically replayed except by the explicit retry API, and transport failures are never retried. Legacy `requestBot` and `requestBotWithRetries` calls do not participate in coordinator state.
 The package now has an experimental native lowering path for linked source
 modules: non-generic records/enums, typed JSON use, `Secret<String>`, native
 environment lookup, async REST helpers, and the Gateway client can be
@@ -92,8 +91,8 @@ resume, invalid-session re-identification, REST response metadata, bounded
 429 retries, and token-redaction checks. A test-only resolver shim routes only
 the native test process to loopback; the Tyvera package keeps its fixed,
 verified Discord origins. This package does not yet provide a reusable
-Actor/Supervisor client API or shared REST bucket coordinator, and it is not
-production-ready.
+Actor/Supervisor client API, automatic route-bucket alias merging, a general
+REST client Actor, or a FIFO request queue, and it is not production-ready.
 There is no interpreter fallback.
 
 When authentication is used, the token remains `Secret<String>` until the

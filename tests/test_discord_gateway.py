@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1136,6 +1137,207 @@ fn main() {
                 self.assertEqual(captured[21:], captured[:21])
                 self.assertNotIn("fake-rest-token", native_result.stdout + native_result.stderr)
 
+
+    def test_coordinated_rest_waits_for_global_and_bucket_limits_with_native_parity(self) -> None:
+        native_available = _native_cpp_available()
+        openssl = shutil.which("openssl")
+        if openssl is None:
+            self.skipTest("OpenSSL is required to create a temporary fake REST certificate")
+
+        with tempfile.TemporaryDirectory(prefix=".tyvera-discord-coordinator-", dir=DISCORD_ROOT) as temporary:
+            directory = Path(temporary)
+            certificate = directory / "discord.crt"
+            private_key = directory / "discord.key"
+            subprocess.run(
+                [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(private_key),
+                 "-out", str(certificate), "-days", "2", "-subj", "/CN=discord.com",
+                 "-addext", "subjectAltName=DNS:discord.com"],
+                check=True, capture_output=True, text=True,
+            )
+            server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_context.load_cert_chain(str(certificate), str(private_key))
+            lock = threading.Lock()
+            state = {"count": 0, "active": 0, "maximum_active": 0, "arrivals": []}
+
+            class Handler(BaseHTTPRequestHandler):
+                protocol_version = "HTTP/1.1"
+
+                def log_message(self, format: str, *args: object) -> None:
+                    return
+
+                def do_GET(self) -> None:
+                    with lock:
+                        index = state["count"]
+                        state["count"] += 1
+                        state["arrivals"].append(time.monotonic())
+                        state["active"] += 1
+                        state["maximum_active"] = max(state["maximum_active"], state["active"])
+                    released = False
+                    try:
+                        # A small server-side hold makes an accidental concurrent
+                        # request visible without relying on a tight timing bound.
+                        time.sleep(0.05)
+                        pair = index % 5
+                        if pair == 0:
+                            status = 429
+                            body = b'{"message":"global limit","retry_after":0.35,"global":true}'
+                            headers = {
+                                "X-RateLimit-Bucket": "global-bucket",
+                                "X-RateLimit-Remaining": "0",
+                                "X-RateLimit-Reset-After": "0.35",
+                                "Retry-After": "0.35",
+                                "X-RateLimit-Global": "true",
+                            }
+                        elif pair == 2:
+                            status = 200
+                            body = b'{"ok":true}'
+                            headers = {
+                                "X-RateLimit-Bucket": "channel-bucket",
+                                "X-RateLimit-Remaining": "0",
+                                "X-RateLimit-Reset-After": "0.35",
+                            }
+                        else:
+                            status = 200
+                            body = b'{"ok":true}'
+                            headers = {
+                                "X-RateLimit-Bucket": "other-bucket" if pair == 1 else "channel-bucket",
+                                "X-RateLimit-Remaining": "3",
+                                "X-RateLimit-Reset-After": "0.35",
+                            }
+                        with lock:
+                            state["active"] -= 1
+                            released = True
+                        self.send_response(status)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.send_header("Connection", "close")
+                        self.send_header("Content-Type", "application/json")
+                        for name, value in headers.items():
+                            self.send_header(name, value)
+                        self.end_headers()
+                        self.wfile.write(body)
+                        self.close_connection = True
+                    finally:
+                        if not released:
+                            with lock:
+                                state["active"] -= 1
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            server.daemon_threads = True
+            local_port = server.server_address[1]
+            server.socket = server_context.wrap_socket(server.socket, server_side=True)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            entry = directory / "coordinator-test.tyv"
+            entry.write_text(r'''import "../src/rest.tyv" as rest
+async fn run() {
+    match environment("TYVERA_FAKE_DISCORD_REST_TOKEN") {
+        None => println("missing token")
+        Some(token) => {
+            let coordinator = rest.newRestRateLimitCoordinator()
+            let invalidTimeout = await rest.requestBotCoordinated(coordinator, "channels/:channel_id/messages", "channel:10", token, "GET", "channels/10/messages", bytesFromString(""), milliseconds(0))
+            match invalidTimeout {
+                Err(_) => println("timeout rejected")
+                Ok(_) => println("timeout accepted")
+            }
+            let global = await rest.requestBotCoordinated(coordinator, "channels/:channel_id/messages", "channel:10", token, "GET", "channels/10/messages", bytesFromString(""), seconds(3))
+            match global {
+                Err(_) => println("global request failed")
+                Ok(response) => println(response.status)
+            }
+            let afterGlobal = await rest.requestBotCoordinated(coordinator, "channels/:channel_id/messages", "channel:11", token, "GET", "channels/11/messages", bytesFromString(""), seconds(3))
+            match afterGlobal {
+                Err(_) => println("global wait failed")
+                Ok(response) => println(response.status)
+            }
+            let exhausted = await rest.requestBotCoordinated(coordinator, "channels/:channel_id/messages", "channel:12", token, "GET", "channels/12/messages", bytesFromString(""), seconds(3))
+            match exhausted {
+                Err(_) => println("bucket request failed")
+                Ok(response) => println(response.status)
+            }
+            let first = rest.requestBotCoordinated(coordinator, "channels/:channel_id/messages", "channel:12", token, "GET", "channels/12/messages", bytesFromString(""), seconds(3))
+            let second = rest.requestBotCoordinated(coordinator, "channels/:channel_id/messages", "channel:12", token, "GET", "channels/12/messages", bytesFromString(""), seconds(3))
+            match await first {
+                Err(_) => println("first queued request failed")
+                Ok(response) => println(response.status)
+            }
+            match await second {
+                Err(_) => println("second queued request failed")
+                Ok(response) => println(response.status)
+            }
+            let bucketRead = coordinator.request(observedBucket, "channels/:channel_id/messages", "channel:12")
+            let observed = await bucketRead
+            println(observed == Some("channel-bucket"))
+        }
+    }
+}
+fn main() {
+    let task = run()
+    match runTasks() {
+        Ok(_) => {}
+        Err(error) => eprintln("runTasks failed: " + error)
+    }
+}
+''', encoding="utf-8")
+            checked = compile_checked_project(entry, DISCORD_ROOT)
+            output = io.StringIO()
+            errors = io.StringIO()
+            original_http_task = Interpreter._http_client_task
+            original_getaddrinfo = socket.getaddrinfo
+
+            def route_https(self, url, request, timeout, location):
+                if url.host == "discord.com" and url.port == 443:
+                    url = HttpUrl(url.scheme, url.host, local_port, url.target)
+                return original_http_task(self, url, request, timeout, location)
+
+            def local_dns(host, port, *args, **kwargs):
+                if host == "discord.com":
+                    return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", port))]
+                return original_getaddrinfo(host, port, *args, **kwargs)
+
+            default_context = ssl.create_default_context
+
+            def trusted_context(*args, **kwargs):
+                context = default_context(*args, **kwargs)
+                context.load_verify_locations(cafile=str(certificate))
+                return context
+
+            try:
+                with patch.object(Interpreter, "_http_client_task", route_https), \
+                        patch("tyvera.interpreter.socket.getaddrinfo", side_effect=local_dns), \
+                        patch("tyvera.interpreter.ssl.create_default_context", side_effect=trusted_context), \
+                        patch.dict(os.environ, {"TYVERA_FAKE_DISCORD_REST_TOKEN": "fake-rest-token"}):
+                    ReferenceInterpreterBackend().execute(
+                        checked, output=output, error_output=errors, project_root=DISCORD_ROOT,
+                    )
+                reference_result = (0, output.getvalue(), errors.getvalue())
+                native_result = None
+                if native_available:
+                    native_result = _native_discord_run(
+                        checked, directory / "coordinator", directory, local_port, certificate,
+                        {"TYVERA_FAKE_DISCORD_REST_TOKEN": "fake-rest-token"},
+                    )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(5)
+
+            self.assertFalse(thread.is_alive(), "fake Discord REST server did not stop")
+            expected = "timeout rejected\n429\n200\n200\n200\n200\ntrue\n"
+            self.assertEqual((0, output.getvalue(), errors.getvalue()), (0, expected, ""))
+            with lock:
+                arrivals = list(state["arrivals"])
+                maximum_active = state["maximum_active"]
+            self.assertEqual(len(arrivals), 5 * (2 if native_result is not None else 1))
+            self.assertEqual(maximum_active, 1)
+            for offset in range(0, len(arrivals), 5):
+                group = arrivals[offset:offset + 5]
+                self.assertGreaterEqual(group[1] - group[0], 0.20)
+                self.assertGreaterEqual(min(group[3], group[4]) - group[2], 0.20)
+            if native_result is not None:
+                self.assertEqual(
+                    (native_result.returncode, native_result.stdout, native_result.stderr),
+                    reference_result,
+                )
 
 if __name__ == "__main__":
     unittest.main()

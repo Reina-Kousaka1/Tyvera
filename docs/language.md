@@ -705,20 +705,24 @@ The reference runtime adapts verified TLS client connections through the
 platform TLS implementation; certificate-chain and hostname verification are
 enabled by default. `https://` requests use this adapter. A bounded WebSocket
 client supports `ws://` and verified `wss://`, masking, control frames,
-fragmentation, bounded payloads, and graceful close. HTTP and WebSocket remain
-experimental interpreter-only features. Native TCP, DNS, and verified TLS
-client operations form an experimental Linux-only subset; native TLS uses
+fragmentation, bounded payloads, and graceful close. HTTP, WebSockets, and the
+native networking/runtime surfaces remain experimental. Native TCP, DNS, and
+verified TLS client operations form an experimental Linux-only subset; native
+HTTP and WebSocket clients also have bounded Linux subsets. Native TLS uses
 OpenSSL trust paths and verifies DNS hostnames and IP addresses by default.
 The native backend also accepts async functions, `Task<T>`, `await`,
 `runTasks()`, cooperative `Task.cancel()`, `isCancelled()`, `isDone()`, and
 `withTimeout(Duration)`. Cancellation cascades through owned child tasks and is
 checked at task statement/loop and socket-poll boundaries. A system DNS lookup
-cannot be interrupted mid-call. Native task groups, Supervisors, HTTP, and
-WebSockets are not implemented. Native Actors have an experimental subset for
-typed fire-and-forget messages, FIFO mailboxes, round-robin `runActors()`,
-`stop`, `isAlive`, and isolated handler failures. Actor request/reply, timers,
-monitoring/links, and actor-owned Tasks remain interpreter-only. The reference
-interpreter remains the complete runtime for those features.
+cannot be interrupted mid-call. Native Actors support typed fire-and-forget
+messages and request/reply through `ReplySender<T>`, `ReplyReceiver<T>`,
+`request`, and `requestWithin`; native Tasks may await replies, and actor-owned
+Tasks are cancelled and drained on lifecycle changes. The experimental native
+supervisor subset supports nested `oneForOne`, `oneForAll`, and `restForOne`
+trees, restart policies and intensity windows, and monotonic exponential
+backoff. Native TaskGroups, `sendAfter`, monitoring/links, and supervised
+actors owning move-only Resources remain unsupported. The reference interpreter
+remains the complete runtime for language features outside the native subset.
 
 ## JSON values
 

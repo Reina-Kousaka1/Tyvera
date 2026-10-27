@@ -26,6 +26,267 @@ fn responseFromHttp(response: HttpResponse) -> DiscordRestResponse {
     return DiscordRestResponse(response.status(), response.body(), headers.get("x-ratelimit-bucket"), headers.get("x-ratelimit-remaining"), headers.get("x-ratelimit-reset-after"), headers.get("retry-after"), global)
 }
 
+fn rateLimitRouteKey(routeTemplate: String, majorScope: String) -> String {
+    return routeTemplate + "|" + majorScope
+}
+
+fn rateLimitRemainingFromHeader(header: Option<String>) -> Option<Int> {
+    match header {
+        None => return None<Int>()
+        Some(value) => match parseJson(value) {
+            Err(_) => return None<Int>()
+            Ok(json) => match json.asInt() {
+                Some(remaining) => {
+                    if remaining < 0 {
+                        return None<Int>()
+                    }
+                    return Some(remaining)
+                }
+                None => return None<Int>()
+            }
+        }
+    }
+    return None<Int>()
+}
+
+fn responseIsGlobalRateLimit(response: DiscordRestResponse) -> Bool {
+    if response.globalRateLimit {
+        return true
+    }
+    if response.status != 429 {
+        return false
+    }
+    match response.body.toString() {
+        Err(_) => return false
+        Ok(text) => match parseJson(text) {
+            Err(_) => return false
+            Ok(root) => match root.objectGet("global") {
+                None => return false
+                Some(value) => match value.asBool() {
+                    None => return false
+                    Some(global) => return global
+                }
+            }
+        }
+    }
+    return false
+}
+
+// Shared, bounded coordination for requests made with the same bot client.
+// The coordinator serializes requests by caller-supplied major scope; this is
+// conservative when Discord has independent buckets under one major resource.
+pub actor DiscordRestRateLimitCoordinator {
+    var routeBuckets: Map<String, String>
+    var routeExpirations: Map<String, Int>
+    var remainingByMajor: Map<String, Int>
+    var resetAtByMajor: Map<String, Int>
+    var blockedUntilByMajor: Map<String, Int>
+    var stateExpirations: Map<String, Int>
+    var activeUntilByMajor: Map<String, Int>
+    var globalBlockedUntil: Int
+
+    init() {
+        self.routeBuckets = Map<String, String>()
+        self.routeExpirations = Map<String, Int>()
+        self.remainingByMajor = Map<String, Int>()
+        self.resetAtByMajor = Map<String, Int>()
+        self.blockedUntilByMajor = Map<String, Int>()
+        self.stateExpirations = Map<String, Int>()
+        self.activeUntilByMajor = Map<String, Int>()
+        self.globalBlockedUntil = 0
+    }
+
+    on acquire(routeTemplate: String, majorScope: String, leaseMilliseconds: Int, reply: ReplySender<Int>) {
+        if leaseMilliseconds <= 0 || leaseMilliseconds > 605000 {
+            reply.send(-1)
+            return
+        }
+        let now = monotonicMilliseconds()
+        let routeKeys = self.routeExpirations.keys()
+        for routeKey in routeKeys {
+            match self.routeExpirations.get(routeKey) {
+                Some(expiresAt) => {
+                    if expiresAt <= now {
+                        self.routeExpirations.remove(routeKey)
+                        self.routeBuckets.remove(routeKey)
+                    }
+                }
+                None => {}
+            }
+        }
+        let activeKeys = self.activeUntilByMajor.keys()
+        for scope in activeKeys {
+            match self.activeUntilByMajor.get(scope) {
+                Some(until) => {
+                    if until <= now {
+                        self.activeUntilByMajor.remove(scope)
+                    }
+                }
+                None => {}
+            }
+        }
+        let stateKeys = self.stateExpirations.keys()
+        for scope in stateKeys {
+            match self.stateExpirations.get(scope) {
+                Some(expiresAt) => {
+                    if expiresAt <= now && !self.activeUntilByMajor.containsKey(scope) {
+                        self.stateExpirations.remove(scope)
+                        self.remainingByMajor.remove(scope)
+                        self.resetAtByMajor.remove(scope)
+                        self.blockedUntilByMajor.remove(scope)
+                    }
+                }
+                None => {}
+            }
+        }
+
+        if self.globalBlockedUntil > now {
+            reply.send(self.globalBlockedUntil - now)
+            return
+        }
+        self.globalBlockedUntil = 0
+
+        match self.blockedUntilByMajor.get(majorScope) {
+            Some(until) => {
+                if until > now {
+                    reply.send(until - now)
+                    return
+                }
+                self.blockedUntilByMajor.remove(majorScope)
+            }
+            None => {}
+        }
+
+        match self.activeUntilByMajor.get(majorScope) {
+            Some(until) => {
+                if until > now {
+                    var waitMilliseconds = until - now
+                    if waitMilliseconds > 50 {
+                        waitMilliseconds = 50
+                    }
+                    reply.send(waitMilliseconds)
+                    return
+                }
+                self.activeUntilByMajor.remove(majorScope)
+            }
+            None => {}
+        }
+
+        match self.resetAtByMajor.get(majorScope) {
+            Some(resetAt) => {
+                if resetAt > now {
+                    match self.remainingByMajor.get(majorScope) {
+                        Some(remaining) => {
+                            if remaining <= 0 {
+                                reply.send(resetAt - now)
+                                return
+                            }
+                        }
+                        None => {}
+                    }
+                } else {
+                    self.resetAtByMajor.remove(majorScope)
+                    self.remainingByMajor.remove(majorScope)
+                    self.blockedUntilByMajor.remove(majorScope)
+                }
+            }
+            None => {}
+        }
+
+        if !self.remainingByMajor.containsKey(majorScope) && self.remainingByMajor.length >= 512 {
+            reply.send(-1)
+            return
+        }
+        if self.activeUntilByMajor.length >= 512 {
+            reply.send(-1)
+            return
+        }
+        match self.remainingByMajor.get(majorScope) {
+            Some(remaining) => {
+                if remaining > 0 {
+                    self.remainingByMajor.put(majorScope, remaining - 1)
+                }
+            }
+            None => {}
+        }
+        self.activeUntilByMajor.put(majorScope, now + leaseMilliseconds)
+        reply.send(0)
+    }
+
+    on complete(routeTemplate: String, majorScope: String, bucket: Option<String>, remaining: Option<Int>, resetDelayMilliseconds: Option<Int>, status: Int, globalLimit: Bool, retryDelayMilliseconds: Option<Int>, reply: ReplySender<Int>) {
+        let now = monotonicMilliseconds()
+        let routeKey = rateLimitRouteKey(routeTemplate, majorScope)
+        self.activeUntilByMajor.remove(majorScope)
+
+        match bucket {
+            Some(bucketId) => {
+                if self.routeBuckets.containsKey(routeKey) || self.routeBuckets.length < 512 {
+                    self.routeBuckets.put(routeKey, bucketId)
+                    self.routeExpirations.put(routeKey, now + 600000)
+                }
+            }
+            None => {}
+        }
+
+        if status == 429 {
+            var delayMilliseconds: Int = 1000
+            match retryDelayMilliseconds {
+                Some(value) => {
+                    if value > 0 {
+                        delayMilliseconds = value
+                    }
+                }
+                None => {}
+            }
+            self.remainingByMajor.put(majorScope, 0)
+            self.resetAtByMajor.put(majorScope, now + delayMilliseconds)
+            self.blockedUntilByMajor.put(majorScope, now + delayMilliseconds)
+            self.stateExpirations.put(majorScope, now + 600000)
+            if globalLimit {
+                self.globalBlockedUntil = now + delayMilliseconds
+            }
+        } else {
+            match remaining {
+                Some(value) => {
+                    self.remainingByMajor.put(majorScope, value)
+                    match resetDelayMilliseconds {
+                        Some(delay) => {
+                            if delay > 0 {
+                                self.resetAtByMajor.put(majorScope, now + delay)
+                                if value == 0 {
+                                    self.blockedUntilByMajor.put(majorScope, now + delay)
+                                }
+                            }
+                        }
+                        None => {
+                            if value == 0 {
+                                self.remainingByMajor.put(majorScope, 0)
+                                self.resetAtByMajor.put(majorScope, now + 1000)
+                                self.blockedUntilByMajor.put(majorScope, now + 1000)
+                            }
+                        }
+                    }
+                    self.stateExpirations.put(majorScope, now + 600000)
+                }
+                None => {
+                    self.remainingByMajor.remove(majorScope)
+                    self.resetAtByMajor.remove(majorScope)
+                    self.stateExpirations.remove(majorScope)
+                }
+            }
+        }
+        reply.send(1)
+    }
+
+    on observedBucket(routeTemplate: String, majorScope: String, reply: ReplySender<Option<String>>) {
+        reply.send(self.routeBuckets.get(rateLimitRouteKey(routeTemplate, majorScope)))
+    }
+}
+
+pub fn newRestRateLimitCoordinator() -> ActorRef<DiscordRestRateLimitCoordinator> {
+    return spawn(DiscordRestRateLimitCoordinator())
+}
+
 // Sends one request to the fixed, verified HTTPS Discord API origin. The
 // endpoint is relative to /api/v10, so a caller cannot redirect the bot token
 // to an arbitrary host. This primitive never retries: callers must apply an
@@ -70,6 +331,115 @@ pub async fn requestBot(token: Secret<String>, methodName: String, endpoint: Str
         }
     }
     return Err<DiscordRestResponse, String>("Discord REST request did not start")
+}
+
+async fn finishCoordinatedRateLimit(coordinator: ActorRef<DiscordRestRateLimitCoordinator>, routeTemplate: String, majorScope: String, response: Option<DiscordRestResponse>) {
+    var bucket: Option<String> = None<String>()
+    var remaining: Option<Int> = None<Int>()
+    var resetDelayMilliseconds: Option<Int> = None<Int>()
+    var retryDelayMilliseconds: Option<Int> = None<Int>()
+    var status: Int = 0
+    var globalLimit: Bool = false
+    match response {
+        Some(value) => {
+            bucket = value.rateLimitBucket
+            remaining = rateLimitRemainingFromHeader(value.rateLimitRemaining)
+            status = value.status
+            globalLimit = responseIsGlobalRateLimit(value)
+            match boundedRetryDelayFromHeader(value.rateLimitResetAfter) {
+                Some(delay) => resetDelayMilliseconds = Some<Int>(delay.inMilliseconds())
+                None => {}
+            }
+            match boundedRetryDelay(value) {
+                Some(delay) => retryDelayMilliseconds = Some<Int>(delay.inMilliseconds())
+                None => {}
+            }
+        }
+        None => {}
+    }
+    let completed = coordinator.request(complete, routeTemplate, majorScope, bucket, remaining, resetDelayMilliseconds, status, globalLimit, retryDelayMilliseconds)
+    let ignored = await completed
+}
+
+pub async fn requestBotCoordinated(coordinator: ActorRef<DiscordRestRateLimitCoordinator>, routeTemplate: String, majorScope: String, token: Secret<String>, methodName: String, endpoint: String, body: Bytes, timeout: Duration) -> Result<DiscordRestResponse, String> {
+    if routeTemplate == "" || majorScope == "" {
+        return Err<DiscordRestResponse, String>("Discord REST rate-limit route and major scope must not be empty")
+    }
+    let timeoutMilliseconds = timeout.inMilliseconds()
+    if timeoutMilliseconds <= 0 || timeoutMilliseconds > 600000 {
+        return Err<DiscordRestResponse, String>("coordinated Discord REST timeout must be between 1 millisecond and 10 minutes")
+    }
+    let deadline = monotonicMilliseconds() + timeoutMilliseconds
+    var acquired: Bool = false
+    while !acquired {
+        let budget = deadline - monotonicMilliseconds()
+        if budget <= 0 {
+            return Err<DiscordRestResponse, String>("Discord REST request timed out while waiting for a rate-limit permit")
+        }
+        let acquire = coordinator.request(acquire, routeTemplate, majorScope, timeoutMilliseconds + 5000)
+        let waitMilliseconds = await acquire
+        if waitMilliseconds < 0 {
+            return Err<DiscordRestResponse, String>("Discord REST rate-limit coordinator capacity is exhausted")
+        }
+        if waitMilliseconds == 0 {
+            acquired = true
+        } else {
+            let remainingBudget = deadline - monotonicMilliseconds()
+            if remainingBudget <= 0 {
+                return Err<DiscordRestResponse, String>("Discord REST request timed out while waiting for a rate-limit permit")
+            }
+            var waitSlice = waitMilliseconds
+            if waitSlice > remainingBudget {
+                waitSlice = remainingBudget
+            }
+            let timer = sleepFor(milliseconds(waitSlice))
+            await timer
+        }
+    }
+    let networkBudget = deadline - monotonicMilliseconds()
+    if networkBudget <= 0 {
+        await finishCoordinatedRateLimit(coordinator, routeTemplate, majorScope, None<DiscordRestResponse>())
+        return Err<DiscordRestResponse, String>("Discord REST request timed out before transport started")
+    }
+    let result = await requestBot(token, methodName, endpoint, body, milliseconds(networkBudget))
+    match result {
+        Err(error) => {
+            await finishCoordinatedRateLimit(coordinator, routeTemplate, majorScope, None<DiscordRestResponse>())
+            return Err<DiscordRestResponse, String>(error)
+        }
+        Ok(response) => {
+            await finishCoordinatedRateLimit(coordinator, routeTemplate, majorScope, Some<DiscordRestResponse>(response))
+            return Ok<DiscordRestResponse, String>(response)
+        }
+    }
+    return Err<DiscordRestResponse, String>("Discord REST request did not complete")
+}
+
+pub async fn requestBotWithRetriesCoordinated(coordinator: ActorRef<DiscordRestRateLimitCoordinator>, routeTemplate: String, majorScope: String, token: Secret<String>, methodName: String, endpoint: String, body: Bytes, timeout: Duration, maxRetries: Int) -> Result<DiscordRestResponse, String> {
+    if maxRetries < 0 || maxRetries > 5 {
+        return Err<DiscordRestResponse, String>("Discord REST retry count must be between 0 and 5")
+    }
+    var retryCount: Int = 0
+    while retryCount <= maxRetries {
+        let result = await requestBotCoordinated(coordinator, routeTemplate, majorScope, token, methodName, endpoint, body, timeout)
+        match result {
+            Err(error) => return Err<DiscordRestResponse, String>(error)
+            Ok(response) => {
+                if response.status != 429 || retryCount == maxRetries {
+                    return Ok<DiscordRestResponse, String>(response)
+                }
+                match boundedRetryDelay(response) {
+                    None => return Ok<DiscordRestResponse, String>(response)
+                    Some(delay) => {
+                        let timer = sleepFor(delay)
+                        await timer
+                        retryCount = retryCount + 1
+                    }
+                }
+            }
+        }
+    }
+    return Err<DiscordRestResponse, String>("Discord REST coordinated retry loop stopped unexpectedly")
 }
 
 fn boundedRetryDelayFromSeconds(retryDelaySeconds: Float) -> Option<Duration> {
