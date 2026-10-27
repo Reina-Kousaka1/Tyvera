@@ -28,7 +28,7 @@ These core types and functions are currently available without an import:
 | `TcpListener` | Move-only listener. `accept()` returns `Task<Result<TcpConnection,String>>`; `localAddress`, `close`, and `isOpen` expose its bound address and lifecycle. `tcpListen(host, port, backlog)` accepts ports from 0 to 65535 and backlog from 1 to 4096; port `0` asks the OS to select a local port. Native support is experimental on Linux. |
 | `TlsConnection` | Move-only TLS client resource. `tlsConnect(host, port)` returns `Task<Result<TlsConnection,String>>`; `read`, `write`, `writeAll`, address accessors, `close`, and `isOpen` mirror the TCP byte-stream contract. Certificate-chain and hostname/IP verification are enabled; TLS 1.2 or later is required, and no insecure mode is exposed. Native V1 accepts ASCII DNS names and IP literals; other host names return a controlled error. The reference runtime uses its platform TLS provider. Experimental native support is Linux-only and uses OpenSSL trust paths, linked at build time. TLS server mode is not implemented. |
 | Async networking | `resolveHost(host, port)`, `tcpConnect(host, port)`, `tlsConnect(host, port)`, `tcpListen(host, port, backlog)`, `TcpListener.accept`, and connection reads/writes return `Task<Result<...,String>>`. Connect ports are from 1 to 65535; resolution ports are from 0 to 65535. The Reference Runtime uses bounded DNS workers and readiness registration. Native Linux uses a 64-task registry, non-blocking sockets, and I/O workers; it permits one pending accept per listener and one pending read/write per connection. Errors use normalized Tyvera strings inside `Result`, not host exception objects. Native socket waits observe task cancellation within the polling interval; cancellation of a blocking system DNS lookup is observed only after the resolver returns. Native `Task.withTimeout(Duration)` uses a monotonic deadline and cancels the pending operation; completion already published takes precedence at the deadline. Cancellation of a system DNS lookup is observed only after the resolver returns. |
-| Experimental HTTP/1.1 and WebSocket | `HttpMethod`, `HttpUrl`, `HttpLimits`, `HttpHeaders`, `HttpRequest`, `HttpResponse`, `HttpDecoder`, `HttpRouter`, and move-only `HttpServer`; client requests use DNS/TCP or verified TLS for `https://`. `webSocketUrl(String)` returns a parsed `WebSocketUrl` with `scheme`, `host`, `port`, `target`, and `hostEndsWith(String)`; `webSocketConnect` accepts either a URL string or this parsed value. The bounded codec handles Content-Length, chunked, and close-delimited responses, rejects ambiguous framing, and enforces message limits. The reference runtime also provides bounded WebSocket client resources over `ws://`/`wss://`. Server requests use plain TCP and the router stores static responses; see [HTTP foundation](http.md). TLS/WebSocket/native support boundaries and known limits are documented there. |
+| Experimental HTTP/1.1 and WebSocket | `HttpMethod`, `HttpUrl`, `HttpLimits`, `HttpHeaders`, `HttpRequest`, `HttpResponse`, `HttpDecoder`, `HttpRouter`, and move-only `HttpServer`; client requests use DNS/TCP or verified TLS for `https://`. `webSocketUrl(String)` returns a parsed `WebSocketUrl` with `scheme`, `host`, `port`, `target`, and `hostEndsWith(String)`; `webSocketConnect` accepts either a URL string or this parsed value. The bounded codec handles Content-Length, chunked, and close-delimited responses, rejects ambiguous framing, and enforces message limits. The reference runtime provides bounded `ws`/`wss` WebSocket resources. Native Linux experimentally supports typed HTTP client values and GET/POST/PUT/DELETE/custom requests, bounded HTTP/1.1 responses, and a bounded `ws`/verified-`wss` client; server/router/decoder support remains interpreter-only. See [HTTP foundation](http.md) for exact limits. |
 | Secrets | `secrets.NAME` reads `.tyvera.secrets` before the process environment and returns `Option<Secret<String>>`; `Secret.reveal()` is explicit. |
 | `Json` | `parseJson(String) -> Result<Json,String>`, `jsonStringify(Json) -> Result<String,String>`, typed constructors, and optional accessors for JSON values. |
 | Host platform | `hostOS() -> String`, `hostArchitecture() -> String`, and `environment(String) -> Option<Secret<String>>`; values are normalized and environment values remain secret-wrapped. See [platform support](platform.md). |
@@ -58,11 +58,12 @@ value semantics. Native `ByteBuffer` supports checked allocation, length,
 Native file operations include UTF-8 text, exact binary data, project-root
 relative paths, and protection for `.tyvera.secrets`. Synchronous text handles
 use the existing move-only ownership rules and deterministic LIFO cleanup.
-Async file operations, TLS, WebSockets, HTTP, Actors, generic user-defined
-functions, and other unsupported types remain interpreter-only. Native Linux
-also has the experimental Task/DNS/TCP subset described above. `tyvera
-build` reports unsupported calls or types; it never routes a native program
-through Python. The private C++ representation is not a public ABI. This
+Async file operations, Actors, generic user-defined functions, and other
+unsupported types remain interpreter-only. Native Linux also has experimental
+Task/DNS/TCP/TLS, HTTP-client, and WebSocket-client paths described above.
+Native HTTP server/router/general decoder and WebSocket server remain
+interpreter-only. `tyvera build` reports unsupported calls or types; it never
+routes a native program through Python. The private C++ representation is not a public ABI. This
 native I/O subset is experimental and CI-tested on Linux x86-64 only.
 
 ## Planned namespaces
@@ -83,9 +84,10 @@ subset supports bounded tasks, cooperative task cancellation, DNS/TCP, and
 experimental monotonic deadlines through `Task.withTimeout(Duration)`.
 Cancellation of an in-progress system DNS lookup is observed after the resolver
 returns.
-HTTP/1.1 client and
-server primitives are experimental and implemented above TCP. There is not yet a
-general user-defined Stream interface: `TcpConnection` defines the current
+HTTP/1.1 client and server primitives are experimental in the reference
+runtime; the native backend currently implements an experimental bounded HTTP
+client and WebSocket client on Linux. There is not yet a general user-defined
+Stream interface: `TcpConnection` defines the current
 byte-stream contract, and async text files reuse their existing resource API.
 JSON, collection, I/O and secret operations
 are bootstrap intrinsics rather than source `.tyv` modules, so they are not

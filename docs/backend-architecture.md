@@ -52,10 +52,11 @@ function.
 
 `tyvera/lowering.py` consumes only a checked program; it does not re-run type
 inference. The IR supports async functions, direct task calls, `await`, `runTasks`,
-and existing TCP/DNS/TLS client value and method signatures. Native task
-cancellation and monotonic deadlines are implemented for the supported task
-subset. Actors, supervisors, task groups, HTTP, classes, interfaces, and generic
-functions remain rejected by `tyvera build`.
+and the supported TCP/DNS/TLS, HTTP client, and WebSocket client value and
+method signatures. Native task cancellation and monotonic deadlines are
+implemented for the supported task subset. Actors, supervisors, task groups,
+HTTP servers/routers/decoders, classes, interfaces, and generic functions remain
+rejected by `tyvera build`.
 
 ## Three separate contracts
 
@@ -116,19 +117,24 @@ is recognized by the bootstrap but is not independently CI-tested. See
 [Host platform foundation](platform.md).
 
 The networking layer has no user-defined general Stream interface. TCP
-establishes a byte-stream contract; text files retain their UTF-8 resource
-API. Experimental HTTP/1.1 codecs, a typed client, a bounded concurrent
-server, verified TLS client connections, and a bounded WebSocket client use
-that owned byte-stream path in the reference interpreter. TLS uses the host
-trust store, SNI, and hostname verification; Tyvera does not implement
-cryptography. The native C++ backend has an experimental Linux TCP/DNS subset and a TLS
-client built on OpenSSL. It verifies the platform trust paths and the requested
-DNS hostname or IP address by default, requires TLS 1.2 or later, and exposes
-no insecure verification mode. Native TLS builds link the host OpenSSL
-libraries, and the executable requires those libraries at runtime. Native V1
-accepts ASCII DNS names and IP literals; other host names return a controlled error. HTTP and WebSocket remain interpreter-only.
-HTTP/2, HTTP/3, TLS server mode, database protocols, and other application
-protocols remain separate work.
+establishes a byte-stream contract; text files retain their UTF-8 resource API.
+The reference interpreter provides the complete experimental HTTP/1.1 codec,
+client/server, and bounded WebSocket client over owned TCP/TLS streams. The
+native C++17 backend now has an experimental Linux client slice for HTTP/1.1,
+WebSocket, TCP, DNS, and verified TLS. Native HTTP supports typed method, URL,
+header, request, and response values plus `httpGet`, `httpPost`, `httpPut`,
+`httpDelete`, and `httpSend`; it parses bounded Content-Length, chunked, and
+close-delimited responses and closes each connection after one request. The
+native WebSocket client supports bounded `ws://` and verified `wss://`
+connections, masked client frames, text/binary messages, ping/pong, fragmented
+messages, and close handling. HTTP server/router/decoder and WebSocket server
+remain reference-only. TLS uses platform trust paths, SNI, and hostname/IP
+verification; TLS 1.2 or later is required and no insecure mode is exposed.
+Native TLS builds link host OpenSSL libraries required at build and runtime.
+Native host names are ASCII DNS names or IP literals; unsupported forms produce
+controlled errors. Tyvera does not implement cryptography. HTTP/2, HTTP/3, TLS
+server mode, database protocols, and other application protocols remain
+separate work.
 
 ### Backend implementation
 
@@ -172,10 +178,11 @@ generated-code representation is:
 This is a private V1 code-generation contract, not a stable public C ABI or an
 FFI. These representations are private compiler details, not a public ABI.
 Generated executables do not embed or invoke Python. Synchronous file and
-binary I/O, `ByteBuffer`, text-file resources, and the limited Linux TCP/DNS
-task path are supported experimentally. Classes, records, user-defined enums,
-tuples, generic functions, Actors, Supervisors, TLS, and HTTP remain
-interpreter-only. No native actor or public error ABI is implemented. There is no
+binary I/O, `ByteBuffer`, text-file resources, and experimental Linux async
+TCP/DNS/TLS, HTTP-client, and WebSocket-client paths are supported. Classes,
+records, user-defined enums, tuples, generic functions, Actors, Supervisors,
+HTTP servers/routers/decoders, and WebSocket servers remain interpreter-only.
+No native actor or public error ABI is implemented. There is no
 `unsafe` or FFI declaration syntax. Any later FFI must define ownership,
 lifetimes, mutability, and error conversion explicitly; a native crash cannot
 become a recoverable Tyvera `Result`. See the [Memory Model](memory-model.md)
@@ -243,7 +250,8 @@ does not make C++ part of Tyvera's language.
 | Text resources | `TextFile`, `TextReader`, `TextWriter`, `using`, move transfer, `Result`/function transfer, synchronous methods, modes, close/isOpen, and deterministic LIFO cleanup are implemented. |
 | Records, tuples, user-defined enums, classes, interfaces, generic functions | Interpreter-only. |
 | `Task<T>`, async functions, `await`, `runTasks()` | Experimental native subset; task bodies are serialized and I/O waits use bounded worker threads. Cooperative task/child cancellation and monotonic `withTimeout(Duration)` deadlines are supported; `tryResult()`, task groups, and actor ownership remain unsupported. |
-| DNS, TCP, and TLS client | Experimental on native Linux: `resolveHost`, `tcpConnect`, `tcpListen`, `accept`, connection read/write, and verified `tlsConnect` with hostname/IP checks, all as typed `Task<Result<...,String>>` operations. RAII handles close sockets and TLS sessions. HTTP/WebSocket remain interpreter-only. |
+| DNS, TCP, and TLS client | Experimental on native Linux: `resolveHost`, `tcpConnect`, `tcpListen`, `accept`, connection read/write, and verified `tlsConnect` with hostname/IP checks, all as typed `Task<Result<...,String>>` operations. RAII handles close sockets and TLS sessions. |
+| HTTP/WebSocket client | Experimental native Linux subset: typed HTTP values and GET/POST/PUT/DELETE/custom request client; bounded HTTP/1.1 responses; bounded `ws`/verified `wss` client. Native HTTP server/router/general codec and WebSocket server remain interpreter-only. |
 | Actors, Supervisors | Interpreter-only; native lowering rejects these constructs. |
 | `hostOS()`, `hostArchitecture()`, `monotonicMilliseconds()` | Native C++17 runtime and reference implementations; OS/architecture names are normalized and elapsed time is monotonic. |
 | Native SIGINT/SIGTERM shutdown | Generated C++17 records the first signal and unwinds at statement/loop safe points; scope resources use RAII cleanup. |
@@ -262,13 +270,14 @@ compiler succeeds. Missing toolchains and unsupported source constructs
 produce controlled diagnostics. CI builds and runs the native examples on
 Linux x86-64 with Python removed from the executable's `PATH`.
 
-End-to-end tests compare stdout, stderr, and exit status for native examples
-against `ReferenceInterpreterBackend`; the local TCP echo example and DNS
-success/failure paths are included. They also cover located runtime failures,
-IR validation, unsupported-feature diagnostics, and the CLI. This is a focused
-compiler corpus, not full-language differential testing. TCP/DNS are not
-claimed for Windows or macOS native builds. Addresses, host tracebacks, and
-timing are not semantic outputs.
+End-to-end tests compare stdout, stderr, and exit status against
+`ReferenceInterpreterBackend`. The local corpus covers TCP echo, DNS
+success/failure, HTTP GET/POST with chunked and malformed responses, verified
+HTTPS using a local certificate, and WebSocket echo/close. It also covers
+located runtime failures, IR validation, unsupported-feature diagnostics, and
+the CLI. This is a focused compiler corpus, not full-language differential
+testing. Native networking clients are not claimed for Windows or macOS.
+Addresses, host tracebacks, and timing are not semantic outputs.
 
 ## Upstream references
 

@@ -73,7 +73,7 @@ implements the supported subset noted below.
 | Enums, newtypes, tuples, records | Typed value types; records are immutable nominal values and fields compare structurally. | Implemented in the bootstrap; native backend remains interpreter-only. |
 | Class instances, lists, maps | Classes use stable identity; lists and maps compare by contents. Assignment copies references; collection contents remain shared. | Lists and maps are implemented natively for supported element types; classes remain interpreter-only. |
 | Actor references, tasks, reply handles, timers, supervisors | Opaque identity handles. Copying a handle does not copy the actor, task, or operation it names. | Implemented in the interpreter; public runtime ABI is planned. |
-| Resource handles | One live owner, explicit transfer, deterministic release. | Implemented for text files, TCP connections/listeners, and HTTP servers. Native file resources use checked moves and synchronous LIFO cleanup. Experimental native Linux TCP uses checked move-only connection/listener handles with a private RAII descriptor; in-flight operations use duplicated descriptors and closing the owner shuts down the shared socket. Native task cancellation cascades through owned children and socket waits; DNS cancellation is observed after the system lookup returns. Native task deadlines remain unsupported. |
+| Resource handles | One live owner, explicit transfer, deterministic release. | Implemented for text files, TCP connections/listeners, and HTTP servers. Native file resources use checked moves and synchronous LIFO cleanup. Experimental native Linux TCP uses checked move-only connection/listener handles with a private RAII descriptor; in-flight operations use duplicated descriptors and closing the owner shuts down the shared socket. Native task cancellation cascades through owned children and socket waits; DNS cancellation is observed after the system lookup returns. Native `Task.withTimeout(Duration)` uses monotonic deadlines and waits for source cleanup. |
 
 For mutable ordinary references, `==` compares identity. Value equality
 compares scalar and immutable tagged values structurally, recursively applying
@@ -184,10 +184,10 @@ canonical direct, traversal, absolute, and symlink paths. The generated C++17
 runtime preserves checked numeric behavior, controlled I/O results, and
 source-located runtime errors. Executables do not invoke or embed Python.
 The native backend has an experimental Linux slice for `Task<T>`, `await`,
-`runTasks`, DNS, TCP, and cooperative task cancellation. Native deadlines,
-task groups, Actors, Supervisors, user-defined types, generic functions, TLS,
-HTTP, and WebSockets remain interpreter-only or planned. No public native ABI
-or FFI is implemented.
+`runTasks`, DNS, TCP, and cooperative task cancellation. Native monotonic task deadlines are implemented for the supported task subset.
+Task groups, Actors, Supervisors, user-defined types, generic functions, HTTP
+servers/routers/general decoders, WebSocket servers, and FFI remain
+interpreter-only or planned. No public native ABI is implemented.
 
 `Bytes` is an immutable Tyvera value. Native values are represented internally
 by vectors and passed by value, preserving observable value semantics.
@@ -229,12 +229,14 @@ experimental HTTP/1.1 codec/client/server operate on bounded `Bytes` messages
 over owned TCP connections. HTTP request/response values are ordinary values;
 `HttpServer`, `TlsConnection`, and `WebSocket` are move-only resources in the
 reference interpreter. Native Linux also supports an experimental move-only
-`TlsConnection` client using OpenSSL's configured trust paths, TLS 1.2 or later,
-and hostname/IP verification. It owns the TCP handle and TLS session; scope cleanup closes the
-TLS session before the socket, while cancellation releases pending operation
-descriptors. `WebSocket` and `HttpServer` remain interpreter-only. Native
-TCP/DNS/TLS is an experimental Linux subset. TLS server mode, native HTTP/
-WebSockets, session Resume, and protocols beyond HTTP/1.1 are not implemented.
+`TlsConnection` client using OpenSSL trust paths, TLS 1.2 or later, and
+hostname/IP verification. It owns the TCP handle and TLS session; scope cleanup
+closes the TLS session before the socket, while cancellation releases pending
+operation descriptors. The native backend also has bounded move-only HTTP and
+WebSocket client resources with typed task results, verified TLS for HTTPS and
+WSS, and cleanup through the same task/socket ownership boundary. HTTP servers,
+routers and general decoders, WebSocket servers, TLS server mode, session Resume,
+and protocols beyond HTTP/1.1 remain unsupported natively.
 
 Native FFI is not implemented. A future ABI may pass `Byte` as an unsigned
 8-bit scalar and immutable `Bytes` as a borrowed pointer/length span valid only

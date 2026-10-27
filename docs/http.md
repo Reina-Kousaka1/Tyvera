@@ -126,7 +126,18 @@ opt-in and connects only to a local echo server on `127.0.0.1:8765`.
 ## Experimental and planned
 
 The HTTP/1.1 protocol core, static router, and reference server are implemented
-and tested, but the bootstrap API is experimental. Current bounds from
+and tested, but the bootstrap API is experimental. The native Linux client is
+also experimental: it supports typed HTTP request/response values and GET,
+POST, PUT, DELETE, and custom requests, with one request per connection and
+`Connection: close`. Native response parsing accepts Content-Length, chunked,
+and close-delimited framing. Native headers are limited to 32 KiB and 100
+fields, the start line to 8 KiB, and the body to 1 MiB. Verified HTTPS uses
+OpenSSL, configured trust paths, and hostname/IP checks; there is no
+verification bypass or redirect following. Native loopback differential tests
+cover GET/POST, binary bodies, repeated headers, chunked responses, malformed
+Content-Length, and verified HTTPS. Native HTTP server, router, generic
+incremental codec, JSON bridge, and streaming remain unsupported. The native
+WebSocket client is separately documented below. Current reference bounds from
 `HttpLimits` are 256–65,536 bytes per request line, 1,024–262,144 bytes for
 headers, 1–1,024 headers, and 0–16 MiB for a message body. The default limits
 are 8 KiB, 32 KiB, 100 headers, 1 MiB, and 128 active connections. The
@@ -143,13 +154,18 @@ There is no dynamic route handler, middleware, request/response streaming,
 compression, automatic JSON-to-record codec, or importable `tyvera.http`
 module. Existing `Json` values can be parsed or serialized explicitly. The
 reference WebSocket client uses the same verified TLS connection for `wss://`
-and has bounded framing. The experimental native backend currently supports a
-Linux TCP/DNS path and a verified TLS client, but does not yet support HTTP or
-WebSockets. HTTP/2, HTTP/3, TLS server mode, databases, and application-specific
-protocols remain outside this milestone.
+and has bounded framing. The experimental native Linux backend also supports a
+bounded WebSocket client: it validates `ws://`/`wss://` URLs, verifies TLS for
+`wss://`, masks client frames, handles text/binary messages, ping/pong,
+fragmentation, close handshakes, and controlled disconnects. Native WebSocket
+frames/messages are capped at 1 MiB. Native HTTP/WebSocket support is client
+only; HTTP server/router/general decoder, WebSocket server, HTTP/2, HTTP/3,
+TLS server mode, databases, and application-specific protocols remain outside
+this milestone.
 
 The reference implementation uses a backend-independent byte codec and the
-existing internal TCP/task adapter. A future native runtime can replace the
-adapter while preserving request/response framing, limits, timeout behavior,
-ownership, and normalized errors. No Python exception or socket object is part
-of Tyvera's observable API.
+existing internal TCP/task adapter. The native client has its own bounded
+C++17 implementation over the same Tyvera TCP/TLS/task contract; it does not
+fall back to the interpreter. Both paths normalize expected failures through
+`Result<T,String>`, and no Python exception, C++ exception, or host socket
+object is part of Tyvera's observable API.
