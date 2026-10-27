@@ -247,8 +247,7 @@ serializes Tyvera task bodies so shared mutable values are not accessed in
 parallel. Native task cancellation is cooperative at statement/loop and socket
 poll checkpoints; owned children are cancelled on owner cancellation/failure
 and joined before owner completion. A blocking native DNS lookup cannot be
-interrupted mid-call. Native task groups and actor-owned tasks remain
-unsupported. The experimental native C++17 actor subset supports typed
+interrupted mid-call. Native task groups remain unsupported. The experimental native C++17 actor subset supports typed
 fire-and-forget messages, FIFO delivery per actor, round-robin actor turns,
 `stop`, `isAlive`, bounded mailboxes, and `runActors()` error results. The
 native supervisor subset supports nested trees, `oneForOne`, `oneForAll`,
@@ -265,7 +264,8 @@ queued actor work or deadline is reported as a controlled scheduler deadlock.
 Native actor-owned Tasks are bound to the actor instance that creates them.
 Stop, crash, supervised restart, and runtime shutdown request cancellation and
 wait for those Tasks to finish cleanup before the lifecycle transition completes.
-A Task that stops its own actor unwinds at its next interruption point. `sendAfter` timers, monitoring/links, task groups, and
+A Task that stops its own actor unwinds at its next interruption point.
+`sendAfter` timers, monitoring/links, task groups, and
 supervised actors owning move-only Resources remain unsupported natively.
 Generated actor references use shared runtime handles; queued callbacks hold
 weak target references, and runtime shutdown clears mailboxes, supervisors,

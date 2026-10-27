@@ -1065,7 +1065,7 @@ fn main() {
             reference = self._reference_result(source, root)
             native = self._native_source_result(source, root, root / "actor-failure-network-cleanup", root)
             self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
-            self.assertEqual(native.stdout, "true\\ntrue\\nactor failure observed\\n")
+            self.assertEqual(native.stdout, "true\ntrue\nactor failure observed\n")
 
     def test_native_actor_crash_diagnostics_redact_secret_arguments(self) -> None:
         source = '''actor Broken {
