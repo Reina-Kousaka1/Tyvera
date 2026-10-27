@@ -722,13 +722,7 @@ interpreter remains the complete runtime for those features.
 
 ## JSON values
 
-`Json` is an opaque, typed value. `parseJson(text) -> Result<Json,String>`
-parses JSON and returns a generic `Err("invalid JSON document")` for malformed
-input, duplicate object keys, non-standard constants, non-finite numbers,
-numbers outside the signed 64-bit `Int` range, excessive nesting, or invalid
-Unicode surrogate values. JSON integers use `Int`; decimal or exponent-form
-numbers use finite binary64 `Float`. No conversion to arbitrary Tyvera classes
-is performed.
+`Json` is an immutable opaque, typed value. `parseJson(text) -> Result<Json,String>` parses JSON and returns a generic `Err("invalid JSON document")` for malformed input, duplicate object keys, non-standard constants, non-finite numbers, numbers outside the signed 64-bit `Int` range, documents larger than 16 MiB, nesting deeper than 128 containers, or invalid Unicode surrogate values. JSON integers use `Int`; decimal or exponent-form numbers use finite binary64 `Float`. No conversion to arbitrary Tyvera classes is performed. The size and nesting limits are the same in the reference and native runtimes.
 
 `jsonStringify(value) -> Result<String,String>` encodes a `Json` value as
 compact JSON. Constructors preserve Tyvera's static types:
@@ -745,10 +739,15 @@ Their payload type is the corresponding primitive, length, `Json`, or
 `List<String>`. A wrong container kind, missing key, or out-of-range index
 returns `None`; there are no implicit numeric conversions. JSON values can be
 inspected or encoded, but automatic mapping to user-defined classes is not yet
-implemented. Records and enum variants do not yet have derived JSON codecs;
+implemented. JSON values compare structurally; object equality ignores key
+insertion order, while stringification and `objectKeys()` preserve that order.
+Records and enum variants do not yet have derived JSON codecs;
 typed serialization needs an explicit schema and validation policy. These
 operations are bootstrap intrinsics and do not yet live in an importable
-`tyvera.json` source module.
+`tyvera.json` source module. The experimental C++17 backend implements the
+same parser, constructors, accessors, structural equality, and compact
+stringifier for natively supported programs. This does not add automatic
+serialization for records or enum variants.
 
 ```tyv
 match parseJson("{\"ready\":true}") {

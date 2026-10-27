@@ -88,6 +88,7 @@ _TYPE_MAP = {
     "Float": IRType.FLOAT,
     "Bool": IRType.BOOL,
     "String": IRType.STRING,
+    "Json": IRType.JSON,
     "Byte": IRType.BYTE,
     "Duration": IRType.DURATION,
     "Bytes": IRType.BYTES,
@@ -627,7 +628,7 @@ class _FunctionLowerer:
                 or isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Task"
                 or isinstance(receiver.type, IRActorRefType)
                 or receiver.type in {
-                    IRType.BYTE, IRType.DURATION, IRType.BYTES, IRType.BYTE_BUFFER,
+                IRType.JSON, IRType.BYTE, IRType.DURATION, IRType.BYTES, IRType.BYTE_BUFFER,
                     IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
                     IRType.SOCKET_ADDRESS, IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER,
                     IRType.WEBSOCKET, IRType.WEBSOCKET_URL, IRType.WEBSOCKET_MESSAGE,
@@ -674,6 +675,7 @@ class _FunctionLowerer:
                 return IRCollectionCreate(expression_type, expression.location)
             if expression.callee in {
                 "milliseconds", "seconds", "durationFromSeconds", "byteFromInt", "bytesFromString", "byteBuffer", "readText", "writeText",
+                "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool", "jsonNull", "jsonArray", "jsonObject",
                 "readBytes", "writeBytes", "pathJoin", "pathExists", "openText",
                 "openTextReader", "openTextWriter", "hostOS", "hostArchitecture", "runActors",
                 "monotonicMilliseconds", "runTasks", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen",

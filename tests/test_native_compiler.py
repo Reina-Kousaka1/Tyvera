@@ -46,6 +46,7 @@ from tyvera.ir import (
     validate_ir,
 )
 from tyvera.lowering import lower_checked_program
+from tyvera.json_limits import MAX_JSON_DOCUMENT_BYTES, MAX_JSON_NESTING
 from tyvera.source import Diagnostic, Location
 from tyvera.websocket_protocol import make_accept_value
 
@@ -118,6 +119,31 @@ fn main() {
         value = module.functions[0].body[0].value
         self.assertEqual(value.type, IRType.INT)
         self.assertEqual(value.value, -(1 << 63))
+
+    def test_json_calls_and_methods_lower_with_explicit_types(self) -> None:
+        module = self.lower('''fn main() {
+    let parsed: Result<Json, String> = parseJson("null")
+    let keyed: Map<Json, Int> = Map<Json, Int>()
+    keyed.put(jsonNull(), 1)
+    println(keyed.containsKey(jsonNull()))
+    match parsed {
+        Ok(value) => println(value.kind())
+        Err(_) => println("invalid")
+    }
+}''')
+        parsed = module.functions[0].body[0].value
+        self.assertIsInstance(parsed, IRBuiltinCall)
+        self.assertEqual(parsed.builtin, "parseJson")
+        self.assertEqual(parsed.type, IRAppliedType("Result", (IRType.JSON, IRType.STRING)))
+        kind_call = module.functions[0].body[4].arms[0].body[0].value
+        self.assertIsInstance(kind_call, IRMethodCall)
+        self.assertEqual(kind_call.receiver.type, IRType.JSON)
+        self.assertEqual(kind_call.method, "kind")
+        validate_ir(module)
+        generated = emit_cpp(module)
+        self.assertIn("tyvera_runtime::parse_json", generated)
+        self.assertIn("tyvera_runtime::json_kind", generated)
+        self.assertIn("tyvera_runtime::map_put<tyvera_runtime::JsonValue", generated)
 
     def test_transparent_primitive_aliases_lower_to_their_target_type(self) -> None:
         module = self.lower('''type Count = Int
@@ -2194,6 +2220,184 @@ fn main() {
                 self.assertEqual(result.returncode, 1)
                 self.assertEqual(result.stderr.strip(), diagnostic)
                 self.assertEqual(result.stdout, "")
+
+    def test_native_json_values_constructors_and_failures_match_reference(self) -> None:
+        source = r'''fn report(document: String) {
+    match parseJson(document) {
+        Ok(value) => match jsonStringify(value) {
+            Ok(encoded) => println(encoded)
+            Err(_) => println("encoding failed")
+        }
+        Err(message) => println(message)
+    }
+}
+fn main() {
+    report("{\"unicode\":\"\\ud83d\\ude03\",\"line\":\"a\\nb\"}")
+    report("[-0,-0.0,1.5,1e-4,1e-5,1e15,1e16,1e-9999]")
+    report("{\"x\":1,\"x\":2}")
+    report("9223372036854775808")
+    report("NaN")
+    report("\"\\ud800\"")
+    let values: List<Json> = List<Json>()
+    values.append(jsonString("hello\nworld"))
+    values.append(jsonBool(true))
+    let entries: Map<String, Json> = Map<String, Json>()
+    entries.put("items", jsonArray(values))
+    entries.put("count", jsonInt(2))
+    println(jsonObject(entries) == jsonObject(entries))
+    let first: Map<String, Json> = Map<String, Json>()
+    first.put("a", jsonInt(1))
+    first.put("b", jsonInt(2))
+    let second: Map<String, Json> = Map<String, Json>()
+    second.put("b", jsonInt(2))
+    second.put("a", jsonInt(1))
+    println(jsonObject(first) == jsonObject(second))
+    let keyed: Map<Json, Int> = Map<Json, Int>()
+    keyed.put(jsonObject(first), 7)
+    match keyed.get(jsonObject(second)) {
+        Some(value) => println(value)
+        None => println(-1)
+    }
+    match jsonStringify(jsonObject(entries)) {
+        Ok(encoded) => println(encoded)
+        Err(_) => println("encoding failed")
+    }
+}'''
+        deep_document = "[" * (MAX_JSON_NESTING + 1) + "0" + "]" * (MAX_JSON_NESTING + 1)
+        source = source.replace(
+            '    report("NaN")',
+            '    report("NaN")\n    report("' + deep_document + '")',
+        )
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-json-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "json", root)
+        self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+        self.assertIn('"unicode":"😃"', native.stdout)
+        self.assertIn("true\ntrue\n7\n", native.stdout)
+
+    def test_native_json_document_size_limit_matches_reference(self) -> None:
+        source = '''fn main() {
+    match readText("large.json") {
+        Ok(document) => match parseJson(document) {
+            Ok(_) => println("accepted")
+            Err(_) => println("rejected")
+        }
+        Err(_) => println("read failed")
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-json-limit-") as temporary:
+            root = Path(temporary)
+            (root / "large.json").write_bytes(b" " * (MAX_JSON_DOCUMENT_BYTES + 1))
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "json-limit", root)
+        self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+        self.assertEqual(native.stdout, "rejected\n")
+
+    def test_native_json_accessors_and_typed_constructors_match_reference(self) -> None:
+        source = r'''fn main() {
+    match parseJson("{\"array\":[null,true,12,1.5,\"text\"],\"key\":\"value\"}") {
+        Err(_) => println("parse failed")
+        Ok(document) => {
+            println(document.kind())
+            match document.objectLength() {
+                Some(length) => println(length)
+                None => println(-1)
+            }
+            match document.objectGet("key") {
+                Some(value) => match value.asString() {
+                    Some(text) => println(text)
+                    None => println("wrong string kind")
+                }
+                None => println("missing key")
+            }
+            match document.objectGet("missing") {
+                Some(_) => println("unexpected key")
+                None => println("missing key")
+            }
+            match document.objectGet("array") {
+                Some(array) => {
+                    match array.arrayLength() {
+                        Some(length) => println(length)
+                        None => println(-1)
+                    }
+                    match array.arrayAt(0) {
+                        Some(value) => println(value.isNull())
+                        None => println(false)
+                    }
+                    match array.arrayAt(1) {
+                        Some(value) => match value.asBool() {
+                            Some(flag) => println(flag)
+                            None => println(false)
+                        }
+                        None => println(false)
+                    }
+                    match array.arrayAt(2) {
+                        Some(value) => match value.asInt() {
+                            Some(number) => println(number)
+                            None => println(-1)
+                        }
+                        None => println(-1)
+                    }
+                    match array.arrayAt(3) {
+                        Some(value) => match value.asFloat() {
+                            Some(number) => println(number)
+                            None => println(-1.0)
+                        }
+                        None => println(-1.0)
+                    }
+                    match array.arrayAt(4) {
+                        Some(value) => match value.asString() {
+                            Some(text) => println(text)
+                            None => println("wrong string kind")
+                        }
+                        None => println("missing array value")
+                    }
+                    match array.arrayAt(-1) {
+                        Some(_) => println("unexpected negative index")
+                        None => println("negative index rejected")
+                    }
+                    match array.arrayAt(5) {
+                        Some(_) => println("unexpected end index")
+                        None => println("end index rejected")
+                    }
+                }
+                None => println("missing array")
+            }
+            match document.objectKeys() {
+                Some(keys) => {
+                    match keys.get(0) {
+                        Some(key) => println(key)
+                        None => println("missing first key")
+                    }
+                    match keys.get(1) {
+                        Some(key) => println(key)
+                        None => println("missing second key")
+                    }
+                }
+                None => println("wrong object kind")
+            }
+        }
+    }
+    match parseJson("null") {
+        Ok(value) => println(value.isNull())
+        Err(_) => println(false)
+    }
+    match jsonStringify(jsonFloat(1.0)) {
+        Ok(encoded) => println(encoded)
+        Err(_) => println("float encoding failed")
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-json-accessors-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "json-accessors", root)
+        self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+        self.assertEqual(
+            native.stdout,
+            "object\n2\nvalue\nmissing key\n5\ntrue\ntrue\n12\n1.5\ntext\n"
+            "negative index rejected\nend index rejected\narray\nkey\ntrue\n1.0\n",
+        )
 
 
 

@@ -20,6 +20,11 @@ remaining design work for later backends.
   identity-based. Scoped resources cannot be compared as public values. Mixed
   `Int`/`Float` equality compares the exact represented numeric values; Bool is
   a separate type.
+- `Json` is an immutable tagged value. Assignment, function arguments, and
+  returns preserve value semantics. Arrays preserve element order; objects
+  preserve insertion order for `objectKeys()` and stringification, while
+  structural equality ignores object key order. Native storage may share
+  private nested values because Tyvera exposes no mutation operation on `Json`.
 - Map storage uses a Tyvera-defined stable hash/equality contract. Keys are
   restricted to recursively hashable values and stable identity references;
   mutable collections and values containing them cannot be keys.
@@ -69,6 +74,7 @@ implements the supported subset noted below.
 | `String` | Immutable Unicode scalar sequence; equality compares exact sequence, without normalization. | Implemented for source and file I/O; indexing and grapheme APIs remain open. |
 | `Bytes` | Immutable byte value; equality compares contents. Assignment, calls, returns, and actor messages preserve value semantics. Binary slices and indexed reads return checked results. | Reference runtime and native `bytesFromString`, equality, length, get, slice, UTF-8 decoding, and binary file I/O are implemented. |
 | `ByteBuffer` | Shared mutable reference to zero-initialized, runtime-managed bytes; access is bounds checked and snapshots are immutable. | Reference runtime and native allocation/access/snapshot are implemented with a 64 MiB cap. Raw pointers, unchecked access, custom allocators, and manual deallocation are not exposed. |
+| `Json` | Immutable tagged value; arrays are ordered and object equality is structural independent of insertion order. Parse/encode are bounded at 16 MiB and 128 nested containers. | Reference and experimental native C++17 parser, constructors, accessors, comparison, and compact encoding share these limits; user-defined record/ADT codecs are not implemented. |
 | `Option<T>`, `Result<T,E>` | Immutable tagged values with structural equality; nested references retain their own identity/value behavior. | Implemented in the bootstrap and native backend for types in the native support subset. |
 | Enums, newtypes, tuples, records | Typed value types; records are immutable nominal values and fields compare structurally. | Implemented in the bootstrap; native backend remains interpreter-only. |
 | Class instances, lists, maps | Classes use stable identity; lists and maps compare by contents. Assignment copies references; collection contents remain shared. | Lists and maps are implemented natively for supported element types; classes remain interpreter-only. |

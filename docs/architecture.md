@@ -114,11 +114,14 @@ manifest and creates starter projects. `cli.py` provides `new`, `run`, `check`,
   cancelled. `ActorRef.sendAfter` uses it to schedule one typed actor message;
   `runActors()` promotes due messages but never sleeps or wakes itself. The
   interpreter's clock injection keeps time-dependent tests deterministic.
-- JSON uses a Tyvera-owned opaque `Json` value and checked constructors,
-  accessors and `Result`-returning parse/encode intrinsics. The bootstrap uses
-  Python's standard JSON codec internally, but rejects duplicate keys,
-  non-finite values, out-of-range integers and invalid surrogate values; host
-  dictionaries and arbitrary Tyvera instances never cross the language API.
+- JSON uses a Tyvera-owned immutable opaque `Json` value, typed constructors,
+  accessors, structural equality, and `Result`-returning parse/encode
+  intrinsics. The reference runtime uses Python's standard codec internally;
+  the experimental native runtime has its own C++17 parser and encoder. Both
+  reject duplicate keys, non-finite values, out-of-range integers, invalid
+  surrogate values, documents over 16 MiB, and nesting beyond 128 containers.
+  Host dictionaries and arbitrary Tyvera instances never cross the language
+  API.
 - Text I/O returns `Result` values and path operations are explicit core
   functions. `SecretProvider` reads project-local secrets first and falls back
   to the process environment. The interpreter wraps loaded values in a
@@ -170,10 +173,12 @@ flow. The first backend emits C++17 with checked
 arithmetic and diagnostics, then invokes a host compiler. Linux x86-64 is the
 CI-tested target. Generated executables do not require Python. `Option`/
 `Result` matching, typed `List`/`Map`, `Byte`, immutable `Bytes`, bounded
-`ByteBuffer`, synchronous text/binary file and path operations, and owned
-text-file resources are now part of the native subset. Classes, generic
-functions, Tasks, Actors, async I/O, networking, and HTTP remain
-interpreter-only. The full boundary and backend evaluation are in
+`ByteBuffer`, opaque `Json`, synchronous text/binary file and path operations,
+and owned text-file resources are part of the native subset. Linux also has
+experimental async DNS/TCP/TLS, HTTP/WebSocket clients, and actor/supervisor
+subsets. Classes, records, user-defined enums, generic functions, task groups,
+actor monitoring/links, and the full Discord package remain interpreter-only.
+The full boundary and backend evaluation are in
 [Backend Architecture](backend-architecture.md); Tyvera's value and resource
 rules are in the [Memory Model](memory-model.md).
 

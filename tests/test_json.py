@@ -7,6 +7,7 @@ from pathlib import Path
 
 from tyvera.compiler import compile_source
 from tyvera.interpreter import Interpreter
+from tyvera.json_limits import MAX_JSON_DOCUMENT_BYTES, MAX_JSON_NESTING
 from tyvera.source import Diagnostic
 
 
@@ -143,6 +144,23 @@ class JsonTests(unittest.TestCase):
         Err(_) => println("rejected")
     }
 }'''), "rejected\n")
+
+    def test_json_document_nesting_limit_is_shared_and_inclusive(self) -> None:
+        for depth, expected in ((MAX_JSON_NESTING, "accepted\n"), (MAX_JSON_NESTING + 1, "rejected\n")):
+            document = "[" * depth + "0" + "]" * depth
+            source = f'''fn main() {{
+    match parseJson("{document}") {{
+        Ok(_) => println("accepted")
+        Err(_) => println("rejected")
+    }}
+}}'''
+            with self.subTest(depth=depth):
+                self.assertEqual(self._run(source), expected)
+
+    def test_json_document_byte_limit_returns_a_result_error(self) -> None:
+        result = Interpreter._parse_json(" " * (MAX_JSON_DOCUMENT_BYTES + 1))
+        self.assertEqual(result.variant, "Err")
+        self.assertEqual(result.payload, "invalid JSON document")
 
     def test_accessors_return_none_for_missing_values_and_wrong_kinds(self) -> None:
         self.assertEqual(self._run(r'''fn main() {

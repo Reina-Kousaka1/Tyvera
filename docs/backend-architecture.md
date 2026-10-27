@@ -43,7 +43,9 @@ flow explicit. Unsupported nodes fail with a source-located backend diagnostic.
 `tyvera/ir.py` defines a small backend-neutral IR: typed scalar literals and
 local references, direct function calls, unary/binary operations, local
 declarations and assignments, output, returns, lexical blocks, `if`, `while`,
-`break`, and `continue`. Every node retains its Tyvera type and source
+`break`, and `continue`. The typed value subset also includes opaque `Json`,
+its parse/stringify constructors and accessors, structural comparison, and
+`Json`-keyed maps. Every node retains its Tyvera type and source
 location. Locals have unique identifiers, so shadowing and mutation do not
 depend on C++ name lookup. `validate_ir()` checks calls, operator/result types,
 binding scopes and mutability, entry-point shape, loop-control placement, and
@@ -160,6 +162,13 @@ generated-code representation is:
 - `ByteBuffer`: private shared storage for zero-initialized managed bytes,
   capped at 67,108,864 bytes. `length`, `get`, `set`, and `toBytes` preserve
   the checked Tyvera API; snapshots copy into immutable `Bytes`.
+- `Json`: a private tagged value with exact `Int`, finite `Float`, UTF-8
+  `String`, array, and insertion-ordered object payloads. The native parser
+  rejects malformed input, duplicate keys, invalid surrogate escapes,
+  out-of-range integers, non-finite numbers, documents over 16 MiB, and nesting
+  beyond 128 containers with the same `Result` error as the reference runtime.
+  Constructors and accessors preserve Tyvera's typed API; object equality is
+  structural and independent of insertion order.
 - `TextFile`, `TextReader`, and `TextWriter`: private stream handles. Checked
   move analysis still permits one Tyvera owner. Generated cleanup scopes close
   handles in reverse acquisition order; C++ RAII is an implementation detail.
@@ -180,8 +189,11 @@ generated-code representation is:
 This is a private V1 code-generation contract, not a stable public C ABI or an
 FFI. These representations are private compiler details, not a public ABI.
 Generated executables do not embed or invoke Python. Synchronous file and
-binary I/O, `ByteBuffer`, text-file resources, and experimental Linux async
-TCP/DNS/TLS, HTTP-client, and WebSocket-client paths are supported. The
+binary I/O, `ByteBuffer`, `Json`, text-file resources, and experimental Linux
+async TCP/DNS/TLS, HTTP-client, and WebSocket-client paths are supported. Native
+JSON parse, construction, access, comparison, and encoding are supported for
+the typed subset; automatic record/enum codecs and an importable `tyvera.json`
+module remain unimplemented. The
 experimental native actor/supervisor subset supports stateful actor
 declarations, `spawn`, typed fire-and-forget messages, `stop`, `isAlive`,
 `runActors()`, nested supervisors, all three restart strategies and child

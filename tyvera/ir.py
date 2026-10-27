@@ -21,6 +21,7 @@ class IRType(str, Enum):
     FLOAT = "Float"
     BOOL = "Bool"
     STRING = "String"
+    JSON = "Json"
     BYTE = "Byte"
     DURATION = "Duration"
     BYTES = "Bytes"
@@ -411,7 +412,7 @@ def _validate_type(type_ref: IRTypeRef, location: Location) -> None:
 
 
 def _hashable_key_type(type_ref: IRTypeRef) -> bool:
-    if type_ref in {IRType.INT, IRType.FLOAT, IRType.BOOL, IRType.STRING, IRType.BYTE, IRType.DURATION}:
+    if type_ref in {IRType.INT, IRType.FLOAT, IRType.BOOL, IRType.STRING, IRType.JSON, IRType.BYTE, IRType.DURATION}:
         return True
     if isinstance(type_ref, IRAppliedType) and type_ref.name == "Option":
         return _hashable_key_type(type_ref.arguments[0])
@@ -451,6 +452,21 @@ def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef
         return signatures.get(method)
     if isinstance(receiver, IRType) and receiver == IRType.BYTE:
         return ((), IRType.INT) if method == "toInt" else None
+    if isinstance(receiver, IRType) and receiver == IRType.JSON:
+        signatures = {
+            "kind": ((), IRType.STRING),
+            "isNull": ((), IRType.BOOL),
+            "asString": ((), _applied("Option", IRType.STRING)),
+            "asInt": ((), _applied("Option", IRType.INT)),
+            "asFloat": ((), _applied("Option", IRType.FLOAT)),
+            "asBool": ((), _applied("Option", IRType.BOOL)),
+            "arrayLength": ((), _applied("Option", IRType.INT)),
+            "objectLength": ((), _applied("Option", IRType.INT)),
+            "arrayAt": ((IRType.INT,), _applied("Option", IRType.JSON)),
+            "objectGet": ((IRType.STRING,), _applied("Option", IRType.JSON)),
+            "objectKeys": ((), _applied("Option", _applied("List", IRType.STRING))),
+        }
+        return signatures.get(method)
     if isinstance(receiver, IRType) and receiver == IRType.DURATION:
         return ((), IRType.INT) if method == "inMilliseconds" else None
     if isinstance(receiver, IRType) and receiver == IRType.BYTES:
@@ -948,6 +964,15 @@ def _validate_expression(
             "writeBytes": ((IRType.STRING, IRType.BYTES), _applied("Result", IRType.BOOL, IRType.STRING)),
             "pathJoin": ((IRType.STRING, IRType.STRING), IRType.STRING),
             "pathExists": ((IRType.STRING,), IRType.BOOL),
+            "parseJson": ((IRType.STRING,), _applied("Result", IRType.JSON, IRType.STRING)),
+            "jsonStringify": ((IRType.JSON,), _applied("Result", IRType.STRING, IRType.STRING)),
+            "jsonString": ((IRType.STRING,), IRType.JSON),
+            "jsonInt": ((IRType.INT,), IRType.JSON),
+            "jsonFloat": ((IRType.FLOAT,), IRType.JSON),
+            "jsonBool": ((IRType.BOOL,), IRType.JSON),
+            "jsonNull": ((), IRType.JSON),
+            "jsonArray": ((_applied("List", IRType.JSON),), IRType.JSON),
+            "jsonObject": ((_applied("Map", IRType.STRING, IRType.JSON),), IRType.JSON),
             "openText": ((IRType.STRING, IRType.STRING), _applied("Result", IRType.TEXT_FILE, IRType.STRING)),
             "openTextReader": ((IRType.STRING,), _applied("Result", IRType.TEXT_READER, IRType.STRING)),
             "openTextWriter": ((IRType.STRING, IRType.STRING), _applied("Result", IRType.TEXT_WRITER, IRType.STRING)),

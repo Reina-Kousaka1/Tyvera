@@ -269,6 +269,7 @@ class _CppGenerator:
             IRType.FLOAT: "double",
             IRType.BOOL: "bool",
             IRType.STRING: "std::string",
+            IRType.JSON: "tyvera_runtime::JsonValue",
             IRType.BYTE: "std::uint8_t",
             IRType.WEBSOCKET_URL: "tyvera_runtime::WebSocketUrl",
             IRType.WEBSOCKET: "std::shared_ptr<tyvera_runtime::WebSocket>",
@@ -644,6 +645,15 @@ class _CppGenerator:
                 "seconds": "duration_seconds",
                 "durationFromSeconds": "duration_from_seconds",
                 "byteFromInt": "byte_from_int",
+                "parseJson": "parse_json",
+                "jsonStringify": "json_stringify",
+                "jsonString": "json_string",
+                "jsonInt": "json_int",
+                "jsonFloat": "json_float",
+                "jsonBool": "json_bool",
+                "jsonNull": "json_null",
+                "jsonArray": "json_array",
+                "jsonObject": "json_object",
                 "bytesFromString": "bytes_from_string",
                 "byteBuffer": "byte_buffer",
                 "readText": "read_text",
@@ -816,7 +826,7 @@ class _CppGenerator:
             compare_operator = {"==": "== 0", "!=": "!= 0", "<": "< 0", "<=": "<= 0", ">": "> 0", ">=": ">= 0"}[operator]
             return f"({comparison} {compare_operator})"
         if operator in {"==", "!=", "<", "<=", ">", ">="}:
-            if operator in {"==", "!="} and isinstance(left_type, IRAppliedType):
+            if operator in {"==", "!="} and (isinstance(left_type, IRAppliedType) or left_type == IRType.JSON):
                 result = f"tyvera_runtime::equal({left}, {right})"
                 return f"(!{result})" if operator == "!=" else result
             return f"({left} {operator} {right})"
@@ -864,6 +874,14 @@ class _CppGenerator:
     @staticmethod
     def _method_call_expression(expression: IRMethodCall, receiver: str, arguments: list[str]) -> str:
         method = expression.method
+        if expression.receiver.type == IRType.JSON:
+            functions = {
+                "kind": "json_kind", "isNull": "json_is_null", "asString": "json_as_string",
+                "asInt": "json_as_int", "asFloat": "json_as_float", "asBool": "json_as_bool",
+                "arrayLength": "json_array_length", "objectLength": "json_object_length",
+                "arrayAt": "json_array_at", "objectGet": "json_object_get", "objectKeys": "json_object_keys",
+            }
+            return f"tyvera_runtime::{functions[method]}({', '.join([receiver, *arguments])})"
         if isinstance(expression.receiver.type, IRActorRefType):
             if method == "isAlive":
                 return f"tyvera_runtime::actor_is_alive({receiver})"
@@ -1114,12 +1132,17 @@ _RUNTIME = r'''#include <charconv>
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <map>
+#include <locale>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
 #include <stdexcept>
+#include <sstream>
+#include <set>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <type_traits>
@@ -1999,7 +2022,19 @@ struct ListData { std::vector<T> values; };
 template <typename K, typename V>
 struct MapData { std::vector<std::pair<K, V>> entries; };
 
+enum class JsonKind { null_value, boolean, integer, floating, string, array, object };
+struct JsonValue {
+    JsonKind kind = JsonKind::null_value;
+    bool boolean = false;
+    std::int64_t integer = 0;
+    double floating = 0.0;
+    std::string text;
+    std::vector<JsonValue> array;
+    std::vector<std::pair<std::string, std::shared_ptr<JsonValue>>> object;
+};
+
 template <typename T> inline bool equal(const T& left, const T& right);
+inline bool equal(const JsonValue& left, const JsonValue& right);
 template <typename T> inline bool equal(const std::optional<T>& left, const std::optional<T>& right);
 template <typename T, typename E> inline bool equal(const std::variant<T, E>& left, const std::variant<T, E>& right);
 template <typename T> inline bool equal(const std::shared_ptr<ListData<T>>& left, const std::shared_ptr<ListData<T>>& right);
@@ -2044,6 +2079,44 @@ inline bool equal(const std::shared_ptr<MapData<K, V>>& left, const std::shared_
             }
         }
         if (!found) return false;
+    }
+    return true;
+}
+
+inline bool equal(const JsonValue& left, const JsonValue& right) {
+    std::vector<std::pair<const JsonValue*, const JsonValue*>> pending{{&left, &right}};
+    while (!pending.empty()) {
+        const auto current = pending.back();
+        pending.pop_back();
+        const JsonValue& a = *current.first;
+        const JsonValue& b = *current.second;
+        if (a.kind != b.kind) return false;
+        switch (a.kind) {
+            case JsonKind::null_value: break;
+            case JsonKind::boolean: if (a.boolean != b.boolean) return false; break;
+            case JsonKind::integer: if (a.integer != b.integer) return false; break;
+            case JsonKind::floating: if (a.floating != b.floating) return false; break;
+            case JsonKind::string: if (a.text != b.text) return false; break;
+            case JsonKind::array:
+                if (a.array.size() != b.array.size()) return false;
+                for (std::size_t index = 0; index < a.array.size(); ++index)
+                    pending.emplace_back(&a.array[index], &b.array[index]);
+                break;
+            case JsonKind::object:
+                if (a.object.size() != b.object.size()) return false;
+                {
+                std::map<std::string, const JsonValue*> right_members;
+                for (const auto& entry : b.object) {
+                    if (!entry.second || !right_members.emplace(entry.first, entry.second.get()).second) return false;
+                }
+                for (const auto& entry : a.object) {
+                    const auto found = right_members.find(entry.first);
+                    if (!entry.second || found == right_members.end()) return false;
+                    pending.emplace_back(entry.second.get(), found->second);
+                }
+                }
+                break;
+        }
     }
     return true;
 }
@@ -2237,6 +2310,484 @@ template <typename T> inline StringResult<T> result_ok(T value) {
 template <typename T> inline StringResult<T> result_error(std::string message) {
     return StringResult<T>{std::in_place_index<1>, std::move(message)};
 }
+
+inline bool valid_utf8_string(const std::string& value);
+inline constexpr std::size_t MAX_JSON_DOCUMENT_BYTES = 16 * 1024 * 1024;
+inline constexpr std::size_t MAX_JSON_NESTING = 128;
+
+inline std::int64_t json_decimal_order(const char* first, const char* last) {
+    const char* cursor = first;
+    if (cursor != last && (*cursor == '-' || *cursor == '+')) ++cursor;
+    const char* exponent_marker = last;
+    for (const char* current = cursor; current != last; ++current) {
+        if (*current == 'e' || *current == 'E') { exponent_marker = current; break; }
+    }
+    std::int64_t explicit_exponent = 0;
+    if (exponent_marker != last) {
+        const char* current = exponent_marker + 1;
+        bool negative = false;
+        if (current != last && (*current == '+' || *current == '-')) { negative = *current == '-'; ++current; }
+        for (; current != last; ++current) {
+            explicit_exponent = std::min<std::int64_t>(1000000000, explicit_exponent * 10 + (*current - '0'));
+        }
+        if (negative) explicit_exponent = -explicit_exponent;
+    }
+    std::int64_t integer_digits = 0;
+    std::int64_t digit_index = 0;
+    std::int64_t first_nonzero = -1;
+    bool after_decimal = false;
+    for (const char* current = cursor; current != exponent_marker; ++current) {
+        if (*current == '.') { after_decimal = true; continue; }
+        if (*current >= '0' && *current <= '9') {
+            if (first_nonzero < 0 && *current != '0') first_nonzero = digit_index;
+            if (!after_decimal) ++integer_digits;
+            ++digit_index;
+        }
+    }
+    if (first_nonzero < 0) return 0;
+    return explicit_exponent + integer_digits - first_nonzero - 1;
+}
+
+class JsonParser {
+public:
+    explicit JsonParser(const std::string& input) : input_(input) {}
+
+    std::optional<JsonValue> parse() {
+        auto value = parse_value(0);
+        if (!value) return std::nullopt;
+        skip_space();
+        if (position_ != input_.size()) return std::nullopt;
+        return value;
+    }
+
+private:
+    const std::string& input_;
+    std::size_t position_ = 0;
+
+    void skip_space() {
+        while (position_ < input_.size()) {
+            const char value = input_[position_];
+            if (value != ' ' && value != '\t' && value != '\n' && value != '\r') break;
+            ++position_;
+        }
+    }
+
+    bool consume(const char* literal) {
+        const std::string_view wanted(literal);
+        if (input_.size() - position_ < wanted.size()
+            || input_.compare(position_, wanted.size(), wanted.data(), wanted.size()) != 0) return false;
+        position_ += wanted.size();
+        return true;
+    }
+
+    static void append_codepoint(std::string& output, std::uint32_t value) {
+        if (value <= 0x7f) output.push_back(static_cast<char>(value));
+        else if (value <= 0x7ff) {
+            output.push_back(static_cast<char>(0xc0 | (value >> 6)));
+            output.push_back(static_cast<char>(0x80 | (value & 0x3f)));
+        } else if (value <= 0xffff) {
+            output.push_back(static_cast<char>(0xe0 | (value >> 12)));
+            output.push_back(static_cast<char>(0x80 | ((value >> 6) & 0x3f)));
+            output.push_back(static_cast<char>(0x80 | (value & 0x3f)));
+        } else {
+            output.push_back(static_cast<char>(0xf0 | (value >> 18)));
+            output.push_back(static_cast<char>(0x80 | ((value >> 12) & 0x3f)));
+            output.push_back(static_cast<char>(0x80 | ((value >> 6) & 0x3f)));
+            output.push_back(static_cast<char>(0x80 | (value & 0x3f)));
+        }
+    }
+
+    std::optional<std::uint16_t> read_hex4() {
+        if (input_.size() - position_ < 4) return std::nullopt;
+        std::uint16_t value = 0;
+        for (int index = 0; index < 4; ++index) {
+            const char digit = input_[position_++];
+            value = static_cast<std::uint16_t>(value << 4);
+            if (digit >= '0' && digit <= '9') value = static_cast<std::uint16_t>(value | (digit - '0'));
+            else if (digit >= 'a' && digit <= 'f') value = static_cast<std::uint16_t>(value | (digit - 'a' + 10));
+            else if (digit >= 'A' && digit <= 'F') value = static_cast<std::uint16_t>(value | (digit - 'A' + 10));
+            else return std::nullopt;
+        }
+        return value;
+    }
+
+    std::optional<std::string> parse_string() {
+        if (position_ >= input_.size() || input_[position_++] != '"') return std::nullopt;
+        std::string result;
+        while (position_ < input_.size()) {
+            const unsigned char current = static_cast<unsigned char>(input_[position_++]);
+            if (current == '"') {
+                if (!valid_utf8_string(result)) return std::nullopt;
+                return result;
+            }
+            if (current < 0x20) return std::nullopt;
+            if (current != '\\') { result.push_back(static_cast<char>(current)); continue; }
+            if (position_ >= input_.size()) return std::nullopt;
+            const char escape = input_[position_++];
+            switch (escape) {
+                case '"': result.push_back('"'); break;
+                case '\\': result.push_back('\\'); break;
+                case '/': result.push_back('/'); break;
+                case 'b': result.push_back('\b'); break;
+                case 'f': result.push_back('\f'); break;
+                case 'n': result.push_back('\n'); break;
+                case 'r': result.push_back('\r'); break;
+                case 't': result.push_back('\t'); break;
+                case 'u': {
+                    auto first = read_hex4();
+                    if (!first) return std::nullopt;
+                    std::uint32_t codepoint = *first;
+                    if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
+                        if (input_.size() - position_ < 6 || input_[position_] != '\\'
+                            || input_[position_ + 1] != 'u') return std::nullopt;
+                        position_ += 2;
+                        auto second = read_hex4();
+                        if (!second || *second < 0xdc00 || *second > 0xdfff) return std::nullopt;
+                        codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (*second - 0xdc00);
+                    } else if (codepoint >= 0xdc00 && codepoint <= 0xdfff) return std::nullopt;
+                    append_codepoint(result, codepoint);
+                    break;
+                }
+                default: return std::nullopt;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<JsonValue> parse_number() {
+        const std::size_t start = position_;
+        if (position_ < input_.size() && input_[position_] == '-') ++position_;
+        if (position_ >= input_.size()) return std::nullopt;
+        if (input_[position_] == '0') ++position_;
+        else {
+            if (input_[position_] < '1' || input_[position_] > '9') return std::nullopt;
+            while (position_ < input_.size() && input_[position_] >= '0' && input_[position_] <= '9') ++position_;
+        }
+        bool is_float = false;
+        if (position_ < input_.size() && input_[position_] == '.') {
+            is_float = true;
+            ++position_;
+            const std::size_t digits = position_;
+            while (position_ < input_.size() && input_[position_] >= '0' && input_[position_] <= '9') ++position_;
+            if (position_ == digits) return std::nullopt;
+        }
+        if (position_ < input_.size() && (input_[position_] == 'e' || input_[position_] == 'E')) {
+            is_float = true;
+            ++position_;
+            if (position_ < input_.size() && (input_[position_] == '+' || input_[position_] == '-')) ++position_;
+            const std::size_t digits = position_;
+            while (position_ < input_.size() && input_[position_] >= '0' && input_[position_] <= '9') ++position_;
+            if (position_ == digits) return std::nullopt;
+        }
+        const char* first = input_.data() + start;
+        const char* last = input_.data() + position_;
+        JsonValue value;
+        if (!is_float) {
+            std::int64_t parsed = 0;
+            const auto conversion = std::from_chars(first, last, parsed, 10);
+            if (conversion.ec != std::errc{} || conversion.ptr != last) return std::nullopt;
+            value.kind = JsonKind::integer;
+            value.integer = parsed;
+            return value;
+        }
+        double parsed = 0.0;
+        const auto conversion = std::from_chars(first, last, parsed, std::chars_format::general);
+        if (conversion.ec == std::errc{} && conversion.ptr == last && std::isfinite(parsed)) {
+            value.kind = JsonKind::floating;
+            value.floating = parsed;
+            return value;
+        }
+        if (conversion.ec != std::errc::result_out_of_range || conversion.ptr != last) return std::nullopt;
+        // Preserve the reference runtime's finite underflow-to-zero behavior.
+        std::istringstream stream(std::string(first, last));
+        stream.imbue(std::locale::classic());
+        long double wide = 0.0L;
+        stream >> wide;
+        if (!stream || !stream.eof()) {
+            if (json_decimal_order(first, last) < -324) {
+                value.kind = JsonKind::floating;
+                value.floating = first != last && *first == '-' ? -0.0 : 0.0;
+                return value;
+            }
+            return std::nullopt;
+        }
+        parsed = static_cast<double>(wide);
+        if (!std::isfinite(parsed)) return std::nullopt;
+        value.kind = JsonKind::floating;
+        value.floating = parsed;
+        return value;
+    }
+
+    std::optional<JsonValue> parse_array(std::size_t depth) {
+        if (depth > MAX_JSON_NESTING) return std::nullopt;
+        JsonValue result;
+        result.kind = JsonKind::array;
+        ++position_;
+        skip_space();
+        if (position_ < input_.size() && input_[position_] == ']') { ++position_; return result; }
+        while (true) {
+            auto item = parse_value(depth);
+            if (!item) return std::nullopt;
+            result.array.push_back(std::move(*item));
+            skip_space();
+            if (position_ >= input_.size()) return std::nullopt;
+            if (input_[position_] == ']') { ++position_; return result; }
+            if (input_[position_++] != ',') return std::nullopt;
+            skip_space();
+        }
+    }
+
+    std::optional<JsonValue> parse_object(std::size_t depth) {
+        if (depth > MAX_JSON_NESTING) return std::nullopt;
+        JsonValue result;
+        result.kind = JsonKind::object;
+        std::set<std::string> keys;
+        ++position_;
+        skip_space();
+        if (position_ < input_.size() && input_[position_] == '}') { ++position_; return result; }
+        while (true) {
+            auto key = parse_string();
+            if (!key) return std::nullopt;
+            if (!keys.insert(*key).second) return std::nullopt;
+            skip_space();
+            if (position_ >= input_.size() || input_[position_++] != ':') return std::nullopt;
+            skip_space();
+            auto item = parse_value(depth);
+            if (!item) return std::nullopt;
+            result.object.emplace_back(std::move(*key), std::make_shared<JsonValue>(std::move(*item)));
+            skip_space();
+            if (position_ >= input_.size()) return std::nullopt;
+            if (input_[position_] == '}') { ++position_; return result; }
+            if (input_[position_++] != ',') return std::nullopt;
+            skip_space();
+        }
+    }
+
+    std::optional<JsonValue> parse_value(std::size_t depth) {
+        skip_space();
+        if (position_ >= input_.size()) return std::nullopt;
+        const char current = input_[position_];
+        if (current == 'n' && consume("null")) return JsonValue{};
+        if (current == 't' && consume("true")) { JsonValue value; value.kind = JsonKind::boolean; value.boolean = true; return value; }
+        if (current == 'f' && consume("false")) { JsonValue value; value.kind = JsonKind::boolean; value.boolean = false; return value; }
+        if (current == '"') {
+            auto text = parse_string();
+            if (!text) return std::nullopt;
+            JsonValue value; value.kind = JsonKind::string; value.text = std::move(*text); return value;
+        }
+        if (current == '[') return parse_array(depth + 1);
+        if (current == '{') return parse_object(depth + 1);
+        if (current == '-' || (current >= '0' && current <= '9')) return parse_number();
+        return std::nullopt;
+    }
+};
+
+inline JsonValue json_string(std::string value) {
+    JsonValue result; result.kind = JsonKind::string; result.text = std::move(value); return result;
+}
+inline JsonValue json_int(std::int64_t value) {
+    JsonValue result; result.kind = JsonKind::integer; result.integer = value; return result;
+}
+inline JsonValue json_float(double value) {
+    JsonValue result; result.kind = JsonKind::floating; result.floating = value; return result;
+}
+inline JsonValue json_bool(bool value) {
+    JsonValue result; result.kind = JsonKind::boolean; result.boolean = value; return result;
+}
+inline JsonValue json_null() { return JsonValue{}; }
+inline JsonValue json_array(const std::shared_ptr<ListData<JsonValue>>& values) {
+    JsonValue result; result.kind = JsonKind::array;
+    if (values) result.array = values->values;
+    return result;
+}
+inline JsonValue json_object(const std::shared_ptr<MapData<std::string, JsonValue>>& values) {
+    JsonValue result; result.kind = JsonKind::object;
+    if (values) {
+        result.object.reserve(values->entries.size());
+        for (const auto& entry : values->entries)
+            result.object.emplace_back(entry.first, std::make_shared<JsonValue>(entry.second));
+    }
+    return result;
+}
+
+inline StringResult<JsonValue> parse_json(const std::string& text) {
+    if (text.size() > MAX_JSON_DOCUMENT_BYTES || !valid_utf8_string(text))
+        return result_error<JsonValue>("invalid JSON document");
+    JsonParser parser(text);
+    auto parsed = parser.parse();
+    if (!parsed) return result_error<JsonValue>("invalid JSON document");
+    return result_ok<JsonValue>(std::move(*parsed));
+}
+
+inline const char* json_kind(const JsonValue& value) {
+    switch (value.kind) {
+        case JsonKind::null_value: return "null";
+        case JsonKind::boolean: return "bool";
+        case JsonKind::integer: return "int";
+        case JsonKind::floating: return "float";
+        case JsonKind::string: return "string";
+        case JsonKind::array: return "array";
+        case JsonKind::object: return "object";
+    }
+    return "null";
+}
+inline bool json_is_null(const JsonValue& value) { return value.kind == JsonKind::null_value; }
+inline std::optional<std::string> json_as_string(const JsonValue& value) {
+    return value.kind == JsonKind::string ? std::optional<std::string>{value.text} : std::nullopt;
+}
+inline std::optional<std::int64_t> json_as_int(const JsonValue& value) {
+    return value.kind == JsonKind::integer ? std::optional<std::int64_t>{value.integer} : std::nullopt;
+}
+inline std::optional<double> json_as_float(const JsonValue& value) {
+    return value.kind == JsonKind::floating ? std::optional<double>{value.floating} : std::nullopt;
+}
+inline std::optional<bool> json_as_bool(const JsonValue& value) {
+    return value.kind == JsonKind::boolean ? std::optional<bool>{value.boolean} : std::nullopt;
+}
+inline std::optional<std::int64_t> json_array_length(const JsonValue& value) {
+    if (value.kind != JsonKind::array || value.array.size() > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return std::nullopt;
+    return static_cast<std::int64_t>(value.array.size());
+}
+inline std::optional<std::int64_t> json_object_length(const JsonValue& value) {
+    if (value.kind != JsonKind::object || value.object.size() > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return std::nullopt;
+    return static_cast<std::int64_t>(value.object.size());
+}
+inline std::optional<JsonValue> json_array_at(const JsonValue& value, std::int64_t index) {
+    if (value.kind != JsonKind::array || index < 0 || static_cast<std::uint64_t>(index) >= value.array.size()) return std::nullopt;
+    return value.array[static_cast<std::size_t>(index)];
+}
+inline std::optional<JsonValue> json_object_get(const JsonValue& value, const std::string& key) {
+    if (value.kind != JsonKind::object) return std::nullopt;
+    const auto found = std::find_if(value.object.begin(), value.object.end(), [&key](const auto& entry) {
+        return entry.first == key;
+    });
+    return found == value.object.end() || !found->second ? std::nullopt : std::optional<JsonValue>{*found->second};
+}
+inline std::optional<std::shared_ptr<ListData<std::string>>> json_object_keys(const JsonValue& value) {
+    if (value.kind != JsonKind::object) return std::nullopt;
+    auto keys = make_list<std::string>();
+    keys->values.reserve(value.object.size());
+    for (const auto& entry : value.object) keys->values.push_back(entry.first);
+    return keys;
+}
+
+inline bool json_append(std::string& output, const std::string& value) {
+    if (value.size() > MAX_JSON_DOCUMENT_BYTES - output.size()) return false;
+    output.append(value);
+    return true;
+}
+inline bool json_append_char(std::string& output, char value) {
+    if (output.size() >= MAX_JSON_DOCUMENT_BYTES) return false;
+    output.push_back(value);
+    return true;
+}
+inline bool json_write_string(const std::string& value, std::string& output) {
+    if (!valid_utf8_string(value) || !json_append_char(output, '"')) return false;
+    static constexpr char hex[] = "0123456789abcdef";
+    for (unsigned char current : value) {
+        switch (current) {
+            case '"': if (!json_append(output, "\\\"")) return false; break;
+            case '\\': if (!json_append(output, "\\\\")) return false; break;
+            case '\b': if (!json_append(output, "\\b")) return false; break;
+            case '\f': if (!json_append(output, "\\f")) return false; break;
+            case '\n': if (!json_append(output, "\\n")) return false; break;
+            case '\r': if (!json_append(output, "\\r")) return false; break;
+            case '\t': if (!json_append(output, "\\t")) return false; break;
+            default:
+                if (current < 0x20) {
+                    char escape[6] = {'\\', 'u', '0', '0', hex[current >> 4], hex[current & 0x0f]};
+                    if (MAX_JSON_DOCUMENT_BYTES - output.size() < sizeof(escape)) return false;
+                    output.append(escape, sizeof(escape));
+                } else if (!json_append_char(output, static_cast<char>(current))) return false;
+        }
+    }
+    return json_append_char(output, '"');
+}
+inline std::optional<std::string> json_format_float(double value) {
+    if (!std::isfinite(value)) return std::nullopt;
+    std::array<char, 128> buffer{};
+    const auto converted = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value, std::chars_format::general);
+    if (converted.ec != std::errc{}) return std::nullopt;
+    std::string raw(buffer.data(), converted.ptr);
+    const std::size_t exponent_marker = raw.find_first_of("eE");
+    if (exponent_marker == std::string::npos) {
+        if (raw.find('.') == std::string::npos) raw += ".0";
+        return raw;
+    }
+    int exponent = 0;
+    const char* exponent_first = raw.data() + exponent_marker + 1;
+    const char* exponent_last = raw.data() + raw.size();
+    bool exponent_negative = false;
+    if (exponent_first != exponent_last && (*exponent_first == '+' || *exponent_first == '-')) {
+        exponent_negative = *exponent_first == '-';
+        ++exponent_first;
+    }
+    const auto exponent_result = std::from_chars(exponent_first, exponent_last, exponent);
+    if (exponent_result.ec != std::errc{} || exponent_result.ptr != exponent_last) return std::nullopt;
+    if (exponent_negative) exponent = -exponent;
+    std::string mantissa = raw.substr(0, exponent_marker);
+    if (exponent >= -4 && exponent < 16) {
+        const bool negative = !mantissa.empty() && mantissa.front() == '-';
+        if (negative) mantissa.erase(mantissa.begin());
+        const std::size_t point = mantissa.find('.');
+        const std::size_t digits_before_point = point == std::string::npos ? mantissa.size() : point;
+        std::string digits = mantissa;
+        if (point != std::string::npos) digits.erase(point, 1);
+        const auto decimal_point = static_cast<std::int64_t>(digits_before_point) + exponent;
+        std::string result = negative ? "-" : "";
+        if (decimal_point <= 0) result += "0." + std::string(static_cast<std::size_t>(-decimal_point), '0') + digits;
+        else if (static_cast<std::uint64_t>(decimal_point) >= digits.size())
+            result += digits + std::string(static_cast<std::size_t>(decimal_point) - digits.size(), '0') + ".0";
+        else result += digits.substr(0, static_cast<std::size_t>(decimal_point)) + "."
+            + digits.substr(static_cast<std::size_t>(decimal_point));
+        return result;
+    }
+    std::string exponent_text = std::to_string(exponent);
+    const bool negative_exponent = exponent < 0;
+    const unsigned int magnitude = negative_exponent
+        ? static_cast<unsigned int>(-(static_cast<std::int64_t>(exponent)))
+        : static_cast<unsigned int>(exponent);
+    exponent_text = (negative_exponent ? "-" : "+") + (magnitude < 10 ? "0" : "") + std::to_string(magnitude);
+    return mantissa + "e" + exponent_text;
+}
+inline bool json_write_value(const JsonValue& value, std::string& output, std::size_t depth) {
+    switch (value.kind) {
+        case JsonKind::null_value: return json_append(output, "null");
+        case JsonKind::boolean: return json_append(output, value.boolean ? "true" : "false");
+        case JsonKind::integer: {
+            const std::string text = std::to_string(value.integer);
+            return json_append(output, text);
+        }
+        case JsonKind::floating: {
+            auto text = json_format_float(value.floating);
+            return text && json_append(output, *text);
+        }
+        case JsonKind::string: return json_write_string(value.text, output);
+        case JsonKind::array:
+            if (depth >= MAX_JSON_NESTING || !json_append_char(output, '[')) return false;
+            for (std::size_t index = 0; index < value.array.size(); ++index) {
+                if (index && !json_append_char(output, ',')) return false;
+                if (!json_write_value(value.array[index], output, depth + 1)) return false;
+            }
+            return json_append_char(output, ']');
+        case JsonKind::object:
+            if (depth >= MAX_JSON_NESTING || !json_append_char(output, '{')) return false;
+            for (std::size_t index = 0; index < value.object.size(); ++index) {
+                const auto& entry = value.object[index];
+                if (!entry.second || (index && !json_append_char(output, ','))
+                    || !json_write_string(entry.first, output) || !json_append_char(output, ':')
+                    || !json_write_value(*entry.second, output, depth + 1)) return false;
+            }
+            return json_append_char(output, '}');
+    }
+    return false;
+}
+inline StringResult<std::string> json_stringify(const JsonValue& value) {
+    std::string output;
+    if (!json_write_value(value, output, 0)) return result_error<std::string>("JSON encoding failed");
+    return result_ok<std::string>(std::move(output));
+}
+
 enum class RestartStrategy { one_for_one, one_for_all, rest_for_one };
 enum class RestartPolicy { permanent, transient, temporary };
 struct SupervisorBackoff {

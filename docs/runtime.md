@@ -226,8 +226,10 @@ limits and client lifecycle.
 
 The experimental native compiler executes a checked synchronous core plus
 selected value features: `Option`/`Result` and matching, `List`/`Map`, `Byte`,
-immutable `Bytes`, bounded `ByteBuffer`, synchronous text/binary/path I/O, and
-owned text-file resources. On Linux it also provides an experimental async
+immutable `Bytes`, bounded `ByteBuffer`, opaque `Json` parsing/construction/
+access/stringification, synchronous text/binary/path I/O, and owned text-file
+resources. JSON rejects documents over 16 MiB and nesting beyond 128
+containers identically in both runtimes. On Linux it also provides an experimental async
 task subset with DNS and TCP connect/listen/accept/read/write, RAII socket
 handles, and cooperative SIGINT/SIGTERM shutdown. The C++ runtime remains
 private and exposes no public ABI. Native builds reject unsupported calls;

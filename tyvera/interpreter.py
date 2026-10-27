@@ -51,6 +51,7 @@ from .ast import (
     WhileStatement,
 )
 from .source import Diagnostic, Location
+from .json_limits import MAX_JSON_DOCUMENT_BYTES, MAX_JSON_NESTING
 from .secrets import SecretProvider, SecretProviderError
 from .io_backend import IOBackend, IOBackendError
 from .platform_runtime import (
@@ -1290,12 +1291,16 @@ class Interpreter:
                 return self._parse_json(arguments[0])
             if expression.callee == "jsonStringify":
                 try:
+                    if not isinstance(arguments[0], _TyveraJson) or not self._json_within_nesting_limit(arguments[0]):
+                        return _TyveraVariant("Err", "JSON encoding failed")
                     serialized = json.dumps(
                         self._json_to_python(arguments[0]), ensure_ascii=False,
                         separators=(",", ":"), allow_nan=False,
                     )
+                    if len(serialized.encode("utf-8", "strict")) > MAX_JSON_DOCUMENT_BYTES:
+                        return _TyveraVariant("Err", "JSON encoding failed")
                     return _TyveraVariant("Ok", serialized)
-                except (TypeError, ValueError, RecursionError):
+                except (TypeError, ValueError, RecursionError, UnicodeError):
                     return _TyveraVariant("Err", "JSON encoding failed")
             if expression.callee == "jsonString":
                 return _TyveraJson("string", arguments[0])
@@ -2171,6 +2176,29 @@ class Interpreter:
             return result
 
         try:
+            encoded = text.encode("utf-8", "strict")
+            if len(encoded) > MAX_JSON_DOCUMENT_BYTES:
+                return _TyveraVariant("Err", "invalid JSON document")
+            depth = 0
+            in_string = False
+            escaped = False
+            for character in text:
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif character == "\\":
+                        escaped = True
+                    elif character == '"':
+                        in_string = False
+                    continue
+                if character == '"':
+                    in_string = True
+                elif character in "[{":
+                    depth += 1
+                    if depth > MAX_JSON_NESTING:
+                        return _TyveraVariant("Err", "invalid JSON document")
+                elif character in "]}" and depth:
+                    depth -= 1
             value = json.loads(
                 text, parse_int=parse_integer, parse_float=parse_float,
                 parse_constant=reject_constant, object_pairs_hook=object_pairs,
@@ -2214,6 +2242,23 @@ class Interpreter:
         if value.kind == "object":
             return {key: Interpreter._json_to_python(item) for key, item in value.value.items()}  # type: ignore[union-attr]
         return value.value
+
+    @staticmethod
+    def _json_within_nesting_limit(value: _TyveraJson) -> bool:
+        pending: list[tuple[_TyveraJson, int]] = [(value, 0)]
+        while pending:
+            current, depth = pending.pop()
+            if current.kind == "array":
+                child_depth = depth + 1
+                if child_depth > MAX_JSON_NESTING:
+                    return False
+                pending.extend((item, child_depth) for item in current.value)
+            elif current.kind == "object":
+                child_depth = depth + 1
+                if child_depth > MAX_JSON_NESTING:
+                    return False
+                pending.extend((item, child_depth) for item in current.value.values())
+        return True
 
     @staticmethod
     def _call_json_method(
