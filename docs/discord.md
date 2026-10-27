@@ -45,6 +45,9 @@ backoff arguments at 120 seconds. Heartbeats use monotonic fixed deadlines;
 the first heartbeat is currently sent after one full interval, without
 Discord's recommended random initial jitter. There is no reconnect jitter;
 callers should use a small reconnect budget appropriate to their application.
+The checked-in bot example composes this bounded Gateway operation as a Task
+created by a transiently supervised `GatewayRunner` actor; the actor owns its
+cancellation and shutdown.
 Resume URLs must be
 `wss`, port 443, root-path URLs on `discord.gg` or its subdomains; this prevents
 forwarding the bot token to an arbitrary host. `runGateway` remains a single
@@ -65,8 +68,10 @@ and DNS/connect/Hello failures before a session is established return a
 controlled error rather than being retried. There is no automatic resume after
 process restart or durable session store. The typed event decoder recognizes
 READY and MESSAGE_CREATE and returns these typed values in the run summary;
-there is no callback/subscription API, Actor/Supervisor client tree, cache, or
-shard coordinator. Gateway compression is not negotiated.
+there is no general callback/subscription API, reusable Actor/Supervisor client
+tree, cache, or shard coordinator. The bot example is a composition example,
+not a reusable Gateway service API; REST remains a direct async client. Gateway
+compression is not negotiated.
 
 REST has one-request transport and rate-limit metadata parsing plus the
 explicit bounded 429 retry function. There is no bucket/global coordinator,
@@ -84,8 +89,9 @@ fake TLS services. Coverage includes Identify, heartbeat ACK, READY, reconnect,
 resume, invalid-session re-identification, REST response metadata, bounded
 429 retries, and token-redaction checks. A test-only resolver shim routes only
 the native test process to loopback; the Tyvera package keeps its fixed,
-verified Discord origins. This does not yet provide an Actor/Supervisor-owned
-Discord lifecycle, a shared REST bucket coordinator, or production readiness.
+verified Discord origins. This package does not yet provide a reusable
+Actor/Supervisor client API or shared REST bucket coordinator, and it is not
+production-ready.
 There is no interpreter fallback.
 
 When authentication is used, the token remains `Secret<String>` until the

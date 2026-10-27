@@ -293,16 +293,13 @@ fn main() {
             entry = directory / "gateway-test.tyv"
             entry.write_text(
                 f'''import "../src/client.tyv" as discord
-async fn run() {{
-    match environment("TYVERA_FAKE_DISCORD_TOKEN") {{
-        None => eprintln("missing fake test token")
-        Some(token) => {{
-            let intents = discord.defaultIntents()
-            intents.append(discord.GatewayIntent.MessageContent)
-            intents.append(discord.GatewayIntent.GuildMessages)
-            let result = await discord.runGateway(token, intents, 1, seconds(3))
+async fn runGateway(token: Secret<String>, intents: List<discord.GatewayIntent>, reply: ReplySender<Int>) {{
+    let result = await discord.runGateway(token, intents, 1, seconds(3))
     match result {{
-        Err(error) => eprintln(error)
+        Err(error) => {{
+            eprintln(error)
+            reply.send(-1)
+        }}
         Ok(summary) => {{
             println(summary.ready)
             println(summary.sessionId == Some("fake-session"))
@@ -312,10 +309,32 @@ async fn run() {{
             println(summary.messageCount)
             println(summary.heartbeatCount)
             println(summary.events.length)
+            reply.send(summary.dispatchCount)
         }}
     }}
+}}
+actor GatewayRunner {{
+    on run(reply: ReplySender<Int>) {{
+        match environment("TYVERA_FAKE_DISCORD_TOKEN") {{
+            None => {{
+                eprintln("missing fake test token")
+                reply.send(-1)
+            }}
+            Some(token) => {{
+                let intents = discord.defaultIntents()
+                intents.append(discord.GatewayIntent.MessageContent)
+                intents.append(discord.GatewayIntent.GuildMessages)
+                let task = runGateway(token, intents, reply)
+            }}
         }}
     }}
+}}
+async fn run() {{
+    let supervisor = oneForOne(1, 1000)
+    let worker = supervisor.start(GatewayRunner(), transientChildPolicy())
+    let pending = worker.request(run)
+    let dispatchCount: Int = await pending
+    worker.stop()
 }}
 fn main() {{
     let task = run()
@@ -323,8 +342,7 @@ fn main() {{
         Ok(_) => {{}}
         Err(error) => eprintln("runTasks failed: " + error)
     }}
-}}
-''',
+}}''',
                 encoding="utf-8",
             )
             checked = compile_checked_project(entry, DISCORD_ROOT)

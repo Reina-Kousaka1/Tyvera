@@ -1,10 +1,13 @@
 import "../src/client.tyv" as discord
 import "../src/gateway.tyv" as gateway
 
-async fn startGateway(token: Secret<String>) {
+async fn runGateway(token: Secret<String>, reply: ReplySender<Int>) {
     let result = await discord.runGatewayReliable(token, discord.defaultIntents(), 1000, seconds(15), 3, 250, 5000)
     match result {
-        Err(error) => eprintln(error)
+        Err(error) => {
+            eprintln(error)
+            reply.send(-1)
+        }
         Ok(summary) => {
             println(summary.ready)
             println(summary.dispatchCount)
@@ -17,19 +20,37 @@ async fn startGateway(token: Secret<String>) {
                     gateway.GatewayDispatch.Unknown(name) => println("Ignored event " + name)
                 }
             }
+            reply.send(summary.dispatchCount)
         }
     }
 }
 
-fn main() {
-    match environment("DISCORD_TOKEN") {
-        None => println("Set DISCORD_TOKEN to run the experimental Discord Gateway client.")
-        Some(token) => {
-            let task = startGateway(token)
-            match runTasks() {
-                Ok(_) => {}
-                Err(error) => eprintln(error)
+actor GatewayRunner {
+    on run(reply: ReplySender<Int>) {
+        match environment("DISCORD_TOKEN") {
+            None => {
+                println("Set DISCORD_TOKEN to run the experimental Discord Gateway client.")
+                reply.send(-1)
+            }
+            Some(token) => {
+                let task = runGateway(token, reply)
             }
         }
+    }
+}
+
+async fn runSupervisedGateway() {
+    let supervisor = oneForOne(2, 1000)
+    let runner = supervisor.start(GatewayRunner(), transientChildPolicy())
+    let pending = runner.request(run)
+    let dispatchCount: Int = await pending
+    runner.stop()
+}
+
+fn main() {
+    let task = runSupervisedGateway()
+    match runTasks() {
+        Ok(_) => {}
+        Err(error) => eprintln(error)
     }
 }
