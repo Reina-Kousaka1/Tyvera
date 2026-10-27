@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .ir import (
     IRAppliedType,
+    IRAwait,
     IRBinary,
     IRBlock,
     IRBindingPattern,
@@ -135,7 +136,7 @@ def _compiler_command(compiler: tuple[str, ...], source: Path, output: Path) -> 
     executable = Path(command[0]).name.lower()
     if executable in {"cl", "cl.exe"}:
         return [*command, "/nologo", "/std:c++17", "/EHsc", str(source), f"/Fe:{output}"]
-    return [*command, "-std=c++17", "-O2", str(source), "-o", str(output)]
+    return [*command, "-std=c++17", "-O2", "-pthread", str(source), "-o", str(output)]
 
 
 def emit_cpp(module: IRModule, project_root: str | Path | None = None) -> str:
@@ -153,6 +154,7 @@ class _CppGenerator:
         self.lines: list[str] = []
         self.indent = 0
         self.temporary = 0
+        self.async_context = False
 
     def generate(self) -> str:
         encoded_root = self.project_root.as_posix().encode("utf-8")
@@ -221,6 +223,8 @@ class _CppGenerator:
                 return f"std::shared_ptr<tyvera_runtime::ListData<{arguments[0]}>>"
             if type_name.name == "Map":
                 return f"std::shared_ptr<tyvera_runtime::MapData<{arguments[0]}, {arguments[1]}>>"
+            if type_name.name == "Task":
+                return f"tyvera_runtime::Task<{arguments[0]}>"
             raise ValueError(f"unknown applied Tyvera IR type: {type_name.name}")
         return {
             IRType.INT: "std::int64_t",
@@ -233,6 +237,9 @@ class _CppGenerator:
             IRType.TEXT_FILE: "std::shared_ptr<tyvera_runtime::TextFile>",
             IRType.TEXT_READER: "std::shared_ptr<tyvera_runtime::TextFile>",
             IRType.TEXT_WRITER: "std::shared_ptr<tyvera_runtime::TextFile>",
+            IRType.SOCKET_ADDRESS: "tyvera_runtime::SocketAddress",
+            IRType.TCP_CONNECTION: "std::shared_ptr<tyvera_runtime::TcpConnection>",
+            IRType.TCP_LISTENER: "std::shared_ptr<tyvera_runtime::TcpListener>",
             IRType.VOID: "void",
         }[type_name]
 
@@ -241,12 +248,84 @@ class _CppGenerator:
             f"{self._cpp_type(parameter.type)} tyv_argument_{parameter.identifier}"
             for parameter in function.parameters
         )
-        return f"{self._cpp_type(function.return_type)} {function.symbol}({parameters})"
+        result_type = self._cpp_type(function.return_type)
+        if function.is_async:
+            result_type = f"tyvera_runtime::Task<{result_type}>"
+        return f"{result_type} {function.symbol}({parameters})"
 
     def _function(self, function: IRFunction) -> None:
         self.temporary = 0
+        previous_async_context = self.async_context
+        self.async_context = function.is_async
         self._line(self._function_signature(function) + " {")
         self.indent += 1
+        if function.is_async:
+            captures = ", ".join(
+                f"tyv_argument_{parameter.identifier} = std::move(tyv_argument_{parameter.identifier})"
+                for parameter in function.parameters
+            )
+            self._line(
+                f"return tyvera_runtime::make_task<{self._cpp_type(function.return_type)}>("
+                f"[{captures}]() mutable -> {self._cpp_type(function.return_type)} {{"
+            )
+            self.indent += 1
+        self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope({_location_args(function.location)});")
+        for parameter in function.parameters:
+            keyword = "auto" if _ir_contains_resource(parameter.type) else "const auument in type_name.arguments]
+            if type_name.name == "Option":
+                return f"std::optional<{arguments[0]}>"
+            if type_name.name == "Result":
+                return f"std::variant<{arguments[0]}, {arguments[1]}>"
+            if type_name.name == "List":
+                return f"std::shared_ptr<tyvera_runtime::ListData<{arguments[0]}>>"
+            if type_name.name == "Map":
+                return f"std::shared_ptr<tyvera_runtime::MapData<{arguments[0]}, {arguments[1]}>>"
+            if type_name.name == "Task":
+                return f"tyvera_runtime::Task<{arguments[0]}>"
+            raise ValueError(f"unknown applied Tyvera IR type: {type_name.name}")
+        return {
+            IRType.INT: "std::int64_t",
+            IRType.FLOAT: "double",
+            IRType.BOOL: "bool",
+            IRType.STRING: "std::string",
+            IRType.BYTE: "std::uint8_t",
+            IRType.BYTES: "std::vector<std::uint8_t>",
+            IRType.BYTE_BUFFER: "std::shared_ptr<tyvera_runtime::ByteBuffer>",
+            IRType.TEXT_FILE: "std::shared_ptr<tyvera_runtime::TextFile>",
+            IRType.TEXT_READER: "std::shared_ptr<tyvera_runtime::TextFile>",
+            IRType.TEXT_WRITER: "std::shared_ptr<tyvera_runtime::TextFile>",
+            IRType.SOCKET_ADDRESS: "tyvera_runtime::SocketAddress",
+            IRType.TCP_CONNECTION: "std::shared_ptr<tyvera_runtime::TcpConnection>",
+            IRType.TCP_LISTENER: "std::shared_ptr<tyvera_runtime::TcpListener>",
+            IRType.VOID: "void",
+        }[type_name]
+
+    def _function_signature(self, function: IRFunction) -> str:
+        parameters = ", ".join(
+            f"{self._cpp_type(parameter.type)} tyv_argument_{parameter.identifier}"
+            for parameter in function.parameters
+        )
+        result_type = self._cpp_type(function.return_type)
+        if function.is_async:
+            result_type = f"tyvera_runtime::Task<{result_type}>"
+        return f"{result_type} {function.symbol}({parameters})"
+
+    def _function(self, function: IRFunction) -> None:
+        self.temporary = 0
+        previous_async_context = self.async_context
+        self.async_context = function.is_async
+        self._line(self._function_signature(function) + " {")
+        self.indent += 1
+        if function.is_async:
+            captures = ", ".join(
+                f"tyv_argument_{parameter.identifier} = std::move(tyv_argument_{parameter.identifier})"
+                for parameter in function.parameters
+            )
+            self._line(
+                f"return tyvera_runtime::make_task<{self._cpp_type(function.return_type)}>("
+                f"[{captures}]() mutable -> {self._cpp_type(function.return_type)} {{"
+            )
+            self.indent += 1
         self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope({_location_args(function.location)});")
         for parameter in function.parameters:
             keyword = "auto" if _ir_contains_resource(parameter.type) else "const auto"
@@ -256,10 +335,18 @@ class _CppGenerator:
             )
         for statement in function.body:
             self._statement(statement)
+        if function.is_async:
+            if function.return_type == IRType.VOID:
+                self._line("return;")
+            self.indent -= 1
+            self._line(");")
         self.indent -= 1
         self._line("}")
+        self.async_context = previous_async_context
 
     def _statement(self, statement) -> None:
+        if self.async_context:
+            self._line("tyvera_runtime::task_checkpoint();")
         self._line(f"tyvera_runtime::check_shutdown({_location_args(statement.location)});")
         if isinstance(statement, IRLet):
             self._line(
@@ -277,6 +364,21 @@ class _CppGenerator:
                 self._line("return;")
             else:
                 self._line(f"return {self._expression(statement.value)};")
+        elif isinstance(statement, IRAwait):
+            task = self._new_temporary()
+            self._line(f"auto {task} = {self._expression(statement.task)};")
+            task_type = statement.task.type
+            if not isinstance(task_type, IRAppliedType) or task_type.name != "Task":
+                raise ValueError("validated IR await has a non-Task operand")
+            await_method = "await_move" if _ir_contains_resource(task_type.arguments[0]) else "await"
+            awaited = f"{task}.{await_method}({_location_args(statement.location)})"
+            if statement.result is None:
+                self._line(f"(void){awaited};")
+            else:
+                keyword = "auto" if _ir_contains_resource(statement.result.type) else "const auto"
+                self._line(
+                    f"{keyword} tyv_local_{statement.result.identifier} = {awaited};"
+                )
         elif isinstance(statement, IRBlock):
             self._line("{")
             self.indent += 1
@@ -303,6 +405,8 @@ class _CppGenerator:
         elif isinstance(statement, IRWhile):
             self._line(f"while ({self._expression(statement.condition)}) {{")
             self.indent += 1
+            if self.async_context:
+                self._line("tyvera_runtime::task_checkpoint();")
             self._line(f"tyvera_runtime::check_shutdown({_location_args(statement.location)});")
             self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(statement.location)});")
             for nested in statement.body:
@@ -319,6 +423,8 @@ class _CppGenerator:
                 self._line(f"const auto {snapshot} = tyvera_runtime::map_keys_snapshot({collection});")
             self._line(f"for (const auto& {snapshot}_item : {snapshot}) {{")
             self.indent += 1
+            if self.async_context:
+                self._line("tyvera_runtime::task_checkpoint();")
             self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(statement.location)});")
             self._line(f"const auto tyv_local_{statement.variable.identifier} = {snapshot}_item;")
             for nested in statement.body:
@@ -334,6 +440,70 @@ class _CppGenerator:
                 self._line(f"{prefix} ({condition}) {{")
                 self.indent += 1
                 self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(arm.location)});")
+                self._pattern_bindings(arm.pattern, subject)
+                for nested in arm.body:
+                    self._statement(nested)
+                self.indent -= 1
+                self._line("}")
+            if statement.exhaustive:
+                self._line("else {")
+                self.indent += 1
+                self._line(
+                    f'tyvera_runtime::fail({_location_args(statement.location)}, '
+                    '"exhaustive match had no matching pattern");'
+                )
+                self.indent -= 1
+                self._line("}")
+        elif isinstance(statement, IRUsing):
+            acquired = self._new_temporary()
+            self._line(f"auto {acquired} = {self._expression(statement.acquisition)};")
+            self._line(f"if ({acquired}.index() == 1) {{")
+            self.indent += 1
+            if statement.error_variable is None:
+                self._line(
+                    f"tyvera_runtime::fail({_location_args(statement.location)}, std::get<1>({acquired}));"
+                )
+            else:
+                self._line(f"const auto tyv_local_{statement.error_variable.identifier} = std::get<1>({acquired});")
+                for nested in statement.else_body:
+                    self._statement(nested)
+            self.indent -= 1
+            self._line("} else {")
+            self.indent += 1
+            self._line("{")
+            self.indent += 1
+            self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(statement.location)});")
+            self._line(
+                f"auto tyv_local_{statement.resource.identifier} = std::move(std::get<0>({acquired}));"
+            )
+            self._line(
+                f"tyvera_runtime::set_resource_location(tyv_local_{statement.resource.identifier}, "
+                f"{_location_args(statement.location)});"
+            )
+            for nested in statement.body:
+                self._statement(nested)
+            self.indent -= 1
+            self._line("}")
+            self.indent -= 1
+            self._line("}")
+        elif isinstance(statement, IRLoopControl):
+            self._line(f"{statement.kind};")
+        else:
+            raise ValueError(f"unhandled IR statement: {type(statement).__name__}")
+
+    def _pattern_condition(self, pattern, value: str) -> str:
+        if isinstance(pattern, (IRWildcardPattern, IRBindingPattern)):
+            return "true"
+        if isinstance(pattern, IRLiteralPattern):
+            return f"tyvera_runtime::equal({value}, {self._expression(pattern.value)})"
+        if isinstance(pattern, IRVariantPattern):
+            if pattern.variant == "None":
+                return f"!({value}).has_value()"
+            if pattern.variant == "Some":
+                if pattern.payload is None:
+                    raise ValueError("validated Some pattern has no payload")
+                payload = f"({value}).value()"
+                return f"(({value}rgs(arm.location)});")
                 self._pattern_bindings(arm.pattern, subject)
                 for nested in arm.body:
                     self._statement(nested)
@@ -507,6 +677,10 @@ class _CppGenerator:
                 "openText": "open_text",
                 "openTextReader": "open_text_reader",
                 "openTextWriter": "open_text_writer",
+                "runTasks": "run_tasks",
+                "resolveHost": "resolve_host",
+                "tcpConnect": "tcp_connect",
+                "tcpListen": "tcp_listen",
             }
             function = runtime_functions.get(expression.builtin)
             if function is None:
@@ -527,6 +701,57 @@ class _CppGenerator:
             elif expression.builtin == "openTextWriter":
                 values.extend([_location_args(expression.location)])
             elif expression.builtin == "pathJoin":
+                values.append(_location_args(expression.location))
+            elif expression.builtin in {"runTasks", "resolveHost", "tcpConnect", "tcpListen"}:
+                values.append(_location_args(expression.location))
+            call = f"tyvera_runtime::{function}({', '.join(values)})"
+            lines.append(f"    return {call};")
+            lines.append("}())")
+            return "\n".join(lines)
+        if isinstance(expression, IRCollectionCreate):
+            if not isinstance(expression.type, IRAppliedType):
+                raise ValueError("validated collection constructor has no applied type")
+            arguments = ", ".join(self._cpp_type(item) for item in expression.type.arguments)
+            constructor = "make_list" if expression.type.name == "List" else "make_map"
+            return f"tyvera_runtime::{constructor}<{arguments}>()"
+        if isinstance(expression, IRCollectionLength):
+            receiver = self._expression(expression.receiver)
+            receiver_type = expression.receiver.type
+            if not isinstance(receiver_type, IRAppliedType):
+                raise ValueError("validated collection length has no applied receiver type")             "writeText": "write_text",
+                "readBytes": "read_bytes",
+                "writeBytes": "write_bytes",
+                "pathJoin": "path_join",
+                "pathExists": "path_exists",
+                "openText": "open_text",
+                "openTextReader": "open_text_reader",
+                "openTextWriter": "open_text_writer",
+                "runTasks": "run_tasks",
+                "resolveHost": "resolve_host",
+                "tcpConnect": "tcp_connect",
+                "tcpListen": "tcp_listen",
+            }
+            function = runtime_functions.get(expression.builtin)
+            if function is None:
+                raise ValueError(f"unknown native builtin: {expression.builtin}")
+            temporaries = [self._new_temporary() for _ in expression.arguments]
+            result_type = self._cpp_type(expression.type)
+            lines = ["([&]() -> " + result_type + " {"]
+            for name, argument in zip(temporaries, expression.arguments):
+                keyword = "auto" if _ir_contains_resource(argument.type) else "const auto"
+                lines.append(f"    {keyword} {name} = {self._expression(argument)};")
+            values = list(temporaries)
+            if expression.builtin in {"byteFromInt", "byteBuffer"}:
+                values.append(_location_args(expression.location))
+            elif expression.builtin == "openText":
+                values.extend([_cpp_string_literal("TextFile"), _location_args(expression.location)])
+            elif expression.builtin == "openTextReader":
+                values.append(_location_args(expression.location))
+            elif expression.builtin == "openTextWriter":
+                values.extend([_location_args(expression.location)])
+            elif expression.builtin == "pathJoin":
+                values.append(_location_args(expression.location))
+            elif expression.builtin in {"runTasks", "resolveHost", "tcpConnect", "tcpListen"}:
                 values.append(_location_args(expression.location))
             call = f"tyvera_runtime::{function}({', '.join(values)})"
             lines.append(f"    return {call};")
@@ -630,6 +855,9 @@ class _CppGenerator:
     @staticmethod
     def _method_call_expression(expression: IRMethodCall, receiver: str, arguments: list[str]) -> str:
         method = expression.method
+        if isinstance(expression.receiver.type, IRAppliedType) and expression.receiver.type.name == "Task":
+            functions = {"cancel": "cancel", "isCancelled": "is_cancelled", "isDone": "is_done"}
+            return f"({receiver}).{functions[method]}()"
         if expression.receiver.type == IRType.BYTE and method == "toInt":
             return f"static_cast<std::int64_t>({receiver})"
         if expression.receiver.type == IRType.BYTES:
@@ -657,6 +885,80 @@ class _CppGenerator:
                 "readAll": "text_read_all", "write": "text_write", "append": "text_append",
                 "flush": "text_flush", "close": "text_close", "isOpen": "text_is_open",
             }
+            return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
+        if expression.receiver.type == IRType.SOCKET_ADDRESS:
+            return f"tyvera_runtime::socket_address_{method}({receiver})"
+        if expression.receiver.type == IRType.TCP_CONNECTION:
+            functions = {
+                "read": "tcp_read", "write": "tcp_write", "writeAll": "tcp_write_all",
+                "localAddress": "tcp_local_address", "remoteAddress": "tcp_remote_address",
+                "close": "tcp_close", "isOpen": "tcp_is_open",
+            }
+            values = [receiver, *arguments]
+            if method == "write":
+                values.append("false")
+            if method not in {"close", "isOpen"}:
+                values.append(_location_args(expression.location))
+            return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
+        if expression.receiver.type == IRType.TCP_LISTENER:
+            functions = {
+                "accept": "tcp_accept", "localAddress": "listener_local_address",
+                "close": "listener_close", "isOpen": "listener_is_open",
+            }
+            values = [receiver, *arguments]
+            if method in {"accept", "localAddress"}:
+                values.append(_location_args(expression.location))
+            return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
+        if isinstance(expression.receiver.type, IRAppliedType) and expression.receiver.type.name == "List":
+            element_type = _CppGenerator._cpp_type(expression.receiver.type.arguments[0])
+            functions = {
+                "append": "list_append", "insert": "list_insert", "get": "list_get",
+                "set": "list_set", "removeAt": "list_remove_at", "contains": "list_contains",
+                "clear": "list_clear",
+            }
+            values = [receiver, *arguments]
+            if method in {"insert", "set"}:
+                values.append(_location_args(expression.location))
+            return f"tyvera_runtime::{functions[method]}<{element_type}>({', '.join(values)})"
+        if isinstance(expression.receiver.type, IRAppliedType) and expression.receiver.type.name == "Map":
+            key_type, value_type = (
+                _CppGenerator._cppt",
+                "set": "byte_buffer_set", "toBytes": "byte_buffer_to_bytes",
+            }
+            values = [receiver, *arguments]
+            if method != "length":
+                values.append(_location_args(expression.location))
+            return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
+        if expression.receiver.type in {IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER}:
+            values = [receiver, *arguments]
+            values.append(_location_args(expression.location))
+            functions = {
+                "readAll": "text_read_all", "write": "text_write", "append": "text_append",
+                "flush": "text_flush", "close": "text_close", "isOpen": "text_is_open",
+            }
+            return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
+        if expression.receiver.type == IRType.SOCKET_ADDRESS:
+            return f"tyvera_runtime::socket_address_{method}({receiver})"
+        if expression.receiver.type == IRType.TCP_CONNECTION:
+            functions = {
+                "read": "tcp_read", "write": "tcp_write", "writeAll": "tcp_write_all",
+                "localAddress": "tcp_local_address", "remoteAddress": "tcp_remote_address",
+                "close": "tcp_close", "isOpen": "tcp_is_open",
+            }
+            values = [receiver, *arguments]
+            if method == "write":
+                values.append("false")
+            if method not in {"close", "isOpen"}:
+                values.append(_location_args(expression.location))
+            return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
+        if expression.receiver.type == IRType.TCP_LISTENER:
+            functions = {
+                "accept": "tcp_accept", "localAddress": "listener_local_address",
+                "close": "listener_close", "isOpen": "listener_is_open",
+            }
+            values = [receiver, *arguments]
+            if method in {"accept", "localAddress"}:
+                values.append(_location_args(expression.location))
             return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
         if isinstance(expression.receiver.type, IRAppliedType) and expression.receiver.type.name == "List":
             element_type = _CppGenerator._cpp_type(expression.receiver.type.arguments[0])
@@ -707,34 +1009,54 @@ def _cpp_string_literal(value: str) -> str:
 
 
 def _ir_contains_resource(type_ref: IRTypeRef) -> bool:
-    if type_ref in {IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER}:
+    if type_ref in {
+        IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
+        IRType.TCP_CONNECTION, IRType.TCP_LISTENER,
+    }:
         return True
     return isinstance(type_ref, IRAppliedType) and any(_ir_contains_resource(item) for item in type_ref.arguments)
 
 
 _RUNTIME = r'''#include <charconv>
+#include <cerrno>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
+
+#if defined(__linux__)
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 
 namespace tyvera_runtime {
 /*TYVERA_PROJECT_ROOT*/
@@ -822,6 +1144,700 @@ struct Failure final : std::exception {
         : file(std::move(source_file)), line(source_line), column(source_column), message(std::move(text)) {}
     const char* what() const noexcept override { return message.c_str(); }
 };
+struct TaskCancelled final : std::exception {
+    const char* what() const noexcept override { return "task was cancelled"; }
+};
+
+constexpr std::size_t MAX_NATIVE_TASKS_PER_RUN = 64;
+struct TaskControl {
+    std::atomic<bool> started{false};
+    std::atomic<bool> done{false};
+    std::atomic<bool> cancellation_requested{false};
+    bool serialized = true;
+    std::string source_file;
+    int source_line = 1;
+    int source_column = 1;
+    TaskControl* owner = nullptr;
+    std::mutex lifecycle_mutex;
+    std::condition_variable lifecycle_changed;
+    mutable std::mutex children_mutex;
+    std::vector<std::shared_ptr<TaskControl>> children;
+    mutable std::mutex child_failure_mutex;
+    std::string child_failure;
+    virtual ~TaskControl() = default;
+    virtual void start() = 0;
+    virtual void join() = 0;
+    virtual std::string failure_message() const = 0;
+    bool request_cancel() {
+        std::vector<std::shared_ptr<TaskControl>> owned;
+        {
+            std::lock_guard<std::mutex> lock(lifecycle_mutex);
+            if (done.load(std::memory_order_acquire) || cancellation_requested.load(std::memory_order_acquire))
+                return false;
+            {
+                std::lock_guard<std::mutex> failure_lock(child_failure_mutex);
+                if (!child_failure.empty()) return false;
+            }
+            cancellation_requested.store(true, std::memory_order_release);
+            std::lock_guard<std::mutex> children_lock(children_mutex);
+            owned = children;
+        }
+        for (auto item = owned.rbegin(); item != owned.rend(); ++item) (*item)->request_cancel();
+        lifecycle_changed.notify_all();
+        return true;
+    }
+    bool is_cancelled() const noexcept { return cancellation_requested.load(std::memory_order_acquire); }
+    bool is_done() const {
+        if (done.load(std::memory_order_acquire) || is_cancelled()) return true;
+        std::lock_guard<std::mutex> lock(child_failure_mutex);
+        return !child_failure.empty();
+    }
+    void add_child(const std::shared_ptr<TaskControl>& child) {
+        child->owner = this;
+        bool cancel_now = false;
+        {
+            std::lock_guard<std::mutex> lock(children_mutex);
+            children.push_back(child);
+            cancel_now = cancellation_requested.load(std::memory_order_acquire);
+        }
+        if (cancel_now) child->request_cancel();
+    }
+    std::vector<std::shared_ptr<TaskControl>> children_snapshot() const {
+        std::lock_guard<std::mutex> lock(children_mutex);
+        return children;
+    }
+    void cancel_children() {
+        const auto owned = children_snapshot();
+        for (auto item = owned.rbegin(); item != owned.rend(); ++item) (*item)->request_cancel();
+    }
+    void record_child_failure(const std::string& message) {
+        if (message.empty()) return;
+        {
+            std::lock_guard<std::mutex> lock(child_failure_mutex);
+            if (child_failure.empty()) child_failure = message;
+        }
+        cancel_children();
+        lifecycle_changed.notify_all();
+    }
+    void check_interruption() const {
+        std::string failure;
+        {
+            std::lock_guard<std::mutex> lock(child_failure_mutex);
+            failure = child_failure;
+        }
+        if (!failure.empty())
+            throw Failure(source_file, source_line, source_column, "owned child task failed: " + failure);
+        if (is_cancelled()) throw TaskCancelled{};
+    }
+    void wait_for_children(bool check_owner) {
+        const auto owned = children_snapshot();
+        for (const auto& child : owned) {
+            while (!child->done.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lock(child->lifecycle_mutex);
+                child->lifecycle_changed.wait_for(loid start() = 0;
+    virtual void join() = 0;
+    virtual std::string failure_message() const = 0;
+    bool request_cancel() {
+        std::vector<std::shared_ptr<TaskControl>> owned;
+        {
+            std::lock_guard<std::mutex> lock(lifecycle_mutex);
+            if (done.load(std::memory_order_acquire) || cancellation_requested.load(std::memory_order_acquire))
+                return false;
+            {
+                std::lock_guard<std::mutex> failure_lock(child_failure_mutex);
+                if (!child_failure.empty()) return false;
+            }
+            cancellation_requested.store(true, std::memory_order_release);
+            std::lock_guard<std::mutex> children_lock(children_mutex);
+            owned = children;
+        }
+        for (auto item = owned.rbegin(); item != owned.rend(); ++item) (*item)->request_cancel();
+        lifecycle_changed.notify_all();
+        return true;
+    }
+    bool is_cancelled() const noexcept { return cancellation_requested.load(std::memory_order_acquire); }
+    bool is_done() const {
+        if (done.load(std::memory_order_acquire) || is_cancelled()) return true;
+        std::lock_guard<std::mutex> lock(child_failure_mutex);
+        return !child_failure.empty();
+    }
+    void add_child(const std::shared_ptr<TaskControl>& child) {
+        child->owner = this;
+        bool cancel_now = false;
+        {
+            std::lock_guard<std::mutex> lock(children_mutex);
+            children.push_back(child);
+            cancel_now = cancellation_requested.load(std::memory_order_acquire);
+        }
+        if (cancel_now) child->request_cancel();
+    }
+    std::vector<std::shared_ptr<TaskControl>> children_snapshot() const {
+        std::lock_guard<std::mutex> lock(children_mutex);
+        return children;
+    }
+    void cancel_children() {
+        const auto owned = children_snapshot();
+        for (auto item = owned.rbegin(); item != owned.rend(); ++item) (*item)->request_cancel();
+    }
+    void record_child_failure(const std::string& message) {
+        if (message.empty()) return;
+        {
+            std::lock_guard<std::mutex> lock(child_failure_mutex);
+            if (child_failure.empty()) child_failure = message;
+        }
+        cancel_children();
+        lifecycle_changed.notify_all();
+    }
+    void check_interruption() const {
+        std::string failure;
+        {
+            std::lock_guard<std::mutex> lock(child_failure_mutex);
+            failure = child_failure;
+        }
+        if (!failure.empty())
+            throw Failure(source_file, source_line, source_column, "owned child task failed: " + failure);
+        if (is_cancelled()) throw TaskCancelled{};
+    }
+    void wait_for_children(bool check_owner) {
+        const auto owned = children_snapshot();
+        for (const auto& child : owned) {
+            while (!child->done.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lock(child->lifecycle_mutex);
+                child->lifecycle_changed.wait_for(lock, std::chrono::milliseconds(50), [&child]() {
+                    return child->done.load(std::memory_order_acquire);
+                });
+                lock.unlock();
+                if (check_owner) check_interruption();
+            }
+            if (!check_owner) continue;
+            check_interruption();
+            const auto message = child->failure_message();
+            if (!message.empty()) {
+                record_child_failure(message);
+                check_interruption();
+            }
+        }
+    }
+    void notify_owner_failure() {
+        if (!owner) return;
+        const auto message = failure_message();
+        if (!message.empty()) owner->record_child_failure(message);
+    }
+};
+inline std::string cleanup_failure_suffix();
+struct NativeScheduler {
+    std::mutex mutex;
+    std::mutex execution_mutex;
+    std::condition_variable changed;
+    std::vector<std::shared_ptr<TaskControl>> tasks;
+    bool running = false;
+    std::size_t completed = 0;
+};
+inline NativeScheduler& native_scheduler() {
+    static NativeScheduler value;
+    return value;
+}
+inline thread_local std::unique_lock<std::mutex>* active_execution_lock = nullptr;
+inline thread_local TaskControl* active_task_control = nullptr;
+class NativeTaskExecution {
+    std::unique_lock<std::mutex> lock_;
+    std::unique_lock<std::mutex>* previous_;
+    TaskControl* previous_task_;
+public:
+    explicit NativeTaskExecution(TaskControl& task)
+        : lock_(native_scheduler().execution_mutex, std::defer_lock), previous_(active_execution_lock),
+          previous_task_(active_task_control) {
+        active_task_control = &task;
+        if (task.serialized) {
+            lock_.lock();
+            active_execution_lock = &lock_;
+        } else {
+            active_execution_lock = nullptr;
+        }
+    }
+    ~NativeTaskExecution() { active_execution_lock = previous_; active_task_control = previous_task_; }
+};
+inline void task_checkpoint() {
+    if (active_task_control) active_task_control->check_interruption();
+    auto* execution_lock = active_execution_lock;
+    if (!execution_lock || !execution_lock->owns_lock()) return;
+    execution_lock->unlock();
+    std::this_thread::yield();
+    execution_lock->lock();
+    if (active_task_control) active_task_control->check_interruption();
+}
+inline void register_native_task(const std::shared_ptr<TaskControl>& task,
+                                 const std::string& file, int line, int column) {
+    auto& scheduler = native_scheduler();
+    bool start_now = false;
+    {
+        std::lock_guard<std::mutex> lock(scheduler.mutex);
+        if (scheduler.tasks.size() >= MAX_NATIVE_TASKS_PER_RUN)
+            throw Failure(file, line, column, "native task capacity exceeded (maximum 64 tasks per run)");
+        if (active_task_control) active_task_control->add_child(task);
+        scheduler.tasks.push_back(task);
+        start_now = scheduler.running;
+    }
+    scheduler.changed.notify_all();
+    if (start_now) task->start();
+}
+
+template <typename T> struct TaskState final : TaskControl, std::enable_shared_from_this<TaskState<T>> {
+    std::function<T()> work;
+    mutable std::mutex mutex;
+    std::condition_variable ready;
+    std::thread worker;
+    std::optional<T> result;
+    std::exception_ptr error;
+    std::string cleanup_failure;
+    explicit TaskState(std::function<T()> operation, bool serialized_execution,
+                       std::string source_file, int source_line, int source_column)
+        : work(std::move(operation)) {
+        serialized = serialized_execution;
+        this->source_file = std::move(source_file);
+        this->source_line = source_line;
+        this->source_column = source_column;
+    }
+    void start() override {
+        bool expected = false;
+        if (!started.compare_exchange_strong(expected, true)) return;
+        auto self = this->shared_from_this();
+        try {
+            worker = std::thread([self]() {
+                std::exception_ptr failure;
+                std::optional<T> value;
+                try {
+                    NativeTaskExecution execution(*self);
+                    self->check_interruption();
+                    value.emplace(self->work());
+                    self->check_interruption();
+                    self->wait_for_children(true);
+                } catch (...) {
+                    failure = std::current_exception();
+                }
+                self->work = nullptr;
+                if (failure) {
+                    value.reset();
+                    self->cancel_children();
+                    self->wait_for_children(false);
+                }
+                std::string cleanup;
+                try { cleanup = cleanup_failure_suffix(); } catch (...) {}
+                {
+                    std::unique_lock<std::mutex> lifecycle_lock(self->lifecycle_mutex);
+                    if (self->cancellation_requested.load(std::memory_order_acquire)) {
+                        lifecycle_lock.unlock();
+                        self->cancel_children();
+                        self->wait_for_children(false);
+                        lifecycle_lock.lock();
+                        failure = std::make_exception_ptr(TaskCancelled{});
+                        if (value) {
+                            value.reset();
+                            try { cleanup += cleanup_failure_suffix(); } catch (...) {}
+                        }
+                    }
+                    std::lock_guard<std::mutex> lock(self->mutex);
+                    self->error = failure;
+                    self->cleanup_failure = std::move(cleanup);
+                    if (value) {
+                        try { self->result.emplace(std::move(*value)); }
+                        catch (...) { self->error = std::current_exception(); }
+                    }
+                    self->done.store(true, std::memory_order_release);
+                }
+                self->lifecycle_changed.notify_all();
+                auto& scheduler = native_scheduler();
+                {
+                    std::lock_guard<std::mutex> lock(scheduler.mutex);
+                    ++scheduler.completed;
+                }
+                self->ready.notify_all();
+                scheduler.changed.notify_all();
+                self->notify_owner_failure();
+            });
+        } catch (...) {
+            const auto failure = std::current_exception();
+            work = nullptr;
+            std::string cleanup;
+            try { cleanup = cleanup_failure_suffix(); } catch (...) {}
+            {
+                std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex);
+                std::lock_guard<std::mutex> lock(mutex);
+                error = failure;
+                cleanup_failure = std::move(cleanup);
+                done.store(true, std::memory_order_release);
+            }
+            lifecycle_changed.notify_all();
+            auto& scheduler = native_scheduler();
+            {
+                std::lock_guard<std::mutex> lock(scheduler.mutex);
+                ++scheduler.completed;
+            }
+            ready.notify_all();
+            scheduler.changed.notify_all();
+            notify_owner_failure();
+        }
+    }
+    T await(const std::string& file, int line, int column) {
+        if (!started.load(std::memory_order_acquire)) start();
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!done.load(std::memory_order_acquire)) {
+            ready.wait_for(lock, std::chrono::milliseconds(50));
+            if (done.load(std::memory_order_acquire)) break;
+            lock.unlock();
+            if (active_task_control) active_task_control->check_interruption();
+            lock.lock();
+        }
+        if (error) {
+            try { std::rethrow_exception(error); }
+            catch (const TaskCancelled&) { throw Failure(file, line, column, "task was cancelled"); }
+        }
+        if (!result) throw Failure(file, line, column, "native task completed without a result");
+        return *result;
+    }
+    T await_move(const std::string& file, int line, int column) {
+        if (!started.load(std::memory_order_acquire)) start();
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!done.load(std::memory_order_acquire)) {
+            ready.wait_for(lock, std::chrono::milliseconds(50));
+            if (done.load(std::memory_order_acquire)) break;
+            lock.unlock();
+            if (active_task_control) active_task_control->check_interruption();
+            lock.lock();
+        }
+        if (error) {
+            try { std::rethrow_exception(error); }
+            catch (const TaskCancelled&) { throw Failure(file, line, column, "task was cancelled"); }
+        }
+        if (!result) throw Failure(file, line, column, "native task result was already consumed");
+        T value = std::move(*result);
+        result.reset();
+        return value;
+    }
+    void join() override { if (worker.joinable()) worker.join(); }
+    std::string failure_message() const override {
+        std::lock_guard<s    {
+                    std::lock_guard<std::mutex> lock(scheduler.mutex);
+                    ++scheduler.completed;
+                }
+                self->ready.notify_all();
+                scheduler.changed.notify_all();
+                self->notify_owner_failure();
+            });
+        } catch (...) {
+            const auto failure = std::current_exception();
+            work = nullptr;
+            std::string cleanup;
+            try { cleanup = cleanup_failure_suffix(); } catch (...) {}
+            {
+                std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex);
+                std::lock_guard<std::mutex> lock(mutex);
+                error = failure;
+                cleanup_failure = std::move(cleanup);
+                done.store(true, std::memory_order_release);
+            }
+            lifecycle_changed.notify_all();
+            auto& scheduler = native_scheduler();
+            {
+                std::lock_guard<std::mutex> lock(scheduler.mutex);
+                ++scheduler.completed;
+            }
+            ready.notify_all();
+            scheduler.changed.notify_all();
+            notify_owner_failure();
+        }
+    }
+    T await(const std::string& file, int line, int column) {
+        if (!started.load(std::memory_order_acquire)) start();
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!done.load(std::memory_order_acquire)) {
+            ready.wait_for(lock, std::chrono::milliseconds(50));
+            if (done.load(std::memory_order_acquire)) break;
+            lock.unlock();
+            if (active_task_control) active_task_control->check_interruption();
+            lock.lock();
+        }
+        if (error) {
+            try { std::rethrow_exception(error); }
+            catch (const TaskCancelled&) { throw Failure(file, line, column, "task was cancelled"); }
+        }
+        if (!result) throw Failure(file, line, column, "native task completed without a result");
+        return *result;
+    }
+    T await_move(const std::string& file, int line, int column) {
+        if (!started.load(std::memory_order_acquire)) start();
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!done.load(std::memory_order_acquire)) {
+            ready.wait_for(lock, std::chrono::milliseconds(50));
+            if (done.load(std::memory_order_acquire)) break;
+            lock.unlock();
+            if (active_task_control) active_task_control->check_interruption();
+            lock.lock();
+        }
+        if (error) {
+            try { std::rethrow_exception(error); }
+            catch (const TaskCancelled&) { throw Failure(file, line, column, "task was cancelled"); }
+        }
+        if (!result) throw Failure(file, line, column, "native task result was already consumed");
+        T value = std::move(*result);
+        result.reset();
+        return value;
+    }
+    void join() override { if (worker.joinable()) worker.join(); }
+    std::string failure_message() const override {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::string message;
+        if (error) {
+            try { std::rethrow_exception(error); }
+            catch (const Failure& failure) { message = failure.what(); }
+            catch (const TaskCancelled&) {}
+            catch (...) { message = "native task failed"; }
+        }
+        return message + cleanup_failure;
+    }
+};
+
+template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_this<TaskState<void>> {
+    std::function<void()> work;
+    mutable std::mutex mutex;
+    std::condition_variable ready;
+    std::thread worker;
+    std::exception_ptr error;
+    std::string cleanup_failure;
+    explicit TaskState(std::function<void()> operation, bool serialized_execution,
+                       std::string source_file, int source_line, int source_column)
+        : work(std::move(operation)) {
+        serialized = serialized_execution;
+        this->source_file = std::move(source_file);
+        this->source_line = source_line;
+        this->source_column = source_column;
+    }
+    void start() override {
+        bool expected = false;
+        if (!started.compare_exchange_strong(expected, true)) return;
+        auto self = this->shared_from_this();
+        try {
+            worker = std::thread([self]() {
+                std::exception_ptr failure;
+                try {
+                    NativeTaskExecution execution(*self);
+                    self->check_interruption();
+                    self->work();
+                    self->check_interruption();
+                    self->wait_for_children(true);
+                } catch (...) { failure = std::current_exception(); }
+                self->work = nullptr;
+                if (failure) {
+                    self->cancel_children();
+                    self->wait_for_children(false);
+                }
+                std::string cleanup;
+                try { cleanup = cleanup_failure_suffix(); } catch (...) {}
+                {
+                    std::unique_lock<std::mutex> lifecycle_lock(self->lifecycle_mutex);
+                    if (self->cancellation_requested.load(std::memory_order_acquire)) {
+                        lifecycle_lock.unlock();
+                        self->cancel_children();
+                        self->wait_for_children(false);
+                        lifecycle_lock.lock();
+                        failure = std::make_exception_ptr(TaskCancelled{});
+                        try { cleanup += cleanup_failure_suffix(); } catch (...) {}
+                    }
+                    std::lock_guard<std::mutex> lock(self->mutex);
+                    self->error = failure;
+                    self->cleanup_failure = std::move(cleanup);
+                    self->done.store(true, std::memory_order_release);
+                }
+                self->lifecycle_changed.notify_all();
+                auto& scheduler = native_scheduler();
+                { std::lock_guard<std::mutex> lock(scheduler.mutex); ++scheduler.completed; }
+                self->ready.notify_all();
+                scheduler.changed.notify_all();
+                self->notify_owner_failure();
+            });
+        } catch (...) {
+            const auto failure = std::current_exception();
+            work = nullptr;
+            std::string cleanup;
+            try { cleanup = cleanup_failure_suffix(); } catch (...) {}
+            {
+                std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex);
+                std::lock_guard<std::mutex> lock(mutex);
+                error = failure;
+                cleanup_failure = std::move(cleanup);
+                done.store(true, std::memory_order_release);
+            }
+            lifecycle_changed.notify_all();
+            auto& scheduler = native_scheduler();
+            { std::lock_guard<std::mutex> lock(scheduler.mutex); ++scheduler.completed; }
+            ready.notify_all();
+            scheduler.changed.notify_all();
+            notify_owner_failure();
+        }
+    }
+    void await(const std::string& file, int line, int column) {
+        if (!started.load(std::memory_order_acquire)) start();
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!done.load(std::memory_order_acquire)) {
+            ready.wait_for(lock, std::chrono::milliseconds(50));
+            if (done.load(std::memory_order_acquire)) break;
+            lock.unlock();
+            if (active_task_control) active_task_control->check_interruption();
+            lock.lock();
+        }
+        if (error) {
+            try { std::rethrow_exception(error); }
+            catch (const TaskCancelled&) { throw Failure(file, line, column, "task was cancelled"); }
+        }
+    }
+    void join() override { if (worker.joinable()) worker.join(); }
+    std::string failure_message() const override {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::string message;
+        if (error) {
+            try { std::rethrow_exception(error); }
+            catch (const Failure& failure) { message = failure.what(); }
+            catch (const TaskCancelled&) {}
+            catch (...) { message = "native task failed"; }
+        }
+        return message + cleanup_failure;
+    }
+};
+
+template <typename T> struct Task {
+    std::shared_ptr<TaskState<T>> state;
+    bool cancel() const { return state && state->request_cancel(); }
+    bool is_cancelled() const { return state && state->is_cancelled(); }
+    bool is_done() const { return !state || state->is_done(); }
+    T await(const std::string& file, int line, int column) const {
+        if (!state) throw Failure(file, line, column, "cannot await an empty Task");
+        auto* execution_lock = active_execution_lock;
+        const bool resume_serialized = execution_lock && execution_lock->owns_lock();
+        if (resume_serialized) execution_lock->unlock();
+        try {
+            T value = state->await(file, line, column);
+            if (active_task_control && active_task_control != state.get())
+                active_task_control->check_interruption();
+            if (resume_serialized) execution_lock->lock();
+            return value;
+        } catch (...) {
+            if (resume_serialized) execution_lock->lock();
+            throw;
+        }
+    }
+    T await_move(const std::string& file, int line, int column) const {
+        if (!state) throw Failure(file, line, column, "cannot await an empty Task");
+        auto* execution_lock = active_execution_lock;
+        const bool resume_serialized = execution_lock && execution_lock->owns_lock();
+        if (resume_serialized) execution_lock->unlock();
+        try {
+            T value = state->await_move(file, line, column);
+            if (active_task_control && active_task_control != state.get())
+                active_task_control->check_interruption();
+            if (resume_serialized) execution_lock->lock();
+            return value;
+        } catch (...) {
+            if (resume_serialized) execution_lock->lock();
+            throw;
+        }
+    }
+};
+template <> struct Task<void> {
+    std::shared_ptr<TaskState<void>> state;
+    bool cancel() const { return state && state->request_cancel(); }
+    bool is_cancelled() const { return state && state->is_cancelled(); }
+    bool is_done() const { return !state || state->is_done(); }
+    void await(const std::string& file, int line, int column) const {
+        if (!state) throw Failure(file, line, column, "cannot await an empty Task");
+        auto* execution_lock = active_execution_lock;
+        const bool resume_serialized = execution_lock && execution_lock->owns_lock();
+        if (resume_serialized) execution_lock->unlock();
+        try {
+            state->await(file, line, column);
+            if (active_task_control && active_task_control != state.get())
+                active_task_control->check_interruption();
+            if (resume_serialized) execution_lock->lock();
+        } catch (...) {
+            if (resume_serialized) execution_lock->lock();
+            throw;
+        }
+    }
+};
+template <typename T> inline Task<T> make_task_with_mode(std::function<T()> operation, bool serialized,
+                                                         const std::string& file, int line, int column) {
+    auto state = std::make_shared<TaskState<T>>(std::move(operation), serialized, file, line, column);
+    register_native_task(state, file, line, column);
+    return Task<T>{std::move(state)};
+}
+template <typename T> inline Task<T> make_task(std::function<T()> operation,
+                                               const std::string& file, int line, int column) {
+    return make_task_with_mode<T>(std::move(operation), true, file, line, column);
+}
+template <typename T> inline Task<T> make_io_task(std::function<T()> operation,
+                                                  const std::string& file, int line, int column) {
+    return make_task_with_mode<T>(std::move(operation), false, file, line, column);
+}
+
+struct CleanupFailure { std::string file; int line; int column; std::string terruption();
+            if (resume_serialized) execution_lock->lock();
+            return value;
+        } catch (...) {
+            if (resume_serialized) execution_lock->lock();
+            throw;
+        }
+    }
+    T await_move(const std::string& file, int line, int column) const {
+        if (!state) throw Failure(file, line, column, "cannot await an empty Task");
+        auto* execution_lock = active_execution_lock;
+        const bool resume_serialized = execution_lock && execution_lock->owns_lock();
+        if (resume_serialized) execution_lock->unlock();
+        try {
+            T value = state->await_move(file, line, column);
+            if (active_task_control && active_task_control != state.get())
+                active_task_control->check_interruption();
+            if (resume_serialized) execution_lock->lock();
+            return value;
+        } catch (...) {
+            if (resume_serialized) execution_lock->lock();
+            throw;
+        }
+    }
+};
+template <> struct Task<void> {
+    std::shared_ptr<TaskState<void>> state;
+    bool cancel() const { return state && state->request_cancel(); }
+    bool is_cancelled() const { return state && state->is_cancelled(); }
+    bool is_done() const { return !state || state->is_done(); }
+    void await(const std::string& file, int line, int column) const {
+        if (!state) throw Failure(file, line, column, "cannot await an empty Task");
+        auto* execution_lock = active_execution_lock;
+        const bool resume_serialized = execution_lock && execution_lock->owns_lock();
+        if (resume_serialized) execution_lock->unlock();
+        try {
+            state->await(file, line, column);
+            if (active_task_control && active_task_control != state.get())
+                active_task_control->check_interruption();
+            if (resume_serialized) execution_lock->lock();
+        } catch (...) {
+            if (resume_serialized) execution_lock->lock();
+            throw;
+        }
+    }
+};
+template <typename T> inline Task<T> make_task_with_mode(std::function<T()> operation, bool serialized,
+                                                         const std::string& file, int line, int column) {
+    auto state = std::make_shared<TaskState<T>>(std::move(operation), serialized, file, line, column);
+    register_native_task(state, file, line, column);
+    return Task<T>{std::move(state)};
+}
+template <typename T> inline Task<T> make_task(std::function<T()> operation,
+                                               const std::string& file, int line, int column) {
+    return make_task_with_mode<T>(std::move(operation), true, file, line, column);
+}
+template <typename T> inline Task<T> make_io_task(std::function<T()> operation,
+                                                  const std::string& file, int line, int column) {
+    return make_task_with_mode<T>(std::move(operation), false, file, line, column);
+}
 
 struct CleanupFailure { std::string file; int line; int column; std::string message; };
 inline std::vector<CleanupFailure>& cleanup_failures() {
@@ -941,6 +1957,75 @@ inline double checked_div_float(double left, double right, const std::string& fi
 inline double checked_remainder_float(double left, double right, const std::string& file, int line, int column) {
     if (right == 0.0) fail(file, line, column, "remainder by zero");
     return checked_float(std::fmod(left, right), file, line, column);
+}
+
+template <typename T>
+struct ListData { std::vector<T> values; };
+
+template <typename K, typename V>
+struct MapData { std::vector<std::pair<K, V>> entries; };
+
+template <typename T> inline bool equal(const T& left, const T& right);
+template <typename T> inline bool equal(const std::optional<T>& left, const std::optional<T>& right);
+template <typename T, typename E> inline bool equal(const std::variant<T, E>& left, const std::variant<T, E>& right);
+template <typename T> inline bool equal(const std::shared_ptr<ListData<T>>& left, const std::shared_ptr<ListData<T>>& right);
+template <typename K, typename V> inline bool equal(const std::shared_ptr<MapData<K, V>>& left, const std::shared_ptr<MapData<K, V>>& right);
+
+template <typename T>
+inline bool equal(const T& left, const T& right) { return left == right; }
+
+template <typename T>
+inline bool equal(const std::optional<T>& left, const std::optional<T>& right) {
+    if (left.has_value() != right.has_value()) return false;
+    return !left.has_value() || equal(left.value(), right.value());
+}
+
+template <typename T, typename E>
+inline bool equal(const std::variant<T, E>& left, const std::variant<T, E>& right) {
+    if (left.index() != right.index()) return false;
+    if (left.index() == 0) return equal(std::get<0>(left), std::get<0>(right));
+    return equal(std::get<1>(left), std::get<1>(right));
+}
+
+template <typename T>
+inline bool equal(const std::shared_ptr<ListData<T>>& left, const std::shared_ptr<ListData<T>>& right) {
+    if (left == right) return true;
+    if (!left || !right || left->values.size() != right->values.size()) return false;
+    for (std::size_t index = 0; index < left->values.size(); ++index)
+        if (!equal(left->values[index], right->values[index])) return false;
+    return true;
+}
+
+template <typename K, typename V>
+inline bool equal(const std::shared_ptr<MapData<K, V>>& left, const std::shared_ptr<MapData<K, V>>& right) {
+    if (left == right) return true;
+    if (!left || !right || left->entries.size() != right->entries.size()) return false;
+    for (const auto& entry : left->entries) {
+        bool found = false;
+        for (const auto& candidate : right->entries) {
+            if (equal(entry.first, candidate.first)) {
+                if (!equal(entry.second, candidate.second)) return false;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+template <typename T>
+inline std::shared_ptr<ListData<T>> make_list() { return std::make_shared<ListData<T>>(); }
+
+template <typename K, typename V>
+inline std::shared_ptr<MapData<K, V>> make_map() { return std::make_shared<MapData<K, V>>(); }
+
+template <typename T>
+inline std::vector<T> list_snapshot(const std::shared_ptr<ListData<T>>& list) { return list->values; }
+
+template <typename K, typename V>
+inline std::vector<K> map_keys_snapshot(const std::shared_ptr<MapData<K, V>>& map) {
+    std::vectloat(std::fmod(left, right), file, line, column);
 }
 
 template <typename T>
@@ -1188,6 +2273,854 @@ template <typename T> inline StringResult<T> result_error(std::string message) {
     return StringResult<T>{std::in_place_index<1>, std::move(message)};
 }
 
+struct SocketAddress {
+    std::string host;
+    std::int64_t port = 0;
+    std::string family;
+};
+
+#if defined(__linux__)
+inline std::string network_error_from_errno(int code) {
+    if (code == ECONNREFUSED) return "connection refused";
+    if (code == ECONNRESET || code == EPIPE || code == ENOTCONN) return "connection reset";
+#ifdef ESHUTDOWN
+    if (code == ESHUTDOWN) return "connection reset";
+#endif
+    if (code == EADDRINUSE) return "address already in use";
+    if (code == EACCES || code == EPERM) return "permission denied";
+    if (code == ETIMEDOUT) return "operation timed out";
+    if (code == EINVAL) return "invalid address";
+    return "network operation failed";
+}
+#endif
+
+struct SocketHandle {
+#if defined(__linux__)
+    std::atomic<int> descriptor{-1};
+    mutableconst auto continuation = bytes[index + offset];
+            if ((continuation & 0xc0) != 0x80) return false;
+            value = (value << 6) | (continuation & 0x3f);
+        }
+        if (value < minimum || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff)) return false;
+        index += count;
+    }
+    return true;
+}
+
+inline std::variant<std::string, std::string> bytes_to_string(const std::vector<std::uint8_t>& bytes) {
+    if (!valid_utf8(bytes))
+        return std::variant<std::string, std::string>{std::in_place_index<1>, "bytes are not valid UTF-8"};
+    std::string value;
+    if (!bytes.empty())
+        value.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    return std::variant<std::string, std::string>{std::in_place_index<0>, std::move(value)};
+}
+
+inline std::variant<std::vector<std::uint8_t>, std::string> bytes_slice(
+    const std::vector<std::uint8_t>& bytes, std::int64_t start, std::int64_t length) {
+    if (start < 0 || length < 0 || static_cast<std::uint64_t>(start) > bytes.size()
+        || static_cast<std::uint64_t>(length) > bytes.size() - static_cast<std::size_t>(start))
+        return std::variant<std::vector<std::uint8_t>, std::string>{std::in_place_index<1>, "Bytes slice is out of bounds"};
+    const auto offset = static_cast<std::size_t>(start);
+    const auto count = static_cast<std::size_t>(length);
+    try {
+        return std::variant<std::vector<std::uint8_t>, std::string>{
+            std::in_place_index<0>, bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+            bytes.begin() + static_cast<std::ptrdiff_t>(offset + count)};
+    } catch (const std::bad_alloc&) {
+        return std::variant<std::vector<std::uint8_t>, std::string>{std::in_place_index<1>, "cannot allocate Bytes slice"};
+    }
+}
+
+constexpr std::uint64_t MAX_BYTE_BUFFER_LENGTH = 67108864;
+template <typename T> using StringResult = std::variant<T, std::string>;
+template <typename T> inline StringResult<T> result_ok(T value) {
+    return StringResult<T>{std::in_place_index<0>, std::move(value)};
+}
+template <typename T> inline StringResult<T> result_error(std::string message) {
+    return StringResult<T>{std::in_place_index<1>, std::move(message)};
+}
+
+struct SocketAddress {
+    std::string host;
+    std::int64_t port = 0;
+    std::string family;
+};
+
+#if defined(__linux__)
+inline std::string network_error_from_errno(int code) {
+    if (code == ECONNREFUSED) return "connection refused";
+    if (code == ECONNRESET || code == EPIPE || code == ENOTCONN) return "connection reset";
+#ifdef ESHUTDOWN
+    if (code == ESHUTDOWN) return "connection reset";
+#endif
+    if (code == EADDRINUSE) return "address already in use";
+    if (code == EACCES || code == EPERM) return "permission denied";
+    if (code == ETIMEDOUT) return "operation timed out";
+    if (code == EINVAL) return "invalid address";
+    return "network operation failed";
+}
+#endif
+
+struct SocketHandle {
+#if defined(__linux__)
+    std::atomic<int> descriptor{-1};
+    mutable std::mutex mutex;
+    explicit SocketHandle(int value) : descriptor(value) {}
+    int duplicate() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        const int value = descriptor.load(std::memory_order_acquire);
+        if (value < 0) return -1;
+        const int copy = ::dup(value);
+        if (copy < 0) return -1;
+        if (::fcntl(copy, F_SETFD, FD_CLOEXEC) < 0) {
+            ::close(copy);
+            return -1;
+        }
+        return copy;
+    }
+    bool is_open() const noexcept { return descriptor.load(std::memory_order_acquire) >= 0; }
+    bool close() noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        const int value = descriptor.exchange(-1, std::memory_order_acq_rel);
+        if (value < 0) return false;
+        (void)::shutdown(value, SHUT_RDWR);
+        return ::close(value) == 0;
+    }
+#else
+    explicit SocketHandle(int) {}
+    int duplicate() const noexcept { return -1; }
+    bool is_open() const noexcept { return false; }
+    bool close() noexcept { return false; }
+#endif
+    ~SocketHandle() { (void)close(); }
+};
+
+struct TcpConnection {
+    std::shared_ptr<SocketHandle> socket;
+    SocketAddress local;
+    SocketAddress remote;
+    std::atomic<bool> pending_read{false};
+    std::atomic<bool> pending_write{false};
+    std::string source_file;
+    int source_line = 1;
+    int source_column = 1;
+    ~TcpConnection() noexcept {
+        if (socket && socket->is_open() && !socket->close())
+            record_cleanup_failure(source_file, source_line, source_column, "cannot close TCP connection");
+    }
+};
+struct TcpListener {
+    std::shared_ptr<SocketHandle> socket;
+    SocketAddress local;
+    std::atomic<bool> pending_accept{false};
+    std::string source_file;
+    int source_line = 1;
+    int source_column = 1;
+    ~TcpListener() noexcept {
+        if (socket && socket->is_open() && !socket->close())
+            record_cleanup_failure(source_file, source_line, source_column, "cannot close TCP listener");
+    }
+};
+
+inline void set_resource_location(const std::shared_ptr<TcpConnection>& resource,
+                                  const std::string& file, int line, int column) {
+    if (!resource) return;
+    resource->source_file = file;
+    resource->source_line = line;
+    resource->source_column = column;
+}
+inline void set_resource_location(const std::shared_ptr<TcpListener>& resource,
+                                  const std::string& file, int line, int column) {
+    if (!resource) return;
+    resource->source_file = file;
+    resource->source_line = line;
+    resource->source_column = column;
+}
+
+struct PendingSocketOperation {
+    std::atomic<bool>* flag;
+    std::shared_ptr<void> lifetime;
+    bool reserved = false;
+    template <typename T>
+    PendingSocketOperation(std::atomic<bool>& value, std::shared_ptr<T> owner)
+        : flag(&value), lifetime(std::move(owner)) {}
+    PendingSocketOperation(const PendingSocketOperation&) = delete;
+    PendingSocketOperation& operator=(const PendingSocketOperation&) = delete;
+    bool acquire() noexcept {
+        bool expected = false;
+        reserved = flag->compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+        return reserved;
+    }
+    void release() noexcept {
+        if (reserved) {
+            flag->store(false, std::memory_order_release);
+            reserved = false;
+        }
+    }
+    ~PendingSocketOperation() { release(); }
+};
+struct PendingSocketOperationReset {
+    std::shared_ptr<PendingSocketOperation> operation;
+    ~PendingSocketOperationReset() { if (operation) operation->release(); }
+};
+
+struct UniqueSocketFd {
+    int value = -1;
+    explicit UniqueSocketFd(int descriptor = -1) : value(descriptor) {}
+    UniqueSocketFd(const UniqueSocketFd&) = delete;
+    UniqueSocketFd& operator=(const UniqueSocketFd&) = delete;
+    UniqueSocketFd(UniqueSocketFd&& other) noexcept : value(other.value) { other.value = -1; }
+    ~UniqueSocketFd() {
+#if defined(__linux__)
+        if (value >= 0) (void)::close(value);
+#endif
+    }
+    int release() noexcept { const int result = value; value = -1; return result; }
+};
+
+#if defined(__linux__)
+inline bool configure_socket_descriptor(int descriptor) {
+    const int descriptor_flags = ::fcntl(descriptor, F_GETFD, 0);
+    if (descriptor_flags < 0 || ::fcntl(descriptor, F_SETFD, descriptor_flags | FD_CLOEXEC) < 0)
+        return false;
+    const int status_flags = ::fcntl(descriptor, F_GETFL, 0);
+    if (status_flags < 0 || ::fcntl(descriptor, F_SETFL, status_flags | O_NONBLOCK) < 0)
+        return false;
+    return true;
+}
+
+inline bool socket_address_from(const sockaddr* raw, socklen_t size, SocketAddress& output) {
+    if (!raw || (raw->sa_family != AF_INET && raw->sa_family != AF_INET6)) return false;
+    char host[NI_MAXHOST]{};
+    if (::getnameinfo(raw, size, host, sizeof(host), nullptr, 0, NI_NUMERICHOST) != 0) return false;
+    output.host = host;
+    if (raw->sa_family == AF_INET) {
+        output.family = "IPv4";
+        output.port = ntohs(reinterpret_cast<const sockaddr_in*>(raw)->sin_port);
+    } else {
+        output.family = "IPv6";
+        output.port = ntohs(reinterpret_cast<const sockaddr_in6*>(raw)->sin6_port);
+    }
+    return true;
+}
+
+inline StringResult<SocketAddress> socket_address_from_fd(
+    const std::shared_ptr<SocketHandle>& handle, bool peer) {
+    if (!handle) return result_error<SocketAddress>("resource is closed");
+    UniqueSocketFd duplicate(handle->duplicate());
+    if (duplicate.value < 0) return result_error<SocketAddress>("resource is closed");
+    sockaddr_storage raw{};
+    socklen_t size = sizeof(raw);
+    const int status = peer
+        ? ::getpeername(duplicate.value, reinterpret_cast<sockaddr*>(&raw), &size)
+        : ::getsockname(duplicate.value, reinterpret_cast<sockaddr*>(&raw), &size);
+    if (status != 0) return result_error<SocketAddress>(network_error_from_errno(errno));
+    SocketAddress result;
+    if (!socket_address_from(reinterpret_cast<const sockaddr*>(&raw), size, result))
+        return result_error<SocketAddress>("network operation failed");
+    return result_ok<SocketAddress>(std::move(result));
+}
+
+inline int poll_socket(const std::shared_ptr<SocketHandle>& handle, int descriptor, short events,
+                       const std::string& file, int line, int column) {
+    for (;;) {
+        task_checkpoint();
+        check_shutdown(file, line, column);
+        if (!handle || !handle->is_open()) return -2;
+        pollfd item{descriptor, events, 0};
+        const int ready = ::poll(&item, 1, 100);
+        if (ready > 0) return item.revents & POLLNVAL ? -1 : ready;
+        if (ready == 0 || errno == EINTR) continue;
+        return -1;
+    }
+}
+inline int poll_descriptor(int descriptor, short events,
+                           const std::string& file, int line, int column) {
+    for (;;) {
+        task_checkpoint();
+        check_shutdown(file, line, column);
+        pollfd item{descriptor, events, 0};
+        const int ready = ::poll(&item, 1, 100);
+        if (ready > 0) return item.revents & POLLNVAL ? -1 : ready;
+        if (ready == 0 || errno == EINTR) continue;
+        return -1;
+    }
+}
+
+inline Task<StringResult<std::shared_ptr<ListData<SocketAddress>>>> resolve_host(
+    std::string host, std::int64_t port, const std::string& file, int line, int column) {
+    using Output = StringResult<std::shared_ptr<ListData<SocketAddress>>>;
+    return make_io_task<Output>([host = std::move(host), port]() -> Output {
+        task_checkpoint();
+        if (host.find_first_not_of(" \t\r\n") == std::string::npos)
+            return result_error<std::shared_ptr<ListData<SocketAddress>>>("invalid address");
+        if (port < 0 || port > 65535)
+            return result_error<std::shared_ptr<ListData<SocketAddress>>>("invalid address");
+#if defined(__linux__)
+        int status = 0;
+        addrinfo* addresses = nullptr;
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        const auto service = std::to_string(port);
+        status = ::getaddrinfo(host.c_str(), service.c_str(), &hints, &addresses);
+        if (status != 0) return result_error<std::shared_ptr<ListData<SocketAddress>>>("DNS resolution failed");
+        std::unique_ptr<addrinfo, decltype(&::freeaddrinfo)> owner(addresses, ::freeaddrinfo);
+        task_checkpoint();
+        auto result = make_list<SocketAddress>();
+        try {
+            for (auto* current = addresses; current; current = current->ai_next) {
+                SocketAddress item;
+                if (!socket_address_from(current->ai_addr, static_cast<socklen_t>(current->ai_addrlen), item)) continue;
+                const auto duplicate = std::find_if(result->values.begin(), result->values.end(), [&](const auto& value) {
+                    return value.host == item.host && value.port == item.port && value.family == item.family;
+                });
+                if (duplicate == result->values.end())))
+        return result_error<SocketAddress>("network operation failed");
+    return result_ok<SocketAddress>(std::move(result));
+}
+
+inline int poll_socket(const std::shared_ptr<SocketHandle>& handle, int descriptor, short events,
+                       const std::string& file, int line, int column) {
+    for (;;) {
+        task_checkpoint();
+        check_shutdown(file, line, column);
+        if (!handle || !handle->is_open()) return -2;
+        pollfd item{descriptor, events, 0};
+        const int ready = ::poll(&item, 1, 100);
+        if (ready > 0) return item.revents & POLLNVAL ? -1 : ready;
+        if (ready == 0 || errno == EINTR) continue;
+        return -1;
+    }
+}
+inline int poll_descriptor(int descriptor, short events,
+                           const std::string& file, int line, int column) {
+    for (;;) {
+        task_checkpoint();
+        check_shutdown(file, line, column);
+        pollfd item{descriptor, events, 0};
+        const int ready = ::poll(&item, 1, 100);
+        if (ready > 0) return item.revents & POLLNVAL ? -1 : ready;
+        if (ready == 0 || errno == EINTR) continue;
+        return -1;
+    }
+}
+
+inline Task<StringResult<std::shared_ptr<ListData<SocketAddress>>>> resolve_host(
+    std::string host, std::int64_t port, const std::string& file, int line, int column) {
+    using Output = StringResult<std::shared_ptr<ListData<SocketAddress>>>;
+    return make_io_task<Output>([host = std::move(host), port]() -> Output {
+        task_checkpoint();
+        if (host.find_first_not_of(" \t\r\n") == std::string::npos)
+            return result_error<std::shared_ptr<ListData<SocketAddress>>>("invalid address");
+        if (port < 0 || port > 65535)
+            return result_error<std::shared_ptr<ListData<SocketAddress>>>("invalid address");
+#if defined(__linux__)
+        int status = 0;
+        addrinfo* addresses = nullptr;
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        const auto service = std::to_string(port);
+        status = ::getaddrinfo(host.c_str(), service.c_str(), &hints, &addresses);
+        if (status != 0) return result_error<std::shared_ptr<ListData<SocketAddress>>>("DNS resolution failed");
+        std::unique_ptr<addrinfo, decltype(&::freeaddrinfo)> owner(addresses, ::freeaddrinfo);
+        task_checkpoint();
+        auto result = make_list<SocketAddress>();
+        try {
+            for (auto* current = addresses; current; current = current->ai_next) {
+                SocketAddress item;
+                if (!socket_address_from(current->ai_addr, static_cast<socklen_t>(current->ai_addrlen), item)) continue;
+                const auto duplicate = std::find_if(result->values.begin(), result->values.end(), [&](const auto& value) {
+                    return value.host == item.host && value.port == item.port && value.family == item.family;
+                });
+                if (duplicate == result->values.end()) result->values.push_back(std::move(item));
+            }
+        } catch (...) { return result_error<std::shared_ptr<ListData<SocketAddress>>>("DNS resolution failed"); }
+        if (result->values.empty()) return result_error<std::shared_ptr<ListData<SocketAddress>>>("DNS resolution failed");
+        return result_ok<std::shared_ptr<ListData<SocketAddress>>>(std::move(result));
+#else
+        return result_error<std::shared_ptr<ListData<SocketAddress>>>("networking is not supported by this native platform");
+#endif
+    }, file, line, column);
+}
+
+inline Task<StringResult<std::shared_ptr<TcpConnection>>> tcp_connect(
+    std::string host, std::int64_t port, const std::string& file, int line, int column) {
+    using Output = StringResult<std::shared_ptr<TcpConnection>>;
+    return make_io_task<Output>([host = std::move(host), port, file, line, column]() -> Output {
+        task_checkpoint();
+        if (host.find_first_not_of(" \t\r\n") == std::string::npos)
+            return result_error<std::shared_ptr<TcpConnection>>("invalid address");
+        if (port < 1 || port > 65535)
+            return result_error<std::shared_ptr<TcpConnection>>("port must be between 1 and 65535");
+#if defined(__linux__)
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        const auto service = std::to_string(port);
+        addrinfo* addresses = nullptr;
+        const int resolved = ::getaddrinfo(host.c_str(), service.c_str(), &hints, &addresses);
+        if (resolved != 0) return result_error<std::shared_ptr<TcpConnection>>("DNS resolution failed");
+        std::unique_ptr<addrinfo, decltype(&::freeaddrinfo)> owner(addresses, ::freeaddrinfo);
+        task_checkpoint();
+        int last_error = 0;
+        for (auto* current = addresses; current; current = current->ai_next) {
+            const int descriptor = ::socket(current->ai_family, current->ai_socktype, current->ai_protocol);
+            if (descriptor < 0) { last_error = errno; continue; }
+            UniqueSocketFd socket_fd(descriptor);
+            if (!configure_socket_descriptor(descriptor)) {
+                last_error = errno;
+                continue;
+            }
+            if (::connect(descriptor, current->ai_addr, static_cast<socklen_t>(current->ai_addrlen)) != 0) {
+                last_error = errno;
+                if (last_error != EINPROGRESS && last_error != EALREADY &&
+                    last_error != EWOULDBLOCK && last_error != EINTR) continue;
+                if (poll_descriptor(descriptor, POLLOUT, file, line, column) < 0) {
+                    last_error = errno ? errno : EIO;
+                    continue;
+                }
+                int connect_error = 0;
+                socklen_t connect_error_size = sizeof(connect_error);
+                if (::getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &connect_error, &connect_error_size) != 0)
+                    connect_error = errno ? errno : EIO;
+                if (connect_error != 0) { last_error = connect_error; continue; }
+            }
+            SocketAddress local;
+            sockaddr_storage local_raw{};
+            socklen_t local_size = sizeof(local_raw);
+            if (::getsockname(descriptor, reinterpret_cast<sockaddr*>(&local_raw), &local_size) != 0 ||
+                !socket_address_from(reinterpret_cast<const sockaddr*>(&local_raw), local_size, local)) {
+                last_error = errno ? errno : EIO;
+                continue;
+            }
+            SocketAddress remote;
+            if (!socket_address_from(current->ai_addr, static_cast<socklen_t>(current->ai_addrlen), remote)) {
+                last_error = EIO;
+                continue;
+            }
+            auto handle = std::make_shared<SocketHandle>(descriptor);
+            socket_fd.release();
+            auto result = std::make_shared<TcpConnection>();
+            result->socket = std::move(handle);
+            set_resource_location(result, file, line, column);
+            result->local = std::move(local);
+            result->remote = std::move(remote);
+            return result_ok<std::shared_ptr<TcpConnection>>(std::move(result));
+        }
+        return result_error<std::shared_ptr<TcpConnection>>(last_error ? network_error_from_errno(last_error) : "connection failed");
+#else
+        return result_error<std::shared_ptr<TcpConnection>>("networking is not supported by this native platform");
+#endif
+    }, file, line, column);
+}
+
+inline Task<StringResult<std::shared_ptr<TcpListener>>> tcp_listen(
+    std::string host, std::int64_t port, std::int64_t backlog,
+    const std::string& file, int line, int column) {
+    using Output = StringResult<std::shared_ptr<TcpListener>>;
+    return make_io_task<Output>([host = std::move(host), port, backlog, file, line, column]() -> Output {
+        task_checkpoint();
+        if (host.find_first_not_of(" \t\r\n") == std::string::npos || port < 0 || port > 65535)
+            return result_error<std::shared_ptr<TcpListener>>("invalid address");
+        if (backlog < 1 || backlog > 4096)
+            return result_error<std::shared_ptr<TcpListener>>("invalid listener backlog");
+#if defined(__linux__)
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        hints.ai_flags = AI_PASSIVE;
+        const auto service = std::to_string(port);
+        addrinfo* addresses = nullptr;
+        const int resolved = ::getaddrinfo(host.c_str(), service.c_str(), &hints, &addresses);
+        if (resolved != 0) return result_error<std::shared_ptr<TcpListener>>("DNS resolution failed");
+        std::unique_ptr<addrinfo, decltype(&::freeaddrinfo)> owner(addresses, ::freeaddrinfo);
+        task_checkpoint();
+        int last_error = 0;
+        for (auto* current = addresses; current; current = current->ai_next) {
+            const int descriptor = ::socket(current->ai_family, current->ai_socktype, current->ai_protocol);
+            if (descriptor < 0) { last_error = errno; continue; }
+            UniqueSocketFd socket_fd(descriptor);
+            if (!configure_socket_descriptor(descriptor)) {
+                last_error = errno;
+                continue;
+            }
+            int reuse = 1;
+            if (::setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
+                last_error = errno;
+                continue;
+            }
+            if (current->ai_family == AF_INET6) {
+                int v6_only = 1;
+                if (::setsockopt(descriptor, IPPROTO_IPV6, IPV6_V6ONLY, &v6_only, sizeof(v6_only)) != 0) {
+                    last_error = errno;
+                    continue;
+                }
+            }
+            if (::bind(descriptor, current->ai_addr, static_cast<socklen_t>(current->ai_addrlen)) != 0 ||
+                ::listen(descriptor, static_cast<int>(backlog)) != 0) {
+                last_error = errno;
+                continue;
+            }
+            sockaddr_storage local_raw{};
+            socklen_t local_size = sizeof(local_raw);
+            SocketAddress local;
+            if (::getsockname(descriptor, reinterpret_cast<sockaddr*>(&local_raw), &local_size) != 0 ||
+                !socket_address_from(reinterpret_cast<const sockaddr*>(&local_raw), local_size, local)) {
+                last_error = errno ? errno : EIO;
+                continue;
+            }
+            auto result = std::make_shared<TcpListener>();
+            result->socket = std::make_shared<SocketHandle>(descriptor);
+            socket_fd.release();
+            set_resource_location(result, file, line, column);
+            result->local = std::move(local);
+            return result_ok<std::shared_ptr<TcpListener>>(std::move(result));
+        }
+        return result_error<std::shared_ptr<TcpListener>>(last_error ? network_error_from_errno(last_error) : "network operation failed");
+#else
+        return result_error<std::shared_ptr<TcpListener>>("networking is not supported by this native platform");
+#endif
+    }, file, line, column);
+}
+
+inline std::string socket_address_host(const SocketAddress& value) { return value.host; }
+inline std::int64_t socket_address_port(const SocketAddress& value) { return value.port; }
+inline std::string socket_address_family(const SocketAddress& value) { return value.family; }
+inline std::string socket_address_to_string(const SocketAddress& value) {
+    return (value.family == "IPv6" ? "[" + value.host + "]" : value.host) + ":" + std::to_string(value.port);
+}
+inline StringResult<SocketAddress> tcp_local_address(const std::shared_ptr<TcpConnection>& value,
+    const std::string& file, int line, int column) {
+    if (!value || !value->socket || !value->socket->is_open()) fail(file, line, column, "TcpConnection is closed");
+#if defined(__linux__)
+    return socket_address_from_fd(value->socket, false);
+#else
+    return result_error<SocketAddress>("networking is not supported by th, current->ai_protocol);
+            if (descriptor < 0) { last_error = errno; continue; }
+            UniqueSocketFd socket_fd(descriptor);
+            if (!configure_socket_descriptor(descriptor)) {
+                last_error = errno;
+                continue;
+            }
+            int reuse = 1;
+            if (::setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
+                last_error = errno;
+                continue;
+            }
+            if (current->ai_family == AF_INET6) {
+                int v6_only = 1;
+                if (::setsockopt(descriptor, IPPROTO_IPV6, IPV6_V6ONLY, &v6_only, sizeof(v6_only)) != 0) {
+                    last_error = errno;
+                    continue;
+                }
+            }
+            if (::bind(descriptor, current->ai_addr, static_cast<socklen_t>(current->ai_addrlen)) != 0 ||
+                ::listen(descriptor, static_cast<int>(backlog)) != 0) {
+                last_error = errno;
+                continue;
+            }
+            sockaddr_storage local_raw{};
+            socklen_t local_size = sizeof(local_raw);
+            SocketAddress local;
+            if (::getsockname(descriptor, reinterpret_cast<sockaddr*>(&local_raw), &local_size) != 0 ||
+                !socket_address_from(reinterpret_cast<const sockaddr*>(&local_raw), local_size, local)) {
+                last_error = errno ? errno : EIO;
+                continue;
+            }
+            auto result = std::make_shared<TcpListener>();
+            result->socket = std::make_shared<SocketHandle>(descriptor);
+            socket_fd.release();
+            set_resource_location(result, file, line, column);
+            result->local = std::move(local);
+            return result_ok<std::shared_ptr<TcpListener>>(std::move(result));
+        }
+        return result_error<std::shared_ptr<TcpListener>>(last_error ? network_error_from_errno(last_error) : "network operation failed");
+#else
+        return result_error<std::shared_ptr<TcpListener>>("networking is not supported by this native platform");
+#endif
+    }, file, line, column);
+}
+
+inline std::string socket_address_host(const SocketAddress& value) { return value.host; }
+inline std::int64_t socket_address_port(const SocketAddress& value) { return value.port; }
+inline std::string socket_address_family(const SocketAddress& value) { return value.family; }
+inline std::string socket_address_to_string(const SocketAddress& value) {
+    return (value.family == "IPv6" ? "[" + value.host + "]" : value.host) + ":" + std::to_string(value.port);
+}
+inline StringResult<SocketAddress> tcp_local_address(const std::shared_ptr<TcpConnection>& value,
+    const std::string& file, int line, int column) {
+    if (!value || !value->socket || !value->socket->is_open()) fail(file, line, column, "TcpConnection is closed");
+#if defined(__linux__)
+    return socket_address_from_fd(value->socket, false);
+#else
+    return result_error<SocketAddress>("networking is not supported by this native platform");
+#endif
+}
+inline StringResult<SocketAddress> tcp_remote_address(const std::shared_ptr<TcpConnection>& value,
+    const std::string& file, int line, int column) {
+    if (!value || !value->socket || !value->socket->is_open()) fail(file, line, column, "TcpConnection is closed");
+#if defined(__linux__)
+    return socket_address_from_fd(value->socket, true);
+#else
+    return result_error<SocketAddress>("networking is not supported by this native platform");
+#endif
+}
+inline StringResult<SocketAddress> listener_local_address(const std::shared_ptr<TcpListener>& value,
+    const std::string& file, int line, int column) {
+    if (!value || !value->socket || !value->socket->is_open()) fail(file, line, column, "TcpListener is closed");
+#if defined(__linux__)
+    return socket_address_from_fd(value->socket, false);
+#else
+    return result_error<SocketAddress>("networking is not supported by this native platform");
+#endif
+}
+inline bool tcp_close(const std::shared_ptr<TcpConnection>& value) { return value && value->socket && value->socket->close(); }
+inline bool tcp_is_open(const std::shared_ptr<TcpConnection>& value) { return value && value->socket && value->socket->is_open(); }
+inline bool listener_close(const std::shared_ptr<TcpListener>& value) { return value && value->socket && value->socket->close(); }
+inline bool listener_is_open(const std::shared_ptr<TcpListener>& value) { return value && value->socket && value->socket->is_open(); }
+
+inline Task<StringResult<std::shared_ptr<TcpConnection>>> tcp_accept(
+    const std::shared_ptr<TcpListener>& listener, const std::string& file, int line, int column) {
+    using Output = StringResult<std::shared_ptr<TcpConnection>>;
+    if (!listener || !listener->socket || !listener->socket->is_open())
+        fail(file, line, column, "TcpListener is closed");
+    auto pending = std::make_shared<PendingSocketOperation>(listener->pending_accept, listener);
+    if (!pending->acquire()) {
+        return make_io_task<Output>([]() -> Output {
+            return result_error<std::shared_ptr<TcpConnection>>("listener already has a pending accept");
+        }, file, line, column);
+    }
+    return make_io_task<Output>([listener, pending, file, line, column]() -> Output {
+        PendingSocketOperationReset pending_reset{pending};
+        if (!listener || !listener->socket || !listener->socket->is_open()) return result_error<std::shared_ptr<TcpConnection>>("TcpListener is closed");
+#if defined(__linux__)
+        UniqueSocketFd listening(listener->socket->duplicate());
+        if (listening.value < 0) return result_error<std::shared_ptr<TcpConnection>>("TcpListener is closed");
+        for (;;) {
+            const int ready = poll_socket(listener->socket, listening.value, POLLIN, file, line, column);
+            if (ready == -2) return result_error<std::shared_ptr<TcpConnection>>("resource closed");
+            if (ready < 0) return result_error<std::shared_ptr<TcpConnection>>("network operation failed");
+            sockaddr_storage remote_raw{};
+            socklen_t remote_size = sizeof(remote_raw);
+            const int accepted = ::accept(listening.value, reinterpret_cast<sockaddr*>(&remote_raw), &remote_size);
+            if (accepted < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                return result_error<std::shared_ptr<TcpConnection>>(network_error_from_errno(errno));
+            }
+            UniqueSocketFd accepted_fd(accepted);
+            if (!configure_socket_descriptor(accepted))
+                return result_error<std::shared_ptr<TcpConnection>>(network_error_from_errno(errno));
+            sockaddr_storage local_raw{};
+            socklen_t local_size = sizeof(local_raw);
+            SocketAddress local, remote;
+            if (::getsockname(accepted, reinterpret_cast<sockaddr*>(&local_raw), &local_size) != 0 ||
+                !socket_address_from(reinterpret_cast<const sockaddr*>(&local_raw), local_size, local) ||
+                !socket_address_from(reinterpret_cast<const sockaddr*>(&remote_raw), remote_size, remote))
+                return result_error<std::shared_ptr<TcpConnection>>("network operation failed");
+            auto result = std::make_shared<TcpConnection>();
+            result->socket = std::make_shared<SocketHandle>(accepted);
+            accepted_fd.release();
+            set_resource_location(result, file, line, column);
+            result->local = std::move(local);
+            result->remote = std::move(remote);
+            return result_ok<std::shared_ptr<TcpConnection>>(std::move(result));
+        }
+#else
+        return result_error<std::shared_ptr<TcpConnection>>("networking is not supported by this native platform");
+#endif
+    }, file, line, column);
+}
+
+inline Task<StringResult<std::optional<std::vector<std::uint8_t>>>> tcp_read(
+    const std::shared_ptr<TcpConnection>& connection, std::int64_t max_bytes,
+    const std::string& file, int line, int column) {
+    using Output = StringResult<std::optional<std::vector<std::uint8_t>>>;
+    if (!connection || !connection->socket || !connection->socket->is_open())
+        fail(file, line, column, "TcpConnection is closed");
+    if (max_bytes < 1 || max_bytes > 1048576) {
+        return make_io_task<Output>([]() -> Output {
+            return result_error<std::optional<std::vector<std::uint8_t>>>("read size must be between 1 and 1048576 bytes");
+        }, file, line, column);
+    }
+    auto pending = std::make_shared<PendingSocketOperation>(connection->pending_read, connection);
+    if (!pending->acquire()) {
+        return make_io_task<Output>([]() -> Output {
+            return result_error<std::optional<std::vector<std::uint8_t>>>("connection already has a pending read");
+        }, file, line, column);
+    }
+    return make_io_task<Output>([connection, pending, max_bytes, file, line, column]() -> Output {
+        PendingSocketOperationReset pending_reset{pending};
+        if (!connection || !connection->socket || !connection->socket->is_open()) return result_error<std::optional<std::vector<std::uint8_t>>>("TcpConnection is closed");
+#if defined(__linux__)
+        UniqueSocketFd descriptor(connection->socket->duplicate());
+        if (descriptor.value < 0) return result_error<std::optional<std::vector<std::uint8_t>>>("TcpConnection is closed");
+        try {
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(max_bytes));
+            for (;;) {
+                const int ready = poll_socket(connection->socket, descriptor.value, POLLIN, file, line, column);
+                if (ready == -2) return result_error<std::optional<std::vector<std::uint8_t>>>("resource closed");
+                if (ready < 0) return result_error<std::optional<std::vector<std::uint8_t>>>("network operation failed");
+                const auto count = ::recv(descriptor.value, bytes.data(), bytes.size(), 0);
+                if (count > 0) { bytes.resize(static_cast<std::size_t>(count)); return result_ok<std::optional<std::vector<std::uint8_t>>>(std::move(bytes)); }
+                if (count == 0) return result_ok<std::optional<std::vector<std::uint8_t>>>(std::nullopt);
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                if (!connection->socket->is_open()) return result_error<std::optional<std::vector<std::uint8_t>>>("resource closed");
+                return result_error<std::optional<std::vector<std::uint8_t>>>(network_error_from_errno(errno));
+            }
+        } catch (...) { return result_error<std::optional<std::vector<std::uint8_t>>>("network operation failed"); }
+#else
+        return result_error<std::optional<std::vector<std::uint8_t>>>("networking is not supported by this native platform");
+#endif
+    }, file, line, column);
+}
+
+inline Task<StringResult<std::int64_t>> tcp_write(
+    const std::shared_ptr<TcpConnection>& connection, std::vector<std::uint8_t> bytes, bool write_all,
+    const std::string& file, int line, int column) {
+    using Output = StringResult<std::int64_t>;
+    if (!connection || !connection->socket || !connection->socket->is_open())
+        fail(file, line, column, "TcpConnection is closed");
+    if (bytes.empty()) {
+        return make_io_task<Output>([]() -> Output { return result_ok<std::int64_t>(0); }, file, line, column);
+    }
+    auto pending = std::make_shared<PendingSocketOperation>(connection->pending_write, connection);
+    if (!pending->acquire()) {
+        return make_io_task<Output>([]() -> Output {
+            return result_error<std::int64_t>("connection already has a pending write");
+        }, file, line, column);
+    }
+    return make_io_task<Output>([connection, pending, bytes = std::move(bytes), write_all, file, line, column]() -> Output {
+        PendingSocketOperationReset pending_reset{pending};
+        if (!connection || !connection->socket || !connection->socket->is_open()) return result_error<std::int64_t>("TcpConnection is closed");
+#if defined(->socket || !connection->socket->is_open()) return result_error<std::optional<std::vector<std::uint8_t>>>("TcpConnection is closed");
+#if defined(__linux__)
+        UniqueSocketFd descriptor(connection->socket->duplicate());
+        if (descriptor.value < 0) return result_error<std::optional<std::vector<std::uint8_t>>>("TcpConnection is closed");
+        try {
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(max_bytes));
+            for (;;) {
+                const int ready = poll_socket(connection->socket, descriptor.value, POLLIN, file, line, column);
+                if (ready == -2) return result_error<std::optional<std::vector<std::uint8_t>>>("resource closed");
+                if (ready < 0) return result_error<std::optional<std::vector<std::uint8_t>>>("network operation failed");
+                const auto count = ::recv(descriptor.value, bytes.data(), bytes.size(), 0);
+                if (count > 0) { bytes.resize(static_cast<std::size_t>(count)); return result_ok<std::optional<std::vector<std::uint8_t>>>(std::move(bytes)); }
+                if (count == 0) return result_ok<std::optional<std::vector<std::uint8_t>>>(std::nullopt);
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                if (!connection->socket->is_open()) return result_error<std::optional<std::vector<std::uint8_t>>>("resource closed");
+                return result_error<std::optional<std::vector<std::uint8_t>>>(network_error_from_errno(errno));
+            }
+        } catch (...) { return result_error<std::optional<std::vector<std::uint8_t>>>("network operation failed"); }
+#else
+        return result_error<std::optional<std::vector<std::uint8_t>>>("networking is not supported by this native platform");
+#endif
+    }, file, line, column);
+}
+
+inline Task<StringResult<std::int64_t>> tcp_write(
+    const std::shared_ptr<TcpConnection>& connection, std::vector<std::uint8_t> bytes, bool write_all,
+    const std::string& file, int line, int column) {
+    using Output = StringResult<std::int64_t>;
+    if (!connection || !connection->socket || !connection->socket->is_open())
+        fail(file, line, column, "TcpConnection is closed");
+    if (bytes.empty()) {
+        return make_io_task<Output>([]() -> Output { return result_ok<std::int64_t>(0); }, file, line, column);
+    }
+    auto pending = std::make_shared<PendingSocketOperation>(connection->pending_write, connection);
+    if (!pending->acquire()) {
+        return make_io_task<Output>([]() -> Output {
+            return result_error<std::int64_t>("connection already has a pending write");
+        }, file, line, column);
+    }
+    return make_io_task<Output>([connection, pending, bytes = std::move(bytes), write_all, file, line, column]() -> Output {
+        PendingSocketOperationReset pending_reset{pending};
+        if (!connection || !connection->socket || !connection->socket->is_open()) return result_error<std::int64_t>("TcpConnection is closed");
+#if defined(__linux__)
+        UniqueSocketFd descriptor(connection->socket->duplicate());
+        if (descriptor.value < 0) return result_error<std::int64_t>("TcpConnection is closed");
+        std::size_t offset = 0;
+        while (offset < bytes.size()) {
+            const int ready = poll_socket(connection->socket, descriptor.value, POLLOUT, file, line, column);
+            if (ready == -2) return result_error<std::int64_t>("resource closed");
+            if (ready < 0) return result_error<std::int64_t>("network operation failed");
+            const auto count = ::send(descriptor.value, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
+            if (count < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                if (!connection->socket->is_open()) return result_error<std::int64_t>("resource closed");
+                return result_error<std::int64_t>(network_error_from_errno(errno));
+            }
+            if (count == 0) return result_error<std::int64_t>("connection reset");
+            offset += static_cast<std::size_t>(count);
+            if (!write_all) break;
+        }
+        return result_ok<std::int64_t>(static_cast<std::int64_t>(offset));
+#else
+        return result_error<std::int64_t>("networking is not supported by this native platform");
+#endif
+    }, file, line, column);
+}
+inline Task<StringResult<std::int64_t>> tcp_write_all(
+    const std::shared_ptr<TcpConnection>& connection, std::vector<std::uint8_t> bytes,
+    const std::string& file, int line, int column) {
+    return tcp_write(connection, std::move(bytes), true, file, line, column);
+}
+
+inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, int column) {
+    auto& scheduler = native_scheduler();
+    {
+        std::lock_guard<std::mutex> lock(scheduler.mutex);
+        if (scheduler.running)
+            return result_error<std::int64_t>("runTasks cannot be called recursively");
+        scheduler.running = true;
+        scheduler.completed = 0;
+    }
+    std::vector<std::shared_ptr<TaskControl>> completed_tasks;
+    std::size_t completed_count = 0;
+    for (;;) {
+        std::vector<std::shared_ptr<TaskControl>> to_start;
+        bool all_done = false;
+        {
+            std::lock_guard<std::mutex> lock(scheduler.mutex);
+            for (const auto& task : scheduler.tasks) {
+                if (!task->started.load(std::memory_order_acquire)) to_start.push_back(task);
+            }
+            all_done = std::all_of(scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
+                return task->done.load(std::memory_order_acquire);
+            });
+            if (all_done) {
+                completed_tasks = scheduler.tasks;
+                completed_count = scheduler.completed;
+                scheduler.tasks.clear();
+                scheduler.running = false;
+            }
+        }
+        if (all_done) break;
+        for (const auto& task : to_start) task->start();
+        std::unique_lock<std::mutex> lock(scheduler.mutex);
+        scheduler.changed.wait(lock, [&scheduler]() {
+            return std::any_of(scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
+                return !task->started.load(std::memory_order_acquire);
+            }) || std::all_of(scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
+                return task->done.load(std::memory_order_acquire);
+            });
+        });
+    }
+    for (const auto& task : completed_tasks) task->join();
+    if (requested_shutdown_signal != 0) check_shutdown(file, line, column);
+    for (const auto& task : completed_tasks) {
+        if (task->owner) continue;
+        const auto failure = task->failure_message();
+        if (!failure.empty()) return result_error<std::int64_t>("async task failed: " + failure);
+    }
+    return result_ok<std::int64_t>(static_cast<std::int64_t>(completed_count));
+}
+
 struct ByteBuffer { std::vector<std::uint8_t> values; };
 inline StringResult<std::shared_ptr<ByteBuffer>> byte_buffer(
     std::int64_t length, const std::string&, int, int) {
@@ -1225,6 +3158,65 @@ inline StringResult<bool> byte_buffer_set(
 inline StringResult<std::vector<std::uint8_t>> byte_buffer_to_bytes(
     const std::shared_ptr<ByteBuffer>& buffer, const std::string&, int, int) {
     if (!buffer) return result_error<std::vector<std::uint8_t>>("cannot allocate Bytes snapshot");
+    try { return result_ok<std::vector<std::uint8_t>>(buffer->values); }
+    catch (const std::bad_alloc&) { return result_error<std::vector<std::uint8_t>>("cannot allocate Bytes snapshot"); }
+}
+
+inline std::filesystem::path tyvera_path(const std::string& value) {
+    auto path = std::filesystem::u8path(value);
+    return path.is_absolute() ? path : (project_root() / path);
+}
+inline std::filesystem::path normalized_path(const std::filesystem::path& path, std::error_code& error) {
+    auto result = std::filesystem::weakly_canonical(path, error);
+    return error ? path.lexically_normal() : result;
+}
+inline std::string path_comparison_key(const std::filesystem::path& path) {
+    auto key = path.generic_u8string();
+#ifdef _WIN32
+    for (auto& character : key) {
+        if (character >= 'A' && character <= 'Z') character = static_cast<char>(character - 'A' + 'a');
+    }
+    // Win32 path lookup ignores trailing spaces and dots in ordinary path components.
+    std::string normalized;
+    std::size_t start = 0;
+    while (start < key.size()) {
+        const auto end = key.find('/', start);
+        auto component = key.substr(start, end == std::string::npos ? end : end - start);
+        while (!component.empty() && (component.back() == '.' || component.back() == ' ')) component.pop_back();
+        normalized += component;
+        if (end == std::string::npos) break;
+        normalized.push_back('/');
+        start = end + 1;
+    }
+    return normalized;
+#else
+    return key;
+#endif
+}
+inline bool path_is_secret_or_child(const std::string& candidate, const std::string& secret) {
+    if (candidate == secret) return true;
+    if (candidate.size() <= secret.size() || candidate.compare(0, secret.size(), secret) != 0)
+        return false;
+    const auto boundary = candidate[secret.size()];
+    if (boundary == '/') return true;
+#ifdef _WIN32
+    // NTFS alternate data stream syntax can name the protected file's default stream.
+    if (boundary == ':') return true;
+#endif
+    return false;
+}
+inline bool is_secret_storage_path(const std::filesystem::path& path) noexcept {
+    try {
+        const auto secret_path = project_root() / ".tyvera.secrets";
+        std::error_code candidate_absolute_error, secret_absolute_error;
+        const auto candidate_absolute = std::filesystem::absolute(path, candidate_absolute_error).lexically_normal();
+        const auto secret_absolute = std::filesystem::absolute(secret_path, secret_absolute_error).lexically_normal();
+        // Lexical checks still protect direct, absolute, and traversal paths when
+        // canonicalization cannot inspect an unrelated permission-restricted path.
+        if (candidate_absolute_error || secret_absolute_error) return true;
+        const auto candidate_lexical_key = path_comparison_key(candidate_absolute);
+        const auto secret_lexical_key = path_comparison_key(secret_absolute);
+        if (path_is_secret_or_child(candidate_lexical_key, secret_:uint8_t>>("cannot allocate Bytes snapshot");
     try { return result_ok<std::vector<std::uint8_t>>(buffer->values); }
     catch (const std::bad_alloc&) { return result_error<std::vector<std::uint8_t>>("cannot allocate Bytes snapshot"); }
 }
@@ -1401,6 +3393,64 @@ struct TextFile {
         closed = true;
         bool ok = true;
         if (mode != "read") { stream.flush(); if (!stream) ok = false; }
+        stream.close();
+        if (stream.fail()) ok = false;
+        return ok;
+    }
+    ~TextFile() noexcept {
+        if (!closed && !close_now())
+            record_cleanup_failure(source_file, source_line, source_column, "cannot close text file");
+    }
+};
+inline StringResult<std::shared_ptr<TextFile>> open_text_resource(
+    const std::string& path_text, const std::string& mode, const std::string& resource_type,
+    const std::string& file, int line, int column) {
+    const auto invalid_mode = resource_type == "TextWriter"
+        ? "openTextWriter mode must be 'write' or 'append'"
+        : "openText mode must be 'read', 'write', or 'append'";
+    if ((resource_type == "TextReader" && mode != "read")
+        || (resource_type == "TextWriter" && mode != "write" && mode != "append")
+        || (resource_type == "TextFile" && mode != "read" && mode != "write" && mode != "append"))
+        return result_error<std::shared_ptr<TextFile>>(invalid_mode);
+    std::shared_ptr<TextFile> resource;
+    try {
+        const auto path = tyvera_path(path_text);
+        if (is_secret_storage_path(path))
+            return result_error<std::shared_ptr<TextFile>>("secret file can only be accessed through the secrets provider");
+        resource = std::make_shared<TextFile>();
+        resource->mode = mode;
+        resource->resource_type = resource_type;
+        resource->source_file = file;
+        resource->source_line = line;
+        resource->source_column = column;
+        auto flags = std::ios::binary;
+        if (mode == "read") flags |= std::ios::in;
+        else if (mode == "write") flags |= std::ios::out | std::ios::trunc;
+        else flags |= std::ios::out | std::ios::app;
+        resource->stream.open(path, flags);
+        if (!resource->stream) {
+            resource->closed = true;
+            return result_error<std::shared_ptr<TextFile>>("cannot open text file");
+        }
+    } catch (...) {
+        // A failed open never acquired a Tyvera resource and must not produce a
+        // second, misleading cleanup failure while its temporary handle dies.
+        if (resource) resource->closed = true;
+        return result_error<std::shared_ptr<TextFile>>("cannot open text file");
+    }
+    return result_ok<std::shared_ptr<TextFile>>(std::move(resource));
+}
+inline StringResult<std::shared_ptr<TextFile>> open_text(
+    const std::string& path, const std::string& mode, const std::string& resource_type,
+    const std::string& file, int line, int column) {
+    return open_text_resource(path, mode, resource_type, file, line, column);
+}
+inline StringResult<std::shared_ptr<TextFile>> open_text_reader(
+    const std::string& path, const std::string& file, int line, int column) {
+    return open_text_resource(path, "read", "TextReader", file, line, column);
+}
+inline StringResult<std::shared_ptr<TextFile>> open_text_writer(
+    const std::string& path, const std::string& mode, const std::string& file, int line, instream.flush(); if (!stream) ok = false; }
         stream.close();
         if (stream.fail()) ok = false;
         return ok;

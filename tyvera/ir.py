@@ -27,6 +27,9 @@ class IRType(str, Enum):
     TEXT_FILE = "TextFile"
     TEXT_READER = "TextReader"
     TEXT_WRITER = "TextWriter"
+    SOCKET_ADDRESS = "SocketAddress"
+    TCP_CONNECTION = "TcpConnection"
+    TCP_LISTENER = "TcpListener"
     VOID = "Void"
 
 
@@ -52,7 +55,7 @@ def _applied(name: str, *arguments: IRTypeRef) -> IRAppliedType:
 
 
 NUMERIC_TYPES = frozenset({IRType.INT, IRType.FLOAT})
-_APPLIED_ARITIES = {"Option": 1, "Result": 2, "List": 1, "Map": 2}
+_APPLIED_ARITIES = {"Option": 1, "Result": 2, "List": 1, "Map": 2, "Task": 1}
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,9 +286,16 @@ class IRForEach(IRStatement):
     location: Location
 
 
+@dataclass(frozen=True, slots=True)
+class IRAwait(IRStatement):
+    task: IRExpression
+    result: IRVariable | None
+    location: Location
+
+
 IRStatementLike: TypeAlias = (
     IRLet | IRAssign | IRExpressionStatement | IROutput | IRReturn | IRBlock
-    | IRUsing | IRIf | IRWhile | IRLoopControl | IRMatch | IRForEach
+    | IRUsing | IRIf | IRWhile | IRLoopControl | IRMatch | IRForEach | IRAwait
 )
 IRExpressionLike: TypeAlias = (
     IRLiteral | IRLocalRef | IRCall | IRUnary | IRBinary | IRVariant | IRBuiltinCall
@@ -301,6 +311,7 @@ class IRFunction:
     return_type: IRTypeRef
     body: tuple[IRStatement, ...]
     location: Location
+    is_async: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,7 +334,7 @@ def _validate_type(type_ref: IRTypeRef, location: Location) -> None:
         raise _invalid(location, f"invalid applied IR type '{ir_type_name(type_ref)}'")
     for argument in type_ref.arguments:
         _validate_type(argument, location)
-        if argument == IRType.VOID:
+        if argument == IRType.VOID and type_ref.name != "Task":
             raise _invalid(location, "IR generic type arguments cannot have type Void")
     if type_ref.name == "Map" and not _hashable_key_type(type_ref.arguments[0]):
         raise _invalid(location, f"IR Map key type '{ir_type_name(type_ref.arguments[0])}' is not hashable")
@@ -340,13 +351,23 @@ def _hashable_key_type(type_ref: IRTypeRef) -> bool:
 
 
 def _contains_resource(type_ref: IRTypeRef) -> bool:
-    resources = {IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER}
+    resources = {
+        IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
+        IRType.TCP_CONNECTION, IRType.TCP_LISTENER,
+    }
     if type_ref in resources:
         return True
     return isinstance(type_ref, IRAppliedType) and any(_contains_resource(item) for item in type_ref.arguments)
 
 
 def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef, ...], IRTypeRef] | None:
+    if isinstance(receiver, IRAppliedType) and receiver.name == "Task":
+        signatures = {
+            "isDone": ((), IRType.BOOL),
+            "isCancelled": ((), IRType.BOOL),
+            "cancel": ((), IRType.BOOL),
+        }
+        return signatures.get(method)
     if isinstance(receiver, IRType) and receiver == IRType.BYTE:
         return ((), IRType.INT) if method == "toInt" else None
     if isinstance(receiver, IRType) and receiver == IRType.BYTES:
@@ -363,6 +384,87 @@ def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef
             "get": ((IRType.INT,), _applied("Result", IRType.BYTE, IRType.STRING)),
             "set": ((IRType.INT, IRType.BYTE), _applied("Result", IRType.BOOL, IRType.STRING)),
             "toBytes": ((), _applied("Result", IRType.BYTES, IRType.STRING)),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.SOCKET_ADDRESS:
+        signatures = {
+            "host": ((), IRType.STRING),
+            "port": ((), IRType.INT),
+            "family": ((), IRType.STRING),
+            "toString": ((), IRType.STRING),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.TCP_CONNECTION:
+        signatures = {
+            "read": ((IRType.INT,), _applied("Task", _applied("Result", _applied("Option", IRType.BYTES), IRType.STRING))),
+            "write": ((IRType.BYTES,), _applied("Task", _applied("Result", IRType.INT, IRType.STRING))),
+            "writeAll": ((IRType.BYTES,), _applied("Task", _applied("Result", IRType.INT, IRType.STRING))),
+            "localAddress": ((), _applied("Result", IRType.SOCKET_ADDRESS, IRType.STRING)),
+            "remoteAddress": ((), _applied("Result", IRType.SOCKET_ADDRESS, IRType.STRING)),
+            "close": ((), IRType.BOOL),
+            "isOpen": ((), IRType.BOOL),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.TCP_LISTENER:
+        signatures = {
+            "accept": ((), _applied("Task", _applied("Result", IRType.TCP_CONNECTION, IRType.STRING))),
+            "localAddress": ((), _applied("Result", IRType.SOCKET_ADDRESS, IRType.STRING)),
+            "close": ((), IRType.BOOL),
+            "isOpen": ((), IRType.BOOL),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver in {IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER}:
+        read_all = _app-> tuple[tuple[IRTypeRef, ...], IRTypeRef] | None:
+    if isinstance(receiver, IRAppliedType) and receiver.name == "Task":
+        signatures = {
+            "isDone": ((), IRType.BOOL),
+            "isCancelled": ((), IRType.BOOL),
+            "cancel": ((), IRType.BOOL),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.BYTE:
+        return ((), IRType.INT) if method == "toInt" else None
+    if isinstance(receiver, IRType) and receiver == IRType.BYTES:
+        signatures: dict[str, tuple[tuple[IRTypeRef, ...], IRTypeRef]] = {
+            "length": ((), IRType.INT),
+            "toString": ((), _applied("Result", IRType.STRING, IRType.STRING)),
+            "get": ((IRType.INT,), _applied("Result", IRType.BYTE, IRType.STRING)),
+            "slice": ((IRType.INT, IRType.INT), _applied("Result", IRType.BYTES, IRType.STRING)),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.BYTE_BUFFER:
+        signatures = {
+            "length": ((), IRType.INT),
+            "get": ((IRType.INT,), _applied("Result", IRType.BYTE, IRType.STRING)),
+            "set": ((IRType.INT, IRType.BYTE), _applied("Result", IRType.BOOL, IRType.STRING)),
+            "toBytes": ((), _applied("Result", IRType.BYTES, IRType.STRING)),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.SOCKET_ADDRESS:
+        signatures = {
+            "host": ((), IRType.STRING),
+            "port": ((), IRType.INT),
+            "family": ((), IRType.STRING),
+            "toString": ((), IRType.STRING),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.TCP_CONNECTION:
+        signatures = {
+            "read": ((IRType.INT,), _applied("Task", _applied("Result", _applied("Option", IRType.BYTES), IRType.STRING))),
+            "write": ((IRType.BYTES,), _applied("Task", _applied("Result", IRType.INT, IRType.STRING))),
+            "writeAll": ((IRType.BYTES,), _applied("Task", _applied("Result", IRType.INT, IRType.STRING))),
+            "localAddress": ((), _applied("Result", IRType.SOCKET_ADDRESS, IRType.STRING)),
+            "remoteAddress": ((), _applied("Result", IRType.SOCKET_ADDRESS, IRType.STRING)),
+            "close": ((), IRType.BOOL),
+            "isOpen": ((), IRType.BOOL),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.TCP_LISTENER:
+        signatures = {
+            "accept": ((), _applied("Task", _applied("Result", IRType.TCP_CONNECTION, IRType.STRING))),
+            "localAddress": ((), _applied("Result", IRType.SOCKET_ADDRESS, IRType.STRING)),
+            "close": ((), IRType.BOOL),
+            "isOpen": ((), IRType.BOOL),
         }
         return signatures.get(method)
     if isinstance(receiver, IRType) and receiver in {IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER}:
@@ -432,7 +534,7 @@ def validate_ir(module: IRModule) -> None:
     if len(entries) != 1 or entries[0].symbol != module.entry_symbol:
         raise _invalid(module.functions[0].location, "IR entry point must be the unique main function")
     entry = entries[0]
-    if entry.parameters or entry.return_type != IRType.VOID:
+    if entry.parameters or entry.return_type != IRType.VOID or entry.is_async:
         raise _invalid(entry.location, "IR main must have no parameters and return Void")
     if module.entry_symbol not in symbols:
         raise _invalid(module.functions[0].location, "IR entry symbol does not exist")
@@ -442,7 +544,7 @@ def validate_ir(module: IRModule) -> None:
             parameter.identifier: parameter for parameter in function.parameters
         }]
         seen_ids = set(scopes[0])
-        _validate_statements(function.body, function.return_type, symbols, scopes, seen_ids, 0)
+        _validate_statements(function.body, function.return_type, symbols, scopes, seen_ids, 0, function.is_async)
         if function.return_type != IRType.VOID and "next" in _flow_outcomes(function.body):
             raise _invalid(function.location, f"IR function '{function.name}' can fall through without returning {function.return_type.value}")
 
@@ -540,7 +642,64 @@ def _validate_expression(
         for argument, parameter in zip(expression.arguments, function.parameters):
             if _validate_expression(argument, functions, scopes) != parameter.type:
                 raise _invalid(argument.location, f"IR argument to '{function.name}' has the wrong type")
-        if expression.type != function.return_type:
+        expected_result = _applied("Task", function.return_type) if function.is_async else function.return_type
+        if expression.type != expected_result:
+            raise _invalid(expression.location, f"I       outcomes.update(_flow_outcomes(arm.body))
+        if not statement.exhaustive:
+            outcomes.add("next")
+        return outcomes
+    return {"next"}
+
+
+def _find_variable(scopes: list[dict[int, IRVariable]], identifier: int) -> IRVariable | None:
+    for scope in reversed(scopes):
+        if identifier in scope:
+            return scope[identifier]
+    return None
+
+
+def _validate_expression(
+    expression: IRExpression,
+    functions: dict[str, IRFunction],
+    scopes: list[dict[int, IRVariable]],
+) -> IRTypeRef:
+    _validate_type(expression.type, expression.location)
+    if isinstance(expression, IRLiteral):
+        valid = (
+            expression.type == IRType.INT and type(expression.value) is int
+            and INT_MIN <= expression.value <= INT_MAX
+            or expression.type == IRType.FLOAT and type(expression.value) is float
+            and math.isfinite(expression.value)
+            or expression.type == IRType.BOOL and type(expression.value) is bool
+            or expression.type == IRType.STRING and isinstance(expression.value, str)
+            or expression.type == IRType.BYTE and type(expression.value) is int and 0 <= expression.value <= 255
+        )
+        if not valid:
+            raise _invalid(expression.location, f"invalid {ir_type_name(expression.type)} literal in IR")
+        return expression.type
+    if isinstance(expression, IRLocalRef):
+        variable = _find_variable(scopes, expression.variable_id)
+        if variable is None:
+            raise _invalid(expression.location, "IR references a local outside its scope")
+        if variable.type != expression.type:
+            raise _invalid(expression.location, "IR local reference type does not match its binding")
+        return expression.type
+    if isinstance(expression, IRMove):
+        operand_type = _validate_expression(expression.operand, functions, scopes)
+        if expression.type != operand_type or not _contains_resource(operand_type):
+            raise _invalid(expression.location, "IR move must transfer a Resource-containing local value")
+        return expression.type
+    if isinstance(expression, IRCall):
+        function = functions.get(expression.function)
+        if function is None:
+            raise _invalid(expression.location, f"IR calls unknown function '{expression.function}'")
+        if len(expression.arguments) != len(function.parameters):
+            raise _invalid(expression.location, f"IR call to '{function.name}' has the wrong number of arguments")
+        for argument, parameter in zip(expression.arguments, function.parameters):
+            if _validate_expression(argument, functions, scopes) != parameter.type:
+                raise _invalid(argument.location, f"IR argument to '{function.name}' has the wrong type")
+        expected_result = _applied("Task", function.return_type) if function.is_async else function.return_type
+        if expression.type != expected_result:
             raise _invalid(expression.location, f"IR call result for '{function.name}' has the wrong type")
         return expression.type
     if isinstance(expression, IRUnary):
@@ -617,6 +776,10 @@ def _validate_expression(
             "openText": ((IRType.STRING, IRType.STRING), _applied("Result", IRType.TEXT_FILE, IRType.STRING)),
             "openTextReader": ((IRType.STRING,), _applied("Result", IRType.TEXT_READER, IRType.STRING)),
             "openTextWriter": ((IRType.STRING, IRType.STRING), _applied("Result", IRType.TEXT_WRITER, IRType.STRING)),
+            "runTasks": ((), _applied("Result", IRType.INT, IRType.STRING)),
+            "resolveHost": ((IRType.STRING, IRType.INT), _applied("Task", _applied("Result", _applied("List", IRType.SOCKET_ADDRESS), IRType.STRING))),
+            "tcpConnect": ((IRType.STRING, IRType.INT), _applied("Task", _applied("Result", IRType.TCP_CONNECTION, IRType.STRING))),
+            "tcpListen": ((IRType.STRING, IRType.INT, IRType.INT), _applied("Task", _applied("Result", IRType.TCP_LISTENER, IRType.STRING))),
         }
         signature = signatures.get(expression.builtin)
         if signature is None:
@@ -662,6 +825,54 @@ def _validate_statements(
     scopes: list[dict[int, IRVariable]],
     seen_ids: set[int],
     loop_depth: int,
+    is_async: bool = False,
+) -> None:
+    for statement in statements:
+        if isinstance(statement, IRLet):
+            if statement.variable.identifier in seen_ids:
+                raise _invalid(statement.location, "IR reuses a local identifier")
+            value_type = _validate_expression(statement.value, functions, scopes)
+            _validate_type(statement.variable.type, statement.variable.location)
+            if statement.variable.type != value_type or statement.variable.type == IRType.VOID:
+                raise _invalid(statement.location, "IR local initializer type does not match its binding")
+            if statement.vanstance(expression, IRCollectionCreate):
+        _validate_type(expression.type, expression.location)
+        if not isinstance(expression.type, IRAppliedType) or expression.type.name not in {"List", "Map"}:
+            raise _invalid(expression.location, "IR collection constructor must produce List or Map")
+        if expression.type.name == "Map" and not _hashable_key_type(expression.type.arguments[0]):
+            raise _invalid(expression.location, f"IR Map key type '{ir_type_name(expression.type.arguments[0])}' is not hashable")
+        return expression.type
+    if isinstance(expression, IRCollectionLength):
+        receiver = _validate_expression(expression.receiver, functions, scopes)
+        if (not isinstance(receiver, IRAppliedType) or receiver.name not in {"List", "Map"}
+                or expression.type != IRType.INT):
+            raise _invalid(expression.location, "IR collection length requires List or Map and returns Int")
+        return expression.type
+    if isinstance(expression, IRMethodCall):
+        receiver_type = _validate_expression(expression.receiver, functions, scopes)
+        expected = _method_signature(receiver_type, expression.method)
+        if expected is None:
+            raise _invalid(expression.location, f"unsupported IR method '{expression.method}' on {ir_type_name(receiver_type)}")
+        parameter_types, result_type = expected
+        if len(expression.arguments) != len(parameter_types):
+            raise _invalid(expression.location, f"IR method '{expression.method}' has the wrong number of arguments")
+        for argument, parameter_type in zip(expression.arguments, parameter_types):
+            if _validate_expression(argument, functions, scopes) != parameter_type:
+                raise _invalid(argument.location, f"IR method '{expression.method}' argument has the wrong type")
+        if expression.type != result_type:
+            raise _invalid(expression.location, f"IR method '{expression.method}' result has the wrong type")
+        return expression.type
+    raise _invalid(expression.location, f"unknown IR expression {type(expression).__name__}")
+
+
+def _validate_statements(
+    statements: tuple[IRStatement, ...],
+    return_type: IRTypeRef,
+    functions: dict[str, IRFunction],
+    scopes: list[dict[int, IRVariable]],
+    seen_ids: set[int],
+    loop_depth: int,
+    is_async: bool = False,
 ) -> None:
     for statement in statements:
         if isinstance(statement, IRLet):
@@ -698,20 +909,21 @@ def _validate_statements(
                 raise _invalid(statement.location, "IR return type does not match its function")
         elif isinstance(statement, IRBlock):
             scopes.append({})
-            _validate_statements(statement.statements, return_type, functions, scopes, seen_ids, loop_depth)
+            _validate_statements(statement.statements, return_type, functions, scopes, seen_ids, loop_depth, is_async)
             scopes.pop()
         elif isinstance(statement, IRUsing):
             acquisition_type = _validate_expression(statement.acquisition, functions, scopes)
             expected_result = _applied("Result", statement.resource.type, IRType.STRING)
             if (statement.resource.type not in {
                     IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
+                    IRType.TCP_CONNECTION, IRType.TCP_LISTENER,
                 } or acquisition_type != expected_result):
-                raise _invalid(statement.location, "IR using requires a checked Result<TextResource,String> acquisition")
+                raise _invalid(statement.location, "IR using requires a checked file or TCP Result acquisition")
             if statement.resource.identifier in seen_ids:
                 raise _invalid(statement.location, "IR reuses a local identifier")
             scopes.append({statement.resource.identifier: statement.resource})
             seen_ids.add(statement.resource.identifier)
-            _validate_statements(statement.body, return_type, functions, scopes, seen_ids, loop_depth)
+            _validate_statements(statement.body, return_type, functions, scopes, seen_ids, loop_depth, is_async)
             scopes.pop()
             if statement.error_variable is None:
                 if statement.else_body:
@@ -722,22 +934,22 @@ def _validate_statements(
                     raise _invalid(statement.location, "IR using error binding must be a fresh String local")
                 scopes.append({error.identifier: error})
                 seen_ids.add(error.identifier)
-                _validate_statements(statement.else_body, return_type, functions, scopes, seen_ids, loop_depth)
+                _validate_statements(statement.else_body, return_type, functions, scopes, seen_ids, loop_depth, is_async)
                 scopes.pop()
         elif isinstance(statement, IRIf):
             if _validate_expression(statement.condition, functions, scopes) != IRType.BOOL:
                 raise _invalid(statement.location, "IR if condition must be Bool")
             scopes.append({})
-            _validate_statements(statement.then_body, return_type, functions, scopes, seen_ids, loop_depth)
+            _validate_statements(statement.then_body, return_type, functions, scopes, seen_ids, loop_depth, is_async)
             scopes.pop()
             scopes.append({})
-            _validate_statements(statement.else_body, return_type, functions, scopes, seen_ids, loop_depth)
+            _validate_statements(statement.else_body, return_type, functions, scopes, seen_ids, loop_depth, is_async)
             scopes.pop()
         elif isinstance(statement, IRWhile):
             if _validate_expression(statement.condition, functions, scopes) != IRType.BOOL:
                 raise _invalid(statement.location, "IR while condition must be Bool")
             scopes.append({})
-            _validate_statements(statement.body, return_type, functions, scopes, seen_ids, loop_depth + 1)
+            _validate_statements(statement.body, return_type, functions, scopes, seen_ids, loop_depth + 1, is_async)
             scopes.pop()
         elif isinstance(statement, IRForEach):
             iterable_type = _validate_expression(statement.iterable, functions, scopes)
@@ -751,8 +963,25 @@ def _validate_statements(
                 raise _invalid(statement.location, "IR reuses a local identifier")
             scopes.append({statement.variable.identifier: statement.variable})
             seen_ids.add(statement.variable.identifier)
-            _validate_statements(statement.body, return_type, functions, scopes, seen_ids, loop_depth + 1)
+            _validate_statements(statement.body, return_type, functions, scopes, seen_ids, loop_depth + 1, is_async)
             scopes.pop()
+        elif isinstance(statement, IRAwait):
+            if not is_async:
+                raise _invalid(statement.location, "IR await is only valid inside an async function")
+            task_type = _validate_expression(statement.task, functions, scopes)
+            if not isinstance(task_type, IRAppliedType) or task_type.name != "Task":
+                raise _invalid(statement.location, "IR await operand must be Task<T>")
+            if statement.result is None and _contains_resource(task_type.arguments[0]):
+                raise _invalid(statement.location, "IR await of a Resource-returning Task requires a result binding")
+            if statement.result is not None:
+                result = statement.result
+                _validate_type(result.type, result.location)
+                if result.type != task_type.arguments[0] or result.type == IRType.VOID:
+                    raise _invalid(statement.location, "IR await binding type does not match Task result")
+                if result.identifier in seen_ids:
+                    raise _invalid(statement.location, "IR await reuses a local identifier")
+                scopes[-1][result.identifier] = result
+                seen_ids.add(result.identifier)
         elif isinstance(statement, IRMatch):
             subject_type = _validate_expression(statement.value, functions, scopes)
             if not statement.arms:
@@ -772,7 +1001,52 @@ def _validate_statements(
             for arm in statement.arms:
                 scopes.append({})
                 _validate_pattern(arm.pattern, subject_type, scopes, seen_ids)
-                _validate_statements(arm.body, return_type, functions, scopes, seen_ids, loop_depth)
+                _validate_statements(arm.body, return_type, functions, scopes, seen_ids, loop_depth, is_async)
+                scopes.pop()
+        elif isinstance(statement, IRLoopControl):
+            if statement.kind not in {"break", "continue"} or loop_depth == 0:
+                raise _invalid(statement.location, "IR loop control is outside a loop")
+        else:
+            raise _invalid(statement.location, f"unknown IR statement {type(statement).__name__}")
+
+
+def _validate_pattern(
+    pattern: IRPattern,
+    expected_type: IRTypeRef,
+    scopes: list[dict[int, IRVariable]],
+    seen_ids: set[int]         if not isinstance(task_type, IRAppliedType) or task_type.name != "Task":
+                raise _invalid(statement.location, "IR await operand must be Task<T>")
+            if statement.result is None and _contains_resource(task_type.arguments[0]):
+                raise _invalid(statement.location, "IR await of a Resource-returning Task requires a result binding")
+            if statement.result is not None:
+                result = statement.result
+                _validate_type(result.type, result.location)
+                if result.type != task_type.arguments[0] or result.type == IRType.VOID:
+                    raise _invalid(statement.location, "IR await binding type does not match Task result")
+                if result.identifier in seen_ids:
+                    raise _invalid(statement.location, "IR await reuses a local identifier")
+                scopes[-1][result.identifier] = result
+                seen_ids.add(result.identifier)
+        elif isinstance(statement, IRMatch):
+            subject_type = _validate_expression(statement.value, functions, scopes)
+            if not statement.arms:
+                raise _invalid(statement.location, "IR match has no arms")
+            if isinstance(subject_type, IRAppliedType) and subject_type.name == "Option":
+                valid_cases = {"Some", "None"}
+                if not statement.covered_cases <= valid_cases:
+                    raise _invalid(statement.location, "IR Option match contains an invalid coverage case")
+                if statement.exhaustive and statement.covered_cases != valid_cases:
+                    raise _invalid(statement.location, "IR Option match is marked exhaustive without covering Some and None")
+            elif isinstance(subject_type, IRAppliedType) and subject_type.name == "Result":
+                valid_cases = {"Ok", "Err"}
+                if not statement.covered_cases <= valid_cases:
+                    raise _invalid(statement.location, "IR Result match contains an invalid coverage case")
+                if statement.exhaustive and statement.covered_cases != valid_cases:
+                    raise _invalid(statement.location, "IR Result match is marked exhaustive without covering Ok and Err")
+            for arm in statement.arms:
+                scopes.append({})
+                _validate_pattern(arm.pattern, subject_type, scopes, seen_ids)
+                _validate_statements(arm.body, return_type, functions, scopes, seen_ids, loop_depth, is_async)
                 scopes.pop()
         elif isinstance(statement, IRLoopControl):
             if statement.kind not in {"break", "continue"} or loop_depth == 0:

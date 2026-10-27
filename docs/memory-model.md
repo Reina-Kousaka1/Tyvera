@@ -73,7 +73,7 @@ implements the supported subset noted below.
 | Enums, newtypes, tuples, records | Typed value types; records are immutable nominal values and fields compare structurally. | Implemented in the bootstrap; native backend remains interpreter-only. |
 | Class instances, lists, maps | Classes use stable identity; lists and maps compare by contents. Assignment copies references; collection contents remain shared. | Lists and maps are implemented natively for supported element types; classes remain interpreter-only. |
 | Actor references, tasks, reply handles, timers, supervisors | Opaque identity handles. Copying a handle does not copy the actor, task, or operation it names. | Implemented in the interpreter; public runtime ABI is planned. |
-| Resource handles | One live owner, explicit transfer, deterministic release. | Implemented for text files, TCP connections/listeners, and HTTP servers. Native `TextFile`/`TextReader`/`TextWriter` support uses checked moves and synchronous LIFO scope cleanup; task/network resources remain interpreter-only. |
+| Resource handles | One live owner, explicit transfer, deterministic release. | Implemented for text files, TCP connections/listeners, and HTTP servers. Native file resources use checked moves and synchronous LIFO cleanup. Experimental native Linux TCP uses checked move-only connection/listener handles with a private RAII descriptor; in-flight operations use duplicated descriptors and closing the owner shuts down the shared socket. Native task cancellation cascades through owned children and socket waits; DNS cancellation is observed after the system lookup returns. Native task deadlines remain unsupported. |
 
 For mutable ordinary references, `==` compares identity. Value equality
 compares scalar and immutable tagged values structurally, recursively applying
@@ -160,9 +160,60 @@ controlled `Result` errors. It does not expose Python sockets, asyncio,
 exceptions, file objects, or OS address structs. The current reference
 adapter uses a selector for TCP readiness and a bounded worker pool for DNS
 and file operations. Native Backend V1 implements synchronous text and binary
-file/path operations; async file operations, DNS, and TCP remain interpreter-
-only. A future native async runtime must implement the same observable behavior
-with the platform's completion or readiness facilities.
+file/path operations, plus an experimental Linux async-task/DNS/TCP subset.
+Native socket readiness uses non-blocking descriptors and worker operations;
+native cooperative cancellation follows owned-task trees and socket waits.
+Deadlines, task groups, and async file operations remain interpreter-only.
+Native operations must continue to match the same
+observable Tyvera behavior with the platform's readiness facilities.
+
+### Native executable subset
+
+Native V1 compiles the synchronous scalar/control-flow subset described in
+[Backend Architecture](; it returns `false` on a second
+   close, and scope cleanup observes that it is already closed.
+5. Cleanup does not suspend. If cleanup fails during an existing failure, the
+   original failure remains primary and cleanup failures are retained as
+   secondary diagnostics.
+6. Resources cannot cross actor-message boundaries or be stored in actor
+   state. Actor handlers may acquire local resources; the handler scope closes
+   them before a supervisor restarts a failed actor.
+
+`using name = openText(path, mode) { ... }` preserves the original scoped
+`TextFile` API. `openTextReader(path)` creates a read-only `TextReader`, while
+`openTextWriter(path, mode)` creates a `TextWriter` in write or append mode.
+Their original operations remain synchronous. The async file operations use
+the same owned handles and defer close until in-flight worker operations
+finish. `tcpConnect` and `tcpListen` return task results that own a connection
+or listener; `accept` transfers a newly accepted connection through the same
+`Result` carrier. A task result holding a resource must be bound and consumed
+once by `await` or `tryResult()`; unclaimed results are closed during task,
+scope, or runtime cleanup. A pending resource-returning task is move-only and
+is cancelled when its scope ends; consuming `tryResult()` on a pending task
+also cancels it and returns `Ok(None)`. Owned resources can move through function
+parameters and into task parameters. A task owns its moved resources until
+completion, failure, cancellation, actor stop/restart, or runtime shutdown;
+detaching the task leaves ownership with that task. Resources cannot be stored
+in collections, tuples, records, classes, newtypes, enums, actor state, or user
+generic instantiations. `Option` and `Result` can carry resources and
+participate in exhaustive ownership-preserving matches. No explicit borrowing
+syntax is needed for receiver method calls; a Rust-style lifetime system is
+not part of V1.
+
+### Async I/O and platform boundary
+
+The Tyvera contract describes task suspension, readiness wakeup, cancellation,
+deadline behavior, partial byte reads/writes, EOF, backpressure, ownership, and
+controlled `Result` errors. It does not expose Python sockets, asyncio,
+exceptions, file objects, or OS address structs. The current reference
+adapter uses a selector for TCP readiness and a bounded worker pool for DNS
+and file operations. Native Backend V1 implements synchronous text and binary
+file/path operations, plus an experimental Linux async-task/DNS/TCP subset.
+Native socket readiness uses non-blocking descriptors and worker operations;
+native cooperative cancellation follows owned-task trees and socket waits.
+Deadlines, task groups, and async file operations remain interpreter-only.
+Native operations must continue to match the same
+observable Tyvera behavior with the platform's readiness facilities.
 
 ### Native executable subset
 
@@ -180,9 +231,11 @@ I/O paths use the project root, and `.tyvera.secrets` is protected through
 canonical direct, traversal, absolute, and symlink paths. The generated C++17
 runtime preserves checked numeric behavior, controlled I/O results, and
 source-located runtime errors. Executables do not invoke or embed Python.
-User-defined types, generic functions, Tasks, Actors, async I/O, networking,
-and HTTP remain reference-interpreter features; native build rejects them
-explicitly. No public native ABI or FFI is implemented.
+The native backend has an experimental Linux slice for `Task<T>`, `await`,
+`runTasks`, DNS, TCP, and cooperative task cancellation. Native deadlines,
+task groups, Actors, Supervisors, user-defined types, generic functions, TLS,
+HTTP, and WebSockets remain interpreter-only or planned. No public native ABI
+or FFI is implemented.
 
 `Bytes` is an immutable Tyvera value. Native values are represented internally
 by vectors and passed by value, preserving observable value semantics.
@@ -203,13 +256,20 @@ An HTTP server owns its listener and the connection tasks it accepts.
 `shutdown()` stops accepting and drains active connection tasks under their
 configured deadlines; `close()` cancels the server tree and closes accepted
 sockets. Active connections are capped by `HttpLimits.maxConnections`. Each
-TCP connection permits one pending read and one pending write; `read(maxBytes)`
-caps one allocation and may return fewer bytes, while `write(Bytes)` reports
-partial progress and `writeAll(Bytes)` waits before continuing. The runtime
-does not keep an unbounded write queue. Cancellation removes a readiness wait;
-the owning scope closes the socket as it unwinds. DNS and in-flight file work
-already running in a worker is allowed to complete, and shutdown drains those
-workers before closing the runtime.
+TCP connection permits one pending read and one pending write; a listener
+permits one pending accept. The native implementation reserves each slot when
+the operation is created, matching the reference runtime's rejection of a
+second pending operation. `read(maxBytes)` caps one allocation and may return
+fewer bytes, while `write(Bytes)` reports partial progress and `writeAll(Bytes)`
+waits before continuing. The runtime does not keep an unbounded write queue.
+The reference runtime can cancel a readiness wait; native `Task.cancel()` uses
+cooperative checks at statement and socket-poll boundaries. Owned child tasks are
+cancelled with their owner and joined before cleanup completes. Native close
+shuts down the shared socket handle and wakes in-flight duplicated descriptors,
+which are released when their bounded worker operation exits. A resource-returning
+native Task transfers its result on `await`, rather than retaining a second owner
+in the completed task. Native DNS uses the system resolver in a worker and
+cannot be interrupted mid-lookup; cancellation is observed once it returns.
 
 No general user-defined Stream interface is exposed yet. TCP is the first
 byte-stream implementation; text files retain text-oriented methods. The
@@ -218,8 +278,9 @@ over owned TCP connections. HTTP request/response values are ordinary values;
 `HttpServer`, `TlsConnection`, and `WebSocket` are move-only resources in the
 reference interpreter. TLS client verification uses the platform trust store
 and hostname checks; WebSocket owns its connection and closes on scope unwind.
-These resources remain interpreter-only. TLS server mode, native networking,
-session Resume, and protocols beyond HTTP/1.1 are not implemented.
+`TlsConnection`, `WebSocket`, and `HttpServer` remain interpreter-only. Native
+TCP/DNS is an experimental Linux subset. TLS server mode, native TLS/HTTP/
+WebSockets, session Resume, and protocols beyond HTTP/1.1 are not implemented.
 
 Native FFI is not implemented. A future ABI may pass `Byte` as an unsigned
 8-bit scalar and immutable `Bytes` as a borrowed pointer/length span valid only

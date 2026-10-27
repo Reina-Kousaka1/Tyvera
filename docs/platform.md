@@ -21,8 +21,12 @@ host detection and secret-wrapped environment lookup. Ubuntu CI asserts the
 Linux x86-64 host and runs the complete test suite on Python 3.10 and 3.13;
 the separate package job targets Ubuntu 24.04 x86-64.
 Windows and macOS remain host-compatible bootstrap targets where the current
-Python runtime and tests work. Native platform intrinsics are part of the
-experimental C++17 subset; generated native networking/process APIs are not.
+Python runtime and tests work. The experimental C++17 backend has native TCP
+and DNS only on Linux; those APIs return a controlled unsupported-platform
+`Result` on other native targets. Ubuntu x86-64 is CI-tested. ARM64 remains
+recognized by the platform adapter but native networking has no ARM64 CI
+coverage yet. This native subset does not make Linux-specific details part of
+the language.
 
 ## Cooperative shutdown
 

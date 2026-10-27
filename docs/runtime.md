@@ -197,6 +197,68 @@ observe that state with `tryResult()`. The reference adapter currently uses
 selectors and a bounded worker pool, but those mechanisms do not define the
 language contract.
 
+The native Linux subset has a separate implementation boundary. `async fn`,
+`await`, and `runTasks()` use a bounded registry of at most 64 task values per
+run. Task bodies are serialized; each pending DNS or socket operation rorm
+support](platform.md) for the host boundary and its limits.
+
+## Resource cleanup
+
+`TextFile`, `TextReader`, `TextWriter`, `TcpConnection`, `TcpListener`, and
+`HttpServer`
+handles are move-only. `Option`, `Result`, and resource-returning `Task` values
+may carry them; other aggregate and collection types reject them. Owned
+handles close in reverse acquisition order at block exit, function return,
+runtime failure, `break`, `continue`, task completion or failure, cancellation,
+actor-handler failure, and supervised restart. Explicit `close()` makes later
+cleanup a no-op. Cleanup errors retain source locations and are added to an
+existing diagnostic without replacing its primary cause. Detached tasks keep
+their own resource handles until completion or runtime shutdown. A completed
+resource result is transferred once through `await` or consuming `tryResult()`;
+an unclaimed task result is closed during owner or runtime cleanup. A
+resource-returning task is itself move-only while pending, so leaving its scope
+cancels it. `tryResult()` consumes that task; if it is still pending, it cancels
+the operation and returns `Ok(None)` so a resource cannot be produced without
+an owner.
+
+Async file operations use the same move-only file handles as synchronous file
+I/O. A handle permits one in-flight worker operation. Scope cleanup marks a
+busy handle for close and the worker completion path closes it after the
+operation returns. Cancellation stops a queued worker operation where
+possible; a worker operation already running completes before its owned file
+is closed. Runtime shutdown waits for the bounded worker pool to drain.
+
+TCP connect, accept, read, and write are scheduler I/O operations. A waiting
+task is in `io_wait`; the platform adapter registers selector readiness and
+returns the awakened operation to the scheduler. Cancellation unregisters the
+wait. Closing a connection also cancels any pending read/write with a
+controlled `Result::Err`. The task scheduler can continue other tasks while a
+socket is waiting. `read(maxBytes)` returns a partial byte chunk or `None` at
+EOF; one read is capped at 1 MiB. `write` reports partial progress and
+`writeAll` retains one supplied buffer and waits for each further writable
+event, so Tyvera does not add an unbounded producer queue.
+
+Expected DNS, socket and file failures are `Result<T,String>` values with
+normalized messages; host exceptions are not part of Tyvera's API. Task
+timeouts reuse `Task.withTimeout(Duration)`: expiry cancels the I/O task and
+fails the timeout wrapper with `"task timed out"`. The `runTasks()` caller can
+observe that state with `tryResult()`. The reference adapter currently uses
+selectors and a bounded worker pool, but those mechanisms do not define the
+language contract.
+
+The native Linux subset has a separate implementation boundary. `async fn`,
+`await`, and `runTasks()` use a bounded registry of at most 64 task values per
+run. Task bodies are serialized; each pending DNS or socket operation runs in
+a worker so another Tyvera task can proceed. DNS uses the platform resolver
+and cannot be interrupted while that call is in progress. Sockets are
+non-blocking and wait through `poll`; only one accept, read, or write may be
+pending on a given resource at a time. A read can be partial and EOF is
+`Ok(None)`. `writeAll` retains one bounded `Bytes` value while it waits.
+Closing a socket resource shuts down its descriptor; an active operation owns a
+duplicate descriptor and completes with a controlled resource-closed result.
+Resource-containing task results move out when awaited, and scope cleanup uses
+the native RAII resource handle.
+
 The experimental HTTP server creates one owned task per accepted connection,
 with a configured cap from `HttpLimits.maxConnections`. Request header and body
 reads share one monotonic request deadline, so sending occasional bytes does
@@ -213,20 +275,27 @@ limits and client lifecycle.
 
 The experimental native compiler executes a checked synchronous core plus
 selected value features: `Option`/`Result` and matching, `List`/`Map`, `Byte`,
-and immutable `Bytes`. Its private C++ runtime implements checked operations
-without exposing a public ABI. It also provides normalized host OS/architecture
-facts, monotonic milliseconds, and cooperative SIGINT/SIGTERM shutdown for
-generated programs. It does not include the task scheduler, actor runtime,
-resource cleanup, file I/O, async I/O, networking, TLS, WebSockets, or HTTP
-services. Those continue through the reference interpreter; native build
-rejects unsupported calls instead of falling back. See
+immutable `Bytes`, bounded `ByteBuffer`, synchronous text/binary/path I/O, and
+owned text-file resources. On Linux it also provides an experimental async
+task subset with DNS and TCP connect/listen/accept/read/write, RAII socket
+handles, and cooperative SIGINT/SIGTERM shutdown. The C++ runtime remains
+private and exposes no public ABI. Native builds reject unsupported calls;
+they never fall back to the reference interpreter. See
 [Backend Architecture](backend-architecture.md).
 
 ## Not implemented
 
-True parallel task execution, HTTP streaming, and a native runtime for Tasks,
-Actors, resources, files, or networking remain planned. Reference-runtime TCP,
-verified TLS/HTTPS, bounded WebSockets, async text-file operations, and
-experimental HTTP/1.1 are implemented. See the
+The reference scheduler remains cooperative and single-threaded. The native
+Linux subset uses OS worker threads for tasks and pending network I/O, but
+serializes Tyvera task bodies so shared mutable values are not accessed in
+parallel. Native task cancellation is cooperative at statement/loop and socket
+poll checkpoints; owned children are cancelled on owner cancellation/failure
+and joined before owner completion. A blocking native DNS lookup cannot be
+interrupted mid-call. Native deadlines, task groups, Actors, TLS, WebSockets,
+and HTTP are not implemented.
+Native `runTasks()` reports completed task values; the reference runtime
+reports continuation steps, so that progress count is not portable. The
+reference runtime provides TCP, verified TLS/HTTPS, bounded WebSockets, async
+text-file operations, and experimental HTTP/1.1. See the
 [memory model](memory-model.md) and
 [backend architecture](backend-architecture.md).

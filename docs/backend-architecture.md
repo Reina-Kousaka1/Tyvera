@@ -38,7 +38,7 @@ function signatures already recorded by the type checker. Its IR makes local
 binding identity, scalar type, calls, source positions, and structured control
 flow explicit. Unsupported nodes fail with a source-located backend diagnostic.
 
-## Typed IR V1
+## Typed IR V1 and native task slice
 
 `tyvera/ir.py` defines a small backend-neutral IR: typed scalar literals and
 local references, direct function calls, unary/binary operations, local
@@ -46,13 +46,15 @@ declarations and assignments, output, returns, lexical blocks, `if`, `while`,
 `break`, and `continue`. Every node retains its Tyvera type and source
 location. Locals have unique identifiers, so shadowing and mutation do not
 depend on C++ name lookup. `validate_ir()` checks calls, operator/result types,
-binding scopes and mutability, entry-point shape, and loop-control placement.
+binding scopes and mutability, entry-point shape, loop-control placement, and
+`Task<T>`/`await` placement. `Task<Void>` is the IR form of a void async
+function.
 
 `tyvera/lowering.py` consumes only a checked program; it does not re-run type
-inference. The IR intentionally omits classes/interfaces, generics, pattern
-matching, resources, Tasks, Actors, collections, and I/O. These remain
-available through `tyvera run` and are rejected by `tyvera build` until their
-semantic and runtime boundaries are represented.
+inference. The IR supports async functions, direct task calls, `await`,
+`runTasks`, and the existing TCP/DNS value and method signatures. Actors,
+supervisors, task groups, task cancellation/deadlines, TLS, HTTP, classes,
+interfaces, and generic functions remain rejected by `tyvera build`.
 
 ## Three separate contracts
 
@@ -75,13 +77,31 @@ The Tyvera-facing contract is typed tasks plus move-only resource handles,
 partial byte operations, EOF, cancellation, deadlines, normalized errors,
 bounded pending operations, and deterministic cleanup. The reference adapter
 uses `selectors.DefaultSelector` for TCP and a bounded worker pool for DNS and
-file work. The native C++17 subset now implements synchronous binary/text file,
-path, `ByteBuffer`, and owned text-file handle APIs. Binary operations use
-immutable `Bytes`; neither backend exposes host file objects or memory
-addresses. Native async I/O, TCP, DNS, and HTTP remain interpreter-only. A
-future runtime may use completion ports, `epoll`, `kqueue`, or another OS
-facility as long as observable scheduling, byte, and ownership rules stay the
-same.
+file work. Native C++17 now has an experimental Linux-only async slice for
+`Task<T>`, `await`, `runTasks`, DNS, and TCP. Tyvera task bodies are serialized;
+blocking DNS/socket waits run in separate workers so they do not hold the task
+execution lock. A run accepts at most 64 registered native Task values in
+total, including tasks created before `runTasks()` starts. Linux sockets use
+private RAII handles. Each in-flight operation duplicates the descriptor;
+closing its owner shuts down the shared socket, wakes the wait, and releases
+the duplicate on task completion. Resource-returning tasks move their result
+out on `await`, so an awaited connection or listener is not retained by the
+completed task. Read, write, and accept slots are reserved when operations are
+created, making duplicate pending operations fail consistently with the
+reference runtime. Expected network failures use the existing typed
+`Result<T,String>` contract and normalized strings. Reads are capped at 1 MiB;
+`write` can be partial and `writeAll` loops under socket backpressure.
+`Task.cancel()`, `isCancelled()`, and `isDone()` are implemented cooperatively.
+Tasks created by an async task are owned children: cancellation and failure
+cascade through descendants, normal return joins children, and a child failure
+fails its owner. Cancellation is checked at Tyvera statement/loop checkpoints
+and during bounded socket polling; an in-progress system DNS lookup cannot be
+interrupted until the resolver returns. `withTimeout`, `tryResult`, task groups,
+and actor-owned tasks remain unsupported natively. Native `runTasks()` currently
+reports completed native tasks, while the reference runtime reports
+continuation steps; that progress count is not portable yet. The native C++17
+subset also implements synchronous file/path/ByteBuffer APIs. Neither backend
+exposes host socket objects or memory addresses.
 
 The bootstrap also has a separate host-platform adapter for normalized OS and
 architecture detection, monotonic time, secret-wrapped environment lookup,
@@ -98,7 +118,8 @@ API. Experimental HTTP/1.1 codecs, a typed client, a bounded concurrent
 server, verified TLS client connections, and a bounded WebSocket client use
 that owned byte-stream path in the reference interpreter. TLS uses the host
 trust store, SNI, and hostname verification; Tyvera does not implement
-cryptography. The native C++ backend still has no TLS or networking runtime.
+cryptography. The native C++ backend has an experimental Linux TCP/DNS subset,
+but no native TLS, HTTP, or WebSocket runtime.
 HTTP/2, HTTP/3, TLS server mode, database protocols, and other application
 protocols remain separate work.
 
@@ -144,10 +165,36 @@ generated-code representation is:
 This is a private V1 code-generation contract, not a stable public C ABI or an
 FFI. These representations are private compiler details, not a public ABI.
 Generated executables do not embed or invoke Python. Synchronous file and
-binary I/O, `ByteBuffer`, and text-file resources are supported in the native
-subset. Classes, records, user-defined enums, tuples, generic functions, Tasks,
-Actors, Supervisors, async I/O, networking, and HTTP remain interpreter-only.
-No native object, task, actor, or public error ABI is implemented. There is no
+binary I/O, `ByteBuffer`, text-file resources, and the limited Linux TCP/DNS
+task path are supported experimentally. Classes, records, user-defined enums,
+tuples, generic functions, Actors, Supervisors, TLS, and HTTP remain
+interpreter-only. No native actor or public error ABI is implemented. There is no
+`unsafe` or FFI declaration syntax. Any later FFI must define ownership,
+lifetimes, mutability, and error conversion explicitly; a native crash cannot
+become a recoverable Tyvera `Result`. See the [Memory Model](memory-model.md)
+for Tyvera's value and resource rules.
+
+## Native backend options
+
+The comparison below is an architecture assessment, not a performance claim.
+It was reviewed on 2026-10-23 against the upstream project documentation
+linked at the end of this section.
+
+| Option | Target fit | Optimization and compile time | Debugging | Toolchain, FFI, and runtime integration | GPLv3 and bootstrap fit |
+| --- | --- | --- | --- | --- | --- |
+| LLVM | Strong fit for all four required targets and object formats: COFF for Windows x64, ELF for Linux x64/ARM64, Mach-O for macOS ARM64. macOS x64 is also available in LLVM's x86 targets. | Broad target optimizers and target selection. Building, packaging, or finding a compatible LLVM toolchain is substantial; Tyvera compile-time impact is unmeasured. | Source-level debug metadata can lower to DWARF and Windows CodeView. Tyvera still has to describe its own source values and locations accurately. | Mature object/linker ecosystem. Cross compilation still needs the target sysroot, libraries, assembler/linker, and system integration. C ABI is available but must not become Tyvera's semantic model. | LLVM states that its Apache-2.0-with-LLVM-exceptions license can be combined with GPLv3. A Python bootstrap can emit IR or invoke a tool initially, but shipping a stable LLVM toolchain is a separate packaging decision. |
+| Cranelift | Strong ISA fit for Windows x64, Linux x64, Linux ARM64, and macOS ARM64; the project documents Windows x64 and System V x64 conventions, Linux AArch64, and Apple Silicon support. | Designed as a relatively fast, simpler code generator. No Tyvera compile-time or optimization comparison exists. | Object generation exists; source-level interactive debugging is less established than LLVM's cross-platform debug metadata and needs an early prototype. | AOT native object output exists. Cranelift is a Rust library, so a Python bootstrap would need a Rust helper or a later native Tyvera compiler. Runtime/FFI integration remains Tyvera work. | The upstream he
+  executable links the platform C++ runtime and small generated support code.
+- Runtime failures retain source file, line, and column and become a controlled
+  stderr diagnostic plus a nonzero process exit.
+
+This is a private V1 code-generation contract, not a stable public C ABI or an
+FFI. These representations are private compiler details, not a public ABI.
+Generated executables do not embed or invoke Python. Synchronous file and
+binary I/O, `ByteBuffer`, text-file resources, and the limited Linux TCP/DNS
+task path are supported experimentally. Classes, records, user-defined enums,
+tuples, generic functions, Actors, Supervisors, TLS, and HTTP remain
+interpreter-only. No native actor or public error ABI is implemented. There is no
 `unsafe` or FFI declaration syntax. Any later FFI must define ownership,
 lifetimes, mutability, and error conversion explicitly; a native crash cannot
 become a recoverable Tyvera `Result`. See the [Memory Model](memory-model.md)
@@ -214,7 +261,9 @@ does not make C++ part of Tyvera's language.
 | Synchronous file/path I/O | `readText`, `writeText`, `readBytes`, `writeBytes`, `pathJoin`, and `pathExists`; relative paths use the project root and `.tyvera.secrets` is protected. |
 | Text resources | `TextFile`, `TextReader`, `TextWriter`, `using`, move transfer, `Result`/function transfer, synchronous methods, modes, close/isOpen, and deterministic LIFO cleanup are implemented. |
 | Records, tuples, user-defined enums, classes, interfaces, generic functions | Interpreter-only. |
-| Actors, Supervisors, Tasks, async I/O, TCP, DNS, HTTP, TLS, WebSocket | Interpreter-only; the native backend rejects these calls. |
+| `Task<T>`, async functions, `await`, `runTasks()` | Experimental native subset; task bodies are serialized and I/O waits use bounded worker threads. Cooperative task/child cancellation is supported; deadlines, `withTimeout`, task groups, and actor ownership remain unsupported. |
+| DNS and TCP | Experimental on native Linux: `resolveHost`, `tcpConnect`, `tcpListen`, `accept`, `read`, `write`, `writeAll`, address queries, and RAII close. Uses `Result<T,String>`. TLS/HTTP/WebSocket remain interpreter-only. |
+| Actors, Supervisors | Interpreter-only; native lowering rejects these constructs. |
 | `hostOS()`, `hostArchitecture()`, `monotonicMilliseconds()` | Native C++17 runtime and reference implementations; OS/architecture names are normalized and elapsed time is monotonic. |
 | Native SIGINT/SIGTERM shutdown | Generated C++17 records the first signal and unwinds at statement/loop safe points; scope resources use RAII cleanup. |
 | Native FFI, stable public ABI, cross-compilation | Planned; no syntax or runtime contract is exposed. |
@@ -233,10 +282,12 @@ produce controlled diagnostics. CI builds and runs the native examples on
 Linux x86-64 with Python removed from the executable's `PATH`.
 
 End-to-end tests compare stdout, stderr, and exit status for native examples
-against `ReferenceInterpreterBackend`; they also cover located runtime
-failures, IR validation, unsupported-feature diagnostics, and the CLI. This is
-a focused compiler corpus, not full-language differential testing. Addresses,
-host tracebacks, and timing are not semantic outputs.
+against `ReferenceInterpreterBackend`; the local TCP echo example and DNS
+success/failure paths are included. They also cover located runtime failures,
+IR validation, unsupported-feature diagnostics, and the CLI. This is a focused
+compiler corpus, not full-language differential testing. TCP/DNS are not
+claimed for Windows or macOS native builds. Addresses, host tracebacks, and
+timing are not semantic outputs.
 
 ## Upstream references
 
