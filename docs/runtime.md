@@ -262,10 +262,10 @@ async task may await a ReplyReceiver; `runTasks()` pumps one queued actor turn
 while a reply is pending, and the task releases serialized execution until the
 reply, timeout, cancellation, or actor failure. An unanswered reply with no
 queued actor work or deadline is reported as a controlled scheduler deadlock.
-Native actor-owned Tasks are bound to the actor instance that creates them;
-stop, crash, supervised restart, and runtime shutdown request cancellation.
-The native task scheduler drains their cancellation and resource cleanup before
-`runTasks()` completes. `sendAfter` timers, monitoring/links, task groups, and
+Native actor-owned Tasks are bound to the actor instance that creates them.
+Stop, crash, supervised restart, and runtime shutdown request cancellation and
+wait for those Tasks to finish cleanup before the lifecycle transition completes.
+A Task that stops its own actor unwinds at its next interruption point. `sendAfter` timers, monitoring/links, task groups, and
 supervised actors owning move-only Resources remain unsupported natively.
 Generated actor references use shared runtime handles; queued callbacks hold
 weak target references, and runtime shutdown clears mailboxes, supervisors,

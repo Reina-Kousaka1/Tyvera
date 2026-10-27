@@ -1593,6 +1593,8 @@ struct NativeExecutionMutex {
     void notify_waiters() noexcept { changed.notify_all(); }
 };
 void notify_execution_waiters() noexcept;
+struct TaskControl;
+inline void reacquire_execution_lock(std::unique_lock<NativeExecutionMutex>& lock, TaskControl* cancellation_owner);
 inline thread_local std::unique_lock<NativeExecutionMutex>* active_execution_lock = nullptr;
 constexpr std::size_t MAX_NATIVE_TASK_VALUES_PER_RUN = 4096;
 constexpr std::size_t MAX_NATIVE_UNFINISHED_TASKS_PER_RUN = 64;
@@ -1743,11 +1745,11 @@ struct TaskControl {
             }
         } catch (...) {
             if (resume_serialized && !execution_lock->owns_lock() && !is_cancelled())
-                execution_lock->lock();
+                reacquire_execution_lock(*execution_lock, this);
             throw;
         }
         if (resume_serialized && !execution_lock->owns_lock() && !is_cancelled())
-            execution_lock->lock();
+            reacquire_execution_lock(*execution_lock, this);
     }
     void notify_owner_failure() {
         if (!owner) return;
@@ -1781,6 +1783,20 @@ inline void notify_task_scheduler() noexcept {
     } catch (...) {}
 }
 inline thread_local TaskControl* active_task_control = nullptr;
+inline void reacquire_execution_lock(std::unique_lock<NativeExecutionMutex>& lock, TaskControl* cancellation_owner) {
+    if (lock.owns_lock()) return;
+    auto* execution = lock.mutex();
+    if (!execution) return;
+    if (cancellation_owner) {
+        if (execution->lock_or_cancel([cancellation_owner]() { return cancellation_owner->is_cancelled(); })) {
+            lock = std::unique_lock<NativeExecutionMutex>(*execution, std::adopt_lock);
+            return;
+        }
+        cancellation_owner->check_interruption();
+        return;
+    }
+    lock.lock();
+}
 class NativeTaskExecution {
     std::unique_lock<NativeExecutionMutex> lock_;
     std::unique_lock<NativeExecutionMutex>* previous_;
@@ -1815,7 +1831,7 @@ inline void task_checkpoint() {
     if (!execution_lock || !execution_lock->owns_lock()) return;
     execution_lock->unlock();
     std::this_thread::yield();
-    execution_lock->lock();
+    reacquire_execution_lock(*execution_lock, active_task_control);
     if (active_task_control) active_task_control->check_interruption();
 }
 inline void attach_task_to_current_actor(const std::shared_ptr<TaskControl>& task,
@@ -2128,10 +2144,10 @@ template <typename T> struct Task {
             T value = state->await(file, line, column);
             if (active_task_control && active_task_control != state.get())
                 active_task_control->check_interruption();
-            if (resume_serialized) execution_lock->lock();
+            if (resume_serialized) reacquire_execution_lock(*execution_lock, active_task_control);
             return value;
         } catch (...) {
-            if (resume_serialized) execution_lock->lock();
+            if (resume_serialized) reacquire_execution_lock(*execution_lock, active_task_control);
             throw;
         }
     }
@@ -2144,10 +2160,10 @@ template <typename T> struct Task {
             T value = state->await_move(file, line, column);
             if (active_task_control && active_task_control != state.get())
                 active_task_control->check_interruption();
-            if (resume_serialized) execution_lock->lock();
+            if (resume_serialized) reacquire_execution_lock(*execution_lock, active_task_control);
             return value;
         } catch (...) {
-            if (resume_serialized) execution_lock->lock();
+            if (resume_serialized) reacquire_execution_lock(*execution_lock, active_task_control);
             throw;
         }
     }
@@ -2166,9 +2182,9 @@ template <> struct Task<void> {
             state->await(file, line, column);
             if (active_task_control && active_task_control != state.get())
                 active_task_control->check_interruption();
-            if (resume_serialized) execution_lock->lock();
+            if (resume_serialized) reacquire_execution_lock(*execution_lock, active_task_control);
         } catch (...) {
-            if (resume_serialized) execution_lock->lock();
+            if (resume_serialized) reacquire_execution_lock(*execution_lock, active_task_control);
             throw;
         }
     }
@@ -2933,11 +2949,11 @@ template <typename T> inline std::optional<T> await_reply(
         }
     } catch (...) {
         unregister();
-        if (resume_serialized_execution) execution_lock->lock();
+        if (resume_serialized_execution) reacquire_execution_lock(*execution_lock, waiter);
         throw;
     }
     unregister();
-    if (resume_serialized_execution) execution_lock->lock();
+    if (resume_serialized_execution) reacquire_execution_lock(*execution_lock, waiter);
     if (!error.empty()) {
         waiter->record_actor_reply_failure(error);
         throw Failure(file, line, column, std::move(error));
