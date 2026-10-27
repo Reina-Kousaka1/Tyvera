@@ -303,74 +303,6 @@ fn main() {
         self.assertEqual(body[7].variable.type, IRType.BYTES)
 
     def test_ir_validator_rejects_out_of_range_byte_literal(self) -> None:
-   invalid_sources:
-            with self.subTest(source=source):
-                with self.assertRaises(Diagnostic) as caught:
-                    compile_checked_source(source, "native-io-types.tyv")
-                self.assertEqual(caught.exception.stage, "type")
-
-    def test_ir_validator_rejects_mistyped_native_byte_buffer_builtin(self) -> None:
-        from tyvera.ir import IRExpressionStatement
-
-        location = Location("bad_buffer_ir.tyv", 1, 1)
-        call = IRBuiltinCall(
-            "byteBuffer", (IRLiteral(1, IRType.INT, location),), IRType.BYTE_BUFFER, location,
-        )
-        main = IRFunction("main", "tyv_fn_main", (), IRType.VOID,
-                          (IRExpressionStatement(call, location),), location)
-        with self.assertRaisesRegex(Diagnostic, "invalid typed IR builtin 'byteBuffer'"):
-            validate_ir(IRModule((main,), "tyv_fn_main"))
-
-    def test_sum_types_and_recursive_patterns_lower_with_checked_types(self) -> None:
-        module = self.lower('''fn main() {
-    let option: Option<Int> = Some(3)
-    match option {
-        Some(value) => println(value)
-        None => println(0)
-    }
-    let result: Result<Option<Int>, String> = Ok<Option<Int>, String>(Some(5))
-    match result {
-        Ok(Some(value)) => println(value)
-        Ok(None) => println(0)
-        Err(reason) => println(reason)
-    }
-}
-''')
-        function = module.functions[0]
-        self.assertIsInstance(function.body[0].value, IRVariant)
-        self.assertEqual(function.body[0].variable.type, IRAppliedType("Option", (IRType.INT,)))
-        option_match = function.body[1]
-        result_match = function.body[3]
-        self.assertIsInstance(option_match, IRMatch)
-        self.assertIsInstance(result_match, IRMatch)
-        self.assertTrue(option_match.exhaustive)
-        self.assertTrue(result_match.exhaustive)
-        self.assertEqual(option_match.covered_cases, frozenset({"Some", "None"}))
-
-    def test_list_map_and_immutable_bytes_lower_to_typed_ir(self) -> None:
-        module = self.lower('''fn main() {
-    let values: List<Int> = List<Int>()
-    values.append(2)
-    println(values.length)
-    for value in values { println(value) }
-    let entries: Map<String, Int> = Map<String, Int>()
-    entries.put("key", 3)
-    for key in entries { println(key) }
-    let bytes: Bytes = bytesFromString("a")
-    println(bytes.length())
-}
-''')
-        body = module.functions[0].body
-        self.assertEqual(body[0].variable.type, IRAppliedType("List", (IRType.INT,)))
-        self.assertIsInstance(body[1].expression, IRMethodCall)
-        self.assertIsInstance(body[2].value, IRCollectionLength)
-        self.assertIsInstance(body[3], IRForEach)
-        self.assertEqual(body[3].iterable.type.name, "List")
-        self.assertIsInstance(body[6], IRForEach)
-        self.assertEqual(body[6].iterable.type.name, "Map")
-        self.assertEqual(body[7].variable.type, IRType.BYTES)
-
-    def test_ir_validator_rejects_out_of_range_byte_literal(self) -> None:
         location = Location("bad_byte_ir.tyv", 1, 1)
         main = IRFunction(
             "main", "tyv_fn_main", (), IRType.VOID,
@@ -484,65 +416,6 @@ fn main() { println(add(1, 2)); println("Tyvera") }
 
     def test_build_cli_reports_missing_compiler_without_creating_artifact(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tyvera-cli-no-cxx-") as temporary:
-            root = Path(temporary)
-            source = root / "hello.tyv"
-            source.write_text("fn main() { println(1) }", encoding="utf-8")
-            output = root / "hello"
-            stderr = io.StringIO()
-            with patch.dict(os.environ, {"CXX": "tyvera-cxx-that-does-not-exist"}):
-                with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
-                    result = cli_main(["build", str(source), "--output", str(output)])
-            self.assertEqual(result, 1)
-            self.assertIn("C++ compiler from CXX was not found", stderr.getvalue())
-            self.assertNotIn("Traceback", stderr.getvalue())
-            self.assertFalse(output.exists())
-
-    def test_missing_cxx_compiler_has_a_controlled_diagnostic(self) -> None:
-        module = self.lower("fn main() { println(1) }")
-        with tempfile.TemporaryDirectory(prefix="tyvera-no-cxx-") as temporary:
-            with patch.dict(os.environ, {"CXX": "tyvera-cxx-that-does-not-exist"}):
-                with self.assertRaises(Diagnostic) as caught:
-                    CppNativeBackend().build(module, Path(temporary) / "app")
-            self.assertEqual(caught.exception.stage, "backend")
-            self.assertIn("was not found", caught.exception.message)
-
-
-@unittest.skipUnless(HAS_CPP_COMPILER, "native end-to-end checks require a C++17 compiler")
-class NativeExecutionTests(unittest.TestCase):
-    def _build_and_run(
-        self, source_file: Path, output: Path, *, project_root: Path = REPOSITORY,
-        cwd: Path = REPOSITORY,
-    ) -> subprocess.CompletedProcess[str]:
-        checked = compile_checked_project(source_file, project_root)
-        module = lower_checked_program(checked)
-        CppNativeBackend().build(module, output, project_root=project_root)
-        environment = os.environ.copy()
-        environment.pop("PYTHONPATH", None)
-        environment.pop("PYTHONHOME", None)
-        if os.name != "nt":
-            # The absolute executable must not depend on Python being on PATH.
-            environment["PATH"] = ""
-        return subprocess.run(
-            [str(output)], cwd=cwd, capture_output=True, text=True, encoding="utf-8", env=environment, check=False,
-        )
-
-    @staticmethod
-    def _reference_result(source: str, project_root: Path) -> tuple[int, str, str]:
-        checked = compile_checked_source(source, "native-io.tyv")
-        output = io.StringIO()
-        errors = io.StringIO()
-        try:
-            ReferenceInterpreterBackend().execute(
-                checked, output=output, error_output=errors, project_root=project_root,
-            )
-        except Diagnostic as error:
-            return 1, output.getvalue(), error.render() + "\n"
-        return 0, output.getvalue(), errors.getvalue()
-
-    def _native_source_result(
-        self, source: str, project_root: Path, output: Path, cwd: Path,
-    ) -> subprocess.CompletedProcess[str]:
-        checked = compile_charyDirectory(prefix="tyvera-cli-no-cxx-") as temporary:
             root = Path(temporary)
             source = root / "hello.tyv"
             source.write_text("fn main() { println(1) }", encoding="utf-8")
@@ -841,85 +714,6 @@ fn main() {
     }
     match writeBytes("directory", bytesFromString("x")) {
         Err(error) => println(error)
-        Ok(_) => println("unexpested" / "copy.bin").read_bytes(), (roots[1] / "nested" / "copy.bin").read_bytes())
-            for name in ("written.txt", "resource.txt", "scoped.txt"):
-                self.assertEqual((roots[0] / name).read_bytes(), (roots[1] / name).read_bytes())
-            self.assertEqual((roots[1] / "scoped.txt").read_text(encoding="utf-8"), "scoped-more")
-
-    def test_native_io_errors_buffer_bounds_and_secret_paths_match_reference(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="tyvera-native-io-errors-") as temporary:
-            workspace = Path(temporary)
-            roots = (workspace / "reference", workspace / "native")
-            for root in roots:
-                root.mkdir()
-                (root / "bad-utf8.txt").write_bytes(b"\xff")
-                (root / ".tyvera.secrets").write_text("TOKEN = \"must-not-appear\"\n", encoding="utf-8")
-                (root / "directory").mkdir()
-                (root / "nested").mkdir()
-            error_source = '''fn main() {
-    match byteBuffer(-1) {
-        Err(error) => println(error)
-        Ok(_) => println("unexpected")
-    }
-    match byteBuffer(67108865) {
-        Err(error) => println(error)
-        Ok(_) => println("unexpected")
-    }
-    match byteFromInt(256) {
-        Err(error) => println(error)
-        Ok(_) => println("unexpected")
-    }
-    match byteBuffer(1) {
-        Err(error) => println(error)
-        Ok(buffer) => {
-            match byteFromInt(0) {
-                Err(error) => println(error)
-                Ok(zero) => {
-                    match buffer.get(-1) {
-                        Err(error) => println(error)
-                        Ok(_) => println("unexpected")
-                    }
-                    match buffer.get(1) {
-                        Err(error) => println(error)
-                        Ok(_) => println("unexpected")
-                    }
-                    match buffer.set(1, zero) {
-                        Err(error) => println(error)
-                        Ok(_) => println("unexpected")
-                    }
-                }
-            }
-        }
-    }
-    match readBytes("missing.bin") {
-        Err(error) => println(error)
-        Ok(_) => println("unexpected")
-    }
-    using reader = openTextReader("missing.txt") {
-        println("unexpected")
-    } else error {
-        println(error)
-    }
-    using writer = openTextWriter("missing-parent/out.txt", "write") {
-        println("unexpected")
-    } else error {
-        println(error)
-    }
-    using invalidMode = openTextWriter("ignored.txt", "read") {
-        println("unexpected")
-    } else error {
-        println(error)
-    }
-    match readText("bad-utf8.txt") {
-        Err(error) => println(error)
-        Ok(_) => println("unexpected")
-    }
-    match readText("directory") {
-        Err(error) => println(error)
-        Ok(_) => println("unexpected")
-    }
-    match writeBytes("directory", bytesFromString("x")) {
-        Err(error) => println(error)
         Ok(_) => println("unexpected")
     }
     match readText(".tyvera.secrets") {
@@ -1052,68 +846,6 @@ fn main() {
             root = workspace / "project"
             root.mkdir()
             expected = self._reference_result(source, root)
-            native = self._native_source_result(source, root, workspace / "native-cleanup", workspace)
-            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
-
-    def test_native_examples_match_reference_interpreter_without_python_path(self) -> None:
-        examples = (
-            "native_hello.tyv", "native_control_flow.tyv", "native_values.tyv",
-            "native_sum_types.tyv", "native_collections.tyv", "native_bytes.tyv",
-            "byte_buffers.tyv",
-        )
-        if sys.platform.startswith("linux"):
-            examples += ("tcp_echo.tyv",)
-        with tempfile.TemporaryDirectory(prefix="tyvera-native-e2e-") as temporary:
-            for name in examples:
-                with self.subTest(example=name):
-                    source = REPOSITORY / "examples" / name
-                    checked = compile_checked_project(source, REPOSITORY)
-                    expected = io.StringIO()
-                    ReferenceInterpreterBackend().execute(
-                        checked, output=expected, error_output=io.StringIO(), project_root=REPOSITORY,
-                    )
-                    result = self._build_and_run(source, Path(temporary) / Path(name).stem)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout, expected.getvalue())
-                    self.assertEqual(result.stderr, "")
-
-    @unittest.skipUnless(sys.platform.startswith("linux"), "native networking tests require Linux")
-    def test_native_dns_success_and_failure_match_reference(self) -> None:
-        source = '''async fn lookups() {
-    let local = await resolveHost("localhost", 80)
-    match local {
-        Ok(addresses) => println(addresses.length > 0)
-        Err(error) => println(error)
-    }
-    let invalid = await resolveHost("not a valid host name", 80)
-    match invalid {
-        Ok(_) => println("unexpected DNS success")
-        Err(error) => println(error)
-    }
-}
-fn main() {
-    let task = lookups()
-    match runTasks() {
-        Ok(_) => {}
-        Err(error) => eprintln(error)
-    }
-}'''
-        with tempfile.TemporaryDirectory(prefix="tyvera-native-dns-") as temporary:
-            root = Path(temporary)
-            expected = self._reference_result(source, root)
-            native = self._native_source_result(source, root, root / "dns-app", root)
-            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
-            self.assertEqual(native.stdout, "true\nDNS resolution failed\n")
-
-    @unittest.skipUnless(sys.platform.startswith("linux"), "native networking tests require Linux")
-    def test_native_task_cancellation_stops_pending_accept_and_matches_reference(self) -> None:
-        source = '''async fn cancelPendingAccept() {
-    let opened = await tcpListen("127.0.0.1", 0, 8)
-    match move opened {
-        Err(error) => println(error)
-        Ok(listener) => {
-            let pending = listener.accept()
-            print
             native = self._native_source_result(source, root, workspace / "native-cleanup", workspace)
             self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
 
@@ -1383,79 +1115,6 @@ async fn serve() {
                         Ok(value) => match value {
                             None => println("unexpected server EOF")
                             Some(bytes) => {
-                                  println(firstResponse)
-                println(secondResponse)
-                listener.close()
-            }
-        }
-    }
-}
-fn main() {
-    let task = serve()
-    match runTasks() { Ok(_) => {} Err(error) => eprintln(error) }
-}'''
-        with tempfile.TemporaryDirectory(prefix="tyvera-native-multi-tcp-") as temporary:
-            root = Path(temporary)
-            expected = self._reference_result(source, root)
-            native = self._native_source_result(source, root, root / "multi-tcp", root)
-            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
-            self.assertEqual(native.stdout, "first\nsecond\n")
-
-    @unittest.skipUnless(sys.platform.startswith("linux"), "native IPv6 networking tests require Linux")
-    def test_native_ipv6_tcp_echo_and_eof_match_reference(self) -> None:
-        try:
-            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
-                probe.bind(("::1", 0))
-        except OSError as error:
-            self.skipTest(f"IPv6 loopback is unavailable: {error}")
-        source = '''async fn client(port: Int) -> String {
-    let opened = await tcpConnect("::1", port)
-    using connection = move opened {
-        let sent = await connection.writeAll(bytesFromString("x"))
-        match sent {
-            Err(error) => return error
-            Ok(_) => {}
-        }
-        let echoed = await connection.read(1)
-        match echoed {
-            Err(error) => return error
-            Ok(value) => match value {
-                None => return "unexpected EOF"
-                Some(bytes) => match bytes.toString() {
-                    Err(error) => return error
-                    Ok(text) => {
-                        let ended = await connection.read(1)
-                        match ended {
-                            Err(error) => return error
-                            Ok(result) => match result {
-                                None => return text + "|EOF"
-                                Some(_) => return "unexpected extra data"
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return "incomplete client exchange"
-    } else error {
-        return "connect: " + error
-    }
-}
-async fn serve() {
-    let opened = await tcpListen("::1", 0, 8)
-    using listener = move opened {
-        match listener.localAddress() {
-            Err(error) => println(error)
-            Ok(address) => {
-                let clientTask = client(address.port())
-                let accepted = await listener.accept()
-                using connection = move accepted {
-                    let received = await connection.read(1)
-                    match received {
-                        Err(error) => println(error)
-                        Ok(value) => match value {
-                            None => println("unexpected server EOF")
-                            Some(bytes) => {
                                 let echoed = await connection.writeAll(bytes)
                                 match echoed {
                                     Ok(_) => {}
@@ -1648,59 +1307,6 @@ fn main() {
             self.assertTrue(output.is_file())
             run_environment = os.environ.copy()
             run_environment.pop("PYTHONPATH", None)
-            r    output_file = root / "signal.txt"
-                    output_file.unlink(missing_ok=True)
-                    process = subprocess.Popen(
-                        [str(executable)], cwd=root, stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                    )
-                    try:
-                        time.sleep(0.05)
-                        self.assertIsNone(process.poll(), "the test program should still be in its loop")
-                        process.send_signal(selected_signal)
-                        _, error = process.communicate(timeout=5)
-                    finally:
-                        if process.poll() is None:
-                            process.kill()
-                            process.wait(timeout=5)
-                    self.assertEqual(process.returncode, expected_code, error)
-                    self.assertIn(f"runtime shutdown requested by {expected_name}", error)
-                    self.assertEqual(output_file.read_text(encoding="utf-8"), "closed on signal")
-
-    def test_native_sync_resource_examples_match_reference_interpreter(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="tyvera-native-resources-") as temporary:
-            root = Path(temporary)
-            for name in ("resource_scopes.tyv", "resource_ownership.tyv"):
-                with self.subTest(example=name):
-                    source = REPOSITORY / "examples" / name
-                    project_root = source.parent
-                    checked = compile_checked_project(source, project_root)
-                    expected = io.StringIO()
-                    ReferenceInterpreterBackend().execute(
-                        checked, output=expected, error_output=io.StringIO(), project_root=project_root,
-                    )
-                    result = self._build_and_run(
-                        source, root / Path(name).stem, project_root=project_root, cwd=root,
-                    )
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout, expected.getvalue())
-                    self.assertEqual(result.stderr, "")
-
-    def test_cli_build_produces_executable_and_keeps_python_out_of_runtime(self) -> None:
-        source = REPOSITORY / "examples" / "native_hello.tyv"
-        with tempfile.TemporaryDirectory(prefix="tyvera-cli-native-") as temporary:
-            output = Path(temporary) / ("hello.exe" if os.name == "nt" else "hello")
-            result = subprocess.run(
-                [sys.executable, "-m", "tyvera", "build", str(source), "--output", str(output)],
-                cwd=REPOSITORY,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertTrue(output.is_file())
-            run_environment = os.environ.copy()
-            run_environment.pop("PYTHONPATH", None)
             run_environment.pop("PYTHONHOME", None)
             if os.name != "nt":
                 run_environment["PATH"] = ""
@@ -1760,3 +1366,4 @@ fn main() {
 
 if __name__ == "__main__":
     unittest.main()
+

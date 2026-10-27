@@ -56,3 +56,4 @@ No raw signal handler, process handle, Python exception, OS socket structure,
 or native pointer is a Tyvera value. The native C++17 executable implements
 host facts, monotonic time, and cooperative signals only; environment and child
 process services remain available through the reference runtime adapter.
+

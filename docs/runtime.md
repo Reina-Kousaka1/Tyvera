@@ -199,55 +199,6 @@ language contract.
 
 The native Linux subset has a separate implementation boundary. `async fn`,
 `await`, and `runTasks()` use a bounded registry of at most 64 task values per
-run. Task bodies are serialized; each pending DNS or socket operation rorm
-support](platform.md) for the host boundary and its limits.
-
-## Resource cleanup
-
-`TextFile`, `TextReader`, `TextWriter`, `TcpConnection`, `TcpListener`, and
-`HttpServer`
-handles are move-only. `Option`, `Result`, and resource-returning `Task` values
-may carry them; other aggregate and collection types reject them. Owned
-handles close in reverse acquisition order at block exit, function return,
-runtime failure, `break`, `continue`, task completion or failure, cancellation,
-actor-handler failure, and supervised restart. Explicit `close()` makes later
-cleanup a no-op. Cleanup errors retain source locations and are added to an
-existing diagnostic without replacing its primary cause. Detached tasks keep
-their own resource handles until completion or runtime shutdown. A completed
-resource result is transferred once through `await` or consuming `tryResult()`;
-an unclaimed task result is closed during owner or runtime cleanup. A
-resource-returning task is itself move-only while pending, so leaving its scope
-cancels it. `tryResult()` consumes that task; if it is still pending, it cancels
-the operation and returns `Ok(None)` so a resource cannot be produced without
-an owner.
-
-Async file operations use the same move-only file handles as synchronous file
-I/O. A handle permits one in-flight worker operation. Scope cleanup marks a
-busy handle for close and the worker completion path closes it after the
-operation returns. Cancellation stops a queued worker operation where
-possible; a worker operation already running completes before its owned file
-is closed. Runtime shutdown waits for the bounded worker pool to drain.
-
-TCP connect, accept, read, and write are scheduler I/O operations. A waiting
-task is in `io_wait`; the platform adapter registers selector readiness and
-returns the awakened operation to the scheduler. Cancellation unregisters the
-wait. Closing a connection also cancels any pending read/write with a
-controlled `Result::Err`. The task scheduler can continue other tasks while a
-socket is waiting. `read(maxBytes)` returns a partial byte chunk or `None` at
-EOF; one read is capped at 1 MiB. `write` reports partial progress and
-`writeAll` retains one supplied buffer and waits for each further writable
-event, so Tyvera does not add an unbounded producer queue.
-
-Expected DNS, socket and file failures are `Result<T,String>` values with
-normalized messages; host exceptions are not part of Tyvera's API. Task
-timeouts reuse `Task.withTimeout(Duration)`: expiry cancels the I/O task and
-fails the timeout wrapper with `"task timed out"`. The `runTasks()` caller can
-observe that state with `tryResult()`. The reference adapter currently uses
-selectors and a bounded worker pool, but those mechanisms do not define the
-language contract.
-
-The native Linux subset has a separate implementation boundary. `async fn`,
-`await`, and `runTasks()` use a bounded registry of at most 64 task values per
 run. Task bodies are serialized; each pending DNS or socket operation runs in
 a worker so another Tyvera task can proceed. DNS uses the platform resolver
 and cannot be interrupted while that call is in progress. Sockets are
@@ -299,3 +250,4 @@ reference runtime provides TCP, verified TLS/HTTPS, bounded WebSockets, async
 text-file operations, and experimental HTTP/1.1. See the
 [memory model](memory-model.md) and
 [backend architecture](backend-architecture.md).
+

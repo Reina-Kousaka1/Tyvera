@@ -183,32 +183,6 @@ linked at the end of this section.
 | Option | Target fit | Optimization and compile time | Debugging | Toolchain, FFI, and runtime integration | GPLv3 and bootstrap fit |
 | --- | --- | --- | --- | --- | --- |
 | LLVM | Strong fit for all four required targets and object formats: COFF for Windows x64, ELF for Linux x64/ARM64, Mach-O for macOS ARM64. macOS x64 is also available in LLVM's x86 targets. | Broad target optimizers and target selection. Building, packaging, or finding a compatible LLVM toolchain is substantial; Tyvera compile-time impact is unmeasured. | Source-level debug metadata can lower to DWARF and Windows CodeView. Tyvera still has to describe its own source values and locations accurately. | Mature object/linker ecosystem. Cross compilation still needs the target sysroot, libraries, assembler/linker, and system integration. C ABI is available but must not become Tyvera's semantic model. | LLVM states that its Apache-2.0-with-LLVM-exceptions license can be combined with GPLv3. A Python bootstrap can emit IR or invoke a tool initially, but shipping a stable LLVM toolchain is a separate packaging decision. |
-| Cranelift | Strong ISA fit for Windows x64, Linux x64, Linux ARM64, and macOS ARM64; the project documents Windows x64 and System V x64 conventions, Linux AArch64, and Apple Silicon support. | Designed as a relatively fast, simpler code generator. No Tyvera compile-time or optimization comparison exists. | Object generation exists; source-level interactive debugging is less established than LLVM's cross-platform debug metadata and needs an early prototype. | AOT native object output exists. Cranelift is a Rust library, so a Python bootstrap would need a Rust helper or a later native Tyvera compiler. Runtime/FFI integration remains Tyvera work. | The upstream he
-  executable links the platform C++ runtime and small generated support code.
-- Runtime failures retain source file, line, and column and become a controlled
-  stderr diagnostic plus a nonzero process exit.
-
-This is a private V1 code-generation contract, not a stable public C ABI or an
-FFI. These representations are private compiler details, not a public ABI.
-Generated executables do not embed or invoke Python. Synchronous file and
-binary I/O, `ByteBuffer`, text-file resources, and the limited Linux TCP/DNS
-task path are supported experimentally. Classes, records, user-defined enums,
-tuples, generic functions, Actors, Supervisors, TLS, and HTTP remain
-interpreter-only. No native actor or public error ABI is implemented. There is no
-`unsafe` or FFI declaration syntax. Any later FFI must define ownership,
-lifetimes, mutability, and error conversion explicitly; a native crash cannot
-become a recoverable Tyvera `Result`. See the [Memory Model](memory-model.md)
-for Tyvera's value and resource rules.
-
-## Native backend options
-
-The comparison below is an architecture assessment, not a performance claim.
-It was reviewed on 2026-10-23 against the upstream project documentation
-linked at the end of this section.
-
-| Option | Target fit | Optimization and compile time | Debugging | Toolchain, FFI, and runtime integration | GPLv3 and bootstrap fit |
-| --- | --- | --- | --- | --- | --- |
-| LLVM | Strong fit for all four required targets and object formats: COFF for Windows x64, ELF for Linux x64/ARM64, Mach-O for macOS ARM64. macOS x64 is also available in LLVM's x86 targets. | Broad target optimizers and target selection. Building, packaging, or finding a compatible LLVM toolchain is substantial; Tyvera compile-time impact is unmeasured. | Source-level debug metadata can lower to DWARF and Windows CodeView. Tyvera still has to describe its own source values and locations accurately. | Mature object/linker ecosystem. Cross compilation still needs the target sysroot, libraries, assembler/linker, and system integration. C ABI is available but must not become Tyvera's semantic model. | LLVM states that its Apache-2.0-with-LLVM-exceptions license can be combined with GPLv3. A Python bootstrap can emit IR or invoke a tool initially, but shipping a stable LLVM toolchain is a separate packaging decision. |
 | Cranelift | Strong ISA fit for Windows x64, Linux x64, Linux ARM64, and macOS ARM64; the project documents Windows x64 and System V x64 conventions, Linux AArch64, and Apple Silicon support. | Designed as a relatively fast, simpler code generator. No Tyvera compile-time or optimization comparison exists. | Object generation exists; source-level interactive debugging is less established than LLVM's cross-platform debug metadata and needs an early prototype. | AOT native object output exists. Cranelift is a Rust library, so a Python bootstrap would need a Rust helper or a later native Tyvera compiler. Runtime/FFI integration remains Tyvera work. | The upstream crates use Apache-2.0 WITH LLVM-exception. Check exact dependency and redistribution obligations for the full compiler distribution. |
 | C/C++ transpilation | Depends on a host compiler; cross targets still need matching sysroots, libraries, and linkers. | Fast route to a small executable slice; machine code and optimization are delegated to the installed compiler. No Tyvera performance results exist. | Compiler debug information is available, but source-level mappings need deliberate work. | C has a smaller runtime surface; C++ offers standard strings and a straightforward private helper runtime. Both need an external toolchain. | Toolchain licensing depends on the compiler. Generated executables must not require Python. |
 | Own native backend | No target is implemented. Each OS/architecture combination needs instruction selection, calling convention, object format, linker/debug integration, and runtime testing. | Full control, but optimization passes, register allocation, instruction selection, and ABI support would become Tyvera's responsibility. | DWARF, CodeView/PDB, and Mach-O debug integration would need to be built and maintained. | Maximum integration control and maximum maintenance burden; a typed FFI and runtime still remain necessary. | No third-party backend license issue, but it does not simplify GPLv3 distribution or the Python-bootstrap transition. Not realistic as the first backend. |
@@ -299,3 +273,4 @@ timing are not semantic outputs.
 - [Cranelift object and JIT crates](https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/docs/index.md)
 - [LLVM license and GPLv3 combination statement](https://github.com/llvm/llvm-project/blob/main/llvm/docs/DeveloperPolicy.md#copyright-license-and-patents)
 - [Cranelift crate license declaration](https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/umbrella/Cargo.toml)
+

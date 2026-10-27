@@ -249,93 +249,6 @@ elements. Values use `(first, second, ...)`, positional reads use `.0`, `.1`,
 and tuple patterns destructure elements in order. Tuples are immutable values;
 their equality is elementwise.
 
-Enums ield access uses
-`instance.field`, method calls use `instance.method(arguments)`, and assignment
-to a field is a statement.
-
-```tyv
-class User {
-    let name: String
-    var score: Int
-
-    fn init(name: String, score: Int) {
-        self.name = name
-        self.score = score
-    }
-
-    fn addScore(points: Int) {
-        self.score = self.score + points
-    }
-}
-```
-
-`init` is the constructor. Constructing `User("Charlotte", 10)` calls
-`init` with those arguments and produces a `User` instance. A class with fields
-must declare one `init`; a class without fields may omit it, in which case
-`ClassName()` constructs an empty instance. Constructors return `Void`.
-Every field must be initialized on every path that can finish construction.
-An immutable `let` field must be initialized exactly once on each path;
-mutable `var` fields may be reassigned. Constructor field assignments through
-`self` are the only way to initialize immutable fields. The checker rejects
-reads of an uninitialized field and passing or using `self` before all fields
-are initialized. Immutable fields cannot be initialized inside loops.
-
-Interfaces declare method signatures, and a class can implement multiple
-interfaces:
-
-```tyv
-interface Printable {
-    fn print() -> Void
-}
-
-class User implements Printable {
-    let name: String
-    fn init(name: String) { self.name = name }
-    fn print() { println(self.name) }
-}
-
-fn display(value: Printable) { value.print() }
-```
-
-The checker verifies that each required method exists and has exactly matching
-parameter and return types. A class implementing an interface can be assigned
-to an interface-typed binding or passed to an interface-typed parameter;
-method calls dispatch to the instance's class implementation. Interfaces have
-no fields, default methods or inheritance. Classes/interfaces and global
-functions share one declaration namespace within each module. Module
-declarations are private by default; `pub` makes a function, type, record,
-enum, newtype or alias importable. Class fields and methods remain public once
-the class itself is imported.
-
-## Records, tuples, enums and nominal wrappers
-
-Records are immutable value types. Their fields are declared in order, and
-construction supplies one value for each field in that order. Field access is
-read-only. A record compares structurally when it has the same nominal record
-type; fields follow their own equality rules. A record containing a mutable
-collection is still shallowly immutable, so that collection can change through
-its methods.
-
-```tyv
-record User<T> {
-    id: T
-    name: String
-}
-
-fn main() {
-    let user = User<Int>(17, "Mira")
-    println(user.name)
-    match user {
-        User(id, name) => println(id)
-    }
-}
-```
-
-Tuple types use `(T1, T2, ...)` and require at least two statically known
-elements. Values use `(first, second, ...)`, positional reads use `.0`, `.1`,
-and tuple patterns destructure elements in order. Tuples are immutable values;
-their equality is elementwise.
-
 Enums are nominal sum types. Each variant can carry zero or more typed
 payloads. Construct a case with `EnumName.Case(values...)`; a case without
 payloads can also be written `EnumName.Case`. Generic enums infer type
@@ -474,74 +387,6 @@ record destructuring, newtype wrappers, built-in Option/Result cases, and
 user-defined enum cases. A binding is immutable and visible only in its arm.
 Literal types must match the subject type. Option/Result, Bool and enum matches
 are checked recursively for exhaustiveness, including nested tuple, record and
-newtype fields. Infinite domains such as `Int`, `Float` and `String` cannot be
-exhausted by listing literals; their matched values need a wildcard/binding.
-A non-exhaustive match simply executes no arm when no pattern matches.
-Duplicate and subsumed patterns, and arms after exhaustive coverage, are errors.
-
-```tyv
-match response {
-    Ok(value) => println(value)
-    Err(message) => println(message)
-}
-```
-
-Nested patterns are supported. Match guards, named-field patterns, and
-message-pattern matching are not implemented.
-
-## Cooperative actors
-
-Actors own state that cannot be read through their reference. Fields use the
-same `let`/`var` rules as classes. A stateful actor needs an `init` constructor;
-the checker verifies that every field is initialized on every constructor
-path. `on name(parameters)` declares a typed, `Void`-returning message handler.
-Handler names and parameter types form that actor's message protocol.
-
-```tyv
-actor Counter {
-    var value: Int
-
-    init(start: Int) { self.value = start }
-    on add(amount: Int) { self.value = self.value + amount }
-    on report() { println(self.value) }
-}
-
-fn main() {
-    let counter: ActorRef<Counter> = spawn(Counter(10))
-    counter.add(5)
-    counter.report()
-    match runActors() {
-        Ok(processed) => println(processed)
-        Err(reason) => eprintln(reason)
-    }
-}
-```
-
-`spawn(Actor(...))` creates an `ActorRef<Actor>`. Calling a handler name on
-that reference enqueues a message and returns `Void`; it does not run the
-handler inline. `runActors()` drains pending mailboxes and returns
-`Result<Int,String>` with the number of delivered messages on success. The
-bootstrap scheduler is deterministic and cooperative: it processes one message
-per actor per round, while preserving FIFO order within each actor. It is not
-parallel and does not preempt a running handler. Handlers cannot recursively
-drive `runActors()`.
-
-Constructor arguments and ordinary message arguments are transferable Tyvera
-values of type `Int`, `Float`, `Bool`, `Byte`, `Bytes`, `String`, `Duration`,
-`Option<T>`, `Result<T,E>`, or `ActorRef<A>` when the nested types are also
-transferable. `Bytes` is transferred as an immutable value; mutable
-`ByteBuffer` values, collections, ordinary class instances and secrets cannot
-cross a mailbox. Request messages additionally carry a `ReplySender<T>` as
-their final parameter; `T` must itself be transferable. A runtime diagnostic
-in a handler marks that actor crashed, discards its queued messages, and lets
-other actors continue; an unsupervised crash is returned as `Err`. Ordinary
-`Result` failures remain application values, separate from actor crashes.
-
-`oneForOne`, `oneForAll`, and `restForOne` each accept
-`(maxRestarts: Int, windowMilliseconds: Int)` and an optional
-`SupervisorBackoff`, and return a `Supervisor`. `maxRestarts` is from 0 through
-1,000; the window must be positive. They select, respectively, the failed
-child, all children, or the failed child ing nested tuple, record and
 newtype fields. Infinite domains such as `Int`, `Float` and `String` cannot be
 exhausted by listing literals; their matched values need a wildcard/binding.
 A non-exhaustive match simply executes no arm when no pattern matches.
@@ -780,66 +625,6 @@ when `main` returns or raises. `runTasks()` may be called repeatedly while
 `main` is active; it is idle between calls and cannot be pumped recursively or
 from an actor constructor/handler. Shutdown cancels every unfinished task,
 including detached and never-started root tasks, stops live actors and
-supervisodline or
-wake itself. The interpreter accepts an injected monotonic clock for
-deterministic tests.
-
-### Cooperative tasks
-
-An `async fn` declares a function that creates a deferred `Task<T>` when called.
-The function body does not start until `runTasks()` drives the task scheduler.
-Async functions use ordinary checked return annotations and return-path
-analysis; `main` remains synchronous. Calling one evaluates its arguments
-immediately and captures them for later execution. Primitive values follow
-ordinary Tyvera value behavior; mutable lists and class instances retain the
-same shared-reference behavior as synchronous function arguments. Tasks execute
-serially and cannot be sent through actor messages.
-
-```tyv
-async fn announce() {
-    println("started")
-    await sleepFor(milliseconds(5))
-    println("resumed")
-}
-
-fn main() {
-    let task = announce()
-    match runTasks() {
-        Ok(_) => println(task.isDone())
-        Err(reason) => println(reason)
-    }
-}
-```
-
-`sleepFor(Duration) -> Task<Void>` creates a timer-backed task. An `await`
-statement suspends the current async function until a task or task group is
-ready. `Task<T>.withTimeout(Duration) -> Task<T>` creates a typed wrapper with
-a monotonic deadline that starts when the method is called. If the source task
-does not complete by the deadline, the wrapper cancels it and fails with
-`"task timed out"`; cancelling the wrapper also cancels its source. A negative
-duration is already expired. A source that is already complete succeeds.
-`let value: T = await task` also binds a typed task result; the same form can
-bind a typed actor reply. An unbound `await replyReceiver` leaves its reply
-available for `tryReceive()`. Failure, cancellation, or timeout of an awaited
-operation fails the awaiting task. `Task<T>.isDone()`, `isCancelled()`,
-`cancel()`, `detach()`, and `tryResult()` expose lifecycle and value status.
-For non-`Void` tasks, `tryResult()` returns `Result<Option<T>,String>`; for `Task<Void>` it
-returns `Result<Bool,String>`. `runTasks() -> Result<Int,String>` advances
-ready tasks round-robin, drives actor messages needed by awaited replies, and
-waits until a deadline when no task can otherwise run. A deadlock with pending
-work but no runnable task or deadline is returned as `Err`.
-
-A task whose result can carry a move-only Resource is itself linear. `await`
-transfers its completed result once. `withTimeout()` transfers the task handle
-to its wrapper. `tryResult()` consumes the handle; if it is still pending, the
-operation is cancelled and `Ok(None)` is returned so a later resource cannot
-become ownerless.
-
-An interpreter runtime is one-shot: `main` starts it and runtime shutdown runs
-when `main` returns or raises. `runTasks()` may be called repeatedly while
-`main` is active; it is idle between calls and cannot be pumped recursively or
-from an actor constructor/handler. Shutdown cancels every unfinished task,
-including detached and never-started root tasks, stops live actors and
 supervisors, clears mailboxes and timers, and fails outstanding replies. No
 work survives that interpreter instance.
 
@@ -928,72 +713,6 @@ functions, `Task<T>`, `await`, `runTasks()`, and cooperative `Task.cancel()`,
 and is checked at task statement/loop and socket-poll boundaries. A system DNS
 lookup cannot be interrupted mid-call. Native deadlines, task groups, Actors,
 Supervisors, TLS, WebSockets, or HTTP are not implemented. The reference interpreter remains the complete runtime for those
-features.
-
-## JSON values
-
-`Json` is an opaque, typed value. `parseJson(text) -> Result<Json,String>`
-parses JSON and returns a generic `Err("invalid JSON document")` for malformed
-input, duplicate object keys, non-standard constants, non-finite numbers,
-numbers outside the signed 64-bit `Int` range, excessive nesting, or invalid
-Unicode surrogate values. JSON integers use `Int`; decimal or exponent-form
-numbers use finite binary64 `Float`. No conversion to arbitrary Tyvera classes
-is performed.
-
-`jsonStringify(value) -> Result<String,String>` encodes a `Json` value as
-compact JSON. Constructors preserve Tyvera's static types:
-`jsonString(String)`, `jsonInt(Int)`, `jsonFloat(Float)`, `jsonBool(Bool)`,
-`jsonNull()`, `jsonArray(List<Json>)`, and
-`jsonObject(Map<String,Json>)`. JSON object key order follows the input order
-or the map's insertion order.
-
-The methods `kind() -> String` and `isNull() -> Bool` inspect the tagged value;
-`kind()` returns `null`, `bool`, `int`, `float`, `string`, `array` or `object`.
-`asString`, `asInt`, `asFloat`, `asBool`, `arrayLength`, `objectLength`,
-`arrayAt(Int)`, `objectGet(String)` and `objectKeys()` return `Option` values.
-Their payload type is the corresponding primitive, length, `Json`, or
-`List<String>`. A wrong container kind, missing key, or out-of-range index
-returns `None`; there are no implicit numeric conversions. JSON values can be
-inspected or encoded, but automatic mapping to user-defined classes is not yet
-implemented. Records and enum variants do not yet have derived JSON codecs;
-typed serialization needs an explicit schema and validation policy. These
-operations are bootstrap intrinsics and do not yet live in an importable
-`tyvera.json` source module.
-
-```tyv
-match parseJson("{\"ready\":true}") {
-    Ok(document) => match document.objectGet("ready") {
-        Some(value) => match value.asBool() {
-            Some(ready) => println(ready)
-            None => println(false)
-        }
-        None => println(false)
-    }
-    Err(_) => println(false)
-}
-```
-
-## Text I/O, paths and secrets
-
-The bootstrap core provides `readText(path) -> Result<String,String>`,
-`writeText(path, contents) -> Result<Bool,String>`, `pathJoin(left,right) ->
-String`, `pathExists(path) -> Bool`, `println` and `eprintln`. Relative file
-paths resolve from the project root. I/O failures return `Err` values; file
-contents and operating-system error details are not copied into the error
-message. Path joining follows the host platform's path rules. Text file
-resource APIs cannot read or overwrite the project `.tyvera.secrets` file.
-
-`using` gives an acquired file resource a deterministic lexical owner:
-
-```tyv
-using file = openText("notes.txt", "write") {
-    file.write("saved")
-}
-```
-
-`openText(path, mode)` supports `"read"`, `"write"` (truncate or create), and
-`"append"` (create if missing), returning `Result<TextFile,String>`. It opens
-UTF-8 text and reports an open failure as `Err(String)`. `openTextReacomplete runtime for those
 features.
 
 ## JSON values
@@ -1219,65 +938,6 @@ registry or dependency manager yet.
 
 Precedence, lowest first; binary operators associate left:
 
-| Precedeources; `accept`, `read`, `write`, and
-`writeAll` suspend through the task scheduler. Address values expose host, port,
-and address family without exposing host-platform socket structs. `read` may be
-partial and uses `None` for EOF. `write` may be partial; `writeAll` waits for
-socket readiness, retaining one caller-provided payload at a time. No general
-Stream trait exists yet. The experimental HTTP API is described in
-[HTTP and web foundation](http.md) and the experimental [Discord source
-package](discord.md). TLS and WebSocket operations are supported by the
-reference interpreter only, not by generated native executables.
-
-The built-in namespace `secrets.NAME` returns `Option<Secret<String>>`. The
-local provider reads `.tyvera.secrets` first, then checks the process
-environment. The local file uses one `NAME = "JSON-escaped string"` entry per
-line; malformed files produce a generic, value-redacted runtime diagnostic.
-The file is gitignored; `.tyvera.secrets.example` may be committed. `Secret<T>`
-cannot be passed to `println`/`eprintln`, concatenated with strings, or
-implicitly converted. The explicit `secret.reveal()` method returns the value
-as `T`; applications should pass the wrapper to trusted APIs and only reveal
-it when needed. Secret values are redacted from the wrapper's representation
-and are never included in provider diagnostics. External secret stores are not
-implemented; the provider boundary is the extension point.
-
-The host-platform intrinsics are `hostOS() -> String`,
-`hostArchitecture() -> String`, and `environment(name: String) ->
-Option<Secret<String>>`. The normalized OS values are `linux`, `windows`,
-`macos`, and `other`; architecture values are `x86_64`, `aarch64`, `x86`, and
-`other`. These report the bootstrap runtime host, not the target of
-`tyvera build`. Invalid environment names and missing values return `None`;
-present values remain secret-wrapped. `environment` reads the process
-environment only; `secrets.NAME` keeps its separate project-file-first
-provider behavior. See [Host platform foundation](platform.md).
-
-## Modules and projects
-
-Each file is one module. Imports name a `.tyv` file relative to the importing
-file and bind it to an alias:
-
-```tyv
-import "models/user.tyv" as models
-
-fn main() {
-    let user: models.User = models.User("Charlotte")
-    println(user.name)
-}
-```
-
-Calls and construction use `alias.symbol(...)`; types use `alias.Type`.
-Unqualified names resolve only inside the current module. Imported symbols
-must be explicitly public. Import aliases are unique and reserved against
-local variables and parameters in that module. Imports are linked before type
-checking; duplicate/missing symbols, missing files, root-escaping paths and
-circular imports produce source-located diagnostics. A project can declare
-`name` and `entry` string keys in a minimal `tyvera.toml`; there is no package
-registry or dependency manager yet.
-
-## Operators
-
-Precedence, lowest first; binary operators associate left:
-
 | Precedence | Operators |
 | --- | --- |
 | 1 | `||` (`or` compatibility spelling) |
@@ -1385,4 +1045,5 @@ termination checking or loop execution budget is provided;
 users can write infinite loops. Parsing and execution use
 the host stack, so extremely deeply nested source is not supported. The
 interpreter is replaceable bootstrap technology, not part of Tyvera semantics.
+
 

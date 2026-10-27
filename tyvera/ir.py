@@ -414,60 +414,6 @@ def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef
         }
         return signatures.get(method)
     if isinstance(receiver, IRType) and receiver in {IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER}:
-        read_all = _app-> tuple[tuple[IRTypeRef, ...], IRTypeRef] | None:
-    if isinstance(receiver, IRAppliedType) and receiver.name == "Task":
-        signatures = {
-            "isDone": ((), IRType.BOOL),
-            "isCancelled": ((), IRType.BOOL),
-            "cancel": ((), IRType.BOOL),
-        }
-        return signatures.get(method)
-    if isinstance(receiver, IRType) and receiver == IRType.BYTE:
-        return ((), IRType.INT) if method == "toInt" else None
-    if isinstance(receiver, IRType) and receiver == IRType.BYTES:
-        signatures: dict[str, tuple[tuple[IRTypeRef, ...], IRTypeRef]] = {
-            "length": ((), IRType.INT),
-            "toString": ((), _applied("Result", IRType.STRING, IRType.STRING)),
-            "get": ((IRType.INT,), _applied("Result", IRType.BYTE, IRType.STRING)),
-            "slice": ((IRType.INT, IRType.INT), _applied("Result", IRType.BYTES, IRType.STRING)),
-        }
-        return signatures.get(method)
-    if isinstance(receiver, IRType) and receiver == IRType.BYTE_BUFFER:
-        signatures = {
-            "length": ((), IRType.INT),
-            "get": ((IRType.INT,), _applied("Result", IRType.BYTE, IRType.STRING)),
-            "set": ((IRType.INT, IRType.BYTE), _applied("Result", IRType.BOOL, IRType.STRING)),
-            "toBytes": ((), _applied("Result", IRType.BYTES, IRType.STRING)),
-        }
-        return signatures.get(method)
-    if isinstance(receiver, IRType) and receiver == IRType.SOCKET_ADDRESS:
-        signatures = {
-            "host": ((), IRType.STRING),
-            "port": ((), IRType.INT),
-            "family": ((), IRType.STRING),
-            "toString": ((), IRType.STRING),
-        }
-        return signatures.get(method)
-    if isinstance(receiver, IRType) and receiver == IRType.TCP_CONNECTION:
-        signatures = {
-            "read": ((IRType.INT,), _applied("Task", _applied("Result", _applied("Option", IRType.BYTES), IRType.STRING))),
-            "write": ((IRType.BYTES,), _applied("Task", _applied("Result", IRType.INT, IRType.STRING))),
-            "writeAll": ((IRType.BYTES,), _applied("Task", _applied("Result", IRType.INT, IRType.STRING))),
-            "localAddress": ((), _applied("Result", IRType.SOCKET_ADDRESS, IRType.STRING)),
-            "remoteAddress": ((), _applied("Result", IRType.SOCKET_ADDRESS, IRType.STRING)),
-            "close": ((), IRType.BOOL),
-            "isOpen": ((), IRType.BOOL),
-        }
-        return signatures.get(method)
-    if isinstance(receiver, IRType) and receiver == IRType.TCP_LISTENER:
-        signatures = {
-            "accept": ((), _applied("Task", _applied("Result", IRType.TCP_CONNECTION, IRType.STRING))),
-            "localAddress": ((), _applied("Result", IRType.SOCKET_ADDRESS, IRType.STRING)),
-            "close": ((), IRType.BOOL),
-            "isOpen": ((), IRType.BOOL),
-        }
-        return signatures.get(method)
-    if isinstance(receiver, IRType) and receiver in {IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER}:
         read_all = _applied("Result", IRType.STRING, IRType.STRING)
         write = _applied("Result", IRType.BOOL, IRType.STRING)
         signatures: dict[str, tuple[tuple[IRTypeRef, ...], IRTypeRef]] = {
@@ -589,62 +535,6 @@ def _statement_outcomes(statement: IRStatement) -> set[str]:
         outcomes: set[str] = set()
         for arm in statement.arms:
             outcomes.update(_flow_outcomes(arm.body))
-        if not statement.exhaustive:
-            outcomes.add("next")
-        return outcomes
-    return {"next"}
-
-
-def _find_variable(scopes: list[dict[int, IRVariable]], identifier: int) -> IRVariable | None:
-    for scope in reversed(scopes):
-        if identifier in scope:
-            return scope[identifier]
-    return None
-
-
-def _validate_expression(
-    expression: IRExpression,
-    functions: dict[str, IRFunction],
-    scopes: list[dict[int, IRVariable]],
-) -> IRTypeRef:
-    _validate_type(expression.type, expression.location)
-    if isinstance(expression, IRLiteral):
-        valid = (
-            expression.type == IRType.INT and type(expression.value) is int
-            and INT_MIN <= expression.value <= INT_MAX
-            or expression.type == IRType.FLOAT and type(expression.value) is float
-            and math.isfinite(expression.value)
-            or expression.type == IRType.BOOL and type(expression.value) is bool
-            or expression.type == IRType.STRING and isinstance(expression.value, str)
-            or expression.type == IRType.BYTE and type(expression.value) is int and 0 <= expression.value <= 255
-        )
-        if not valid:
-            raise _invalid(expression.location, f"invalid {ir_type_name(expression.type)} literal in IR")
-        return expression.type
-    if isinstance(expression, IRLocalRef):
-        variable = _find_variable(scopes, expression.variable_id)
-        if variable is None:
-            raise _invalid(expression.location, "IR references a local outside its scope")
-        if variable.type != expression.type:
-            raise _invalid(expression.location, "IR local reference type does not match its binding")
-        return expression.type
-    if isinstance(expression, IRMove):
-        operand_type = _validate_expression(expression.operand, functions, scopes)
-        if expression.type != operand_type or not _contains_resource(operand_type):
-            raise _invalid(expression.location, "IR move must transfer a Resource-containing local value")
-        return expression.type
-    if isinstance(expression, IRCall):
-        function = functions.get(expression.function)
-        if function is None:
-            raise _invalid(expression.location, f"IR calls unknown function '{expression.function}'")
-        if len(expression.arguments) != len(function.parameters):
-            raise _invalid(expression.location, f"IR call to '{function.name}' has the wrong number of arguments")
-        for argument, parameter in zip(expression.arguments, function.parameters):
-            if _validate_expression(argument, functions, scopes) != parameter.type:
-                raise _invalid(argument.location, f"IR argument to '{function.name}' has the wrong type")
-        expected_result = _applied("Task", function.return_type) if function.is_async else function.return_type
-        if expression.type != expected_result:
-            raise _invalid(expression.location, f"I       outcomes.update(_flow_outcomes(arm.body))
         if not statement.exhaustive:
             outcomes.add("next")
         return outcomes
@@ -835,53 +725,6 @@ def _validate_statements(
             _validate_type(statement.variable.type, statement.variable.location)
             if statement.variable.type != value_type or statement.variable.type == IRType.VOID:
                 raise _invalid(statement.location, "IR local initializer type does not match its binding")
-            if statement.vanstance(expression, IRCollectionCreate):
-        _validate_type(expression.type, expression.location)
-        if not isinstance(expression.type, IRAppliedType) or expression.type.name not in {"List", "Map"}:
-            raise _invalid(expression.location, "IR collection constructor must produce List or Map")
-        if expression.type.name == "Map" and not _hashable_key_type(expression.type.arguments[0]):
-            raise _invalid(expression.location, f"IR Map key type '{ir_type_name(expression.type.arguments[0])}' is not hashable")
-        return expression.type
-    if isinstance(expression, IRCollectionLength):
-        receiver = _validate_expression(expression.receiver, functions, scopes)
-        if (not isinstance(receiver, IRAppliedType) or receiver.name not in {"List", "Map"}
-                or expression.type != IRType.INT):
-            raise _invalid(expression.location, "IR collection length requires List or Map and returns Int")
-        return expression.type
-    if isinstance(expression, IRMethodCall):
-        receiver_type = _validate_expression(expression.receiver, functions, scopes)
-        expected = _method_signature(receiver_type, expression.method)
-        if expected is None:
-            raise _invalid(expression.location, f"unsupported IR method '{expression.method}' on {ir_type_name(receiver_type)}")
-        parameter_types, result_type = expected
-        if len(expression.arguments) != len(parameter_types):
-            raise _invalid(expression.location, f"IR method '{expression.method}' has the wrong number of arguments")
-        for argument, parameter_type in zip(expression.arguments, parameter_types):
-            if _validate_expression(argument, functions, scopes) != parameter_type:
-                raise _invalid(argument.location, f"IR method '{expression.method}' argument has the wrong type")
-        if expression.type != result_type:
-            raise _invalid(expression.location, f"IR method '{expression.method}' result has the wrong type")
-        return expression.type
-    raise _invalid(expression.location, f"unknown IR expression {type(expression).__name__}")
-
-
-def _validate_statements(
-    statements: tuple[IRStatement, ...],
-    return_type: IRTypeRef,
-    functions: dict[str, IRFunction],
-    scopes: list[dict[int, IRVariable]],
-    seen_ids: set[int],
-    loop_depth: int,
-    is_async: bool = False,
-) -> None:
-    for statement in statements:
-        if isinstance(statement, IRLet):
-            if statement.variable.identifier in seen_ids:
-                raise _invalid(statement.location, "IR reuses a local identifier")
-            value_type = _validate_expression(statement.value, functions, scopes)
-            _validate_type(statement.variable.type, statement.variable.location)
-            if statement.variable.type != value_type or statement.variable.type == IRType.VOID:
-                raise _invalid(statement.location, "IR local initializer type does not match its binding")
             if statement.variable.identifier in scopes[-1]:
                 raise _invalid(statement.location, "IR local is declared twice in one scope")
             scopes[-1][statement.variable.identifier] = statement.variable
@@ -1014,51 +857,6 @@ def _validate_pattern(
     pattern: IRPattern,
     expected_type: IRTypeRef,
     scopes: list[dict[int, IRVariable]],
-    seen_ids: set[int]         if not isinstance(task_type, IRAppliedType) or task_type.name != "Task":
-                raise _invalid(statement.location, "IR await operand must be Task<T>")
-            if statement.result is None and _contains_resource(task_type.arguments[0]):
-                raise _invalid(statement.location, "IR await of a Resource-returning Task requires a result binding")
-            if statement.result is not None:
-                result = statement.result
-                _validate_type(result.type, result.location)
-                if result.type != task_type.arguments[0] or result.type == IRType.VOID:
-                    raise _invalid(statement.location, "IR await binding type does not match Task result")
-                if result.identifier in seen_ids:
-                    raise _invalid(statement.location, "IR await reuses a local identifier")
-                scopes[-1][result.identifier] = result
-                seen_ids.add(result.identifier)
-        elif isinstance(statement, IRMatch):
-            subject_type = _validate_expression(statement.value, functions, scopes)
-            if not statement.arms:
-                raise _invalid(statement.location, "IR match has no arms")
-            if isinstance(subject_type, IRAppliedType) and subject_type.name == "Option":
-                valid_cases = {"Some", "None"}
-                if not statement.covered_cases <= valid_cases:
-                    raise _invalid(statement.location, "IR Option match contains an invalid coverage case")
-                if statement.exhaustive and statement.covered_cases != valid_cases:
-                    raise _invalid(statement.location, "IR Option match is marked exhaustive without covering Some and None")
-            elif isinstance(subject_type, IRAppliedType) and subject_type.name == "Result":
-                valid_cases = {"Ok", "Err"}
-                if not statement.covered_cases <= valid_cases:
-                    raise _invalid(statement.location, "IR Result match contains an invalid coverage case")
-                if statement.exhaustive and statement.covered_cases != valid_cases:
-                    raise _invalid(statement.location, "IR Result match is marked exhaustive without covering Ok and Err")
-            for arm in statement.arms:
-                scopes.append({})
-                _validate_pattern(arm.pattern, subject_type, scopes, seen_ids)
-                _validate_statements(arm.body, return_type, functions, scopes, seen_ids, loop_depth, is_async)
-                scopes.pop()
-        elif isinstance(statement, IRLoopControl):
-            if statement.kind not in {"break", "continue"} or loop_depth == 0:
-                raise _invalid(statement.location, "IR loop control is outside a loop")
-        else:
-            raise _invalid(statement.location, f"unknown IR statement {type(statement).__name__}")
-
-
-def _validate_pattern(
-    pattern: IRPattern,
-    expected_type: IRTypeRef,
-    scopes: list[dict[int, IRVariable]],
     seen_ids: set[int],
 ) -> None:
     if isinstance(pattern, IRWildcardPattern):
@@ -1105,3 +903,4 @@ def _validate_pattern(
             return
         raise _invalid(pattern.location, "IR variant pattern requires Option or Result")
     raise _invalid(pattern.location, f"unknown IR pattern {type(pattern).__name__}")
+

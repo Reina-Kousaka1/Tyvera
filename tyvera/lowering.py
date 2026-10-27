@@ -293,58 +293,6 @@ class _FunctionLowerer:
                 try:
                     error_variable = self._new_variable(
                         statement.error_name, "String", mutable=False, location=statement.location,
- ocation)
-        if isinstance(statement, ReturnStatement):
-            return IRReturn(
-                None if statement.value is None else self._expression(statement.value),
-                statement.location,
-            )
-        if isinstance(statement, AwaitStatement):
-            task = self._expression(statement.value)
-            if not isinstance(task.type, IRAppliedType) or task.type.name != "Task":
-                raise Diagnostic(statement.location, "backend", "native backend currently supports await only for Task<T>")
-            result = None
-            if statement.binding_name is not None:
-                result = self._new_variable(
-                    statement.binding_name,
-                    ir_type_name(task.type.arguments[0]),
-                    mutable=statement.mutable,
-                    location=statement.location,
-                )
-                if statement.annotation is not None and result.type != self._type(statement.annotation, statement.location):
-                    raise Diagnostic(statement.location, "backend", "native await annotation does not match its checked result")
-            return IRAwait(task, result, statement.location)
-        if isinstance(statement, Block):
-            return IRBlock(self._statements(statement.body, nested_scope=True), statement.location)
-        if isinstance(statement, UsingStatement):
-            acquisition = self._expression(statement.resource)
-            if not isinstance(acquisition.type, IRAppliedType) or acquisition.type.name != "Result":
-                raise Diagnostic(statement.location, "backend", "native using requires a checked Result acquisition")
-            resource_type = acquisition.type.arguments[0]
-            if resource_type not in {
-                IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
-                IRType.TCP_CONNECTION, IRType.TCP_LISTENER,
-            }:
-                raise Diagnostic(statement.location, "backend", "native using supports synchronous file and TCP resources")
-            if self.checked.ownership_transfers.get(statement.location) != (
-                f"{ir_type_name(resource_type)} to scoped owner {statement.name}"
-            ):
-                raise Diagnostic(statement.location, "backend", "native using is missing checked ownership-transfer metadata")
-            self.scopes.append({})
-            try:
-                resource = self._new_variable(
-                    statement.name, ir_type_name(resource_type), mutable=False, location=statement.location,
-                )
-                body = self._statements(statement.body)
-            finally:
-                self.scopes.pop()
-            error_variable = None
-            else_body = ()
-            if statement.error_name is not None:
-                self.scopes.append({})
-                try:
-                    error_variable = self._new_variable(
-                        statement.error_name, "String", mutable=False, location=statement.location,
                     )
                     else_body = self._statements(statement.else_body)
                 finally:
@@ -492,52 +440,6 @@ class _FunctionLowerer:
                 return IRLiteral(-(1 << 63), expression_type, expression.location)
             return IRUnary(
                 expression.operator,
-                self._expr        elif pattern.variant == "Err":
-                    payload_type = expected_type.arguments[1]
-                else:
-                    raise Diagnostic(pattern.location, "backend", f"Result has no native pattern '{pattern.variant}'")
-            else:
-                raise Diagnostic(pattern.location, "backend", "native variant matching requires Option or Result")
-            payload = pattern.payload_pattern
-            if payload is None:
-                if pattern.binding is None:
-                    raise Diagnostic(pattern.location, "backend", f"native {pattern.variant} pattern requires a payload pattern")
-                lowered_payload = IRBindingPattern(
-                    self._new_variable(pattern.binding, ir_type_name(payload_type), mutable=False,
-                                       location=pattern.location),
-                    pattern.location,
-                )
-            else:
-                lowered_payload = self._pattern(payload, payload_type)
-            return IRVariantPattern(pattern.variant, lowered_payload, pattern.location)
-        if isinstance(pattern, EnumPattern):
-            raise Diagnostic(pattern.location, "backend", "native backend does not yet support user-defined enum patterns")
-        raise Diagnostic(pattern.location, "backend", f"native backend does not yet support {type(pattern).__name__} patterns")
-
-    def _expression(self, expression: Expression) -> IRExpression:
-        if isinstance(expression, Unary) and expression.operator == "move":
-            if not isinstance(expression.operand, Name):
-                raise Diagnostic(expression.location, "backend", "native move requires a local resource binding")
-            source = self._lookup(expression.operand.identifier, expression.operand.location)
-            if self.checked.move_sites.get(expression.location) != expression.operand.identifier:
-                raise Diagnostic(expression.location, "backend", "native move is missing checked ownership metadata")
-            return IRMove(
-                IRLocalRef(source.identifier, source.type, expression.operand.location),
-                source.type,
-                expression.location,
-            )
-        if isinstance(expression, Name):
-            variable = self._lookup(expression.identifier, expression.location)
-            return IRLocalRef(variable.identifier, variable.type, expression.location)
-        expression_type = self._expression_type(expression)
-        if isinstance(expression, Literal):
-            return IRLiteral(expression.value, expression_type, expression.location)
-        if isinstance(expression, Unary):
-            if (expression.operator == "-" and isinstance(expression.operand, Literal)
-                    and expression.operand.type_name == "Int" and expression.operand.value == 1 << 63):
-                return IRLiteral(-(1 << 63), expression_type, expression.location)
-            return IRUnary(
-                expression.operator,
                 self._expression(expression.operand),
                 expression_type,
                 expression.location,
@@ -617,3 +519,4 @@ class _FunctionLowerer:
         if type(expression).__name__ == "TupleExpression":
             raise Diagnostic(expression.location, "backend", "native backend does not yet support tuples")
         raise Diagnostic(expression.location, "backend", f"native backend does not yet support {type(expression).__name__}")
+

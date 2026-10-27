@@ -81,3 +81,4 @@ request header or Identify payload is formed. The library itself never logs it;
 HTTP header and request representations are redacted. Callers remain
 responsible for not printing remote response bodies or explicitly revealed
 secrets.
+

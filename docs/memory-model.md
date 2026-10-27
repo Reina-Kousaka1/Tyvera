@@ -170,54 +170,6 @@ observable Tyvera behavior with the platform's readiness facilities.
 ### Native executable subset
 
 Native V1 compiles the synchronous scalar/control-flow subset described in
-[Backend Architecture](; it returns `false` on a second
-   close, and scope cleanup observes that it is already closed.
-5. Cleanup does not suspend. If cleanup fails during an existing failure, the
-   original failure remains primary and cleanup failures are retained as
-   secondary diagnostics.
-6. Resources cannot cross actor-message boundaries or be stored in actor
-   state. Actor handlers may acquire local resources; the handler scope closes
-   them before a supervisor restarts a failed actor.
-
-`using name = openText(path, mode) { ... }` preserves the original scoped
-`TextFile` API. `openTextReader(path)` creates a read-only `TextReader`, while
-`openTextWriter(path, mode)` creates a `TextWriter` in write or append mode.
-Their original operations remain synchronous. The async file operations use
-the same owned handles and defer close until in-flight worker operations
-finish. `tcpConnect` and `tcpListen` return task results that own a connection
-or listener; `accept` transfers a newly accepted connection through the same
-`Result` carrier. A task result holding a resource must be bound and consumed
-once by `await` or `tryResult()`; unclaimed results are closed during task,
-scope, or runtime cleanup. A pending resource-returning task is move-only and
-is cancelled when its scope ends; consuming `tryResult()` on a pending task
-also cancels it and returns `Ok(None)`. Owned resources can move through function
-parameters and into task parameters. A task owns its moved resources until
-completion, failure, cancellation, actor stop/restart, or runtime shutdown;
-detaching the task leaves ownership with that task. Resources cannot be stored
-in collections, tuples, records, classes, newtypes, enums, actor state, or user
-generic instantiations. `Option` and `Result` can carry resources and
-participate in exhaustive ownership-preserving matches. No explicit borrowing
-syntax is needed for receiver method calls; a Rust-style lifetime system is
-not part of V1.
-
-### Async I/O and platform boundary
-
-The Tyvera contract describes task suspension, readiness wakeup, cancellation,
-deadline behavior, partial byte reads/writes, EOF, backpressure, ownership, and
-controlled `Result` errors. It does not expose Python sockets, asyncio,
-exceptions, file objects, or OS address structs. The current reference
-adapter uses a selector for TCP readiness and a bounded worker pool for DNS
-and file operations. Native Backend V1 implements synchronous text and binary
-file/path operations, plus an experimental Linux async-task/DNS/TCP subset.
-Native socket readiness uses non-blocking descriptors and worker operations;
-native cooperative cancellation follows owned-task trees and socket waits.
-Deadlines, task groups, and async file operations remain interpreter-only.
-Native operations must continue to match the same
-observable Tyvera behavior with the platform's readiness facilities.
-
-### Native executable subset
-
-Native V1 compiles the synchronous scalar/control-flow subset described in
 [Backend Architecture](backend-architecture.md), plus native `Option` and
 `Result` values and nested constructor/literal/binding patterns. `List` and
 `Map` support their typed core methods and snapshot iteration. Native `Byte`
@@ -300,3 +252,4 @@ implemented task and actor ownership rules are in the
 [runtime document](runtime.md). File and stream resources follow the scope
 rules above. HTTP server ownership reuses the same move-only handles and
 structured task cleanup; it does not add a separate lifetime system.
+

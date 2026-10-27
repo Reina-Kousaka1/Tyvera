@@ -70,46 +70,6 @@ The module paths below are design targets, not current imports:
 
 | Namespace | Planned APIs |
 | --- | --- |
-| `tyvera.time` | Importable wrm | `hostOS() -> String`, `hostArchitecture() -> String`, and `environment(String) -> Option<Secret<String>>`; values are normalized and environment values remain secret-wrapped. See [platform support](platform.md). |
-| Actor runtime | `spawn(Actor(...)) -> ActorRef<Actor>`, `oneForOne`/`oneForAll`/`restForOne(maxRestarts, windowMilliseconds[, SupervisorBackoff]) -> Supervisor`, typed `RestartPolicy` values from `permanentChildPolicy()`/`transientChildPolicy()`/`temporaryChildPolicy()`, `exponentialBackoff(baseMilliseconds, maximumMilliseconds)`, nested `Supervisor.start`, and existing actor lifecycle APIs. Stop order is reverse child start order; restart order is start order. Restarts use monotonic intensity windows and bounded exponential backoff. Runtime lifecycle diagnostics are exposed to Python embedders; Tyvera-level monitor/link APIs are not implemented. |
-
-See [the language reference](language.md#core-collections-and-iteration) for
-collection signatures, key restrictions, ordering, mutation and runtime error
-behavior, and [JSON values](language.md#json-values) for JSON signatures and
-number handling.
-Collections are mutable references even when held by a `let` binding. `Option`
-and `Result` are implemented core sum types. `readText`/`writeText` resolve
-relative paths from the project root and refuse direct access to
-`.tyvera.secrets`. Secret values are redacted in diagnostics, and
-`println`/`eprintln` reject `Secret<T>`.
-
-## Native compiler support
-
-The experimental native path supports the synchronous core and selected
-standard-library values: `Option<T>`, `Result<T,E>`, typed matching for their
-variants, `List<T>`, `Map<K,V>`, `Byte`, immutable `Bytes`, `ByteBuffer`,
-synchronous file/path operations, and synchronous `TextFile`, `TextReader`,
-and `TextWriter` resources. These work only when nested types are part of the
-native backend matrix in [Backend Architecture](backend-architecture.md).
-List/Map and `ByteBuffer` preserve shared mutation; `Bytes` preserves immutable
-value semantics. Native `ByteBuffer` supports checked allocation, length,
-`get`, `set`, and immutable `toBytes` snapshots, capped at 67,108,864 bytes.
-Native file operations include UTF-8 text, exact binary data, project-root
-relative paths, and protection for `.tyvera.secrets`. Synchronous text handles
-use the existing move-only ownership rules and deterministic LIFO cleanup.
-Async file operations, TLS, WebSockets, HTTP, Actors, generic user-defined
-functions, and other unsupported types remain interpreter-only. Native Linux
-also has the experimental Task/DNS/TCP subset described above. `tyvera
-build` reports unsupported calls or types; it never routes a native program
-through Python. The private C++ representation is not a public ABI. This
-native I/O subset is experimental and CI-tested on Linux x86-64 only.
-
-## Planned namespaces
-
-The module paths below are design targets, not current imports:
-
-| Namespace | Planned APIs |
-| --- | --- |
 | `tyvera.time` | Importable wrappers around the implemented bootstrap `Duration` and `Timer` primitives. |
 | `tyvera.concurrent` | Importable wrappers around implemented task ownership, groups, timeout, and cancellation APIs. |
 | `tyvera.net` | Importable wrappers around the implemented TCP primitives. |
@@ -167,4 +127,5 @@ cancels every unfinished task (including detached roots), stops actors and
 supervisors, clears queued messages and timers, and fails pending replies.
 Detached task failures stay visible through `runTasks()` before shutdown. See
 [Runtime semantics](runtime.md) for ownership and scheduling details.
+
 
