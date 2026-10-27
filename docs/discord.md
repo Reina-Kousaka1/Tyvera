@@ -78,7 +78,7 @@ tree, cache, or shard coordinator. The bot example is a composition example,
 not a reusable Gateway service API; REST remains a direct async client. Gateway
 compression is not negotiated.
 
-The coordinator caps retained route mappings and major-scope states at 512 each and expires idle entries after ten minutes. It allows at most 512 active major scopes, serializes requests within one major scope, and conservatively applies the latest remaining/reset state to that whole scope; independent Discord buckets under one major scope can therefore be over-throttled. The queue is capped at 512 outstanding tickets. Waiting tasks recheck at most every 50 ms; reservation order is retained per major scope, while unrelated scopes remain independent. A request timeout removes its ticket. If a task is externally cancelled before that path runs, its ticket remains inert only until its bounded deadline and is pruned lazily on the next reservation or acquisition. Cancellation during transport leaves a bounded lease until its request timeout plus five seconds. Coordinated requests accept timeouts from 1 ms through 10 minutes. Malformed 429 delays use a one-second local block; no request is automatically replayed except by the explicit retry API, and transport failures are never retried. Legacy `requestBot` and `requestBotWithRetries` calls do not participate in coordinator state.
+The coordinator caps retained route mappings and major-scope states at 512 each and expires idle entries after ten minutes. It allows at most 512 active major scopes, serializes requests within one major scope, and conservatively applies the latest remaining/reset state to that whole scope; independent Discord buckets under one major scope can therefore be over-throttled. The queue is capped at 512 outstanding tickets. Waiting tasks recheck at most every 50 ms; reservation order is the order in which the coordinator accepts reservation messages, and it is retained per major scope while unrelated scopes remain independent. A request timeout removes its ticket. If a task is externally cancelled before that path runs, its ticket remains inert only until its bounded deadline and is pruned lazily on the next reservation or acquisition. Cancellation during transport leaves a bounded lease until its request timeout plus five seconds. Coordinated requests accept timeouts from 1 ms through 10 minutes. Malformed 429 delays use a one-second local block; no request is automatically replayed except by the explicit retry API, and transport failures are never retried. Legacy `requestBot` and `requestBotWithRetries` calls do not participate in coordinator state.
 The package now has an experimental native lowering path for linked source
 modules: non-generic records/enums, typed JSON use, `Secret<String>`, native
 environment lookup, async REST helpers, and the Gateway client can be
@@ -90,9 +90,7 @@ fake TLS services. Coverage includes Identify, heartbeat ACK, READY, reconnect,
 resume, invalid-session re-identification, REST response metadata, bounded
 429 retries, and token-redaction checks. A test-only resolver shim routes only
 the native test process to loopback; the Tyvera package keeps its fixed,
-verified Discord origins. This package does not yet provide a reusable
-Actor/Supervisor client API, automatic route-bucket alias merging, a general
-REST client Actor, or a general REST client Actor, and it is not production-ready.
+verified Discord origins. This package does not yet provide automatic route-bucket alias merging or a reusable REST Actor API, and it is not production-ready.
 There is no interpreter fallback.
 
 When authentication is used, the token remains `Secret<String>` until the
