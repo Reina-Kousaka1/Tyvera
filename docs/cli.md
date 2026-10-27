@@ -38,9 +38,11 @@ The native subset currently includes synchronous functions over `Int`,
 `Map`, with typed matching for `Option`/`Result`; local `let`/`var`,
 assignments, calls, returns, arithmetic, comparisons, boolean short-circuiting,
 `if`/`else`, `while`, `for` over collection snapshots, `break`/`continue`,
-`println`, and `eprintln`. Binary file I/O, `ByteBuffer`, resources, generic
-functions, Tasks, Actors, networking, HTTP, and user-defined object/value types
-remain unsupported by native builds. A source program that type-checks but
+`println`, and `eprintln`. Native programs also expose normalized host facts,
+monotonic milliseconds, and cooperative SIGINT/SIGTERM shutdown. Binary file
+I/O, `ByteBuffer`, resources, generic functions, Tasks, Actors, TCP, DNS, TLS,
+WebSockets, HTTP, and user-defined object/value types remain unsupported by
+native builds. A source program that type-checks but
 uses a feature outside the subset fails with a source-located backend
 diagnostic and produces no executable. The full support table and runtime
 boundary are in [Backend Architecture](backend-architecture.md).

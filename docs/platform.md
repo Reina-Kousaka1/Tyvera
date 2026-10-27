@@ -9,18 +9,20 @@ exposing Python platform objects to Tyvera programs.
 
 | Area | Implemented | Boundary / not yet implemented |
 | --- | --- | --- |
-| Host detection | `hostOS()` and `hostArchitecture()` report normalized strings. The Python adapter recognizes Linux, Windows, macOS, x86-64, AArch64, x86, and unknown values. | Ubuntu is the Linux CI reference; the language does not depend on a distribution name. Linux x86-64 is the required CI host. AArch64 is normalized, but this branch does not add an ARM64 runner or native-backend conformance run. |
+| Host detection | `hostOS()` and `hostArchitecture()` report normalized strings in the reference runtime and native C++17 subset. Both recognize Linux, Windows, macOS, x86-64, AArch64, x86, and unknown values. | Ubuntu x86-64 is the CI reference; the language does not depend on a distribution name. AArch64 is recognized, but this branch does not add an ARM64 runner or native-backend conformance run. |
 | Environment | `environment(name) -> Option<Secret<String>>` reads a syntactically valid process environment name. Missing and invalid names produce `None`. | Values remain secret-wrapped and cannot be printed or concatenated. Reading a value does not reveal it; `Secret.reveal()` is explicit. The environment intrinsic does not inherit project-local `.tyvera.secrets`; `secrets.NAME` keeps its existing provider precedence. |
-| Time | Runtime deadlines and restart windows use an injected monotonic clock; production bootstrap uses a monotonic host clock. | Wall-clock timestamps and a public wall-clock API are not added. |
-| Signals and exit | `tyvera run` translates SIGINT/SIGTERM into cooperative shutdown at interpreter safe points. Exit status is 0 for success, 1 for ordinary Tyvera diagnostics, 130 for SIGINT, and 143 for SIGTERM. | `check`, `build`, and `new` do not install runtime signal handlers. Synchronous Tyvera statements are not preempted; shutdown is observed at statement, loop, task, actor, and I/O wakeup boundaries. A second signal does not bypass cleanup. |
+| Time | Runtime deadlines and restart windows use an injected monotonic clock; the reference and native runtime expose monotonic milliseconds. | Wall-clock timestamps and a public wall-clock API are not added. |
+| Signals and exit | `tyvera run` and generated native C++17 executables translate SIGINT/SIGTERM into cooperative shutdown at safe points. Runtime success is 0, ordinary failure is 1, SIGINT is 130, and SIGTERM is 143. | `check`, `build`, and `new` do not install runtime signal handlers. Synchronous Tyvera statements are not preempted. A repeated signal does not bypass cleanup. Native signal integration is only exercised by Linux C++ CI. |
 | Child processes | The Python runtime adapter has an owned `ChildProcess` service with argv-separated launch, `shell=False`, explicit child environment, bounded stdout/stderr capture, wait, timeout, terminate, and kill. It does not log argv or environment values in normalized errors. | This adapter is not a Tyvera language API and is not available to native programs. No shell-command string API is exposed. Process-tree termination and platform job objects are not implemented. |
-| Packaging | The existing `pyproject.toml`, version source, and CI install path remain the bootstrap distribution foundation. Ubuntu CI builds/tests the Python package and compiles native examples with the system C++17 compiler. | There is no `.deb`, standalone Tyvera runtime bundle, package manager, or release pipeline yet. Generated native executables still link the host C++ runtime. |
+| Packaging | Experimental Debian metadata builds an architecture-independent Python bootstrap package; an Ubuntu 24.04 CI job is configured to build two revisions and test install, upgrade, reinstall, remove, and purge while retaining a user project and local secret file. | This is packaging validation, not a locally or remotely confirmed release build yet. No PPA, signed source upload, package repository, or standalone runtime bundle exists. Generated native executables still link the host C++ runtime. |
 
 The checked-in [platform example](../examples/platform_runtime.tyv) exercises
 host detection and secret-wrapped environment lookup. Ubuntu CI asserts the
-Linux x86-64 host and runs the complete test suite on Python 3.10 and 3.13.
+Linux x86-64 host and runs the complete test suite on Python 3.10 and 3.13;
+the separate package job targets Ubuntu 24.04 x86-64.
 Windows and macOS remain host-compatible bootstrap targets where the current
-Python runtime and tests work; this is not a native-backend support claim.
+Python runtime and tests work. Native platform intrinsics are part of the
+experimental C++17 subset; generated native networking/process APIs are not.
 
 ## Cooperative shutdown
 
@@ -47,5 +49,6 @@ argument and environment contents. The environment intrinsic returns only
 protections remain in force.
 
 No raw signal handler, process handle, Python exception, OS socket structure,
-or native pointer is a Tyvera value. Native platform support for these runtime
-services remains future work.
+or native pointer is a Tyvera value. The native C++17 executable implements
+host facts, monotonic time, and cooperative signals only; environment and child
+process services remain available through the reference runtime adapter.

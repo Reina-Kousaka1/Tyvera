@@ -94,13 +94,13 @@ is recognized by the bootstrap but is not independently CI-tested. See
 
 The networking layer has no user-defined general Stream interface. TCP
 establishes a byte-stream contract; text files retain their UTF-8 resource
-API. Experimental HTTP/1.1 codecs, a typed client, and a bounded concurrent
-server use that same owned byte-stream path. The HTTP parser/encoder is
-backend-independent; the reference interpreter adapts it to existing TCP
-tasks. A TLS adapter can later wrap the owned byte-stream boundary using a
-vetted platform cryptography library. Tyvera does not implement TLS or
-cryptography here. HTTP/2, HTTP/3, WebSockets, database protocols, and other
-application protocols beyond this foundation remain separate work.
+API. Experimental HTTP/1.1 codecs, a typed client, a bounded concurrent
+server, verified TLS client connections, and a bounded WebSocket client use
+that owned byte-stream path in the reference interpreter. TLS uses the host
+trust store, SNI, and hostname verification; Tyvera does not implement
+cryptography. The native C++ backend still has no TLS or networking runtime.
+HTTP/2, HTTP/3, TLS server mode, database protocols, and other application
+protocols remain separate work.
 
 ### Backend implementation
 
@@ -214,7 +214,9 @@ does not make C++ part of Tyvera's language.
 | Synchronous file/path I/O | `readText`, `writeText`, `readBytes`, `writeBytes`, `pathJoin`, and `pathExists`; relative paths use the project root and `.tyvera.secrets` is protected. |
 | Text resources | `TextFile`, `TextReader`, `TextWriter`, `using`, move transfer, `Result`/function transfer, synchronous methods, modes, close/isOpen, and deterministic LIFO cleanup are implemented. |
 | Records, tuples, user-defined enums, classes, interfaces, generic functions | Interpreter-only. |
-| Actors, Supervisors, Tasks, async I/O, TCP, DNS, HTTP | Interpreter-only. |
+| Actors, Supervisors, Tasks, async I/O, TCP, DNS, HTTP, TLS, WebSocket | Interpreter-only; the native backend rejects these calls. |
+| `hostOS()`, `hostArchitecture()`, `monotonicMilliseconds()` | Native C++17 runtime and reference implementations; OS/architecture names are normalized and elapsed time is monotonic. |
+| Native SIGINT/SIGTERM shutdown | Generated C++17 records the first signal and unwinds at statement/loop safe points; scope resources use RAII cleanup. |
 | Native FFI, stable public ABI, cross-compilation | Planned; no syntax or runtime contract is exposed. |
 
 Unsupported features never fall back to the interpreter. The full source is

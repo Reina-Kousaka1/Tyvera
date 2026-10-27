@@ -173,21 +173,33 @@ class _CppGenerator:
         self._line("")
         self._line("int main() {")
         self.indent += 1
+        self._line("if (!tyvera_runtime::install_shutdown_handlers()) {")
+        self.indent += 1
+        self._line('std::cerr << "<native>:1:1: runtime initialization failed: could not install shutdown handlers\\n";')
+        self._line("return static_cast<int>(tyvera_runtime::ExitCode::initialization_failure);")
+        self.indent -= 1
+        self._line("}")
         self._line("try {")
         self.indent += 1
         self._line(f"tyvera_generated::{self.module.entry_symbol}();")
+        self._line('tyvera_runtime::check_shutdown("<native>", 1, 1);')
         self._line("if (tyvera_runtime::report_cleanup_failures()) return 1;")
-        self._line("return 0;")
+        self._line("return static_cast<int>(tyvera_runtime::ExitCode::success);")
+        self.indent -= 1
+        self._line("} catch (const tyvera_runtime::SignalShutdown& signal) {")
+        self.indent += 1
+        self._line("""std::cerr << signal.file << ':' << signal.line << ':' << signal.column << ": runtime shutdown: " << signal.what() << tyvera_runtime::cleanup_failure_suffix() << '\\n';""")
+        self._line("return signal.exit_code;")
         self.indent -= 1
         self._line("} catch (const tyvera_runtime::Failure& error) {")
         self.indent += 1
         self._line("""std::cerr << error.file << ':' << error.line << ':' << error.column << ": runtime error: " << error.message << tyvera_runtime::cleanup_failure_suffix() << '\\n';""")
-        self._line("return 1;")
+        self._line("return static_cast<int>(tyvera_runtime::ExitCode::runtime_failure);")
         self.indent -= 1
         self._line("} catch (const std::exception&) {")
         self.indent += 1
         self._line("""std::cerr << "<native>:1:1: runtime error: native runtime failure" << tyvera_runtime::cleanup_failure_suffix() << '\\n';""")
-        self._line("return 1;")
+        self._line("return static_cast<int>(tyvera_runtime::ExitCode::runtime_failure);")
         self.indent -= 1
         self._line("}")
         self.indent -= 1
@@ -248,6 +260,7 @@ class _CppGenerator:
         self._line("}")
 
     def _statement(self, statement) -> None:
+        self._line(f"tyvera_runtime::check_shutdown({_location_args(statement.location)});")
         if isinstance(statement, IRLet):
             self._line(
                 f"{self._cpp_type(statement.variable.type)} tyv_local_{statement.variable.identifier} = "
@@ -290,6 +303,7 @@ class _CppGenerator:
         elif isinstance(statement, IRWhile):
             self._line(f"while ({self._expression(statement.condition)}) {{")
             self.indent += 1
+            self._line(f"tyvera_runtime::check_shutdown({_location_args(statement.location)});")
             self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(statement.location)});")
             for nested in statement.body:
                 self._statement(nested)
@@ -478,6 +492,9 @@ class _CppGenerator:
             raise ValueError(f"unsupported variant constructor for {ir_type_name(expression.type)}")
         if isinstance(expression, IRBuiltinCall):
             runtime_functions = {
+                "hostOS": "host_os",
+                "hostArchitecture": "host_architecture",
+                "monotonicMilliseconds": "monotonic_milliseconds",
                 "byteFromInt": "byte_from_int",
                 "bytesFromString": "bytes_from_string",
                 "byteBuffer": "byte_buffer",
@@ -698,6 +715,8 @@ def _ir_contains_resource(type_ref: IRTypeRef) -> bool:
 _RUNTIME = r'''#include <charconv>
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <csignal>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -721,6 +740,77 @@ namespace tyvera_runtime {
 /*TYVERA_PROJECT_ROOT*/
 inline std::filesystem::path project_root() {
     return std::filesystem::u8path(project_root_text);
+}
+
+enum class ExitCode : int {
+    success = 0,
+    controlled_stop = 0,
+    runtime_failure = 1,
+    supervisor_escalation = 70,
+    initialization_failure = 71,
+    platform_failure = 72,
+};
+
+inline volatile std::sig_atomic_t requested_shutdown_signal = 0;
+inline void shutdown_signal_handler(int number) noexcept {
+    // Signal context may only record a small scalar. The first signal owns the
+    // shutdown request; repeats do not bypass deterministic RAII cleanup.
+    if (requested_shutdown_signal == 0) requested_shutdown_signal = number;
+}
+inline bool install_shutdown_handlers() noexcept {
+    if (std::signal(SIGINT, shutdown_signal_handler) == SIG_ERR) return false;
+#ifdef SIGTERM
+    if (std::signal(SIGTERM, shutdown_signal_handler) == SIG_ERR) return false;
+#endif
+    return true;
+}
+inline std::string signal_name(int number) {
+    if (number == SIGINT) return "SIGINT";
+#ifdef SIGTERM
+    if (number == SIGTERM) return "SIGTERM";
+#endif
+    return "signal";
+}
+struct SignalShutdown final : std::exception {
+    std::string file;
+    int line;
+    int column;
+    int exit_code;
+    std::string message;
+    SignalShutdown(std::string source_file, int source_line, int source_column, int number)
+        : file(std::move(source_file)), line(source_line), column(source_column),
+          exit_code(128 + number), message("runtime shutdown requested by " + signal_name(number)) {}
+    const char* what() const noexcept override { return message.c_str(); }
+};
+inline void check_shutdown(const std::string& file, int line, int column) {
+    const int number = static_cast<int>(requested_shutdown_signal);
+    if (number != 0) throw SignalShutdown(file, line, column, number);
+}
+inline std::int64_t monotonic_milliseconds() noexcept {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+inline std::string host_os() {
+#if defined(__linux__)
+    return "linux";
+#elif defined(_WIN32)
+    return "windows";
+#elif defined(__APPLE__)
+    return "macos";
+#else
+    return "other";
+#endif
+}
+inline std::string host_architecture() {
+#if defined(__x86_64__) || defined(_M_X64)
+    return "x86_64";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    return "aarch64";
+#elif defined(__i386__) || defined(_M_IX86)
+    return "x86";
+#else
+    return "other";
+#endif
 }
 
 struct Failure final : std::exception {

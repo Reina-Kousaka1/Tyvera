@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import io
 import os
+import signal
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -302,6 +304,8 @@ fn main() { println(add(1, 2)); println("Tyvera") }
         self.assertIn("std::int64_t tyv_fn_0", source)
         self.assertIn("checked_add", source)
         self.assertIn("tyvera_runtime::Failure", source)
+        self.assertIn("if (!tyvera_runtime::install_shutdown_handlers())", source)
+        self.assertIn("ExitCode::initialization_failure", source)
         self.assertNotIn("python", source.lower())
         self.assertNotIn("PyObject", source)
 
@@ -789,6 +793,45 @@ fn main() {
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, expected.getvalue())
                     self.assertEqual(result.stderr, "")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "native signal integration requires Linux")
+    def test_native_sigint_and_sigterm_unwind_resources_with_stable_exit_codes(self) -> None:
+        source = '''fn main() {
+    using writer = openTextWriter("signal.txt", "write") {
+        writer.write("closed on signal")
+        while true {}
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-signals-") as temporary:
+            root = Path(temporary)
+            executable = root / "signal-app"
+            checked = compile_checked_source(source, "native-signal.tyv")
+            CppNativeBackend().build(
+                lower_checked_program(checked), executable, project_root=root,
+            )
+            for selected_signal, expected_code, expected_name in (
+                (signal.SIGINT, 130, "SIGINT"),
+                (signal.SIGTERM, 143, "SIGTERM"),
+            ):
+                with self.subTest(signal=expected_name):
+                    output_file = root / "signal.txt"
+                    output_file.unlink(missing_ok=True)
+                    process = subprocess.Popen(
+                        [str(executable)], cwd=root, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                    )
+                    try:
+                        time.sleep(0.05)
+                        self.assertIsNone(process.poll(), "the test program should still be in its loop")
+                        process.send_signal(selected_signal)
+                        _, error = process.communicate(timeout=5)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait(timeout=5)
+                    self.assertEqual(process.returncode, expected_code, error)
+                    self.assertIn(f"runtime shutdown requested by {expected_name}", error)
+                    self.assertEqual(output_file.read_text(encoding="utf-8"), "closed on signal")
 
     def test_native_sync_resource_examples_match_reference_interpreter(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tyvera-native-resources-") as temporary:
