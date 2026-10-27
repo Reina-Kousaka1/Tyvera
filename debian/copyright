@@ -1,0 +1,13 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Tyvera
+Source: https://github.com/Reina-Kousaka1/Tyvera
+
+Files: *
+Copyright: Tyvera contributors
+License: GPL-3
+ This package is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the Free
+ Software Foundation, version 3 only.
+ .
+ On Debian and Ubuntu systems, the complete license text is available in
+ /usr/share/common-licenses/GPL-3.

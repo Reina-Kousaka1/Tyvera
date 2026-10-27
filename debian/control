@@ -1,0 +1,18 @@
+Source: tyvera
+Section: devel
+Priority: optional
+Maintainer: Tyvera contributors
+Build-Depends: debhelper-compat (= 13), dh-python, pybuild-plugin-pyproject, python3-all, python3-setuptools
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/Reina-Kousaka1/Tyvera
+
+Package: tyvera
+Architecture: all
+Depends: ${misc:Depends}, ${python3:Depends}, python3 (>= 3.10)
+Recommends: g++
+Description: experimental bootstrap toolchain for the Tyvera language
+ Tyvera is an experimental statically typed programming language with its own
+ syntax, type checker, runtime, and standard library. This package installs
+ the Python bootstrap/reference toolchain; generated native programs do not
+ require Python at runtime, while compiling them requires a C++17 compiler.

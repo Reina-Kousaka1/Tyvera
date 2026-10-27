@@ -39,8 +39,10 @@ typed HTTP client build on those same TCP tasks and resource rules. See
 [`examples/http_server.tyv`](examples/http_server.tyv) for local examples.
 The experimental native compiler supports the synchronous core plus selected
 `Option`/`Result`, collection, `Byte`, and immutable `Bytes` operations; see the
-[Backend Architecture](docs/backend-architecture.md) support table. TLS and
-WebSockets remain planned.
+[Backend Architecture](docs/backend-architecture.md) support table. Verified
+TLS client connections, HTTPS requests, and a bounded RFC 6455 WebSocket client
+are implemented in the reference runtime; networking remains unsupported by
+native executables.
 
 The deterministic actor runtime supports typed messages, isolated state, FIFO
 mailboxes, crash isolation, nested supervisors, bounded restart intensity,
@@ -60,10 +62,16 @@ Linux is the primary platform foundation in this development wave. Ubuntu
 x86-64 is explicitly checked in CI; Linux AArch64 is recognized by the runtime
 adapter but is not yet covered by a CI runner. Host services, cooperative
 SIGINT/SIGTERM shutdown, and the bootstrap's internal argv-based child-process
-adapter are described in [Platform support](docs/platform.md). A small experimental Tyvera Discord
-source package currently decodes typed Gateway dispatch JSON; it has no TLS,
-WebSocket, REST transport, bot-token handling, or live Discord connection yet
+adapter are described in [Platform support](docs/platform.md). The experimental
+Tyvera Discord package now has a fixed-origin HTTPS REST request path and a
+bounded WSS Gateway client session with typed intents, Identify, heartbeat/ACK,
+and basic dispatch counting. Transport tests use local TLS fakes; no production
+Discord connection has been exercised. Reconnect/Resume, REST rate-limit
+scheduling, and an event callback/Actor API remain unimplemented
 ([package status](docs/discord.md)).
+An experimental Debian package build and Ubuntu 24.04 install/upgrade smoke are
+configured but not yet verified in CI; no public package or PPA exists
+([packaging status](docs/packaging.md)).
 
 ## Dependency graphs
 
@@ -225,7 +233,7 @@ bounded server, and static router. The experimental native compiler supports
 the typed synchronous core plus selected value and collection features
 documented in [Backend Architecture](docs/backend-architecture.md); Actors,
 Tasks, resources, file I/O, networking, and HTTP remain interpreter-only. True
-parallel execution, TLS, WebSockets, separate standard-library modules,
+parallel execution, native TLS/networking, separate standard-library modules,
 external secret stores, and broader native runtime support remain planned. See
 the [roadmap](docs/roadmap.md) for sequence and scope, and
 [release/versioning notes](docs/release-process.md) for the

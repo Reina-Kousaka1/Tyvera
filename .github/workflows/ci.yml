@@ -52,8 +52,8 @@ jobs:
           PY
           tyvera check examples/platform_runtime.tyv
           tyvera run examples/platform_runtime.tyv
-          tyvera check libraries/discord
-          tyvera run libraries/discord
+          env -u DISCORD_TOKEN tyvera check libraries/discord
+          env -u DISCORD_TOKEN tyvera run libraries/discord
 
       - name: Run complete test suite
         run: python -m unittest discover -v
@@ -99,6 +99,11 @@ jobs:
             tyvera check "$source"
             tyvera run "$source"
           done
+          for source in libraries/discord/examples/*.tyv; do
+            test -f "$source"
+            env -u DISCORD_TOKEN tyvera check "$source"
+            env -u DISCORD_TOKEN tyvera run "$source"
+          done
 
       - name: Smoke-test generated project
         run: |
@@ -114,3 +119,77 @@ jobs:
               subprocess.run(["tyvera", "check", str(project)], check=True)
               subprocess.run(["tyvera", "run", str(project)], check=True)
           PY
+
+  ubuntu-package:
+    name: Ubuntu 24.04 package install and upgrade
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Debian packaging toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential debhelper dh-python pybuild-plugin-pyproject python3-all python3-setuptools
+
+      - name: Build, install, upgrade, reinstall, remove, and purge
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x debian/rules
+          dpkg-buildpackage -us -uc -b
+          package_a="$GITHUB_WORKSPACE/../tyvera_0.1.0-1_all.deb"
+          test -f "$package_a"
+          package_a_hash="$(sha256sum "$package_a" | cut -d ' ' -f 1)"
+          dpkg-buildpackage -us -uc -b
+          repeated_hash="$(sha256sum "$package_a" | cut -d ' ' -f 1)"
+          test "$package_a_hash" = "$repeated_hash"
+
+          user_data="$HOME/.local/share/tyvera-package-smoke"
+          mkdir -p "$user_data/project"
+          cat > "$user_data/project/main.tyv" <<'TYV'
+          fn main() {
+              println("installed Tyvera works")
+          }
+          TYV
+          printf '%s\n' 'preserve-user-project' > "$user_data/project/marker.txt"
+          printf '%s\n' 'fake-local-secret-never-a-real-token' > "$user_data/project/.tyvera.secrets"
+
+          sudo apt-get install -y "$package_a"
+          tyvera --version
+          tyvera check "$user_data/project"
+          tyvera run "$user_data/project"
+          test "$(cat "$user_data/project/marker.txt")" = 'preserve-user-project'
+          test "$(cat "$user_data/project/.tyvera.secrets")" = 'fake-local-secret-never-a-real-token'
+
+          sed -i '1s/0\.1\.0-1/0.1.0-2/' debian/changelog
+          dpkg-buildpackage -us -uc -b
+          package_b="$GITHUB_WORKSPACE/../tyvera_0.1.0-2_all.deb"
+          test -f "$package_b"
+
+          sudo apt-get install -y "$package_b"
+          test "$(dpkg-query -W -f='${Version}' tyvera)" = '0.1.0-2'
+          sudo apt-get install --reinstall -y "$package_b"
+          tyvera check "$user_data/project"
+          tyvera run "$user_data/project"
+
+          sudo apt-get remove -y tyvera
+          test -f "$user_data/project/main.tyv"
+          test -f "$user_data/project/.tyvera.secrets"
+          sudo apt-get purge -y tyvera
+          test -f "$user_data/project/main.tyv"
+          test -f "$user_data/project/marker.txt"
+          test -f "$user_data/project/.tyvera.secrets"
+
+          source_epoch="$(git log -1 --format=%ct HEAD)"
+          orig_root="$RUNNER_TEMP/tyvera-orig"
+          mkdir -p "$orig_root"
+          git archive --format=tar --prefix=tyvera-0.1.0/ HEAD \
+            | tar --exclude='tyvera-0.1.0/debian' -xf - -C "$orig_root"
+          tar --sort=name --mtime="@$source_epoch" --owner=0 --group=0 \
+            --numeric-owner -C "$orig_root" -cf - tyvera-0.1.0 \
+            | gzip -n > "$GITHUB_WORKSPACE/../tyvera_0.1.0.orig.tar.gz"
+          dpkg-buildpackage -S -us -uc
+          test -f "$GITHUB_WORKSPACE/../tyvera_0.1.0-2.dsc"

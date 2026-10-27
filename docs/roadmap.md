@@ -16,12 +16,12 @@ implemented.
 | 4. Standard library | Core slice implemented | Generic collections, `for`, `Option<T>`, `Result<T,E>`, core matching, text I/O/path helpers, move-only `TextFile`/`TextReader`/`TextWriter` ownership with general move transfer and deterministic LIFO cleanup, local/environment secret providers, typed JSON, signed `Duration`, monotonic one-shot timers, timer-backed sleep tasks, cooperative parent-scoped lifecycle, owner-local `TaskGroup` joins/cancellation, explicit child detachment, actor-owned task cancellation, one-shot runtime shutdown and typed task deadlines. Separate stdlib modules remain planned. |
 | 5. Actor runtime | First slice implemented | Actor declarations, typed immutable message transfer, isolated state, FIFO mailboxes, deterministic round-robin cooperative scheduling, typed one-shot request/reply, cancellation, request deadlines, delayed typed messages, stop/alive lifecycle, and isolated crash reporting. Parallel scheduling and backpressure remain open. |
 | 6. Supervisors | V2 foundation implemented; experimental | Nested supervisors, `one_for_one`/`one_for_all`/`rest_for_one`, permanent/transient/temporary policies, monotonic restart intensity, capped exponential backoff, typed crash/runtime events, bounded dead-letter diagnostics, and deterministic tree shutdown. User-defined monitor/link APIs and native supervisor runtime remain planned. |
-| 7. Async I/O & TCP | V1 implemented | Selector-backed TCP connect/listen/accept/read/write, worker-backed DNS and async text-file I/O, cancellation, deadlines, move-only network resources, address/error values, and bounded write behavior. TLS and protocols beyond HTTP/1.1 remain planned. |
-| 8. HTTP & Web Backend Foundation | V1 implemented; experimental | Bounded HTTP/1.1 codec, typed request/response values, TCP client and concurrent server, keep-alive, static routing, query/path parameters, JSON core integration, deadlines, and ownership cleanup. Streaming, dynamic handlers, TLS, and HTTP/2/3 remain planned. |
+| 7. Async I/O & TCP | V1 implemented; experimental | Selector-backed TCP connect/listen/accept/read/write, worker-backed DNS and async text-file I/O, cancellation, deadlines, move-only resources, and bounded writes. Reference TLS client verification and bounded WebSocket client are implemented; native networking remains planned. |
+| 8. HTTP & Web Backend Foundation | V1 implemented; experimental | Bounded HTTP/1.1 codec with Content-Length, chunked, and close-delimited responses; typed client/server, verified HTTPS client, static routing, JSON core integration, deadlines, and ownership cleanup. Streaming, TLS server mode, dynamic handlers, and HTTP/2/3 remain planned. |
 | 9. Native backend | V1 expanded; experimental | Typed IR and C++17 host compilation support the synchronous scalar/control-flow core, `Option`/`Result` matching, typed `List`/`Map`, `Byte`/`Bytes`, bounded `ByteBuffer`, synchronous text/binary/path I/O, and owned text-file resources with deterministic cleanup. Linux x86-64 is CI-tested; objects, generic functions, Actors, Tasks, async I/O, networking, HTTP, and FFI remain interpreter-only or planned. |
-| 10. Linux platform foundation | First bootstrap slice implemented; experimental | Ubuntu x86-64 CI validation, normalized OS/architecture detection, secret-wrapped environment access, monotonic host time, cooperative SIGINT/SIGTERM shutdown, and an internal argv-based child-process adapter. ARM64 is recognized but not CI-tested; native platform runtime and packaged distributions remain planned. |
-| 11. Package system | Planned | Reproducible package metadata, dependency resolution and versioning after modules and the standard library stabilize. The Discord source example is repository-local, not package-manager support. |
-| 12. Application library ecosystem | First source example | An experimental local Discord package decodes typed `READY`, `MESSAGE_CREATE`, and unknown Gateway dispatch JSON. TLS, WebSockets, live Gateway lifecycle, REST transport, rate-limit enforcement, and client actors are not implemented. General-purpose libraries and application protocols remain outside compiler semantics. |
+| 10. Linux platform foundation | First bootstrap slice implemented; experimental | Ubuntu x86-64 CI validation, normalized OS/architecture detection, secret-wrapped environment access, monotonic host time, cooperative interpreter/native SIGINT/SIGTERM shutdown, and an internal argv-based child-process adapter. ARM64 is recognized but not CI-tested; native process/network runtime remains planned. |
+| 11. Ubuntu packaging | Experimental Debian package validation | Debian metadata builds the Python bootstrap package; Ubuntu 24.04 CI is configured for install, revision upgrade, reinstall, remove, purge, and preservation of a user project and local secret file. No public `.deb`, signed source upload, PPA, repository, or dependency resolver exists. |
+| 12. Application library ecosystem | Experimental live slice | Local Discord source package has a fixed-origin HTTPS REST request primitive, typed rate-limit metadata, typed Gateway intents, and one bounded live WSS Gateway session with Identify/heartbeat/ACK/sequence and basic dispatch counting. Reconnect/Resume, REST rate-limit coordination/retries, event callbacks, Actors/cache, and native networking are not implemented. |
 
 ## Near-term sequence
 
@@ -64,11 +64,13 @@ branches, loops and match arms. Move-only text and TCP resources support
 `Option`/`Result` carriers, task transfer, control-flow checking, and
 deterministic cleanup. Async text-file operations, DNS, selector-backed TCP,
 backpressure, and cancellation are implemented in the reference runtime.
-True parallelism, TLS, HTTP streaming, WebSockets, non-network resource families,
-standard-library modules, and a native runtime for the full language remain
-planned. The native backend's synchronous core and selected `Option`/`Result`,
-collection, `Byte`, and `Bytes` paths are implemented experimentally. HTTP/1.1
-V1 is experimental and implemented. Resource scopes
+True parallelism, HTTP streaming, native network services, non-network resource
+families, standard-library modules, and a native runtime for the full language
+remain planned. The reference runtime's verified TLS client and bounded
+WebSocket client are implemented experimentally; the native backend's
+synchronous core and selected `Option`/`Result`, collection, `Byte`, and
+`Bytes` paths remain interpreter-independent but networking-free. HTTP/1.1 V1
+is experimental and implemented. Resource scopes
 close on normal exit, return, errors, task cancellation, loop control, actor
 failure, and supervisor restart. Runtime ownership, shutdown, detached task
 failures, timed wrappers, and actor reply fairness have explicit semantics and
