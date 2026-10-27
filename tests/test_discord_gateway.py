@@ -1028,9 +1028,9 @@ fn main() {
             self.assertEqual(
                 [path for path, _, _ in captured], expected_paths * (2 if native_result is not None else 1),
             )
-            self.assertEqual(retry_attempts, 2 * (2 if native_result is not None else 1))
-            self.assertEqual(header_retry_attempts, 2 * (2 if native_result is not None else 1))
-            self.assertEqual(integer_retry_attempts, 2 * (2 if native_result is not None else 1))
+            self.assertEqual(retry_attempts, 2)
+            self.assertEqual(header_retry_attempts, 2)
+            self.assertEqual(integer_retry_attempts, 2)
             self.assertTrue(all(auth == "Bot fake-rest-token" for _, auth, _ in captured))
             self.assertEqual(captured[0][2], b"")
             self.assertEqual(captured[1][2], b'{"content":"hello"}')
