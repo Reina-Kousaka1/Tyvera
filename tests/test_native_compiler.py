@@ -916,7 +916,10 @@ fn main() {
 }
 fn main() {
     let task = cancelPendingAccept()
-    match runTasks() { Ok(_) => {} Err(error) => eprintln(error) }
+    match runTasks() {
+        Ok(_) => {}
+        Err(error) => eprintln(error)
+    }
 }'''
         with tempfile.TemporaryDirectory(prefix="tyvera-native-task-cancel-") as temporary:
             root = Path(temporary)
@@ -929,17 +932,32 @@ fn main() {
     def test_native_dns_and_tcp_argument_errors_match_reference(self) -> None:
         source = '''async fn invalidCalls() {
     let emptyHost = await resolveHost("", 80)
-    match emptyHost { Ok(_) => println("unexpected") Err(error) => println(error) }
+    match emptyHost {
+        Ok(_) => println("unexpected")
+        Err(error) => println(error)
+    }
     let invalidPort = await resolveHost("localhost", -1)
-    match invalidPort { Ok(_) => println("unexpected") Err(error) => println(error) }
+    match invalidPort {
+        Ok(_) => println("unexpected")
+        Err(error) => println(error)
+    }
     let invalidConnect = await tcpConnect("127.0.0.1", 0)
-    match move invalidConnect { Ok(connection) => connection.close() Err(error) => println(error) }
+    match move invalidConnect {
+        Ok(connection) => connection.close()
+        Err(error) => println(error)
+    }
     let invalidBacklog = await tcpListen("127.0.0.1", 0, 0)
-    match move invalidBacklog { Ok(listener) => listener.close() Err(error) => println(error) }
+    match move invalidBacklog {
+        Ok(listener) => listener.close()
+        Err(error) => println(error)
+    }
 }
 fn main() {
     let task = invalidCalls()
-    match runTasks() { Ok(_) => {} Err(error) => eprintln(error) }
+    match runTasks() {
+        Ok(_) => {}
+        Err(error) => eprintln(error)
+    }
 }'''
         with tempfile.TemporaryDirectory(prefix="tyvera-native-network-errors-") as temporary:
             root = Path(temporary)
@@ -1017,7 +1035,10 @@ async fn echo(opened: Result<TcpConnection,String>) {
                     None => println("unexpected EOF")
                     Some(bytes) => {
                         let sent = await connection.writeAll(bytes)
-                        match sent { Ok(_) => {} Err(error) => println(error) }
+                        match sent {
+                            Ok(_) => {}
+                            Err(error) => println(error)
+                        }
                     }
                 }
             }
@@ -1051,7 +1072,10 @@ async fn serve() {
 }
 fn main() {
     let task = serve()
-    match runTasks() { Ok(_) => {} Err(error) => eprintln(error) }
+    match runTasks() {
+        Ok(_) => {}
+        Err(error) => eprintln(error)
+    }
 }'''
         with tempfile.TemporaryDirectory(prefix="tyvera-native-multi-tcp-") as temporary:
             root = Path(temporary)
@@ -1168,11 +1192,20 @@ fn main() {
 }}
 fn main() {{
     let normal = reserve({port}, false)
-    match runTasks() {{ Ok(_) => println("normal") Err(_) => println("normal failed") }}
+    match runTasks() {{
+        Ok(_) => println("normal")
+        Err(_) => println("normal failed")
+    }}
     let failing = reserve({port}, true)
-    match runTasks() {{ Ok(_) => println("unexpected success") Err(_) => println("failure unwound") }}
+    match runTasks() {{
+        Ok(_) => println("unexpected success")
+        Err(_) => println("failure unwound")
+    }}
     let reopened = reserve({port}, false)
-    match runTasks() {{ Ok(_) => println("reopened") Err(_) => println("reopen failed") }}
+    match runTasks() {{
+        Ok(_) => println("reopened")
+        Err(_) => println("reopen failed")
+    }}
 }}'''
         with tempfile.TemporaryDirectory(prefix="tyvera-native-tcp-cleanup-") as temporary:
             root = Path(temporary)

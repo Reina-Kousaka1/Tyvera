@@ -282,6 +282,7 @@ class _CppGenerator:
             if function.return_type == IRType.VOID:
                 self._line("return;")
             self.indent -= 1
+            self._line("}")
             self._line(");")
         self.indent -= 1
         self._line("}")
