@@ -2026,7 +2026,7 @@ fn main() {{
             thread.start()
             port = server.server_address[1]
             source = f'''async fn client() {{
-    match httpUrl("http://127.0.0.1:${port}/") {{
+    match httpUrl("http://127.0.0.1:{port}/") {{
         Err(error) => println(error)
         Ok(url) => {{
             let response = await httpGet(url, milliseconds(2000))
