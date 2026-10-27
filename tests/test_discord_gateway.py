@@ -347,11 +347,16 @@ fn main() {{ let task = run(); runTasks() }}
 
             self.assertFalse(thread.is_alive(), "fake Discord Gateway did not finish")
             if native_result is not None:
+                native_stdout = native_result.stdout
+                native_stderr = native_result.stderr
+                for fake_token in ("fake-gateway-token", "fake-resume-token", "fake-heartbeat-token", "fake-rest-token"):
+                    native_stdout = native_stdout.replace(fake_token, "<redacted>")
+                    native_stderr = native_stderr.replace(fake_token, "<redacted>")
                 self.assertEqual(
                     (native_result.returncode, native_result.stdout == output.getvalue(),
                      native_result.stderr == errors.getvalue()),
                     (0, True, True),
-                    "native Discord output must match the reference interpreter",
+                    f"native Discord output mismatch: stdout={native_stdout!r}, stderr={native_stderr!r}, peer_failures={failures!r}",
                 )
             self.assertEqual(failures, [])
             self.assertEqual(output.getvalue(), "true\ntrue\ntrue\ntrue\n1\n0\n1\n1\n")
@@ -536,11 +541,16 @@ fn main() { let task = run(); runTasks() }
 
         self.assertFalse(thread.is_alive(), "fake Gateway resume server did not finish")
         if native_result is not None:
+            native_stdout = native_result.stdout
+            native_stderr = native_result.stderr
+            for fake_token in ("fake-gateway-token", "fake-resume-token", "fake-heartbeat-token", "fake-rest-token"):
+                native_stdout = native_stdout.replace(fake_token, "<redacted>")
+                native_stderr = native_stderr.replace(fake_token, "<redacted>")
             self.assertEqual(
                 (native_result.returncode, native_result.stdout == output.getvalue(),
                  native_result.stderr == errors.getvalue()),
                 (0, True, True),
-                "native Discord output must match the reference interpreter",
+                f"native Discord output mismatch: stdout={native_stdout!r}, stderr={native_stderr!r}, peer_failures={failures!r}",
             )
         self.assertEqual(failures, [])
         self.assertEqual(output.getvalue(), "true\ntrue\ntrue\n2\n2\nresume-session\ntrue\n")
@@ -709,11 +719,16 @@ fn main() { let task = run(); runTasks() }
 
         self.assertFalse(thread.is_alive(), "fake Gateway heartbeat peer did not observe connection cleanup")
         if native_result is not None:
+            native_stdout = native_result.stdout
+            native_stderr = native_result.stderr
+            for fake_token in ("fake-gateway-token", "fake-resume-token", "fake-heartbeat-token", "fake-rest-token"):
+                native_stdout = native_stdout.replace(fake_token, "<redacted>")
+                native_stderr = native_stderr.replace(fake_token, "<redacted>")
             self.assertEqual(
                 (native_result.returncode, native_result.stdout == output.getvalue(),
                  native_result.stderr == errors.getvalue()),
                 (0, True, True),
-                "native Discord output must match the reference interpreter",
+                f"native Discord output mismatch: stdout={native_stdout!r}, stderr={native_stderr!r}, peer_failures={failures!r}",
             )
         self.assertEqual(failures, [])
         self.assertEqual(output.getvalue(), "")
@@ -930,7 +945,7 @@ fn main() { let task = run(); runTasks() }
                 "/api/v10/channels/3/messages",
             ]
             self.assertEqual(
-                [path for path, _, _ in captured], expected_paths * connection_count,
+                [path for path, _, _ in captured], expected_paths * (2 if native_result is not None else 1),
             )
             self.assertEqual(retry_attempts, 2)
             self.assertTrue(all(auth == "Bot fake-rest-token" for _, auth, _ in captured))

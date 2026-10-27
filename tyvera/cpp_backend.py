@@ -3629,6 +3629,9 @@ inline StringResult<std::int64_t> run_actors(
                 continue;
             }
             if (!wait_for_actor_or_restart(file, line, column, wait_for_pending)) break;
+            const auto due_settled = settle_due_supervisor_restarts();
+            if (due_settled && !due_settled->empty() && first_crash.empty())
+                first_crash = *due_settled;
         }
         if (!actor) break;
         ++processed;
