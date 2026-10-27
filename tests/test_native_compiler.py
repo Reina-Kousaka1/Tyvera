@@ -1753,6 +1753,362 @@ fn main() {
                 "WebSocket URL scheme must be ws or wss\n",
             )
 
+    def test_native_http_url_values_match_reference(self) -> None:
+        source = '''fn main() {
+    match httpUrl("HTTPS://ExAmple.test:8443/path?q=1") {
+        Err(error) => println(error)
+        Ok(url) => {
+            println(url.scheme())
+            println(url.host())
+            println(url.port())
+            println(url.target())
+            println(url.authority())
+        }
+    }
+    match httpUrl("http://[::1]:8080/") {
+        Err(error) => println(error)
+        Ok(url) => {
+            println(url.host())
+            println(url.port())
+            println(url.authority())
+        }
+    }
+    match httpMethod("custom-method") {
+        Err(error) => println(error)
+        Ok(method) => {
+            println(method.name())
+            println(method.isStandard())
+        }
+    }
+    match httpUrl("ftp://example.test/") {
+        Err(error) => println(error)
+        Ok(_) => println("unexpected URL")
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-http-url-") as temporary:
+            root = Path(temporary)
+            expected = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "http-url", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            self.assertEqual(
+                native.stdout,
+                "https\nexample.test\n8443\n/path?q=1\nexample.test:8443\n"
+                "::1\n8080\n[::1]:8080\ncustom-method\nfalse\n"
+                "HTTP URL scheme must be http or https\n",
+            )
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "native HTTPS tests require Linux and OpenSSL",
+    )
+    def test_native_https_client_uses_verified_tls_and_matches_reference(self) -> None:
+        openssl = shutil.which("openssl")
+        if openssl is None:
+            self.skipTest("OpenSSL command line tools are unavailable")
+        handled = 0
+        lock = threading.Lock()
+        complete = threading.Event()
+        failures: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-https-") as temporary:
+            root = Path(temporary)
+            certificate, private_key = root / "cert.pem", root / "key.pem"
+            subprocess.run(
+                [
+                    openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", str(private_key), "-out", str(certificate), "-days", "2",
+                    "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
+                ],
+                capture_output=True, text=True, check=True,
+            )
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certificate, private_key)
+
+            class Handler(socketserver.BaseRequestHandler):
+                def handle(self) -> None:
+                    nonlocal handled
+                    try:
+                        self.request.settimeout(5)
+                        request = bytearray()
+                        while b"\r\n\r\n" not in request:
+                            data = self.request.recv(4096)
+                            if not data:
+                                raise EOFError("request closed during headers")
+                            request.extend(data)
+                        if not bytes(request).startswith(b"GET /data HTTP/1.1\r\n"):
+                            raise AssertionError("unexpected HTTPS request")
+                        self.request.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n"
+                            b"X-Secure: verified\r\nConnection: close\r\n\r\nsecure"
+                        )
+                    except Exception as error:
+                        failures.append(f"{type(error).__name__}: {error}")
+                    finally:
+                        with lock:
+                            handled += 1
+                            if handled == 2:  # reference and native clients
+                                complete.set()
+
+            class LoopbackTlsServer(socketserver.ThreadingTCPServer):
+                allow_reuse_address = True
+                daemon_threads = True
+
+                def get_request(self):
+                    raw, address = super().get_request()
+                    try:
+                        return context.wrap_socket(raw, server_side=True), address
+                    except OSError:
+                        raw.close()
+                        raise
+
+                def handle_error(self, request, client_address) -> None:
+                    return
+
+            server = LoopbackTlsServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True,
+            )
+            thread.start()
+            port = server.server_address[1]
+            source = f'''async fn client() {{
+    match httpUrl("https://localhost:{port}/data") {{
+        Err(error) => println(error)
+        Ok(url) => match await httpGet(url, milliseconds(3000)) {{
+            Err(error) => println(error)
+            Ok(response) => {{
+                println(response.status())
+                match response.headers().get("x-secure") {{
+                    None => println("missing")
+                    Some(value) => println(value)
+                }}
+                match response.body().toString() {{
+                    Err(error) => println(error)
+                    Ok(text) => println(text)
+                }}
+            }}
+        }}
+    }}
+}}
+fn main() {{
+    let task = client()
+    match runTasks() {{
+        Err(error) => eprintln(error)
+        Ok(_) => {{}}
+    }}
+}}'''
+            try:
+                with patch.dict(os.environ, {"SSL_CERT_FILE": str(certificate)}):
+                    expected = self._reference_result(source, root)
+                    native = self._native_source_result(source, root, root / "https-client", root)
+                self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+                self.assertEqual(native.stdout, "200\nverified\nsecure\n")
+                self.assertTrue(complete.wait(timeout=5), "loopback HTTPS handlers did not finish")
+                self.assertEqual(failures, [])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=1)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "native HTTP tests require Linux")
+    def test_native_http_malformed_content_length_matches_reference(self) -> None:
+        handled = 0
+        lock = threading.Lock()
+        complete = threading.Event()
+        failures: list[str] = []
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                nonlocal handled
+                try:
+                    self.request.settimeout(5)
+                    request = bytearray()
+                    while b"\r\n\r\n" not in request:
+                        data = self.request.recv(4096)
+                        if not data:
+                            raise EOFError("request closed during headers")
+                        request.extend(data)
+                    self.request.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n"
+                        b"Content-Length: 1\r\nConnection: close\r\n\r\nx"
+                    )
+                except Exception as error:
+                    failures.append(f"{type(error).__name__}: {error}")
+                finally:
+                    with lock:
+                        handled += 1
+                        if handled == 2:  # reference and native requests
+                            complete.set()
+
+        class LoopbackServer(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-http-invalid-") as temporary:
+            root = Path(temporary)
+            server = LoopbackServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True,
+            )
+            thread.start()
+            port = server.server_address[1]
+            source = f'''async fn client() {{
+    match httpUrl("http://127.0.0.1:{port}/") {{
+        Err(error) => println(error)
+        Ok(url) => match await httpGet(url, milliseconds(2000)) {{
+            Err(error) => println(error)
+            Ok(_) => println("unexpected response")
+        }}
+    }}
+}}
+fn main() {{
+    let task = client()
+    match runTasks() {{
+        Err(error) => eprintln(error)
+        Ok(_) => {{}}
+    }}
+}}'''
+            try:
+                expected = self._reference_result(source, root)
+                native = self._native_source_result(source, root, root / "http-invalid", root)
+                self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+                self.assertEqual(native.stdout, "HTTP response parse error: invalid Content-Length\n")
+                self.assertTrue(complete.wait(timeout=5), "loopback malformed-response handlers did not finish")
+                self.assertEqual(failures, [])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=1)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "native HTTP tests require Linux")
+    def test_native_http_get_post_chunked_matches_reference(self) -> None:
+        failures: list[str] = []
+        handled = 0
+        lock = threading.Lock()
+        complete = threading.Event()
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                nonlocal handled
+                try:
+                    self.request.settimeout(5)
+                    raw = bytearray()
+                    while b"\r\n\r\n" not in raw:
+                        chunk = self.request.recv(4096)
+                        if not chunk:
+                            raise EOFError("request closed during headers")
+                        raw.extend(chunk)
+                        if len(raw) > 65536:
+                            raise AssertionError("oversized request headers")
+                    header_end = raw.index(b"\r\n\r\n") + 4
+                    lines = bytes(raw[:header_end]).decode("ascii").split("\r\n")
+                    method, target, _ = lines[0].split(" ")
+                    headers = {}
+                    for line in lines[1:]:
+                        if not line:
+                            break
+                        name, value = line.split(":", 1)
+                        headers.setdefault(name.lower(), []).append(value.strip())
+                    length = int(headers.get("content-length", ["0"])[0])
+                    body = bytearray(raw[header_end:])
+                    while len(body) < length:
+                        chunk = self.request.recv(length - len(body))
+                        if not chunk:
+                            raise EOFError("request closed during body")
+                        body.extend(chunk)
+                    if target != "/api?q=1" or headers.get("connection") != ["close"]:
+                        raise AssertionError("unexpected request target or connection mode")
+                    if method == "GET":
+                        if body:
+                            raise AssertionError("GET unexpectedly included a body")
+                        response = (
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+                            b"X-Repeat: alpha\r\nX-Repeat: beta\r\nConnection: close\r\n\r\nhello"
+                        )
+                    elif method == "POST":
+                        if bytes(body[:length]) != b"upload" or headers.get("x-upload") != ["yes"]:
+                            raise AssertionError("POST body or header was not preserved")
+                        response = (
+                            b"HTTP/1.1 201 Created\r\nTransfer-Encoding: chunked\r\n"
+                            b"Connection: close\r\n\r\n3\r\nack\r\n0\r\nX-Trailer: ignored\r\n\r\n"
+                        )
+                    else:
+                        raise AssertionError("unexpected HTTP method")
+                    self.request.sendall(response)
+                except Exception as error:
+                    failures.append(f"{type(error).__name__}: {error}")
+                finally:
+                    with lock:
+                        handled += 1
+                        if handled == 4:  # two requests from each backend
+                            complete.set()
+
+        class LoopbackServer(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-http-") as temporary:
+            root = Path(temporary)
+            server = LoopbackServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True,
+            )
+            thread.start()
+            port = server.server_address[1]
+            source = f'''async fn client(url: HttpUrl) {{
+    let received = await httpGet(url, milliseconds(2000))
+    match received {{
+        Err(error) => println(error)
+        Ok(response) => {{
+            println(response.status())
+            match response.headers().get("x-repeat") {{
+                None => println("missing header")
+                Some(value) => println(value)
+            }}
+            match response.body().toString() {{
+                Err(error) => println(error)
+                Ok(text) => println(text)
+            }}
+        }}
+    }}
+    let headers = httpHeaders()
+    match headers.add("X-Upload", "yes") {{
+        Err(error) => println(error)
+        Ok(_) => {{}}
+    }}
+    let posted = await httpPost(url, headers, bytesFromString("upload"), milliseconds(2000))
+    match posted {{
+        Err(error) => println(error)
+        Ok(response) => {{
+            println(response.status())
+            match response.body().toString() {{
+                Err(error) => println(error)
+                Ok(text) => println(text)
+            }}
+        }}
+    }}
+}}
+fn main() {{
+    match httpUrl("http://127.0.0.1:{port}/api?q=1") {{
+        Err(error) => println(error)
+        Ok(url) => {{
+            let task = client(url)
+            match runTasks() {{
+                Err(error) => eprintln(error)
+                Ok(_) => {{}}
+            }}
+        }}
+    }}
+}}'''
+            try:
+                expected = self._reference_result(source, root)
+                native = self._native_source_result(source, root, root / "http-client", root)
+                self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+                self.assertEqual(native.stdout, "200\nalpha, beta\nhello\n201\nack\n")
+                self.assertTrue(complete.wait(timeout=5), "loopback HTTP handlers did not finish")
+                self.assertEqual(failures, [])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=1)
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "native WebSocket tests require Linux")
     def test_native_websocket_echo_and_close_match_reference(self) -> None:
         failures: list[str] = []

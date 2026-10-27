@@ -62,7 +62,7 @@ class CppNativeBackend:
         validate_ir(module)
         native_tls = _module_uses_tls(module)
         if native_tls and not sys.platform.startswith("linux"):
-            raise Diagnostic(module.functions[0].location, "backend", "native TLS and WebSocket are currently supported only on Linux")
+            raise Diagnostic(module.functions[0].location, "backend", "native TLS, WebSocket, and HTTP clients are currently supported only on Linux")
         destination = Path(output).expanduser().resolve()
         if destination.exists() and destination.is_dir():
             raise Diagnostic(module.functions[0].location, "backend", "native output path names a directory")
@@ -245,6 +245,11 @@ class _CppGenerator:
             IRType.WEBSOCKET_URL: "tyvera_runtime::WebSocketUrl",
             IRType.WEBSOCKET: "std::shared_ptr<tyvera_runtime::WebSocket>",
             IRType.WEBSOCKET_MESSAGE: "tyvera_runtime::WebSocketMessage",
+            IRType.HTTP_METHOD: "tyvera_runtime::HttpMethod",
+            IRType.HTTP_URL: "tyvera_runtime::HttpUrl",
+            IRType.HTTP_HEADERS: "std::shared_ptr<tyvera_runtime::HttpHeaders>",
+            IRType.HTTP_REQUEST: "std::shared_ptr<tyvera_runtime::HttpRequest>",
+            IRType.HTTP_RESPONSE: "std::shared_ptr<tyvera_runtime::HttpResponse>",
             IRType.TLS_CONNECTION: "std::shared_ptr<tyvera_runtime::TlsConnection>",
             IRType.DURATION: "tyvera_runtime::Duration",
             IRType.BYTES: "std::vector<std::uint8_t>",
@@ -581,6 +586,15 @@ class _CppGenerator:
                 "tcpListen": "tcp_listen",
                 "webSocketUrl": "websocket_url",
                 "webSocketConnect": "websocket_connect",
+                "httpMethod": "http_method",
+                "httpUrl": "http_url",
+                "httpHeaders": "http_headers",
+                "httpRequest": "http_request",
+                "httpSend": "http_send",
+                "httpGet": "http_get",
+                "httpPost": "http_post",
+                "httpPut": "http_put",
+                "httpDelete": "http_delete",
             }
             function = runtime_functions.get(expression.builtin)
             if function is None:
@@ -602,7 +616,8 @@ class _CppGenerator:
                 values.extend([_location_args(expression.location)])
             elif expression.builtin == "pathJoin":
                 values.append(_location_args(expression.location))
-            elif expression.builtin in {"runTasks", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen", "webSocketConnect"}:
+            elif expression.builtin in {"runTasks", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen",
+                                         "webSocketConnect", "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete"}:
                 values.append(_location_args(expression.location))
             call = f"tyvera_runtime::{function}({', '.join(values)})"
             lines.append(f"    return {call};")
@@ -748,6 +763,37 @@ class _CppGenerator:
                 "flush": "text_flush", "close": "text_close", "isOpen": "text_is_open",
             }
             return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
+        if expression.receiver.type == IRType.HTTP_METHOD:
+            functions = {"name": "http_method_name", "isStandard": "http_method_is_standard"}
+            return f"tyvera_runtime::{functions[method]}({receiver})"
+        if expression.receiver.type == IRType.HTTP_URL:
+            functions = {
+                "scheme": "http_url_scheme", "host": "http_url_host",
+                "port": "http_url_port", "target": "http_url_target",
+                "authority": "http_url_authority",
+            }
+            return f"tyvera_runtime::{functions[method]}({receiver})"
+        if expression.receiver.type == IRType.HTTP_HEADERS:
+            functions = {
+                "add": "http_headers_add", "set": "http_headers_set",
+                "remove": "http_headers_remove", "get": "http_headers_get",
+                "values": "http_headers_values", "contains": "http_headers_contains",
+                "length": "http_headers_length",
+            }
+            values = [receiver, *arguments, _location_args(expression.location)]
+            return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
+        if expression.receiver.type == IRType.HTTP_REQUEST:
+            functions = {
+                "method": "http_request_method", "target": "http_request_target",
+                "headers": "http_request_headers", "body": "http_request_body",
+            }
+            return f"tyvera_runtime::{functions[method]}({receiver})"
+        if expression.receiver.type == IRType.HTTP_RESPONSE:
+            functions = {
+                "status": "http_response_status", "headers": "http_response_headers",
+                "body": "http_response_body",
+            }
+            return f"tyvera_runtime::{functions[method]}({receiver})"
         if expression.receiver.type == IRType.WEBSOCKET_URL:
             functions = {
                 "scheme": "websocket_url_scheme", "host": "websocket_url_host",
@@ -869,6 +915,10 @@ def _module_uses_tls(module: IRModule) -> bool:
     def contains_tls(value) -> bool:
         if isinstance(value, IRType):
             return value in {IRType.TLS_CONNECTION, IRType.WEBSOCKET}
+        if isinstance(value, IRBuiltinCall) and value.builtin in {
+            "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete",
+        }:
+            return True
         if isinstance(value, IRAppliedType):
             return any(contains_tls(argument) for argument in value.arguments)
         if isinstance(value, (tuple, list)):
@@ -2051,6 +2101,29 @@ struct WebSocketUrl {
 struct WebSocketMessage {
     int opcode = 1;
     std::vector<std::uint8_t> payload;
+};
+struct HttpMethod {
+    std::string name;
+};
+struct HttpUrl {
+    std::string scheme;
+    std::string host;
+    std::int64_t port = 0;
+    std::string target;
+};
+struct HttpHeaders {
+    std::vector<std::pair<std::string, std::string>> entries;
+};
+struct HttpRequest {
+    HttpMethod method;
+    std::string target;
+    std::shared_ptr<HttpHeaders> headers;
+    std::vector<std::uint8_t> body;
+};
+struct HttpResponse {
+    std::int64_t status = 0;
+    std::shared_ptr<HttpHeaders> headers;
+    std::vector<std::uint8_t> body;
 };
 
 #if defined(__linux__)
@@ -4164,6 +4237,809 @@ inline std::string format_float(double value) {
     }
     return negative ? "-" + fixed : fixed;
 }
+
+inline bool http_token_character(unsigned char value) {
+    return (value >= '0' && value <= '9') || (value >= 'A' && value <= 'Z')
+        || (value >= 'a' && value <= 'z') || value == '!' || value == '#' || value == '
+
+
+        || value == '%' || value == '&' || value == 39 || value == '*' || value == '+'
+        || value == '-' || value == '.' || value == '^' || value == '_' || value == 96
+        || value == '|' || value == '~';
+}
+inline std::string http_lower_ascii(std::string value) {
+    for (auto& character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (byte >= 'A' && byte <= 'Z') character = static_cast<char>(byte - 'A' + 'a');
+    }
+    return value;
+}
+inline std::string http_trim_ows(std::string value) {
+    std::size_t begin = 0, end = value.size();
+    while (begin < end && (value[begin] == ' ' || value[begin] == '\t')) ++begin;
+    while (end > begin && (value[end - 1] == ' ' || value[end - 1] == '\t')) --end;
+    return value.substr(begin, end - begin);
+}
+inline bool http_header_name_valid(const std::string& name) {
+    return !name.empty() && std::all_of(name.begin(), name.end(), [](unsigned char c) {
+        return http_token_character(c);
+    });
+}
+inline std::vector<std::uint32_t> http_utf8_codepoints(const std::string& value, bool& valid) {
+    std::vector<std::uint32_t> result;
+    valid = valid_utf8(value);
+    if (!valid) return result;
+    for (std::size_t i = 0; i < value.size();) {
+        const auto first = static_cast<unsigned char>(value[i]);
+        std::uint32_t cp = 0;
+        std::size_t count = 1;
+        if (first < 0x80) cp = first;
+        else if ((first & 0xe0) == 0xc0) { cp = first & 0x1f; count = 2; }
+        else if ((first & 0xf0) == 0xe0) { cp = first & 0x0f; count = 3; }
+        else { cp = first & 0x07; count = 4; }
+        for (std::size_t j = 1; j < count; ++j)
+            cp = (cp << 6) | (static_cast<unsigned char>(value[i + j]) & 0x3f);
+        result.push_back(cp);
+        i += count;
+    }
+    return result;
+}
+inline bool http_header_value_valid(const std::string& value) {
+    bool valid = false;
+    const auto codepoints = http_utf8_codepoints(value, valid);
+    if (!valid) return false;
+    for (const auto cp : codepoints)
+        if (cp > 255 || cp <= 8 || cp == 10 || cp == 13 || (cp >= 14 && cp <= 31) || cp == 127)
+            return false;
+    return true;
+}
+inline std::string http_latin1_to_utf8(const std::string& value) {
+    std::string result;
+    result.reserve(value.size() * 2);
+    for (const auto raw : value) {
+        const auto byte = static_cast<unsigned char>(raw);
+        if (byte < 0x80) result.push_back(static_cast<char>(byte));
+        else {
+            result.push_back(static_cast<char>(0xc0 | (byte >> 6)));
+            result.push_back(static_cast<char>(0x80 | (byte & 0x3f)));
+        }
+    }
+    return result;
+}
+inline StringResult<std::string> http_utf8_to_latin1(const std::string& value) {
+    bool valid = false;
+    const auto codepoints = http_utf8_codepoints(value, valid);
+    if (!valid) return result_error<std::string>("HTTP header value must use the ISO-8859-1 range");
+    std::string result;
+    result.reserve(codepoints.size());
+    for (const auto cp : codepoints) {
+        if (cp > 255) return result_error<std::string>("HTTP header value must use the ISO-8859-1 range");
+        result.push_back(static_cast<char>(cp));
+    }
+    return result_ok<std::string>(std::move(result));
+}
+inline StringResult<std::string> http_validate_header(const std::string& name, const std::string& value) {
+    if (!http_header_name_valid(name)) return result_error<std::string>("invalid HTTP header name");
+    if (!http_header_value_valid(value)) {
+        bool valid = false; (void)http_utf8_codepoints(value, valid);
+        return result_error<std::string>(valid ? "invalid HTTP header value"
+                                                : "HTTP header value must use the ISO-8859-1 range");
+    }
+    return result_ok<std::string>(http_lower_ascii(name));
+}
+inline StringResult<bool> http_headers_add_internal(
+    const std::shared_ptr<HttpHeaders>& headers, const std::string& name, const std::string& value) {
+    if (!headers) return result_error<bool>("invalid HTTP headers");
+    auto normalized = http_validate_header(name, value);
+    if (std::holds_alternative<std::string>(normalized))
+        return result_error<bool>(std::get<1>(std::move(normalized)));
+    headers->entries.emplace_back(std::get<0>(std::move(normalized)), http_trim_ows(value));
+    return result_ok<bool>(true);
+}
+inline std::int64_t http_headers_remove_internal(
+    const std::shared_ptr<HttpHeaders>& headers, const std::string& key) {
+    if (!headers) return 0;
+    const auto old = headers->entries.size();
+    headers->entries.erase(std::remove_if(headers->entries.begin(), headers->entries.end(),
+        [&key](const auto& entry) { return entry.first == key; }), headers->entries.end());
+    return static_cast<std::int64_t>(old - headers->entries.size());
+}
+inline StringResult<bool> http_headers_set_internal(
+    const std::shared_ptr<HttpHeaders>& headers, const std::string& name, const std::string& value) {
+    auto normalized = http_validate_header(name, value);
+    if (std::holds_alternative<std::string>(normalized))
+        return result_error<bool>(std::get<1>(std::move(normalized)));
+    const auto key = std::get<0>(normalized);
+    http_headers_remove_internal(headers, key);
+    return http_headers_add_internal(headers, name, value);
+}
+inline StringResult<bool> http_headers_add(
+    const std::shared_ptr<HttpHeaders>& headers, const std::string& name, const std::string& value,
+    const std::string&, int, int) {
+    return http_headers_add_internal(headers, name, value);
+}
+inline StringResult<bool> http_headers_set(
+    const std::shared_ptr<HttpHeaders>& headers, const std::string& name, const std::string& value,
+    const std::string&, int, int) {
+    return http_headers_set_internal(headers, name, value);
+}
+inline std::vector<std::string> http_headers_values_internal(
+    const std::shared_ptr<HttpHeaders>& headers, const std::string& name,
+    const std::string& file, int line, int column) {
+    auto normalized = http_validate_header(name, "");
+    if (std::holds_alternative<std::string>(normalized))
+        fail(file, line, column, std::get<1>(std::move(normalized)));
+    std::vector<std::string> result;
+    if (!headers) return result;
+    const auto& key = std::get<0>(normalized);
+    for (const auto& entry : headers->entries)
+        if (entry.first == key) result.push_back(entry.second);
+    return result;
+}
+inline std::int64_t http_headers_remove(
+    const std::shared_ptr<HttpHeaders>& headers, const std::string& name,
+    const std::string& file, int line, int column) {
+    auto normalized = http_validate_header(name, "");
+    if (std::holds_alternative<std::string>(normalized))
+        fail(file, line, column, std::get<1>(std::move(normalized)));
+    return http_headers_remove_internal(headers, std::get<0>(std::move(normalized)));
+}
+inline std::optional<std::string> http_headers_get(
+    const std::shared_ptr<HttpHeaders>& headers, const std::string& name,
+    const std::string& file, int line, int column) {
+    const auto values = http_headers_values_internal(headers, name, file, line, column);
+    if (values.empty()) return std::nullopt;
+    if (http_lower_ascii(name) == "set-cookie") return values.front();
+    std::string result;
+    for (const auto& value : values) { if (!result.empty()) result += ", "; result += value; }
+    return result;
+}
+inline std::shared_ptr<ListData<std::string>> http_headers_values(
+    const std::shared_ptr<HttpHeaders>& headers, const std::string& name,
+    const std::string& file, int line, int column) {
+    auto result = make_list<std::string>();
+    result->values = http_headers_values_internal(headers, name, file, line, column);
+    return result;
+}
+inline bool http_headers_contains(
+    const std::shared_ptr<HttpHeaders>& headers, const std::string& name,
+    const std::string& file, int line, int column) {
+    return !http_headers_values_internal(headers, name, file, line, column).empty();
+}
+inline std::int64_t http_headers_length(const std::shared_ptr<HttpHeaders>& headers,
+                                        const std::string&, int, int) {
+    return headers ? static_cast<std::int64_t>(headers->entries.size()) : 0;
+}
+inline std::string http_method_name(const HttpMethod& method) { return method.name; }
+inline bool http_method_is_standard(const HttpMethod& method) {
+    static const std::set<std::string> standard{"GET", "HEAD", "POST", "PUT", "DELETE",
+        "PATCH", "OPTIONS", "CONNECT", "TRACE"};
+    return standard.find(method.name) != standard.end();
+}
+inline std::shared_ptr<HttpHeaders> http_headers() { return std::make_shared<HttpHeaders>(); }
+inline StringResult<HttpMethod> http_method(const std::string& value) {
+    if (value.empty() || !std::all_of(value.begin(), value.end(), [](unsigned char c) { return http_token_character(c); }))
+        return result_error<HttpMethod>("invalid HTTP method");
+    return result_ok<HttpMethod>(HttpMethod{value});
+}
+inline std::string http_url_scheme(const HttpUrl& url) { return url.scheme; }
+inline std::string http_url_host(const HttpUrl& url) { return url.host; }
+inline std::int64_t http_url_port(const HttpUrl& url) { return url.port; }
+inline std::string http_url_target(const HttpUrl& url) { return url.target; }
+inline std::string http_url_authority(const HttpUrl& url) {
+    std::string value = url.host.find(':') == std::string::npos ? url.host : "[" + url.host + "]";
+    if (url.port != (url.scheme == "https" ? 443 : 80)) value += ":" + std::to_string(url.port);
+    return value;
+}
+inline bool http_valid_ipv4(const std::string& value) {
+    std::size_t start = 0, groups = 0;
+    while (start <= value.size()) {
+        const auto end = value.find('.', start);
+        const auto stop = end == std::string::npos ? value.size() : end;
+        if (start == stop || stop - start > 3) return false;
+        unsigned int part = 0;
+        for (std::size_t i = start; i < stop; ++i) {
+            const auto c = static_cast<unsigned char>(value[i]);
+            if (c < '0' || c > '9') return false;
+            part = part * 10 + (c - '0');
+        }
+        if (part > 255) return false;
+        ++groups;
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return groups == 4;
+}
+inline bool http_valid_ipv6(const std::string& value) {
+    if (value.empty() || value.find('%') != std::string::npos || value.find(":::") != std::string::npos)
+        return false;
+    const auto compression = value.find("::");
+    const bool compressed = compression != std::string::npos;
+    if (compressed && value.find("::", compression + 2) != std::string::npos) return false;
+    const auto before = compressed ? value.substr(0, compression) : value;
+    const auto after = compressed ? value.substr(compression + 2) : std::string();
+    std::size_t groups = 0;
+    auto count = [&groups](const std::string& side, bool allow_ipv4) {
+        if (side.empty()) return true;
+        std::size_t start = 0;
+        while (start <= side.size()) {
+            const auto end = side.find(':', start);
+            const auto stop = end == std::string::npos ? side.size() : end;
+            const auto part = side.substr(start, stop - start);
+            if (part.empty()) return false;
+            if (part.find('.') != std::string::npos) {
+                if (!allow_ipv4 || end != std::string::npos || !http_valid_ipv4(part)) return false;
+                groups += 2;
+            } else {
+                if (part.size() > 4) return false;
+                for (const auto c : part) {
+                    const auto byte = static_cast<unsigned char>(c);
+                    if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f')
+                          || (byte >= 'A' && byte <= 'F'))) return false;
+                }
+                ++groups;
+            }
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+        return true;
+    };
+    if (!count(before, !compressed) || !count(after, true) || groups > 8) return false;
+    return compressed ? groups < 8 : groups == 8;
+}
+inline bool http_valid_hostname(const std::string& host) {
+    if (host.empty() || host.size() > 253) return false;
+    const auto checked = host.back() == '.' ? host.substr(0, host.size() - 1) : host;
+    if (checked.empty()) return false;
+    std::size_t start = 0;
+    while (start < checked.size()) {
+        const auto end = checked.find('.', start);
+        const auto stop = end == std::string::npos ? checked.size() : end;
+        if (stop == start || stop - start > 63 || checked[start] == '-' || checked[stop - 1] == '-') return false;
+        for (std::size_t i = start; i < stop; ++i) {
+            const auto c = static_cast<unsigned char>(checked[i]);
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                  || (c >= '0' && c <= '9') || c == '-')) return false;
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return true;
+}
+inline bool http_parse_port(const std::string& value, std::int64_t& port) {
+    if (value.empty() || !std::all_of(value.begin(), value.end(), [](unsigned char c) { return c >= '0' && c <= '9'; }))
+        return false;
+    std::uint64_t parsed = 0;
+    const auto converted = std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (converted.ec != std::errc{} || converted.ptr != value.data() + value.size() || parsed < 1 || parsed > 65535)
+        return false;
+    port = static_cast<std::int64_t>(parsed);
+    return true;
+}
+inline bool http_valid_target(const std::string& target) {
+    if (target == "*") return true;
+    if (target.empty() || target.front() != '/' || target.find('#') != std::string::npos) return false;
+    for (std::size_t i = 0; i < target.size(); ++i) {
+        const auto byte = static_cast<unsigned char>(target[i]);
+        if (byte < 33 || byte > 126) return false;
+        if (byte == '%') {
+            if (i + 2 >= target.size() || !std::isxdigit(static_cast<unsigned char>(target[i + 1]))
+                || !std::isxdigit(static_cast<unsigned char>(target[i + 2]))) return false;
+            i += 2;
+        }
+    }
+    return true;
+}
+inline StringResult<HttpUrl> http_url(const std::string& input) {
+    const auto separator = input.find("://");
+    if (separator == std::string::npos)
+        return result_error<HttpUrl>("HTTP URL must include a scheme and authority");
+    const auto scheme = http_lower_ascii(input.substr(0, separator));
+    if (scheme != "http" && scheme != "https")
+        return result_error<HttpUrl>("HTTP URL scheme must be http or https");
+    const auto remainder = input.substr(separator + 3);
+    if (remainder.find('#') != std::string::npos)
+        return result_error<HttpUrl>("HTTP request URL must not contain a fragment");
+    const auto slash = remainder.find('/');
+    const auto question = remainder.find('?');
+    std::size_t authority_end = remainder.size();
+    if (slash != std::string::npos) authority_end = std::min(authority_end, slash);
+    if (question != std::string::npos) authority_end = std::min(authority_end, question);
+    const auto authority = remainder.substr(0, authority_end);
+    const auto suffix = remainder.substr(authority_end);
+    if (authority.empty() || authority.find('@') != std::string::npos)
+        return result_error<HttpUrl>("invalid HTTP URL authority");
+    HttpUrl url;
+    url.scheme = scheme;
+    url.port = scheme == "https" ? 443 : 80;
+    if (authority.front() == '[') {
+        const auto close = authority.find(']');
+        if (close == std::string::npos) return result_error<HttpUrl>("invalid IPv6 URL authority");
+        url.host = authority.substr(1, close - 1);
+        if (url.host.find('%') != std::string::npos)
+            return result_error<HttpUrl>("IPv6 URL scope identifiers are not supported");
+        if (!http_valid_ipv6(url.host)) return result_error<HttpUrl>("invalid IPv6 URL authority");
+        const auto remainder_authority = authority.substr(close + 1);
+        if (!remainder_authority.empty()
+            && (remainder_authority.front() != ':' || !http_parse_port(remainder_authority.substr(1), url.port)))
+            return result_error<HttpUrl>("invalid HTTP URL port");
+    } else {
+        if (std::count(authority.begin(), authority.end(), ':') > 1)
+            return result_error<HttpUrl>("IPv6 URL hosts must be enclosed in brackets");
+        const auto colon = authority.find(':');
+        url.host = authority.substr(0, colon);
+        if (colon != std::string::npos && !http_parse_port(authority.substr(colon + 1), url.port))
+            return result_error<HttpUrl>("invalid HTTP URL port");
+        if (!http_valid_hostname(url.host)) return result_error<HttpUrl>("invalid HTTP URL hostname");
+    }
+    url.host = http_lower_ascii(url.host);
+    if (suffix.empty()) url.target = "/";
+    else if (suffix.front() == '?') url.target = "/" + suffix;
+    else if (suffix.front() == '/') url.target = suffix;
+    else return result_error<HttpUrl>("invalid HTTP URL target");
+    if (!http_valid_target(url.target))
+        return result_error<HttpUrl>("HTTP request target must be origin-form without a fragment");
+    return result_ok<HttpUrl>(std::move(url));
+}
+inline StringResult<std::shared_ptr<HttpRequest>> http_request(
+    HttpMethod method, std::string target, std::shared_ptr<HttpHeaders> headers,
+    std::vector<std::uint8_t> body) {
+    if (!http_valid_target(target))
+        return result_error<std::shared_ptr<HttpRequest>>("HTTP request target must be origin-form without a fragment");
+    if (!headers) return result_error<std::shared_ptr<HttpRequest>>("invalid HTTP request values");
+    auto result = std::make_shared<HttpRequest>();
+    result->method = std::move(method);
+    result->target = std::move(target);
+    result->headers = std::move(headers);
+    result->body = std::move(body);
+    return result_ok<std::shared_ptr<HttpRequest>>(std::move(result));
+}
+inline HttpMethod http_request_method(const std::shared_ptr<HttpRequest>& value) {
+    return value ? value->method : HttpMethod{};
+}
+inline std::string http_request_target(const std::shared_ptr<HttpRequest>& value) {
+    return value ? value->target : std::string();
+}
+inline std::shared_ptr<HttpHeaders> http_request_headers(const std::shared_ptr<HttpRequest>& value) {
+    return value ? value->headers : std::make_shared<HttpHeaders>();
+}
+inline std::vector<std::uint8_t> http_request_body(const std::shared_ptr<HttpRequest>& value) {
+    return value ? value->body : std::vector<std::uint8_t>{};
+}
+inline std::int64_t http_response_status(const std::shared_ptr<HttpResponse>& value) {
+    return value ? value->status : 0;
+}
+inline std::shared_ptr<HttpHeaders> http_response_headers(const std::shared_ptr<HttpResponse>& value) {
+    return value ? value->headers : std::make_shared<HttpHeaders>();
+}
+inline std::vector<std::uint8_t> http_response_body(const std::shared_ptr<HttpResponse>& value) {
+    return value ? value->body : std::vector<std::uint8_t>{};
+}
+constexpr std::size_t HTTP_REQUEST_LINE_LIMIT = 8192;
+constexpr std::size_t HTTP_HEADER_BYTES_LIMIT = 32768;
+constexpr std::size_t HTTP_HEADER_COUNT_LIMIT = 100;
+constexpr std::size_t HTTP_BODY_BYTES_LIMIT = 1048576;
+constexpr std::size_t HTTP_BUFFER_BYTES_LIMIT =
+    HTTP_REQUEST_LINE_LIMIT + HTTP_HEADER_BYTES_LIMIT + HTTP_BODY_BYTES_LIMIT + HTTP_HEADER_BYTES_LIMIT + 4;
+struct HttpDecodedResponse { std::shared_ptr<HttpResponse> value; std::size_t consumed = 0; };
+using HttpDecodeResult = StringResult<std::optional<HttpDecodedResponse>>;
+inline HttpDecodeResult http_decode_response(
+    const std::vector<std::uint8_t>& input, bool eof, const std::string& method,
+    const std::string& file, int line, int column) {
+    const std::string bytes = input.empty()
+        ? std::string() : std::string(reinterpret_cast<const char*>(input.data()), input.size());
+    const auto header_end = bytes.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        if (input.size() > HTTP_REQUEST_LINE_LIMIT + HTTP_HEADER_BYTES_LIMIT + 4)
+            return result_error<std::optional<HttpDecodedResponse>>("HTTP headers exceed configured size limit");
+        if (eof && !input.empty())
+            return result_error<std::optional<HttpDecodedResponse>>("connection closed during HTTP headers");
+        return result_ok<std::optional<HttpDecodedResponse>>(std::nullopt);
+    }
+    if (header_end + 4 > HTTP_REQUEST_LINE_LIMIT + HTTP_HEADER_BYTES_LIMIT + 4)
+        return result_error<std::optional<HttpDecodedResponse>>("HTTP headers exceed configured size limit");
+    const auto head = bytes.substr(0, header_end);
+    std::vector<std::string> lines;
+    std::size_t start = 0;
+    for (;;) {
+        const auto end = head.find("\r\n", start);
+        lines.push_back(head.substr(start, end == std::string::npos ? std::string::npos : end - start));
+        if (end == std::string::npos) break;
+        start = end + 2;
+    }
+    if (lines.empty() || lines.front().size() > HTTP_REQUEST_LINE_LIMIT)
+        return result_error<std::optional<HttpDecodedResponse>>("HTTP start line exceeds configured size limit");
+    if (lines.size() - 1 > HTTP_HEADER_COUNT_LIMIT)
+        return result_error<std::optional<HttpDecodedResponse>>("HTTP header count exceeds configured limit");
+    const auto first_space = lines.front().find(' ');
+    const auto second_space = first_space == std::string::npos ? std::string::npos : lines.front().find(' ', first_space + 1);
+    if (first_space == std::string::npos
+        || (lines.front().substr(0, first_space) != "HTTP/1.0"
+            && lines.front().substr(0, first_space) != "HTTP/1.1")
+        || !std::all_of(lines.front().begin(), lines.front().end(), [](unsigned char c) { return c < 0x80; }))
+        return result_error<std::optional<HttpDecodedResponse>>("invalid HTTP status line");
+    const auto code = lines.front().substr(first_space + 1,
+        (second_space == std::string::npos ? lines.front().size() : second_space) - first_space - 1);
+    if (code.size() != 3 || !std::all_of(code.begin(), code.end(), [](unsigned char c) { return c >= '0' && c <= '9'; }))
+        return result_error<std::optional<HttpDecodedResponse>>("invalid HTTP status code");
+    int status = 0;
+    if (std::from_chars(code.data(), code.data() + code.size(), status).ec != std::errc{} || status < 100 || status > 599)
+        return result_error<std::optional<HttpDecodedResponse>>("invalid HTTP status code");
+    auto headers = std::make_shared<HttpHeaders>();
+    for (std::size_t index = 1; index < lines.size(); ++index) {
+        const auto& field = lines[index];
+        if (field.size() > HTTP_HEADER_BYTES_LIMIT)
+            return result_error<std::optional<HttpDecodedResponse>>("HTTP header exceeds configured size limit");
+        if (field.empty() || field.front() == ' ' || field.front() == '\t')
+            return result_error<std::optional<HttpDecodedResponse>>("invalid HTTP header line");
+        const auto colon = field.find(':');
+        if (colon == std::string::npos)
+            return result_error<std::optional<HttpDecodedResponse>>("invalid HTTP header line");
+        const auto name = field.substr(0, colon);
+        const auto raw_value = field.substr(colon + 1);
+        if (!http_header_name_valid(name)
+            || !std::all_of(raw_value.begin(), raw_value.end(), [](unsigned char c) {
+                return !(c <= 8 || c == 10 || c == 13 || (c >= 14 && c <= 31) || c == 127);
+            }))
+            return result_error<std::optional<HttpDecodedResponse>>("invalid HTTP header line");
+        headers->entries.emplace_back(http_lower_ascii(name), http_trim_ows(http_latin1_to_utf8(raw_value)));
+    }
+    const auto lengths = http_headers_values_internal(headers, "content-length", file, line, column);
+    const auto encodings = http_headers_values_internal(headers, "transfer-encoding", file, line, column);
+    std::optional<std::uint64_t> content_length;
+    if (!lengths.empty()) {
+        if (lengths.size() != 1 || lengths.front().empty()
+            || !std::all_of(lengths.front().begin(), lengths.front().end(), [](unsigned char c) { return c >= '0' && c <= '9'; }))
+            return result_error<std::optional<HttpDecodedResponse>>("invalid Content-Length");
+        std::uint64_t length = 0;
+        const auto parsed = std::from_chars(lengths.front().data(), lengths.front().data() + lengths.front().size(), length);
+        if (parsed.ec != std::errc{} || parsed.ptr != lengths.front().data() + lengths.front().size())
+            return result_error<std::optional<HttpDecodedResponse>>("invalid Content-Length");
+        if (length > 16'777'216)
+            return result_error<std::optional<HttpDecodedResponse>>("HTTP body exceeds configured size limit");
+        content_length = length;
+    }
+    std::vector<std::string> coding;
+    for (const auto& value : encodings) {
+        std::size_t pos = 0;
+        for (;;) {
+            const auto end = value.find(',', pos);
+            coding.push_back(http_lower_ascii(http_trim_ows(value.substr(pos, end == std::string::npos ? std::string::npos : end - pos))));
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+    }
+    if (!encodings.empty() && coding != std::vector<std::string>{"chunked"})
+        return result_error<std::optional<HttpDecodedResponse>>("unsupported HTTP transfer encoding");
+    const bool chunked = coding == std::vector<std::string>{"chunked"};
+    if (content_length && chunked)
+        return result_error<std::optional<HttpDecodedResponse>>("ambiguous HTTP message framing");
+    const auto body_start = header_end + 4;
+    std::vector<std::uint8_t> body;
+    std::size_t message_end = body_start;
+    const bool no_body = method == "HEAD" || (status >= 100 && status < 200) || status == 204 || status == 304;
+    if (no_body) {
+        // Empty body is determined solely by the status/method semantics.
+    } else if (chunked) {
+        std::size_t cursor = body_start, overhead = 0;
+        for (;;) {
+            const auto end = bytes.find("\r\n", cursor);
+            if (end == std::string::npos) {
+                if (overhead + bytes.size() - cursor > HTTP_HEADER_BYTES_LIMIT)
+                    return result_error<std::optional<HttpDecodedResponse>>("HTTP chunk metadata exceeds configured size limit");
+                if (eof) return result_error<std::optional<HttpDecodedResponse>>("connection closed during HTTP chunk metadata");
+                return result_ok<std::optional<HttpDecodedResponse>>(std::nullopt);
+            }
+            const auto chunk_line = bytes.substr(cursor, end - cursor);
+            cursor = end + 2;
+            overhead += chunk_line.size() + 2;
+            if (overhead > HTTP_HEADER_BYTES_LIMIT)
+                return result_error<std::optional<HttpDecodedResponse>>("HTTP chunk metadata exceeds configured size limit");
+            const auto semicolon = chunk_line.find(';');
+            const auto digits = chunk_line.substr(0, semicolon);
+            if (digits.empty() || digits.size() > 16
+                || !std::all_of(chunk_line.begin(), chunk_line.end(), [](unsigned char c) { return c >= 32 && c <= 126; })
+                || !std::all_of(digits.begin(), digits.end(), [](unsigned char c) { return std::isxdigit(c) != 0; }))
+                return result_error<std::optional<HttpDecodedResponse>>("invalid HTTP chunk size");
+            std::uint64_t length = 0;
+            const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), length, 16);
+            if (parsed.ec != std::errc{} || length > HTTP_BODY_BYTES_LIMIT - body.size())
+                return result_error<std::optional<HttpDecodedResponse>>("HTTP body exceeds configured size limit");
+            if (length == 0) {
+                std::size_t trailer_count = 0;
+                for (;;) {
+                    const auto trailer_end = bytes.find("\r\n", cursor);
+                    if (trailer_end == std::string::npos) {
+                        if (overhead + bytes.size() - cursor > HTTP_HEADER_BYTES_LIMIT)
+                            return result_error<std::optional<HttpDecodedResponse>>("HTTP chunk metadata exceeds configured size limit");
+                        if (eof) return result_error<std::optional<HttpDecodedResponse>>("connection closed during HTTP chunk trailers");
+                        return result_ok<std::optional<HttpDecodedResponse>>(std::nullopt);
+                    }
+                    const auto trailer = bytes.substr(cursor, trailer_end - cursor);
+                    cursor = trailer_end + 2;
+                    overhead += trailer.size() + 2;
+                    if (overhead > HTTP_HEADER_BYTES_LIMIT)
+                        return result_error<std::optional<HttpDecodedResponse>>("HTTP chunk metadata exceeds configured size limit");
+                    if (trailer.empty()) break;
+                    const auto colon = trailer.find(':');
+                    if (trailer.front() == ' ' || trailer.front() == '\t' || colon == std::string::npos
+                        || !http_header_name_valid(trailer.substr(0, colon))
+                        || !http_header_value_valid(http_latin1_to_utf8(trailer.substr(colon + 1))))
+                        return result_error<std::optional<HttpDecodedResponse>>("invalid HTTP trailer line");
+                    const auto name = http_lower_ascii(trailer.substr(0, colon));
+                    if (name == "content-length" || name == "transfer-encoding" || name == "host")
+                        return result_error<std::optional<HttpDecodedResponse>>("forbidden HTTP trailer field");
+                    if (++trailer_count > HTTP_HEADER_COUNT_LIMIT)
+                        return result_error<std::optional<HttpDecodedResponse>>("invalid HTTP trailer line");
+                }
+                message_end = cursor;
+                break;
+            }
+            const auto end64 = static_cast<std::uint64_t>(cursor) + length;
+            if (end64 > bytes.size() || end64 + 2 > bytes.size()) {
+                if (eof) return result_error<std::optional<HttpDecodedResponse>>("connection closed during HTTP chunk data");
+                return result_ok<std::optional<HttpDecodedResponse>>(std::nullopt);
+            }
+            const auto data_end = static_cast<std::size_t>(end64);
+            if (bytes.compare(data_end, 2, "\r\n") != 0)
+                return result_error<std::optional<HttpDecodedResponse>>("HTTP chunk data must end with CRLF");
+            body.insert(body.end(), input.begin() + static_cast<std::ptrdiff_t>(cursor),
+                        input.begin() + static_cast<std::ptrdiff_t>(data_end));
+            overhead += 2;
+            if (overhead > HTTP_HEADER_BYTES_LIMIT)
+                return result_error<std::optional<HttpDecodedResponse>>("HTTP chunk metadata exceeds configured size limit");
+            cursor = data_end + 2;
+        }
+    } else if (!content_length) {
+        if (!eof) {
+            if (bytes.size() - body_start > HTTP_BODY_BYTES_LIMIT)
+                return result_error<std::optional<HttpDecodedResponse>>("HTTP body exceeds configured size limit");
+            return result_ok<std::optional<HttpDecodedResponse>>(std::nullopt);
+        }
+        const auto length = bytes.size() - body_start;
+        if (length > HTTP_BODY_BYTES_LIMIT)
+            return result_error<std::optional<HttpDecodedResponse>>("HTTP body exceeds configured size limit");
+        body.assign(input.begin() + static_cast<std::ptrdiff_t>(body_start), input.end());
+        message_end = input.size();
+    } else {
+        if (*content_length > HTTP_BODY_BYTES_LIMIT)
+            return result_error<std::optional<HttpDecodedResponse>>("HTTP body exceeds configured size limit");
+        const auto end64 = static_cast<std::uint64_t>(body_start) + *content_length;
+        if (end64 > bytes.size()) {
+            if (eof) return result_error<std::optional<HttpDecodedResponse>>("connection closed during HTTP body");
+            return result_ok<std::optional<HttpDecodedResponse>>(std::nullopt);
+        }
+        body.assign(input.begin() + static_cast<std::ptrdiff_t>(body_start),
+                    input.begin() + static_cast<std::ptrdiff_t>(end64));
+        message_end = static_cast<std::size_t>(end64);
+    }
+    auto response = std::make_shared<HttpResponse>();
+    response->status = status;
+    response->headers = std::move(headers);
+    response->body = std::move(body);
+    return result_ok<std::optional<HttpDecodedResponse>>(HttpDecodedResponse{std::move(response), message_end});
+}
+inline StringResult<std::vector<std::uint8_t>> http_encode_request(const HttpRequest& request, const HttpUrl& url) {
+    if (request.method.name.empty()
+        || !std::all_of(request.method.name.begin(), request.method.name.end(), [](unsigned char c) { return http_token_character(c); }))
+        return result_error<std::vector<std::uint8_t>>("invalid HTTP method");
+    if (!http_valid_target(request.target)) return result_error<std::vector<std::uint8_t>>("invalid HTTP request target");
+    if (request.body.size() > HTTP_BODY_BYTES_LIMIT)
+        return result_error<std::vector<std::uint8_t>>("HTTP body exceeds configured size limit");
+    auto headers = std::make_shared<HttpHeaders>();
+    if (request.headers) headers->entries = request.headers->entries;
+    auto host = http_headers_set_internal(headers, "Host", http_url_authority(url));
+    if (std::holds_alternative<std::string>(host)) return result_error<std::vector<std::uint8_t>>(std::get<1>(std::move(host)));
+    auto connection = http_headers_set_internal(headers, "Connection", "close");
+    if (std::holds_alternative<std::string>(connection)) return result_error<std::vector<std::uint8_t>>(std::get<1>(std::move(connection)));
+    const auto lengths = http_headers_values_internal(headers, "content-length", "<native>", 1, 1);
+    if (lengths.empty()) {
+        auto set_length = http_headers_set_internal(headers, "Content-Length", std::to_string(request.body.size()));
+        if (std::holds_alternative<std::string>(set_length)) return result_error<std::vector<std::uint8_t>>(std::get<1>(std::move(set_length)));
+    } else if (lengths.size() != 1 || lengths.front() != std::to_string(request.body.size())) {
+        return result_error<std::vector<std::uint8_t>>("Content-Length does not match body size");
+    }
+    if (!http_headers_values_internal(headers, "transfer-encoding", "<native>", 1, 1).empty())
+        return result_error<std::vector<std::uint8_t>>("transfer-encoding is not supported");
+    if (headers->entries.size() > HTTP_HEADER_COUNT_LIMIT)
+        return result_error<std::vector<std::uint8_t>>("HTTP header count exceeds configured limit");
+    const auto start = request.method.name + " " + request.target + " HTTP/1.1\r\n";
+    if (start.size() > HTTP_REQUEST_LINE_LIMIT)
+        return result_error<std::vector<std::uint8_t>>("HTTP request line exceeds configured size limit");
+    std::string encoded_headers;
+    for (const auto& entry : headers->entries) {
+        if (!http_header_name_valid(entry.first) || !http_header_value_valid(entry.second))
+            return result_error<std::vector<std::uint8_t>>("invalid HTTP header line");
+        auto latin = http_utf8_to_latin1(entry.second);
+        if (std::holds_alternative<std::string>(latin)) return result_error<std::vector<std::uint8_t>>(std::get<1>(std::move(latin)));
+        encoded_headers += entry.first + ": " + std::get<0>(std::move(latin)) + "\r\n";
+    }
+    if (encoded_headers.size() > HTTP_HEADER_BYTES_LIMIT)
+        return result_error<std::vector<std::uint8_t>>("HTTP headers exceed configured size limit");
+    std::vector<std::uint8_t> result;
+    result.reserve(start.size() + encoded_headers.size() + request.body.size() + 2);
+    result.insert(result.end(), start.begin(), start.end());
+    result.insert(result.end(), encoded_headers.begin(), encoded_headers.end());
+    result.push_back('\r'); result.push_back('\n');
+    result.insert(result.end(), request.body.begin(), request.body.end());
+    return result_ok<std::vector<std::uint8_t>>(std::move(result));
+}
+#if defined(__linux__) && defined(TYVERA_NATIVE_TLS)
+struct NativeHttpTransport {
+    std::shared_ptr<TcpConnection> tcp;
+    std::shared_ptr<TlsConnection> tls;
+    void close() noexcept {
+        if (tls) (void)tls->close();
+        else if (tcp && tcp->socket) (void)tcp->socket->close();
+    }
+};
+using NativeHttpReadResult = StringResult<std::optional<std::vector<std::uint8_t>>>;
+using NativeHttpWriteResult = StringResult<std::int64_t>;
+inline Task<NativeHttpReadResult> http_transport_read(
+    const std::shared_ptr<NativeHttpTransport>& transport, const std::string& file, int line, int column) {
+    if (transport->tls) return tls_read(transport->tls, 65536, file, line, column);
+    return tcp_read(transport->tcp, 65536, file, line, column);
+}
+inline Task<NativeHttpWriteResult> http_transport_write(
+    const std::shared_ptr<NativeHttpTransport>& transport, std::vector<std::uint8_t> bytes,
+    const std::string& file, int line, int column) {
+    if (transport->tls) return tls_write_all(transport->tls, std::move(bytes), file, line, column);
+    return tcp_write_all(transport->tcp, std::move(bytes), file, line, column);
+}
+inline Task<StringResult<std::shared_ptr<HttpResponse>>> http_send(
+    HttpUrl url, std::shared_ptr<HttpRequest> request, Duration timeout,
+    const std::string& file, int line, int column) {
+    using Output = StringResult<std::shared_ptr<HttpResponse>>;
+    if (timeout.milliseconds <= 0)
+        return make_io_task<Output>([]() -> Output { return result_error<std::shared_ptr<HttpResponse>>("HTTP timeout must be greater than zero"); },
+                                    file, line, column);
+    return make_io_task<Output>(
+        [url = std::move(url), request = std::move(request), timeout, file, line, column]() mutable -> Output {
+            if (!request) return result_error<std::shared_ptr<HttpResponse>>("invalid HTTP request values");
+            auto encoded = http_encode_request(*request, url);
+            if (std::holds_alternative<std::string>(encoded))
+                return result_error<std::shared_ptr<HttpResponse>>("HTTP request encoding failed: " + std::get<1>(std::move(encoded)));
+            auto transport = std::make_shared<NativeHttpTransport>();
+            if (url.scheme == "https") {
+                auto operation = tls_connect(url.host, url.port, file, line, column);
+                std::optional<StringResult<std::shared_ptr<TlsConnection>>> opened;
+                if (!websocket_await_timed(std::move(operation), timeout.milliseconds, file, line, column, opened))
+                    return result_error<std::shared_ptr<HttpResponse>>("HTTP timeout");
+                if (!opened || std::holds_alternative<std::string>(*opened))
+                    return result_error<std::shared_ptr<HttpResponse>>("HTTP connect failed: "
+                        + (opened ? std::get<1>(*opened) : std::string("invalid connect completion")));
+                transport->tls = std::get<0>(std::move(*opened));
+            } else {
+                auto operation = tcp_connect(url.host, url.port, file, line, column);
+                std::optional<StringResult<std::shared_ptr<TcpConnection>>> opened;
+                if (!websocket_await_timed(std::move(operation), timeout.milliseconds, file, line, column, opened))
+                    return result_error<std::shared_ptr<HttpResponse>>("HTTP timeout");
+                if (!opened || std::holds_alternative<std::string>(*opened))
+                    return result_error<std::shared_ptr<HttpResponse>>("HTTP connect failed: "
+                        + (opened ? std::get<1>(*opened) : std::string("invalid connect completion")));
+                transport->tcp = std::get<0>(std::move(*opened));
+            }
+            auto writing = http_transport_write(transport, std::get<0>(std::move(encoded)), file, line, column);
+            std::optional<NativeHttpWriteResult> write_result;
+            if (!websocket_await_timed(std::move(writing), timeout.milliseconds, file, line, column, write_result)) {
+                transport->close();
+                return result_error<std::shared_ptr<HttpResponse>>("HTTP timeout");
+            }
+            if (!write_result || std::holds_alternative<std::string>(*write_result)) {
+                const auto detail = write_result ? std::get<1>(*write_result) : std::string("invalid write completion");
+                transport->close();
+                return result_error<std::shared_ptr<HttpResponse>>("HTTP write failed: " + detail);
+            }
+            std::vector<std::uint8_t> receive_buffer;
+            for (;;) {
+                auto reading = http_transport_read(transport, file, line, column);
+                std::optional<NativeHttpReadResult> read_result;
+                if (!websocket_await_timed(std::move(reading), timeout.milliseconds, file, line, column, read_result)) {
+                    transport->close();
+                    return result_error<std::shared_ptr<HttpResponse>>("HTTP timeout");
+                }
+                if (!read_result || std::holds_alternative<std::string>(*read_result)) {
+                    const auto detail = read_result ? std::get<1>(*read_result) : std::string("invalid read completion");
+                    transport->close();
+                    return result_error<std::shared_ptr<HttpResponse>>("HTTP read failed: " + detail);
+                }
+                auto chunk = std::get<0>(std::move(*read_result));
+                const bool eof = !chunk.has_value();
+                if (chunk) {
+                    if (chunk->size() > HTTP_BUFFER_BYTES_LIMIT
+                        || receive_buffer.size() > HTTP_BUFFER_BYTES_LIMIT - chunk->size()) {
+                        transport->close();
+                        return result_error<std::shared_ptr<HttpResponse>>("HTTP message exceeds configured size limits");
+                    }
+                    receive_buffer.insert(receive_buffer.end(), chunk->begin(), chunk->end());
+                }
+                auto decoded = http_decode_response(receive_buffer, eof, request->method.name, file, line, column);
+                if (std::holds_alternative<std::string>(decoded)) {
+                    transport->close();
+                    return result_error<std::shared_ptr<HttpResponse>>("HTTP response parse error: " + std::get<1>(std::move(decoded)));
+                }
+                auto message = std::get<0>(std::move(decoded));
+                if (!message) {
+                    if (eof) {
+                        transport->close();
+                        return result_error<std::shared_ptr<HttpResponse>>("HTTP connection closed before a complete response");
+                    }
+                    continue;
+                }
+                auto response = std::move(message->value);
+                if (message->consumed > receive_buffer.size()) {
+                    transport->close();
+                    return result_error<std::shared_ptr<HttpResponse>>("invalid HTTP response completion");
+                }
+                receive_buffer.erase(receive_buffer.begin(),
+                    receive_buffer.begin() + static_cast<std::ptrdiff_t>(message->consumed));
+                if (response->status >= 100 && response->status < 200 && response->status != 101) {
+                    if (receive_buffer.empty()) {
+                        if (eof) {
+                            transport->close();
+                            return result_error<std::shared_ptr<HttpResponse>>("HTTP connection closed before a complete response");
+                        }
+                        continue;
+                    }
+                    auto next = http_decode_response(receive_buffer, eof, request->method.name, file, line, column);
+                    if (std::holds_alternative<std::string>(next)) {
+                        transport->close();
+                        return result_error<std::shared_ptr<HttpResponse>>("HTTP response parse error: " + std::get<1>(std::move(next)));
+                    }
+                    auto next_message = std::get<0>(std::move(next));
+                    if (!next_message) continue;
+                    response = std::move(next_message->value);
+                    if (response->status >= 100 && response->status < 200 && response->status != 101) {
+                        transport->close();
+                        return result_error<std::shared_ptr<HttpResponse>>("too many interim HTTP responses");
+                    }
+                }
+                transport->close();
+                return result_ok<std::shared_ptr<HttpResponse>>(std::move(response));
+            }
+        }, file, line, column);
+}
+#else
+inline Task<StringResult<std::shared_ptr<HttpResponse>>> http_send(
+    HttpUrl, std::shared_ptr<HttpRequest>, Duration, const std::string& file, int line, int column) {
+    return make_io_task<StringResult<std::shared_ptr<HttpResponse>>>([] {
+        return result_error<std::shared_ptr<HttpResponse>>("HTTP client is not supported by this native platform");
+    }, file, line, column);
+}
+#endif
+inline Task<StringResult<std::shared_ptr<HttpResponse>>> http_get(
+    HttpUrl url, Duration timeout, const std::string& file, int line, int column) {
+    auto request = std::make_shared<HttpRequest>();
+    request->method = HttpMethod{"GET"}; request->target = url.target;
+    request->headers = std::make_shared<HttpHeaders>();
+    return http_send(std::move(url), std::move(request), timeout, file, line, column);
+}
+inline Task<StringResult<std::shared_ptr<HttpResponse>>> http_delete(
+    HttpUrl url, Duration timeout, const std::string& file, int line, int column) {
+    auto request = std::make_shared<HttpRequest>();
+    request->method = HttpMethod{"DELETE"}; request->target = url.target;
+    request->headers = std::make_shared<HttpHeaders>();
+    return http_send(std::move(url), std::move(request), timeout, file, line, column);
+}
+inline Task<StringResult<std::shared_ptr<HttpResponse>>> http_post(
+    HttpUrl url, std::shared_ptr<HttpHeaders> headers, std::vector<std::uint8_t> body,
+    Duration timeout, const std::string& file, int line, int column) {
+    auto request = std::make_shared<HttpRequest>();
+    request->method = HttpMethod{"POST"}; request->target = url.target;
+    request->headers = headers ? std::move(headers) : std::make_shared<HttpHeaders>();
+    request->body = std::move(body);
+    return http_send(std::move(url), std::move(request), timeout, file, line, column);
+}
+inline Task<StringResult<std::shared_ptr<HttpResponse>>> http_put(
+    HttpUrl url, std::shared_ptr<HttpHeaders> headers, std::vector<std::uint8_t> body,
+    Duration timeout, const std::string& file, int line, int column) {
+    auto request = std::make_shared<HttpRequest>();
+    request->method = HttpMethod{"PUT"}; request->target = url.target;
+    request->headers = headers ? std::move(headers) : std::make_shared<HttpHeaders>();
+    request->body = std::move(body);
+    return http_send(std::move(url), std::move(request), timeout, file, line, column);
+}
+
 } // namespace tyvera_runtime
 '''
 

@@ -96,6 +96,11 @@ _TYPE_MAP = {
     "WebSocketUrl": IRType.WEBSOCKET_URL,
     "WebSocket": IRType.WEBSOCKET,
     "WebSocketMessage": IRType.WEBSOCKET_MESSAGE,
+    "HttpMethod": IRType.HTTP_METHOD,
+    "HttpUrl": IRType.HTTP_URL,
+    "HttpHeaders": IRType.HTTP_HEADERS,
+    "HttpRequest": IRType.HTTP_REQUEST,
+    "HttpResponse": IRType.HTTP_RESPONSE,
     "Void": IRType.VOID,
     "Unit": IRType.VOID,
 }
@@ -514,7 +519,8 @@ class _FunctionLowerer:
                 "readBytes", "writeBytes", "pathJoin", "pathExists", "openText",
                 "openTextReader", "openTextWriter", "hostOS", "hostArchitecture",
                 "monotonicMilliseconds", "runTasks", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen",
-                "webSocketUrl", "webSocketConnect",
+                "webSocketUrl", "webSocketConnect", "httpMethod", "httpUrl", "httpHeaders",
+                "httpRequest", "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete",
             }:
                 return IRBuiltinCall(
                     expression.callee,

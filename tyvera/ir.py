@@ -35,6 +35,11 @@ class IRType(str, Enum):
     WEBSOCKET_URL = "WebSocketUrl"
     WEBSOCKET = "WebSocket"
     WEBSOCKET_MESSAGE = "WebSocketMessage"
+    HTTP_METHOD = "HttpMethod"
+    HTTP_URL = "HttpUrl"
+    HTTP_HEADERS = "HttpHeaders"
+    HTTP_REQUEST = "HttpRequest"
+    HTTP_RESPONSE = "HttpResponse"
     VOID = "Void"
 
 
@@ -445,6 +450,39 @@ def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef
             "text": ((), _applied("Result", IRType.STRING, IRType.STRING)),
         }
         return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.HTTP_METHOD:
+        signatures = {"name": ((), IRType.STRING), "isStandard": ((), IRType.BOOL)}
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.HTTP_URL:
+        signatures = {
+            "scheme": ((), IRType.STRING), "host": ((), IRType.STRING),
+            "port": ((), IRType.INT), "target": ((), IRType.STRING),
+            "authority": ((), IRType.STRING),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.HTTP_HEADERS:
+        signatures = {
+            "add": ((IRType.STRING, IRType.STRING), _applied("Result", IRType.BOOL, IRType.STRING)),
+            "set": ((IRType.STRING, IRType.STRING), _applied("Result", IRType.BOOL, IRType.STRING)),
+            "remove": ((IRType.STRING,), IRType.INT),
+            "get": ((IRType.STRING,), _applied("Option", IRType.STRING)),
+            "values": ((IRType.STRING,), _applied("List", IRType.STRING)),
+            "contains": ((IRType.STRING,), IRType.BOOL),
+            "length": ((), IRType.INT),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.HTTP_REQUEST:
+        signatures = {
+            "method": ((), IRType.HTTP_METHOD), "target": ((), IRType.STRING),
+            "headers": ((), IRType.HTTP_HEADERS), "body": ((), IRType.BYTES),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.HTTP_RESPONSE:
+        signatures = {
+            "status": ((), IRType.INT), "headers": ((), IRType.HTTP_HEADERS),
+            "body": ((), IRType.BYTES),
+        }
+        return signatures.get(method)
     if isinstance(receiver, IRType) and receiver == IRType.WEBSOCKET:
         signatures = {
             "sendText": ((IRType.STRING,), _applied("Task", _applied("Result", IRType.INT, IRType.STRING))),
@@ -725,7 +763,23 @@ def _validate_expression(
             "tlsConnect": ((IRType.STRING, IRType.INT), _applied("Task", _applied("Result", IRType.TLS_CONNECTION, IRType.STRING))),
             "tcpListen": ((IRType.STRING, IRType.INT, IRType.INT), _applied("Task", _applied("Result", IRType.TCP_LISTENER, IRType.STRING))),
             "webSocketUrl": ((IRType.STRING,), _applied("Result", IRType.WEBSOCKET_URL, IRType.STRING)),
+            "httpMethod": ((IRType.STRING,), _applied("Result", IRType.HTTP_METHOD, IRType.STRING)),
+            "httpUrl": ((IRType.STRING,), _applied("Result", IRType.HTTP_URL, IRType.STRING)),
+            "httpHeaders": ((), IRType.HTTP_HEADERS),
+            "httpRequest": ((IRType.HTTP_METHOD, IRType.STRING, IRType.HTTP_HEADERS, IRType.BYTES),
+                            _applied("Result", IRType.HTTP_REQUEST, IRType.STRING)),
         }
+        if expression.builtin in {"httpSend", "httpGet", "httpPost", "httpPut", "httpDelete"}:
+            expected_result = _applied("Task", _applied("Result", IRType.HTTP_RESPONSE, IRType.STRING))
+            if expression.builtin in {"httpSend"}:
+                expected = (IRType.HTTP_URL, IRType.HTTP_REQUEST, IRType.DURATION)
+            elif expression.builtin in {"httpGet", "httpDelete"}:
+                expected = (IRType.HTTP_URL, IRType.DURATION)
+            else:
+                expected = (IRType.HTTP_URL, IRType.HTTP_HEADERS, IRType.BYTES, IRType.DURATION)
+            if argument_types != expected or expression.type != expected_result:
+                raise _invalid(expression.location, f"invalid typed IR builtin '{expression.builtin}'")
+            return expression.type
         if expression.builtin == "webSocketConnect":
             expected_result = _applied("Task", _applied("Result", IRType.WEBSOCKET, IRType.STRING))
             if (len(argument_types) != 2 or argument_types[0] not in {IRType.STRING, IRType.WEBSOCKET_URL}
