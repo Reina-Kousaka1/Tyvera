@@ -1403,16 +1403,19 @@ def _validate_statements(
         elif isinstance(statement, IRAwait):
             if not is_async:
                 raise _invalid(statement.location, "IR await is only valid inside an async function")
-            task_type = _validate_expression(statement.task, functions, scopes)
-            if not isinstance(task_type, IRAppliedType) or task_type.name != "Task":
-                raise _invalid(statement.location, "IR await operand must be Task<T>")
-            if statement.result is None and _contains_resource(task_type.arguments[0]):
-                raise _invalid(statement.location, "IR await of a Resource-returning Task requires a result binding")
+            awaitable_type = _validate_expression(statement.task, functions, scopes)
+            if (not isinstance(awaitable_type, IRAppliedType)
+                    or awaitable_type.name not in {"Task", "ReplyReceiver"}
+                    or len(awaitable_type.arguments) != 1):
+                raise _invalid(statement.location, "IR await operand must be Task<T> or ReplyReceiver<T>")
+            result_type = awaitable_type.arguments[0]
+            if statement.result is None and _contains_resource(result_type):
+                raise _invalid(statement.location, "IR await of a Resource result requires a result binding")
             if statement.result is not None:
                 result = statement.result
                 _validate_type(result.type, result.location)
-                if result.type != task_type.arguments[0] or result.type == IRType.VOID:
-                    raise _invalid(statement.location, "IR await binding type does not match Task result")
+                if result.type != result_type or result.type == IRType.VOID:
+                    raise _invalid(statement.location, "IR await binding type does not match awaitable result")
                 if result.identifier in seen_ids:
                     raise _invalid(statement.location, "IR await reuses a local identifier")
                 scopes[-1][result.identifier] = result

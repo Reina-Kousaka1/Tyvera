@@ -380,8 +380,11 @@ class _FunctionLowerer:
             )
         if isinstance(statement, AwaitStatement):
             task = self._expression(statement.value)
-            if not isinstance(task.type, IRAppliedType) or task.type.name != "Task":
-                raise Diagnostic(statement.location, "backend", "native backend currently supports await only for Task<T>")
+            if not isinstance(task.type, IRAppliedType) or task.type.name not in {"Task", "ReplyReceiver"}:
+                raise Diagnostic(
+                    statement.location, "backend",
+                    "native backend currently supports await for Task<T> and ReplyReceiver<T>",
+                )
             result = None
             if statement.binding_name is not None:
                 result = self._new_variable(

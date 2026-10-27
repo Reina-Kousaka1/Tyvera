@@ -558,17 +558,30 @@ class _CppGenerator:
             task = self._new_temporary()
             self._line(f"auto {task} = {self._expression(statement.task)};")
             task_type = statement.task.type
-            if not isinstance(task_type, IRAppliedType) or task_type.name != "Task":
-                raise ValueError("validated IR await has a non-Task operand")
-            await_method = "await_move" if _ir_contains_resource(task_type.arguments[0]) else "await"
-            awaited = f"{task}.{await_method}({_location_args(statement.location)})"
-            if statement.result is None:
-                self._line(f"(void){awaited};")
-            else:
-                keyword = "auto" if _ir_contains_resource(statement.result.type) else "const auto"
-                self._line(
-                    f"{keyword} tyv_local_{statement.result.identifier} = {awaited};"
+            if not isinstance(task_type, IRAppliedType):
+                raise ValueError("validated IR await has a non-applied operand")
+            if task_type.name == "ReplyReceiver":
+                consume = "true" if statement.result is not None else "false"
+                awaited = (
+                    f"tyvera_runtime::await_reply({task}, {consume}, "
+                    f"{_location_args(statement.location)})"
                 )
+                if statement.result is None:
+                    self._line(f"(void){awaited};")
+                else:
+                    self._line(f"auto tyv_local_{statement.result.identifier} = *{awaited};")
+            elif task_type.name == "Task":
+                await_method = "await_move" if _ir_contains_resource(task_type.arguments[0]) else "await"
+                awaited = f"{task}.{await_method}({_location_args(statement.location)})"
+                if statement.result is None:
+                    self._line(f"(void){awaited};")
+                else:
+                    keyword = "auto" if _ir_contains_resource(statement.result.type) else "const auto"
+                    self._line(
+                        f"{keyword} tyv_local_{statement.result.identifier} = {awaited};"
+                    )
+            else:
+                raise ValueError("validated IR await has an unsupported awaitable")
         elif isinstance(statement, IRBlock):
             self._line("{")
             self.indent += 1
@@ -1552,6 +1565,8 @@ struct TaskControl {
     std::atomic<bool> done{false};
     std::atomic<bool> cancellation_requested{false};
     std::atomic<bool> deadline_cancellation{false};
+    std::atomic<bool> waiting_for_actor_reply{false};
+    std::atomic<bool> actor_reply_wait_has_deadline{false};
     bool serialized = true;
     std::optional<std::chrono::steady_clock::time_point> start_deadline;
     std::weak_ptr<TaskControl> cancellation_target;
@@ -1565,6 +1580,8 @@ struct TaskControl {
     std::vector<std::shared_ptr<TaskControl>> children;
     mutable std::mutex child_failure_mutex;
     std::string child_failure;
+    mutable std::mutex actor_reply_failure_mutex;
+    std::string actor_reply_failure;
     virtual ~TaskControl() = default;
     virtual void start() = 0;
     virtual void join() = 0;
@@ -1633,6 +1650,14 @@ struct TaskControl {
     void cancel_children() {
         const auto owned = children_snapshot();
         for (auto item = owned.rbegin(); item != owned.rend(); ++item) (*item)->request_cancel();
+    }
+    void record_actor_reply_failure(const std::string& message) {
+        std::lock_guard<std::mutex> lock(actor_reply_failure_mutex);
+        actor_reply_failure = message;
+    }
+    std::string actor_reply_failure_message() const {
+        std::lock_guard<std::mutex> lock(actor_reply_failure_mutex);
+        return actor_reply_failure;
     }
     void record_child_failure(const std::string& message) {
         if (message.empty()) return;
@@ -2632,8 +2657,15 @@ template <typename T> struct ReplyCell final : ReplyCellBase {
     std::string error;
     std::chrono::steady_clock::time_point started_at = std::chrono::steady_clock::now();
     std::optional<std::int64_t> timeout_milliseconds;
+    std::vector<TaskControl*> waiters;
 
     explicit ReplyCell(std::optional<std::int64_t> timeout) : timeout_milliseconds(timeout) {}
+    void notify_waiters_locked() noexcept {
+        for (auto* waiter : waiters) {
+            if (waiter) waiter->lifecycle_changed.notify_all();
+        }
+        native_scheduler().changed.notify_all();
+    }
     void refresh_locked() {
         if (state != ReplyState::pending || !timeout_milliseconds) return;
         const auto elapsed = std::chrono::duration<long double, std::milli>(
@@ -2641,6 +2673,7 @@ template <typename T> struct ReplyCell final : ReplyCellBase {
         if (elapsed >= static_cast<long double>(*timeout_milliseconds)) {
             state = ReplyState::timed_out;
             error = "request timed out";
+            notify_waiters_locked();
         }
     }
     void fail(const std::string& message) noexcept override {
@@ -2650,9 +2683,11 @@ template <typename T> struct ReplyCell final : ReplyCellBase {
             if (state != ReplyState::pending) return;
             state = ReplyState::failed;
             error = message;
+            notify_waiters_locked();
         } catch (...) {
             state = ReplyState::failed;
             error.clear();
+            notify_waiters_locked();
         }
     }
     bool is_pending() override {
@@ -2666,6 +2701,7 @@ template <typename T> struct ReplyCell final : ReplyCellBase {
         if (state != ReplyState::pending) return false;
         value.emplace(std::move(next));
         state = ReplyState::sent;
+        notify_waiters_locked();
         return true;
     }
     bool is_ready() {
@@ -2688,6 +2724,7 @@ template <typename T> struct ReplyCell final : ReplyCellBase {
         refresh_locked();
         if (state != ReplyState::pending) return false;
         state = ReplyState::cancelled;
+        notify_waiters_locked();
         return true;
     }
     StringResult<std::optional<T>> try_receive() {
@@ -2697,6 +2734,7 @@ template <typename T> struct ReplyCell final : ReplyCellBase {
             std::optional<T> received{std::move(*value)};
             value.reset();
             state = ReplyState::consumed;
+            notify_waiters_locked();
             return result_ok<std::optional<T>>(std::move(received));
         }
         if (state == ReplyState::failed || state == ReplyState::timed_out) {
@@ -2719,6 +2757,115 @@ template <typename T> struct ReplyReceiver {
         return cell ? cell->try_receive() : result_error<std::optional<T>>("reply receiver is unavailable");
     }
 };
+
+template <typename T> inline std::optional<T> await_reply(
+    const ReplyReceiver<T>& receiver, bool consume, const std::string& file, int line, int column) {
+    const auto cell = receiver.cell;
+    if (!cell) throw Failure(file, line, column, "reply receiver is unavailable");
+    auto* waiter = active_task_control;
+    if (!waiter) throw Failure(file, line, column, "awaiting a ReplyReceiver requires an async Task");
+
+    auto* execution_lock = active_execution_lock;
+    const bool resume_serialized_execution = execution_lock && execution_lock->owns_lock();
+    if (resume_serialized_execution) execution_lock->unlock();
+
+    bool registered = false;
+    std::optional<T> received;
+    std::string error;
+    const auto unregister = [&]() {
+        if (!registered) return;
+        {
+            std::lock_guard<std::mutex> lock(cell->mutex);
+            const auto end = std::remove(cell->waiters.begin(), cell->waiters.end(), waiter);
+            cell->waiters.erase(end, cell->waiters.end());
+            waiter->waiting_for_actor_reply.store(false, std::memory_order_release);
+            waiter->actor_reply_wait_has_deadline.store(false, std::memory_order_release);
+        }
+        registered = false;
+        native_scheduler().changed.notify_all();
+    };
+    try {
+        waiter->check_interruption();
+        {
+            std::lock_guard<std::mutex> lock(cell->mutex);
+            cell->refresh_locked();
+            if (cell->state == ReplyState::pending) {
+                cell->waiters.push_back(waiter);
+                waiter->actor_reply_wait_has_deadline.store(
+                    cell->timeout_milliseconds.has_value(), std::memory_order_release);
+                waiter->waiting_for_actor_reply.store(true, std::memory_order_release);
+                registered = true;
+            }
+        }
+        native_scheduler().changed.notify_all();
+
+        for (;;) {
+            waiter->check_interruption();
+            {
+                std::unique_lock<std::mutex> lock(waiter->lifecycle_mutex);
+                const auto ready = [&]() {
+                    if (waiter->is_done()) return true;
+                    std::lock_guard<std::mutex> cell_lock(cell->mutex);
+                    cell->refresh_locked();
+                    return cell->state != ReplyState::pending;
+                };
+                if (!ready()) {
+                    std::optional<std::chrono::steady_clock::time_point> deadline;
+                    {
+                        std::lock_guard<std::mutex> cell_lock(cell->mutex);
+                        if (cell->state == ReplyState::pending && cell->timeout_milliseconds) {
+                            const auto maximum = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::time_point::max() - cell->started_at).count();
+                            if (*cell->timeout_milliseconds > maximum)
+                                deadline = std::chrono::steady_clock::time_point::max();
+                            else
+                                deadline = cell->started_at
+                                    + std::chrono::milliseconds(*cell->timeout_milliseconds);
+                        }
+                    }
+                    if (deadline)
+                        waiter->lifecycle_changed.wait_until(lock, *deadline, ready);
+                    else
+                        waiter->lifecycle_changed.wait(lock, ready);
+                }
+            }
+            waiter->check_interruption();
+            {
+                std::lock_guard<std::mutex> lock(cell->mutex);
+                cell->refresh_locked();
+                if (cell->state == ReplyState::pending) continue;
+                if (cell->state == ReplyState::sent) {
+                    if (consume) {
+                        if (!cell->value) error = "reply was already consumed";
+                        else {
+                            received.emplace(std::move(*cell->value));
+                            cell->value.reset();
+                            cell->state = ReplyState::consumed;
+                            cell->notify_waiters_locked();
+                        }
+                    }
+                    break;
+                }
+                if (!cell->error.empty()) error = cell->error;
+                else if (cell->state == ReplyState::timed_out) error = "request timed out";
+                else if (cell->state == ReplyState::consumed) error = "reply was already consumed";
+                else error = "actor request did not complete";
+                break;
+            }
+        }
+    } catch (...) {
+        unregister();
+        if (resume_serialized_execution) execution_lock->lock();
+        throw;
+    }
+    unregister();
+    if (resume_serialized_execution) execution_lock->lock();
+    if (!error.empty()) {
+        waiter->record_actor_reply_failure(error);
+        throw Failure(file, line, column, std::move(error));
+    }
+    return received;
+}
 
 inline bool valid_utf8_string(const std::string& value);
 inline constexpr std::size_t MAX_JSON_DOCUMENT_BYTES = 16 * 1024 * 1024;
@@ -3821,12 +3968,13 @@ inline std::string apply_actor_failure(
     return supervisor_handle_failure(supervisor, actor, {}, failure, false, file, line, column);
 }
 inline StringResult<std::int64_t> run_actors(
-    const std::string& file, int line, int column, bool wait_for_pending = true) {
+    const std::string& file, int line, int column, bool wait_for_pending = true,
+    std::size_t delivery_limit = MAX_ACTOR_DELIVERIES, bool report_delivery_limit = true) {
     if (actor_handler_active())
         throw Failure(file, line, column, "runActors cannot be called from an actor message handler");
     std::int64_t processed = 0;
     std::string first_crash;
-    while (processed < MAX_ACTOR_DELIVERIES) {
+    while (processed < delivery_limit) {
         check_shutdown(file, line, column);
         const auto settled = settle_due_supervisor_restarts();
         if (settled && !settled->empty() && first_crash.empty()) first_crash = *settled;
@@ -3923,11 +4071,17 @@ inline StringResult<std::int64_t> run_actors(
     {
         auto& state = actor_runtime_state();
         std::lock_guard<std::mutex> lock(state.mutex);
-        if (processed >= MAX_ACTOR_DELIVERIES && !state.ready.empty() && first_crash.empty())
+        if (report_delivery_limit && processed >= delivery_limit
+            && !state.ready.empty() && first_crash.empty())
             first_crash = "actor scheduler reached the 100000-message safety limit; messages remain queued";
     }
     if (!first_crash.empty()) return result_error<std::int64_t>(std::move(first_crash));
     return result_ok<std::int64_t>(processed);
+}
+inline bool native_actor_message_ready() {
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return !state.ready.empty();
 }
 inline void shutdown_actors() noexcept {
     auto& state = actor_runtime_state();
@@ -5715,6 +5869,7 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
     }
     std::vector<std::shared_ptr<TaskControl>> completed_tasks;
     std::size_t completed_count = 0;
+    std::string scheduler_failure;
     for (;;) {
         std::vector<std::shared_ptr<TaskControl>> to_start;
         bool all_done = false;
@@ -5735,21 +5890,76 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
         }
         if (all_done) break;
         for (const auto& task : to_start) task->start();
+
         std::unique_lock<std::mutex> lock(scheduler.mutex);
         scheduler.changed.wait(lock, [&scheduler]() {
-            return std::any_of(scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
+            const bool unstarted = std::any_of(scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
                 return !task->started.load(std::memory_order_acquire);
-            }) || std::all_of(scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
+            });
+            const bool all_finished = std::all_of(scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
                 return task->done.load(std::memory_order_acquire);
             });
+            const bool waiting_reply = std::any_of(
+                scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
+                    return task->waiting_for_actor_reply.load(std::memory_order_acquire);
+                });
+            const bool all_waiting_without_deadline = std::any_of(
+                scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
+                    return !task->done.load(std::memory_order_acquire);
+                }) && std::all_of(scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
+                    return task->done.load(std::memory_order_acquire)
+                        || (task->waiting_for_actor_reply.load(std::memory_order_acquire)
+                            && !task->actor_reply_wait_has_deadline.load(std::memory_order_acquire)
+                            && !task->is_cancelled());
+                });
+            const bool actor_ready = native_actor_message_ready();
+            return unstarted || all_finished || (waiting_reply && actor_ready)
+                || (all_waiting_without_deadline && !actor_ready);
         });
+        const bool actor_ready = native_actor_message_ready();
+        const bool waiting_reply = std::any_of(
+            scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
+                return task->waiting_for_actor_reply.load(std::memory_order_acquire);
+            });
+        const bool all_waiting_without_deadline = std::any_of(
+            scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
+                return !task->done.load(std::memory_order_acquire);
+            }) && std::all_of(scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
+                return task->done.load(std::memory_order_acquire)
+                    || (task->waiting_for_actor_reply.load(std::memory_order_acquire)
+                        && !task->actor_reply_wait_has_deadline.load(std::memory_order_acquire)
+                        && !task->is_cancelled());
+            });
+        const bool deadlocked = all_waiting_without_deadline && !actor_ready;
+        const bool pump_actor = waiting_reply && actor_ready;
+        const auto active_tasks = scheduler.tasks;
+        lock.unlock();
+        if (deadlocked) {
+            if (scheduler_failure.empty())
+                scheduler_failure = "task scheduler has an unresolved actor reply with no runnable work or deadline";
+            for (const auto& task : active_tasks) {
+                if (!task->done.load(std::memory_order_acquire)) task->request_cancel();
+            }
+        }
+        if (pump_actor) {
+            std::unique_lock<std::mutex> actor_turn_lock(scheduler.execution_mutex);
+            const auto actor_result = run_actors(file, line, column, false, 1, false);
+            if (std::holds_alternative<std::string>(actor_result) && scheduler_failure.empty())
+                scheduler_failure = std::get<1>(actor_result);
+        }
     }
     for (const auto& task : completed_tasks) task->join();
     if (requested_shutdown_signal != 0) check_shutdown(file, line, column);
+    if (!scheduler_failure.empty()) return result_error<std::int64_t>(std::move(scheduler_failure));
     for (const auto& task : completed_tasks) {
         if (task->owner) continue;
         const auto failure = task->failure_message();
-        if (!failure.empty()) return result_error<std::int64_t>("async task failed: " + failure);
+        if (!failure.empty()) {
+            const auto reply_failure = task->actor_reply_failure_message();
+            if (!reply_failure.empty() && failure == reply_failure)
+                return result_error<std::int64_t>(reply_failure);
+            return result_error<std::int64_t>("async task failed: " + failure);
+        }
     }
     return result_ok<std::int64_t>(static_cast<std::int64_t>(completed_count));
 }

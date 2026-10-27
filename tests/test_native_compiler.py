@@ -885,6 +885,132 @@ fn main() {
             self.assertEqual(native.stdout,
                              "true\ntrue\ntrue\ntrue\n2\nrequest timed out\ncancelled empty\n")
 
+    def test_native_task_await_reply_pumps_actor_and_consumes_value(self) -> None:
+        source = '''actor Worker {
+    on get(reply: ReplySender<Int>) { reply.send(73) }
+}
+async fn query() {
+    let worker = spawn(Worker())
+    let pending = worker.request(get)
+    let value = await pending
+    println(value)
+}
+fn main() {
+    let task = query()
+    match runTasks() {
+        Ok(_) => println("finished")
+        Err(error) => println(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-await-reply-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "await-reply", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "73\nfinished\n")
+
+    def test_native_bare_await_reply_preserves_try_receive_value(self) -> None:
+        source = '''actor Worker {
+    on get(reply: ReplySender<Int>) { reply.send(27) }
+}
+async fn query() {
+    let worker = spawn(Worker())
+    let pending = worker.request(get)
+    await pending
+    match pending.tryReceive() {
+        Ok(Some(value)) => println(value)
+        Ok(None) => println("pending")
+        Err(error) => println(error)
+    }
+}
+fn main() {
+    let task = query()
+    match runTasks() {
+        Ok(_) => println("finished")
+        Err(error) => println(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-await-bare-reply-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "await-bare-reply", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "27\nfinished\n")
+
+    def test_native_await_reply_timeout_and_deadlock_match_reference(self) -> None:
+        programs = (
+            '''actor Worker {
+    on get(reply: ReplySender<Int>) { reply.send(19) }
+}
+async fn query() {
+    let worker = spawn(Worker())
+    let pending = worker.requestWithin(milliseconds(0), get)
+    let value = await pending
+    println(value)
+}
+fn main() {
+    let task = query()
+    match runTasks() {
+        Ok(_) => println("unexpected success")
+        Err(error) => println(error)
+    }
+}
+''',
+            '''actor Worker {
+    on ignore(reply: ReplySender<Int>) {}
+}
+async fn query() {
+    let worker = spawn(Worker())
+    let pending = worker.request(ignore)
+    let value = await pending
+    println(value)
+}
+fn main() {
+    let task = query()
+    match runTasks() {
+        Ok(_) => println("unexpected success")
+        Err(error) => println(error)
+    }
+}
+''',
+        )
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-await-reply-errors-") as temporary:
+            root = Path(temporary)
+            for index, source in enumerate(programs):
+                with self.subTest(index=index):
+                    reference = self._reference_result(source, root)
+                    native = self._native_source_result(source, root, root / f"await-reply-error-{index}", root)
+                    self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+
+    def test_native_await_reply_actor_crash_matches_reference(self) -> None:
+        source = '''actor Broken {
+    on get(reply: ReplySender<Int>) {
+        let failure: Float = 1 / 0
+        reply.send(9)
+    }
+}
+async fn query() {
+    let worker = spawn(Broken())
+    let pending = worker.request(get)
+    let value = await pending
+    println(value)
+}
+fn main() {
+    let task = query()
+    match runTasks() {
+        Ok(_) => println("unexpected success")
+        Err(error) => println(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-await-reply-crash-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "await-reply-crash", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+
     def test_native_actor_stop_fails_pending_reply_like_reference(self) -> None:
         source = '''actor Worker {
     on get(reply: ReplySender<Int>) { reply.send(9) }

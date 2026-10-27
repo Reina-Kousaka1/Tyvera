@@ -254,15 +254,18 @@ fire-and-forget messages, FIFO delivery per actor, round-robin actor turns,
 native supervisor subset supports nested trees, `oneForOne`, `oneForAll`,
 `restForOne`, all child restart policies, restart-intensity windows, and
 monotonic exponential backoff. Restarts stop affected children in reverse
-start order and reconstruct them in start order. Backoff deadlines and actor
-turns are serviced by `runActors()`; native `runTasks()` does not yet pump
-actors or settle their delayed restarts. Native `request` and `requestWithin`
-produce typed ReplyReceivers; readiness, cancellation, timeout observation, and
-`tryReceive()` work when the caller explicitly pumps messages with
-`runActors()`. Awaiting a ReplyReceiver, `sendAfter` timers, monitoring/links,
-actor-owned Tasks, and supervised actors owning Resources or Tasks remain
-unsupported natively. Generated actor references use shared
-runtime handles; queued callbacks hold weak target references, and runtime
+start order and reconstruct them in start order. Backoff deadlines and general actor turns are serviced by `runActors()`;
+while a native task waits for a reply, `runTasks()` pumps one actor turn. It
+does not independently settle delayed supervisor restarts. Native `request` and `requestWithin` produce typed ReplyReceivers. Readiness,
+cancellation, timeout observation, and `tryReceive()` work directly. A native
+async task may await a ReplyReceiver; `runTasks()` pumps one queued actor turn
+while a reply is pending, and the task releases serialized execution until the
+reply, timeout, cancellation, or actor failure. An unanswered reply with no
+queued actor work or deadline is reported as a controlled scheduler deadlock.
+`sendAfter` timers, monitoring/links, actor-owned Tasks, and supervised actors
+owning Resources or Tasks remain unsupported natively. Generated actor
+references use shared runtime handles; queued callbacks hold weak target
+references, and runtime
 shutdown clears mailboxes, supervisors, and actor state to break reference
 cycles. The native runtime retains spawned actors until process shutdown even
 when user `ActorRef` values leave scope. Calling `runActors()` or `runTasks()`
