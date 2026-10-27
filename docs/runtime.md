@@ -244,7 +244,9 @@ they never fall back to the reference interpreter. See
 The reference scheduler remains cooperative and single-threaded. The native
 Linux subset uses OS worker threads for tasks and pending network I/O, but
 serializes Tyvera task bodies so shared mutable values are not accessed in
-parallel. Native task cancellation is cooperative at statement/loop and socket
+parallel. Among simultaneously runnable tasks, exact native turn interleaving
+is not a cross-backend guarantee; native parity covers values and lifecycle,
+while fairness checks ensure a task awaiting an actor reply is not starved. Native task cancellation is cooperative at statement/loop and socket
 poll checkpoints; owned children are cancelled on owner cancellation/failure
 and joined before owner completion. A blocking native DNS lookup cannot be
 interrupted mid-call. Native task groups remain unsupported. The experimental
