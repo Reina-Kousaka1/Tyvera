@@ -1060,8 +1060,8 @@ fn main() {
             self.assertEqual(errors.getvalue(), "")
             self.assertEqual(output.getvalue(),
                              '200\ntrue\ntrue\ntrue\n{"id":"fake-user","username":"test-bot"}\n'
-                             '429\ntrue\ntrue\ntrue\n429\ntrue\ntrue\n200\n500\n200\n429\n200\n429\nretry budget rejected\n'
-                             '204\nno failure\n400\n400\nbad request\n401\n401\nunauthorized\n403\n403\nforbidden\n404\n404\nnot found\n429\n429\nrate limited\n500\n500\nserver error\n502\n502\nbad gateway\n503\n503\nunavailable\n502\ndecode rejected\n')
+                             '429\ntrue\ntrue\ntrue\n429\ntrue\ntrue\n200\n500\n200\n429\n200\n429\n'
+                             '204\nno failure\n400\n400\nbad request\n401\n401\nunauthorized\n403\n403\nforbidden\n404\n404\nnot found\n429\n429\nrate limited\n500\n500\nserver error\n502\n502\nbad gateway\n503\n503\nunavailable\n502\ndecode rejected\nretry budget rejected\n')
             expected_paths = [
                 "/api/v10/users/@me", "/api/v10/channels/1/messages",
                 "/api/v10/channels/2/messages", "/api/v10/channels/2/messages",

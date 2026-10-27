@@ -21,8 +21,12 @@ instruction and do not make a network request. CI checks/runs both without
 credentials. Local integration tests use fake TLS Gateway/REST servers and
 fixed fake tokens, never Discord production.
 
-There is no shared REST bucket/global coordinator or queue, typed event
-callback, client Actor/cache tree, or native networking. The package manager
-is not implemented and this package is not published. See
-[the full support status](../../docs/discord.md). This software is experimental
-and not production-ready.
+This package has an experimental native C++17 path for linked source
+modules. Linux CI exercises REST and Gateway flows through both the reference
+runtime and native executables against local fake TLS services. The package
+does not yet provide an Actor/Supervisor-owned Discord lifecycle, a shared
+REST bucket/global rate-limit coordinator or request queue, a typed event
+callback, cache, or shard coordinator. The package manager is not implemented
+and this package is not published. See [the full support
+status](../../docs/discord.md). This software is experimental and not
+production-ready.
