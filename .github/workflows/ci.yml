@@ -137,15 +137,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD)"
+          export PYTHONHASHSEED=0
+          export TZ=UTC
 
           chmod +x debian/rules
           dpkg-buildpackage -us -uc -b
           package_a="$GITHUB_WORKSPACE/../tyvera_0.1.0-1_all.deb"
           test -f "$package_a"
-          package_a_hash="$(sha256sum "$package_a" | cut -d ' ' -f 1)"
+          package_a_copy="$RUNNER_TEMP/tyvera-package-first-build.deb"
+          cp "$package_a" "$package_a_copy"
+          package_a_hash="$(sha256sum "$package_a_copy" | cut -d ' ' -f 1)"
           dpkg-buildpackage -us -uc -b
           repeated_hash="$(sha256sum "$package_a" | cut -d ' ' -f 1)"
-          test "$package_a_hash" = "$repeated_hash"
+          if [[ "$package_a_hash" != "$repeated_hash" ]]; then
+            echo "The repeated Tyvera package build was not byte-for-byte reproducible." >&2
+            first_contents="$RUNNER_TEMP/tyvera-package-first"
+            second_contents="$RUNNER_TEMP/tyvera-package-second"
+            mkdir -p "$first_contents" "$second_contents"
+            dpkg-deb -x "$package_a_copy" "$first_contents"
+            dpkg-deb -x "$package_a" "$second_contents"
+            diff -qr "$first_contents" "$second_contents" || true
+            exit 1
+          fi
 
           user_data="$HOME/.local/share/tyvera-package-smoke"
           mkdir -p "$user_data/project"

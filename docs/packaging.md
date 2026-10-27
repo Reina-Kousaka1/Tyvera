@@ -11,9 +11,11 @@ who invoke `tyvera build`; it is not required to run the bootstrap interpreter.
 - **Implemented:** Debian control/changelog/rules/copyright metadata and PEP 517
   pybuild integration. The Ubuntu 24.04 CI job builds deterministic
   binary/source packages and exercises install/upgrade/reinstall/remove using
-  two revisions. Its first run exposed that Debian's staged pybuild tree lacks
-  repository-only test fixtures; `debian/rules` now leaves the full suite to
-  the Python matrix and the package job focuses on install/upgrade. That fix
+  two revisions. The first CI run exposed that Debian's staged pybuild tree
+  lacks repository-only test fixtures; `debian/rules` now leaves the full
+  suite to the Python matrix. The next run reached the reproducibility check
+  but produced different package hashes. The workflow now fixes the build
+  timestamp/environment and reports extracted-payload differences; that fix
   still needs a CI rerun.
 - **Experimental:** the package job is configured for Ubuntu 24.04 x86-64 only.
   The package is `Architecture: all`; that metadata describes its Python
