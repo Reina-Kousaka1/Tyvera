@@ -2747,7 +2747,8 @@ inline std::optional<std::string> json_format_float(double value) {
     const unsigned int magnitude = negative_exponent
         ? static_cast<unsigned int>(-(static_cast<std::int64_t>(exponent)))
         : static_cast<unsigned int>(exponent);
-    exponent_text = (negative_exponent ? "-" : "+") + (magnitude < 10 ? "0" : "") + std::to_string(magnitude);
+    exponent_text = std::string(negative_exponent ? "-" : "+")
+        + (magnitude < 10 ? "0" : "") + std::to_string(magnitude);
     return mantissa + "e" + exponent_text;
 }
 inline bool json_write_value(const JsonValue& value, std::string& output, std::size_t depth) {
