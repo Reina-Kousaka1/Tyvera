@@ -1369,7 +1369,8 @@ fn main() {
         with tempfile.TemporaryDirectory(prefix="tyvera-native-task-active-limit-") as temporary:
             root = Path(temporary)
             native = self._native_source_result(source, root, root / "task-active-limit-app", root)
-            self.assertEqual(native.returncode, 1, native.stderr)
+            self.assertEqual(native.returncode, 0, native.stderr)
+            self.assertEqual(native.stdout, "")
             self.assertIn("native task capacity exceeded (maximum 64 unfinished tasks per run)", native.stderr)
 
     def test_native_task_timeout_cancels_source_and_matches_reference(self) -> None:

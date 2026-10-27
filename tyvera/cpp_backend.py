@@ -5066,12 +5066,26 @@ template <typename T>
 inline bool websocket_await_timed(
     Task<T> operation, std::int64_t milliseconds, const std::string& file, int line, int column,
     std::optional<T>& output) {
-    auto timed = task_with_timeout(std::move(operation), Duration{milliseconds}, true, file, line, column);
+    if (!operation.state) throw Failure(file, line, column, "cannot await an empty Task");
+    const auto target = operation.state;
+    const auto deadline = duration_deadline(Duration{milliseconds});
+    if (!target->done.load(std::memory_order_acquire)) {
+        if (milliseconds <= 0) target->request_cancel(true);
+        else target->defer_start_until(deadline);
+    }
+    if (!target->wait_until(deadline, active_task_control)) {
+        if (active_task_control) active_task_control->check_interruption();
+        if (!target->done.load(std::memory_order_acquire)
+            && !target->is_cancelled()
+            && std::chrono::steady_clock::now() >= deadline)
+            target->request_cancel(true);
+    }
+    if (active_task_control) active_task_control->check_interruption();
     try {
-        output.emplace(timed.await_move(file, line, column));
+        output.emplace(operation.await_move(file, line, column));
         return true;
-    } catch (const Failure& failure) {
-        if (std::string(failure.what()) == "task timed out") return false;
+    } catch (const Failure&) {
+        if (target->deadline_cancellation.load(std::memory_order_acquire)) return false;
         throw;
     }
 }
