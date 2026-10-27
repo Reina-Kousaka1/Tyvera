@@ -203,6 +203,26 @@ fn resumePayload(token: Secret<String>, sessionId: String, sequence: Int) -> Res
     return jsonStringify(jsonObject(envelope))
 }
 
+fn retryableGatewayConnectError(error: String) -> Bool {
+    if error == "WebSocket connect failed: DNS resolution failed" || error == "WebSocket connect failed: connection refused" || error == "WebSocket connect failed: connection reset" || error == "WebSocket connect failed: operation timed out" || error == "WebSocket connect failed: network operation failed" {
+        return true
+    }
+    if error == "WebSocket handshake-write failed: connection reset" || error == "WebSocket handshake-write failed: operation timed out" || error == "WebSocket handshake-write failed: network operation failed" || error == "WebSocket handshake-read failed: connection reset" || error == "WebSocket handshake-read failed: operation timed out" || error == "WebSocket handshake-read failed: network operation failed" || error == "WebSocket server closed during handshake" {
+        return true
+    }
+    if error == "WebSocket operation timed out" || error == "WebSocket operation failed: connection reset" || error == "WebSocket operation failed: network operation failed" || error == "WebSocket connection closed without a close frame" || error == "Discord Gateway closed before Hello" {
+        return true
+    }
+    return false
+}
+
+fn retryableGatewaySessionTransportError(error: String) -> Bool {
+    if error == "WebSocket operation failed: connection reset" || error == "WebSocket operation failed: network operation failed" || error == "WebSocket operation failed: operation timed out" || error == "WebSocket operation timed out" || error == "WebSocket connection closed without a close frame" || error == "WebSocket write failed: connection reset" || error == "WebSocket write failed: network operation failed" || error == "WebSocket write timed out" {
+        return true
+    }
+    return false
+}
+
 // One transport session. Reconnect policy is kept in runGatewayReliable so
 // the session itself remains bounded and its transitions are easy to test.
 async fn runGatewaySession(token: Secret<String>, intents: List<GatewayIntent>, maxDispatches: Int, timeout: Duration, previous: Option<GatewayRunSummary>) -> Result<GatewayRunSummary, String> {
@@ -263,8 +283,14 @@ async fn runGatewaySession(token: Secret<String>, intents: List<GatewayIntent>, 
                 }
                 Ok(value) => match value {
                     None => {
+                        let earlyCloseCode = connection.closeCode()
+                        let earlyAction = recoveryForClose(earlyCloseCode, sessionId, resumeUrl, sequence)
+                        let earlyReason: Option<String> = Some("Discord Gateway closed before Hello")
                         connection.close()
-                        return Err<GatewayRunSummary, String>("Discord Gateway closed before Hello")
+                        if earlyAction == gateway.GatewayRecoveryAction.Fatal {
+                            return Err<GatewayRunSummary, String>("Discord Gateway closed before Hello with a fatal status")
+                        }
+                        return Ok<GatewayRunSummary, String>(GatewayRunSummary(ready, sessionId, resumeUrl, sequence, dispatches, messages, heartbeats, earlyAction, earlyReason, earlyCloseCode, events))
                     }
                     Some(message) => match helloInterval(message) {
                         Err(error) => {
@@ -449,6 +475,11 @@ async fn runGatewaySession(token: Secret<String>, intents: List<GatewayIntent>, 
                                     match failed {
                                         Some(error) => {
                                             connection.close()
+                                            if retryableGatewaySessionTransportError(error) {
+                                                recoveryAction = recoveryForClose(None<Int>(), sessionId, resumeUrl, sequence)
+                                                recoveryReason = Some(error)
+                                                return Ok<GatewayRunSummary, String>(GatewayRunSummary(ready, sessionId, resumeUrl, sequence, dispatches, messages, heartbeats, recoveryAction, recoveryReason, closeCode, events))
+                                            }
                                             return Err<GatewayRunSummary, String>(error)
                                         }
                                         None => {
@@ -496,7 +527,24 @@ pub async fn runGatewayReliable(token: Secret<String>, intents: List<GatewayInte
     while active {
         let result = await runGatewaySession(token, intents, maxDispatches, timeout, previous)
         match result {
-            Err(error) => return Err<GatewayRunSummary, String>(error)
+            Err(error) => {
+                if !retryableGatewayConnectError(error) || reconnects >= maxReconnects {
+                    return Err<GatewayRunSummary, String>(error)
+                }
+                let timer = sleepFor(milliseconds(delay))
+                await timer
+                reconnects = reconnects + 1
+                if delay > 0 {
+                    if delay > maximumBackoffMilliseconds / 2 {
+                        delay = maximumBackoffMilliseconds
+                    } else {
+                        delay = delay * 2
+                    }
+                    if delay > maximumBackoffMilliseconds {
+                        delay = maximumBackoffMilliseconds
+                    }
+                }
+            }
             Ok(summary) => {
                 if summary.dispatchCount >= maxDispatches || summary.recoveryAction == gateway.GatewayRecoveryAction.Stop {
                     return Ok<GatewayRunSummary, String>(summary)
