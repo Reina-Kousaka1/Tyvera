@@ -912,6 +912,44 @@ fn main() {
             self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
             self.assertEqual(native.stdout, "73\nfinished\n")
 
+
+    def test_native_actor_reply_waiter_is_not_starved_by_ready_tasks(self) -> None:
+        source = '''async fn spin() {
+    var index: Int = 0
+    while index < 20 {
+        println(index)
+        index = index + 1
+    }
+}
+actor Worker {
+    on ping(reply: ReplySender<Int>) {
+        println("handled")
+        reply.send(7)
+    }
+}
+async fn query(worker: ActorRef<Worker>) {
+    let answer: Int = await worker.request(ping)
+    println(answer)
+}
+fn main() {
+    let worker = spawn(Worker())
+    let spinner = spin()
+    let request = query(worker)
+    match runTasks() {
+        Ok(_) => println("complete")
+        Err(reason) => println(reason)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-actor-reply-fairness-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actor-reply-fairness", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout.splitlines()[0], "handled")
+            self.assertLess(native.stdout.index("handled\n"), native.stdout.index("19\n"))
+            self.assertIn("7\n", native.stdout)
+
     def test_native_bare_await_reply_preserves_try_receive_value(self) -> None:
         source = '''actor Worker {
     on get(reply: ReplySender<Int>) { reply.send(27) }

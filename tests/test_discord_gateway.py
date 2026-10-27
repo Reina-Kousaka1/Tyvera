@@ -1138,6 +1138,88 @@ fn main() {
                 self.assertNotIn("fake-rest-token", native_result.stdout + native_result.stderr)
 
 
+
+    def test_rate_limit_coordinator_enforces_scope_fifo_with_native_parity(self) -> None:
+        if not _native_cpp_available():
+            self.skipTest("native rate-limit coordinator parity requires a C++17 compiler")
+        source = r'''import "../src/rest.tyv" as rest
+async fn run() {
+    let coordinator = rest.newRestRateLimitCoordinator()
+    let firstTicket = await coordinator.request(reserveWaiter, "channel:10", 60000)
+    let secondTicket = await coordinator.request(reserveWaiter, "channel:10", 60000)
+    let secondEarly = await coordinator.request(acquire, "channels/:channel_id/messages", "channel:10", secondTicket, 60000)
+    println(secondEarly > 0)
+    let firstPermit = await coordinator.request(acquire, "channels/:channel_id/messages", "channel:10", firstTicket, 60000)
+    println(firstPermit)
+    let firstComplete = coordinator.request(complete, "channels/:channel_id/messages", "channel:10", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
+    let firstCompleteValue = await firstComplete
+    let secondPermit = await coordinator.request(acquire, "channels/:channel_id/messages", "channel:10", secondTicket, 60000)
+    println(secondPermit)
+    let secondComplete = coordinator.request(complete, "channels/:channel_id/messages", "channel:10", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
+    let secondCompleteValue = await secondComplete
+
+    let olderTicket = await coordinator.request(reserveWaiter, "channel:20", 60000)
+    let laterTicket = await coordinator.request(reserveWaiter, "channel:20", 60000)
+    let independentTicket = await coordinator.request(reserveWaiter, "channel:21", 60000)
+    let laterEarly = await coordinator.request(acquire, "channels/:channel_id/messages", "channel:20", laterTicket, 60000)
+    println(laterEarly > 0)
+    let independentPermit = await coordinator.request(acquire, "channels/:channel_id/messages", "channel:21", independentTicket, 60000)
+    println(independentPermit)
+    let independentComplete = coordinator.request(complete, "channels/:channel_id/messages", "channel:21", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
+    let independentCompleteValue = await independentComplete
+    let olderPermit = await coordinator.request(acquire, "channels/:channel_id/messages", "channel:20", olderTicket, 60000)
+    println(olderPermit)
+    let olderComplete = coordinator.request(complete, "channels/:channel_id/messages", "channel:20", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
+    let olderCompleteValue = await olderComplete
+    let laterPermit = await coordinator.request(acquire, "channels/:channel_id/messages", "channel:20", laterTicket, 60000)
+    println(laterPermit)
+    let laterComplete = coordinator.request(complete, "channels/:channel_id/messages", "channel:20", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
+    let laterCompleteValue = await laterComplete
+
+    let cancelledTicket = await coordinator.request(reserveWaiter, "channel:30", 60000)
+    let cancelled = await coordinator.request(cancelWaiter, cancelledTicket)
+    println(cancelled)
+    let cancelledAcquire = await coordinator.request(acquire, "channels/:channel_id/messages", "channel:30", cancelledTicket, 60000)
+    println(cancelledAcquire)
+}
+fn main() {
+    let pending = run()
+    match runTasks() {
+        Ok(_) => {}
+        Err(error) => eprintln(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix=".tyvera-discord-fifo-", dir=DISCORD_ROOT) as temporary:
+            directory = Path(temporary)
+            entry = directory / "fifo.tyv"
+            entry.write_text(source, encoding="utf-8")
+            checked = compile_checked_project(entry, DISCORD_ROOT)
+            output = io.StringIO()
+            errors = io.StringIO()
+            ReferenceInterpreterBackend().execute(
+                checked, output=output, error_output=errors, project_root=DISCORD_ROOT,
+            )
+            reference = (0, output.getvalue(), errors.getvalue())
+            executable = directory / "fifo-native"
+            CppNativeBackend().build(
+                lower_checked_program(checked), executable, project_root=DISCORD_ROOT,
+            )
+            environment = os.environ.copy()
+            environment.pop("PYTHONPATH", None)
+            environment.pop("PYTHONHOME", None)
+            environment.pop("DISCORD_TOKEN", None)
+            if os.name != "nt":
+                environment["PATH"] = ""
+            native = subprocess.run(
+                [str(executable)], cwd=DISCORD_ROOT, capture_output=True, text=True,
+                encoding="utf-8", env=environment, check=False, timeout=30,
+            )
+            native_result = (native.returncode, native.stdout, native.stderr)
+            expected = "true\n0\n0\ntrue\n0\n0\n0\ntrue\n-2\n"
+            self.assertEqual(reference, (0, expected, ""))
+            self.assertEqual(native_result, reference)
+
     def test_coordinated_rest_waits_for_global_and_bucket_limits_with_native_parity(self) -> None:
         native_available = _native_cpp_available()
         openssl = shutil.which("openssl")

@@ -73,8 +73,9 @@ fn responseIsGlobalRateLimit(response: DiscordRestResponse) -> Bool {
 }
 
 // Shared, bounded coordination for requests made with the same bot client.
-// The coordinator serializes requests by caller-supplied major scope; this is
-// conservative when Discord has independent buckets under one major resource.
+// Bounded waiter tickets preserve FIFO order within each major scope while
+// allowing independent scopes to proceed. Rate state remains conservative when
+// Discord has independent buckets under one major resource.
 pub actor DiscordRestRateLimitCoordinator {
     var routeBuckets: Map<String, String>
     var routeExpirations: Map<String, Int>
@@ -83,6 +84,10 @@ pub actor DiscordRestRateLimitCoordinator {
     var blockedUntilByMajor: Map<String, Int>
     var stateExpirations: Map<String, Int>
     var activeUntilByMajor: Map<String, Int>
+    var waiterOrder: List<Int>
+    var waiterScopes: Map<Int, String>
+    var waiterExpiresAt: Map<Int, Int>
+    var nextWaiterId: Int
     var globalBlockedUntil: Int
 
     init() {
@@ -93,15 +98,146 @@ pub actor DiscordRestRateLimitCoordinator {
         self.blockedUntilByMajor = Map<String, Int>()
         self.stateExpirations = Map<String, Int>()
         self.activeUntilByMajor = Map<String, Int>()
+        self.waiterOrder = List<Int>()
+        self.waiterScopes = Map<Int, String>()
+        self.waiterExpiresAt = Map<Int, Int>()
+        self.nextWaiterId = 1
         self.globalBlockedUntil = 0
     }
 
-    on acquire(routeTemplate: String, majorScope: String, leaseMilliseconds: Int, reply: ReplySender<Int>) {
+    on reserveWaiter(majorScope: String, timeoutMilliseconds: Int, reply: ReplySender<Int>) {
+        if majorScope == "" || timeoutMilliseconds <= 0 || timeoutMilliseconds > 605000 {
+            reply.send(-1)
+            return
+        }
+        let now = monotonicMilliseconds()
+        var index: Int = 0
+        while index < self.waiterOrder.length {
+            match self.waiterOrder.get(index) {
+                Some(ticket) => match self.waiterExpiresAt.get(ticket) {
+                    Some(expiresAt) => {
+                        if expiresAt <= now {
+                            let removed = self.waiterOrder.removeAt(index)
+                            self.waiterScopes.remove(ticket)
+                            self.waiterExpiresAt.remove(ticket)
+                        } else {
+                            index = index + 1
+                        }
+                    }
+                    None => {
+                        let removed = self.waiterOrder.removeAt(index)
+                        self.waiterScopes.remove(ticket)
+                    }
+                }
+                None => index = index + 1
+            }
+        }
+        if self.waiterOrder.length >= 512 {
+            reply.send(-1)
+            return
+        }
+        if self.waiterOrder.length == 0 {
+            self.nextWaiterId = 1
+        }
+        if self.nextWaiterId >= 2147483647 {
+            reply.send(-1)
+            return
+        }
+        let ticket = self.nextWaiterId
+        self.nextWaiterId = self.nextWaiterId + 1
+        self.waiterOrder.append(ticket)
+        self.waiterScopes.put(ticket, majorScope)
+        self.waiterExpiresAt.put(ticket, now + timeoutMilliseconds)
+        reply.send(ticket)
+    }
+
+    on cancelWaiter(waiterId: Int, reply: ReplySender<Bool>) {
+        var index: Int = 0
+        var removedTicket: Bool = false
+        while index < self.waiterOrder.length {
+            match self.waiterOrder.get(index) {
+                Some(ticket) => {
+                    if ticket == waiterId {
+                        let removed = self.waiterOrder.removeAt(index)
+                        removedTicket = true
+                        index = self.waiterOrder.length
+                    } else {
+                        index = index + 1
+                    }
+                }
+                None => index = index + 1
+            }
+        }
+        if removedTicket {
+            self.waiterScopes.remove(waiterId)
+            self.waiterExpiresAt.remove(waiterId)
+            if self.waiterOrder.length == 0 {
+                self.nextWaiterId = 1
+            }
+        }
+        reply.send(removedTicket)
+    }
+
+    on acquire(routeTemplate: String, majorScope: String, waiterId: Int, leaseMilliseconds: Int, reply: ReplySender<Int>) {
         if leaseMilliseconds <= 0 || leaseMilliseconds > 605000 {
             reply.send(-1)
             return
         }
         let now = monotonicMilliseconds()
+        var waiterIndex: Int = 0
+        while waiterIndex < self.waiterOrder.length {
+            match self.waiterOrder.get(waiterIndex) {
+                Some(ticket) => match self.waiterExpiresAt.get(ticket) {
+                    Some(expiresAt) => {
+                        if expiresAt <= now {
+                            let removed = self.waiterOrder.removeAt(waiterIndex)
+                            self.waiterScopes.remove(ticket)
+                            self.waiterExpiresAt.remove(ticket)
+                        } else {
+                            waiterIndex = waiterIndex + 1
+                        }
+                    }
+                    None => {
+                        let removed = self.waiterOrder.removeAt(waiterIndex)
+                        self.waiterScopes.remove(ticket)
+                    }
+                }
+                None => waiterIndex = waiterIndex + 1
+            }
+        }
+        var validTicket: Bool = false
+        match self.waiterScopes.get(waiterId) {
+            Some(scope) => validTicket = scope == majorScope
+            None => {}
+        }
+        if !validTicket {
+            reply.send(-2)
+            return
+        }
+        var foundTicket: Bool = false
+        var firstForScope: Bool = true
+        for ticket in self.waiterOrder {
+            if ticket == waiterId {
+                foundTicket = true
+                break
+            }
+            match self.waiterScopes.get(ticket) {
+                Some(scope) => {
+                    if scope == majorScope {
+                        firstForScope = false
+                    }
+                }
+                None => {}
+            }
+        }
+        if !foundTicket {
+            reply.send(-2)
+            return
+        }
+        if !firstForScope {
+            reply.send(50)
+            return
+        }
         let routeKeys = self.routeExpirations.keys()
         for routeKey in routeKeys {
             match self.routeExpirations.get(routeKey) {
@@ -200,6 +336,25 @@ pub actor DiscordRestRateLimitCoordinator {
         if self.activeUntilByMajor.length >= 512 {
             reply.send(-1)
             return
+        }
+        var removeIndex: Int = 0
+        while removeIndex < self.waiterOrder.length {
+            match self.waiterOrder.get(removeIndex) {
+                Some(ticket) => {
+                    if ticket == waiterId {
+                        let removed = self.waiterOrder.removeAt(removeIndex)
+                        removeIndex = self.waiterOrder.length
+                    } else {
+                        removeIndex = removeIndex + 1
+                    }
+                }
+                None => removeIndex = removeIndex + 1
+            }
+        }
+        self.waiterScopes.remove(waiterId)
+        self.waiterExpiresAt.remove(waiterId)
+        if self.waiterOrder.length == 0 {
+            self.nextWaiterId = 1
         }
         match self.remainingByMajor.get(majorScope) {
             Some(remaining) => {
@@ -361,6 +516,11 @@ async fn finishCoordinatedRateLimit(coordinator: ActorRef<DiscordRestRateLimitCo
     let ignored = await completed
 }
 
+async fn cancelCoordinatedRateLimitWaiter(coordinator: ActorRef<DiscordRestRateLimitCoordinator>, waiterId: Int) {
+    let cancellation = coordinator.request(cancelWaiter, waiterId)
+    let ignored = await cancellation
+}
+
 pub async fn requestBotCoordinated(coordinator: ActorRef<DiscordRestRateLimitCoordinator>, routeTemplate: String, majorScope: String, token: Secret<String>, methodName: String, endpoint: String, body: Bytes, timeout: Duration) -> Result<DiscordRestResponse, String> {
     if routeTemplate == "" || majorScope == "" {
         return Err<DiscordRestResponse, String>("Discord REST rate-limit route and major scope must not be empty")
@@ -370,15 +530,26 @@ pub async fn requestBotCoordinated(coordinator: ActorRef<DiscordRestRateLimitCoo
         return Err<DiscordRestResponse, String>("coordinated Discord REST timeout must be between 1 millisecond and 10 minutes")
     }
     let deadline = monotonicMilliseconds() + timeoutMilliseconds
+    let reservation = coordinator.request(reserveWaiter, majorScope, timeoutMilliseconds + 5000)
+    let waiterId = await reservation
+    if waiterId <= 0 {
+        return Err<DiscordRestResponse, String>("Discord REST rate-limit coordinator queue is full")
+    }
     var acquired: Bool = false
     while !acquired {
         let budget = deadline - monotonicMilliseconds()
         if budget <= 0 {
+            await cancelCoordinatedRateLimitWaiter(coordinator, waiterId)
             return Err<DiscordRestResponse, String>("Discord REST request timed out while waiting for a rate-limit permit")
         }
-        let acquire = coordinator.request(acquire, routeTemplate, majorScope, timeoutMilliseconds + 5000)
+        let acquire = coordinator.request(acquire, routeTemplate, majorScope, waiterId, timeoutMilliseconds + 5000)
         let waitMilliseconds = await acquire
+        if waitMilliseconds == -2 {
+            await cancelCoordinatedRateLimitWaiter(coordinator, waiterId)
+            return Err<DiscordRestResponse, String>("Discord REST rate-limit queue reservation expired or is invalid")
+        }
         if waitMilliseconds < 0 {
+            await cancelCoordinatedRateLimitWaiter(coordinator, waiterId)
             return Err<DiscordRestResponse, String>("Discord REST rate-limit coordinator capacity is exhausted")
         }
         if waitMilliseconds == 0 {
@@ -386,6 +557,7 @@ pub async fn requestBotCoordinated(coordinator: ActorRef<DiscordRestRateLimitCoo
         } else {
             let remainingBudget = deadline - monotonicMilliseconds()
             if remainingBudget <= 0 {
+                await cancelCoordinatedRateLimitWaiter(coordinator, waiterId)
                 return Err<DiscordRestResponse, String>("Discord REST request timed out while waiting for a rate-limit permit")
             }
             var waitSlice = waitMilliseconds
