@@ -213,19 +213,20 @@ limits and client lifecycle.
 
 The experimental native compiler executes a checked synchronous core plus
 selected value features: `Option`/`Result` and matching, `List`/`Map`, `Byte`,
-and immutable `Bytes`. Its private C++ runtime implements Tyvera's checked
-operations without exposing a public ABI. It does not include the task
-scheduler, actor runtime, resource cleanup, file I/O, async I/O, networking, or
-HTTP services described above. Those features continue to run through the
-reference interpreter and native build rejects them instead of falling back.
-The native subset and its internal runtime helpers are documented in
+and immutable `Bytes`. Its private C++ runtime implements checked operations
+without exposing a public ABI. It also provides normalized host OS/architecture
+facts, monotonic milliseconds, and cooperative SIGINT/SIGTERM shutdown for
+generated programs. It does not include the task scheduler, actor runtime,
+resource cleanup, file I/O, async I/O, networking, TLS, WebSockets, or HTTP
+services. Those continue through the reference interpreter; native build
+rejects unsupported calls instead of falling back. See
 [Backend Architecture](backend-architecture.md).
 
 ## Not implemented
 
-True parallel task execution, TLS, WebSockets, HTTP streaming, and a native
-runtime for Tasks, Actors, resources, or I/O remain planned. TCP V1, async
-text-file operations, experimental HTTP/1.1 V1, and the synchronous scalar
-native compiler slice are implemented. See the
+True parallel task execution, HTTP streaming, and a native runtime for Tasks,
+Actors, resources, files, or networking remain planned. Reference-runtime TCP,
+verified TLS/HTTPS, bounded WebSockets, async text-file operations, and
+experimental HTTP/1.1 are implemented. See the
 [memory model](memory-model.md) and
 [backend architecture](backend-architecture.md).

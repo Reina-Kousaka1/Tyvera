@@ -699,9 +699,12 @@ Timeout and I/O cancellation do not change the ownership rules of the resource.
 This first version has no user-defined general `Stream` interface. TCP
 connections establish the byte-stream contract and text files keep their
 existing text API. HTTP V1 uses bounded buffering and the TCP byte-stream API;
-TLS can later adapt the owned stream boundary through a vetted platform
-cryptography library. TLS, WebSockets, richer HTTP routing, and native I/O
-backends remain planned.
+The reference runtime adapts verified TLS client connections through the
+platform TLS implementation; certificate-chain and hostname verification are
+enabled by default. `https://` requests use this adapter. A bounded WebSocket
+client supports `ws://` and verified `wss://`, masking, control frames,
+fragmentation, bounded payloads, and graceful close. These remain experimental
+interpreter-only features; the native backend rejects them.
 
 ## JSON values
 
@@ -869,8 +872,9 @@ and address family without exposing host-platform socket structs. `read` may be
 partial and uses `None` for EOF. `write` may be partial; `writeAll` waits for
 socket readiness, retaining one caller-provided payload at a time. No general
 Stream trait exists yet. The experimental HTTP API is described in
-[HTTP and web foundation](http.md); TLS and WebSockets are not part of this
-API version.
+[HTTP and web foundation](http.md) and the experimental [Discord source
+package](discord.md). TLS and WebSocket operations are supported by the
+reference interpreter only, not by generated native executables.
 
 The built-in namespace `secrets.NAME` returns `Option<Secret<String>>`. The
 local provider reads `.tyvera.secrets` first, then checks the process
@@ -1012,7 +1016,7 @@ Current limits: classes, interfaces and the deterministic cooperative actor
 runtime with bounded `one_for_one` supervision are supported, but there is no
 inheritance, generic methods/interfaces, generic type-declaration constraints,
 collection literals,
-`try`/`catch`, parallel process scheduling, TLS, WebSockets, importable
+`try`/`catch`, parallel process scheduling, native TLS/networking, importable
 standard-library modules, external secret-store provider, native interop,
 garbage collector implementation, and package manager. The native compiler
 does not yet support classes, generics, collections, `Option`/`Result`,

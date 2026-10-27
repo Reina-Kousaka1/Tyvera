@@ -1,0 +1,39 @@
+async fn runLocalClient() {
+    let opened = await webSocketConnect("ws://127.0.0.1:8765", seconds(3))
+    match move opened {
+        Err(error) => println(error)
+        Ok(connection) => {
+            let sent = await connection.sendText("hello from Tyvera")
+            match sent {
+                Err(error) => println(error)
+                Ok(_) => println("message sent")
+            }
+            let received = await connection.receiveWithin(seconds(3))
+            match received {
+                Err(error) => println(error)
+                Ok(value) => match value {
+                    None => println("server closed the WebSocket")
+                    Some(message) => match message.text() {
+                        Err(error) => println(error)
+                        Ok(text) => println(text)
+                    }
+                }
+            }
+            let closed = await connection.closeGracefully()
+            match closed {
+                Err(error) => println(error)
+                Ok(_) => println("WebSocket closed")
+            }
+        }
+    }
+}
+
+fn main() {
+    match environment("TYVERA_RUN_LOCAL_WEBSOCKET_EXAMPLE") {
+        None => println("Start a WebSocket echo server on 127.0.0.1:8765 and set TYVERA_RUN_LOCAL_WEBSOCKET_EXAMPLE to run this example.")
+        Some(_) => {
+            let task = runLocalClient()
+            runTasks()
+        }
+    }
+}

@@ -53,14 +53,14 @@ from .type_names import make_type, split_type, substitute_type
 
 _BUILTIN_TYPES = {
     "Int", "Float", "Bool", "String", "Byte", "Void", "Unit", "List", "Map", "Option", "Result",
-    "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "RestartPolicy", "SupervisorBackoff", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile", "TextReader", "TextWriter", "Bytes", "ByteBuffer", "SocketAddress", "TcpConnection", "TcpListener",
+    "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "RestartPolicy", "SupervisorBackoff", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile", "TextReader", "TextWriter", "Bytes", "ByteBuffer", "SocketAddress", "TcpConnection", "TcpListener", "TlsConnection", "WebSocket", "WebSocketMessage",
     "HttpMethod", "HttpUrl", "HttpLimits", "HttpHeaders", "HttpRequest", "HttpResponse", "HttpDecoder", "HttpRouter", "HttpServer",
 }
 _BUILTIN_FUNCTIONS = {
-    "println", "eprintln", "readText", "writeText", "readBytes", "writeBytes", "openText", "openTextReader", "openTextWriter", "openTextAsync", "bytesFromString", "byteFromInt", "byteBuffer", "resolveHost", "tcpConnect", "tcpListen", "pathJoin", "pathExists",
+    "println", "eprintln", "readText", "writeText", "readBytes", "writeBytes", "openText", "openTextReader", "openTextWriter", "openTextAsync", "bytesFromString", "byteFromInt", "byteBuffer", "resolveHost", "tcpConnect", "tcpListen", "tlsConnect", "webSocketConnect", "pathJoin", "pathExists",
     "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool",
     "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors", "oneForOne", "oneForAll", "restForOne",
-    "permanentChildPolicy", "transientChildPolicy", "temporaryChildPolicy", "exponentialBackoff", "hostOS", "hostArchitecture", "environment",
+    "permanentChildPolicy", "transientChildPolicy", "temporaryChildPolicy", "exponentialBackoff", "hostOS", "hostArchitecture", "monotonicMilliseconds", "environment",
     "milliseconds", "seconds", "timerAfter", "sleepFor", "runTasks", "taskGroup",
     "httpMethod", "httpUrl", "httpLimits", "httpDefaultLimits", "httpHeaders", "httpRequest", "httpResponse",
     "httpTextResponse", "httpJsonResponse", "httpRouter", "httpRequestDecoder", "httpResponseDecoder", "httpEncodeRequest", "httpEncodeResponse", "httpServer", "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete",
@@ -155,7 +155,7 @@ class TypeChecker:
         self._ownership_flow: dict[int, str] = {}
         self._next_ownership_id = 1
         self._next_scope_id = 1
-        self.resource_types = {"TextFile", "TextReader", "TextWriter", "TcpConnection", "TcpListener", "HttpServer"}
+        self.resource_types = {"TextFile", "TextReader", "TextWriter", "TcpConnection", "TcpListener", "TlsConnection", "WebSocket", "HttpServer"}
         self.move_sites: dict[Location, str] = {}
         self.resource_scopes: dict[Location, str] = {}
         self.cleanup_points: dict[Location, tuple[str, ...]] = {}
@@ -1053,6 +1053,7 @@ class TypeChecker:
                 "httpPost": (("HttpUrl", "HttpHeaders", "Bytes", "Duration"), "Task<Result<HttpResponse,String>>"),
                 "httpPut": (("HttpUrl", "HttpHeaders", "Bytes", "Duration"), "Task<Result<HttpResponse,String>>"),
                 "httpDelete": (("HttpUrl", "Duration"), "Task<Result<HttpResponse,String>>"),
+                "webSocketConnect": (("String", "Duration"), "Task<Result<WebSocket,String>>"),
             }
             if expression.callee in http_signatures:
                 if expression.type_arguments:
@@ -1068,13 +1069,14 @@ class TypeChecker:
                 argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
                 self._check_arguments(expression.arguments, argument_types, expected, expression.location, "resolveHost")
                 return "Task<Result<List<SocketAddress>,String>>"
-            if expression.callee in {"tcpConnect", "tcpListen"}:
-                expected = ("String", "Int") if expression.callee == "tcpConnect" else ("String", "Int", "Int")
+            if expression.callee in {"tcpConnect", "tcpListen", "tlsConnect"}:
+                expected = ("String", "Int", "Int") if expression.callee == "tcpListen" else ("String", "Int")
                 if expression.type_arguments:
                     raise Diagnostic(expression.location, "type", f"'{expression.callee}' does not accept type arguments")
                 argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
                 self._check_arguments(expression.arguments, argument_types, expected, expression.location, expression.callee)
-                result = "TcpConnection" if expression.callee == "tcpConnect" else "TcpListener"
+                result = ("TcpListener" if expression.callee == "tcpListen" else
+                          "TlsConnection" if expression.callee == "tlsConnect" else "TcpConnection")
                 return f"Task<Result<{result},String>>"
             if expression.callee == "openTextAsync":
                 if expression.type_arguments:
@@ -1152,10 +1154,10 @@ class TypeChecker:
                 self._check_arguments(expression.arguments, argument_types, ("Int", "Int"),
                                       expression.location, "exponentialBackoff")
                 return "SupervisorBackoff"
-            if expression.callee in {"hostOS", "hostArchitecture"}:
+            if expression.callee in {"hostOS", "hostArchitecture", "monotonicMilliseconds"}:
                 if expression.type_arguments or expression.arguments:
                     raise Diagnostic(expression.location, "type", f"'{expression.callee}' expects no arguments")
-                return "String"
+                return "Int" if expression.callee == "monotonicMilliseconds" else "String"
             if expression.callee == "environment":
                 if expression.type_arguments:
                     raise Diagnostic(expression.location, "type", "'environment' does not accept type arguments")
@@ -1391,6 +1393,24 @@ class TypeChecker:
                         "close": ((), "Bool"),
                         "isOpen": ((), "Bool"),
                     },
+                    "TlsConnection": {
+                        "read": (("Int",), "Task<Result<Option<Bytes>,String>>"),
+                        "write": (("Bytes",), "Task<Result<Int,String>>"),
+                        "writeAll": (("Bytes",), "Task<Result<Int,String>>"),
+                        "localAddress": ((), "Result<SocketAddress,String>"),
+                        "remoteAddress": ((), "Result<SocketAddress,String>"),
+                        "close": ((), "Bool"),
+                        "isOpen": ((), "Bool"),
+                    },
+                    "WebSocket": {
+                        "sendText": (("String",), "Task<Result<Int,String>>"),
+                        "send": (("Bytes",), "Task<Result<Int,String>>"),
+                        "receive": ((), "Task<Result<Option<WebSocketMessage>,String>>"),
+                        "receiveWithin": (("Duration",), "Task<Result<Option<WebSocketMessage>,String>>"),
+                        "close": ((), "Bool"),
+                        "closeGracefully": ((), "Task<Result<Bool,String>>"),
+                        "isOpen": ((), "Bool"),
+                    },
                     "TcpListener": {
                         "accept": ((), "Task<Result<TcpConnection,String>>"),
                         "localAddress": ((), "Result<SocketAddress,String>"),
@@ -1412,7 +1432,7 @@ class TypeChecker:
                 expected_types, result_type = method_signature
                 self._check_arguments(expression.arguments, argument_types, expected_types,
                                       expression.location, f"{receiver_base}.{expression.method}")
-                if resource_binding is not None and expression.method in {"close", "closeAsync"}:
+                if resource_binding is not None and expression.method in {"close", "closeAsync", "closeGracefully"}:
                     status = self._ownership_status(resource_binding)
                     if status not in {"closed", "maybe_closed"} and resource_binding.ownership_id is not None:
                         self._ownership_flow[resource_binding.ownership_id] = "closed"
@@ -1604,6 +1624,10 @@ class TypeChecker:
                 "HttpUrl": {
                     "scheme": ((), "String"), "host": ((), "String"), "port": ((), "Int"),
                     "target": ((), "String"), "authority": ((), "String"),
+                },
+                "WebSocketMessage": {
+                    "kind": ((), "String"), "bytes": ((), "Bytes"),
+                    "text": ((), "Result<String,String>"),
                 },
                 "HttpLimits": {
                     "requestLineBytes": ((), "Int"), "headerBytes": ((), "Int"),

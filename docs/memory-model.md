@@ -215,9 +215,11 @@ No general user-defined Stream interface is exposed yet. TCP is the first
 byte-stream implementation; text files retain text-oriented methods. The
 experimental HTTP/1.1 codec/client/server operate on bounded `Bytes` messages
 over owned TCP connections. HTTP request/response values are ordinary values;
-`HttpServer` and its listener/connections remain move-only resources. TLS can
-later adapt the owned byte-stream boundary using a vetted platform
-cryptography library. TLS and protocols beyond HTTP/1.1 remain planned.
+`HttpServer`, `TlsConnection`, and `WebSocket` are move-only resources in the
+reference interpreter. TLS client verification uses the platform trust store
+and hostname checks; WebSocket owns its connection and closes on scope unwind.
+These resources remain interpreter-only. TLS server mode, native networking,
+session Resume, and protocols beyond HTTP/1.1 are not implemented.
 
 Native FFI is not implemented. A future ABI may pass `Byte` as an unsigned
 8-bit scalar and immutable `Bytes` as a borrowed pointer/length span valid only

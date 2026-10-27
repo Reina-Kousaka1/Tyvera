@@ -13,8 +13,10 @@ adapter.
 - Incremental HTTP/1.0 and HTTP/1.1 parsing with CRLF validation, bounded
   request line/header/body sizes, repeated headers, query values, and
   pipelined messages. HTTP/1.1 requests require exactly one `Host` header.
-- `Content-Length` framing and rejection of duplicate or invalid lengths,
-  `Transfer-Encoding`, and ambiguous framing. Chunked transfer coding is not
+- Request bodies use `Content-Length`; duplicate or invalid lengths and
+  request `Transfer-Encoding` are rejected, including ambiguous framing.
+  The client response decoder supports bounded `Content-Length`, chunked, and
+  close-delimited response bodies; request-side chunked bodies are not
   implemented.
 - Typed request/response constructors and encoders, HEAD response-body
   suppression, case-insensitive headers, and a small router with static
@@ -89,7 +91,11 @@ ADT reflection is performed. `httpSend` accepts a custom typed request.
 Convenience client operations use the same request/response models and existing
 DNS/TCP tasks. The client replaces `Host` with the authority derived from its
 `HttpUrl`, sends `Connection: close`, applies the requested timeout, and parses
-bounded Content-Length or close-delimited responses. TLS URLs are rejected.
+bounded Content-Length, chunked, or close-delimited responses. The reference
+client also accepts `https://` URLs through a verified TLS connection. It uses
+the platform trust store, SNI, and hostname verification by default; there is
+no verification-disable option and redirects are not followed. The HTTP server
+remains plain TCP.
 
 `HttpServer` takes ownership of a listener explicitly. `start()` is one-shot
 and returns `Task<Result<Bool, String>>`; the task completes after shutdown and
@@ -99,7 +105,9 @@ connection; a write timeout closes the connection. Shutdown closes the
 listener and stops accepts; close is the force-cancellation operation.
 
 See [`examples/http_server.tyv`](../examples/http_server.tyv) for a real local
-server with two concurrent clients.
+HTTP server/client exchange with two concurrent clients. The
+[`examples/websocket_client.tyv`](../examples/websocket_client.tyv) example is
+opt-in and connects only to a local echo server on `127.0.0.1:8765`.
 
 ## Experimental and planned
 
@@ -117,13 +125,13 @@ connect/write/read operation. The decoder buffers at most
 one configured message at a time; responses are materialized as one bounded
 byte payload, so there is no streaming response API yet.
 
-There is no dynamic route handler, middleware, request body streaming, chunked
-coding, compression, automatic JSON-to-record codec, or importable `tyvera.http`
-module. Existing `Json` values can be parsed or serialized explicitly. HTTPS
-and TLS are planned at an owned byte-stream
-adapter boundary and must use a vetted platform cryptography library. HTTP/2,
-HTTP/3, WebSockets, native code generation, databases, and application-specific
-protocols are outside this milestone.
+There is no dynamic route handler, middleware, request/response streaming,
+compression, automatic JSON-to-record codec, or importable `tyvera.http`
+module. Existing `Json` values can be parsed or serialized explicitly. The
+reference WebSocket client uses the same verified TLS connection for `wss://`
+and has bounded framing; networking is still unsupported by the native
+backend. HTTP/2, HTTP/3, TLS server mode, native networking, databases, and
+application-specific protocols remain outside this milestone.
 
 The reference implementation uses a backend-independent byte codec and the
 existing internal TCP/task adapter. A future native runtime can replace the

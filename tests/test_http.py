@@ -60,6 +60,57 @@ class HttpProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(HttpProtocolError, "body exceeds"):
             limited.next_message()
 
+    def test_response_decoder_accepts_fragmented_chunked_body_and_trailers(self) -> None:
+        decoder = HttpMessageDecoder(HttpLimits(), response=True)
+        wire = (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                b"4;name=value\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Checksum: ok\r\n\r\n"
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+        messages = []
+        for byte in wire:
+            decoder.feed(bytes((byte,)))
+            message = decoder.next_message()
+            if message is not None:
+                messages.append(message)
+        self.assertEqual(len(messages), 2)
+        response = messages[0]
+        self.assertIsInstance(response, HttpResponse)
+        assert isinstance(response, HttpResponse)
+        self.assertEqual(response.body, b"Wikipedia")
+        second = messages[1]
+        self.assertIsInstance(second, HttpResponse)
+        assert isinstance(second, HttpResponse)
+        self.assertEqual((second.status, second.body), (204, b""))
+
+    def test_chunked_decoder_enforces_body_metadata_and_trailer_limits(self) -> None:
+        oversized = HttpMessageDecoder(HttpLimits(body_bytes=4), response=True)
+        oversized.feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n12345\r\n0\r\n\r\n")
+        with self.assertRaisesRegex(HttpProtocolError, "body exceeds"):
+            oversized.next_message()
+
+        forbidden = HttpMessageDecoder(HttpLimits(), response=True)
+        forbidden.feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 0\r\n\r\n")
+        with self.assertRaisesRegex(HttpProtocolError, "forbidden HTTP trailer"):
+            forbidden.next_message()
+
+        malformed = HttpMessageDecoder(HttpLimits(), response=True)
+        malformed.feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZ\r\n")
+        with self.assertRaisesRegex(HttpProtocolError, "chunk size"):
+            malformed.next_message()
+
+        unsupported = HttpMessageDecoder(HttpLimits(), response=True)
+        unsupported.feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n")
+        with self.assertRaisesRegex(HttpProtocolError, "unsupported HTTP transfer"):
+            unsupported.next_message()
+
+    def test_large_content_length_response_is_not_mistaken_for_oversized_headers(self) -> None:
+        body = b"x" * 65_536
+        decoder = HttpMessageDecoder(HttpLimits(body_bytes=len(body)), response=True)
+        decoder.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n" + body)
+        response = decoder.next_message()
+        self.assertIsInstance(response, HttpResponse)
+        assert isinstance(response, HttpResponse)
+        self.assertEqual(response.body, body)
+
     def test_decoder_rejects_duplicate_content_length_and_malformed_target(self) -> None:
         decoder = HttpMessageDecoder(HttpLimits())
         decoder.feed(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx")

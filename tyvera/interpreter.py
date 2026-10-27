@@ -5,6 +5,7 @@ import math
 import errno
 import selectors
 import socket
+import ssl
 import sys
 from collections import ChainMap, deque
 from dataclasses import dataclass, field as dataclass_field
@@ -73,6 +74,18 @@ from .http_protocol import (
     HttpHeaders, HttpLimits, HttpMessageDecoder, HttpMethod, HttpProtocolError,
     HttpRequest, HttpResponse, HttpRouter, HttpUrl, encode_request, encode_response,
     make_method, parse_url, text_response,
+)
+from .websocket_protocol import (
+    MAX_WEBSOCKET_HANDSHAKE_BYTES,
+    WebSocketEvent,
+    WebSocketFrameDecoder,
+    WebSocketProtocolError,
+    WebSocketUrl,
+    create_client_handshake,
+    encode_client_frame,
+    parse_websocket_url,
+    validate_close_payload,
+    validate_server_handshake,
 )
 from .typesys import INT_MAX, INT_MIN, canonical_type
 from .type_names import split_type
@@ -231,6 +244,8 @@ class _TyveraNetworkResource:
     pending_write: bool = False
     pending_read_task: _TyveraTask | None = None
     pending_write_task: _TyveraTask | None = None
+    websocket_decoder: WebSocketFrameDecoder | None = None
+    operation_timeout_milliseconds: int = 0
     identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
     def __repr__(self) -> str:
@@ -251,6 +266,15 @@ class _TyveraHttpServer:
 
     def __repr__(self) -> str:
         return "<HttpServer>"
+
+
+@dataclass(slots=True, frozen=True, repr=False)
+class _TyveraWebSocketMessage:
+    opcode: int
+    payload: bytes
+
+    def __repr__(self) -> str:
+        return "<WebSocketMessage redacted>"
 
 
 _TyveraResource = _TyveraTextFile | _TyveraNetworkResource | _TyveraHttpServer
@@ -938,7 +962,9 @@ class Interpreter:
                 group = _TyveraTaskGroup(self._current_task)
                 self._task_groups.append(group)
                 return group
-            if expression.callee in {"hostOS", "hostArchitecture"}:
+            if expression.callee in {"hostOS", "hostArchitecture", "monotonicMilliseconds"}:
+                if expression.callee == "monotonicMilliseconds":
+                    return int(self._clock() * 1000)
                 platform = detect_host_platform()
                 return (platform.operating_system.value if expression.callee == "hostOS"
                         else platform.architecture.value)
@@ -1123,6 +1149,9 @@ class Interpreter:
                     request = HttpRequest(method=HttpMethod(method_name), target=url.target,
                                           headers=headers, body=body.value)
                 return self._http_client_task(url, request, timeout, expression.location)
+            if expression.callee == "webSocketConnect":
+                url, timeout = arguments
+                return self._websocket_connect_task(url, timeout, expression.location)
             if expression.callee == "resolveHost":
                 host, port = arguments
                 if not 0 <= port <= 65_535:
@@ -1130,13 +1159,16 @@ class Interpreter:
                     self._complete_io_task(task, _TyveraVariant("Err", "port must be between 0 and 65535", "Result", 1))
                     return task
                 return self._resolve_host_task(host, port, expression.location)
-            if expression.callee == "tcpConnect":
+            if expression.callee in {"tcpConnect", "tlsConnect"}:
                 host, port = arguments
                 if not 1 <= port <= 65_535:
-                    task = self._create_io_task("Result<TcpConnection,String>", expression.location)
+                    result_type = "TlsConnection" if expression.callee == "tlsConnect" else "TcpConnection"
+                    task = self._create_io_task(f"Result<{result_type},String>", expression.location)
                     self._complete_io_task(task, _TyveraVariant("Err", "port must be between 1 and 65535", "Result", 1))
                     return task
-                return self._tcp_connect_task(host, port, expression.location)
+                return self._tcp_connect_task(
+                    host, port, expression.location, secure=expression.callee == "tlsConnect",
+                )
             if expression.callee == "tcpListen":
                 host, port, backlog = arguments
                 if not 0 <= port <= 65_535:
@@ -1403,6 +1435,8 @@ class Interpreter:
                 if expression.method == "close":
                     was_open = not receiver.closed
                     return was_open and self._close_resource(receiver) is None
+                if receiver.resource_type == "WebSocket" and expression.method == "closeGracefully":
+                    return self._websocket_close_task(receiver, expression.location)
                 if receiver.closed:
                     raise Diagnostic(expression.location, "runtime", f"{receiver.resource_type} is closed")
                 if expression.method in {"localAddress", "remoteAddress"}:
@@ -1414,11 +1448,37 @@ class Interpreter:
                     except OSError as error:
                         return _TyveraVariant("Err", self._network_error(error), "Result", 1)
                 arguments = self._evaluate_arguments(expression.arguments, variables, depth)
+                if receiver.resource_type == "WebSocket":
+                    if expression.method == "sendText":
+                        try:
+                            payload = arguments[0].encode("utf-8", "strict")
+                            return self._websocket_send_task(receiver, payload, 1, expression.location)
+                        except UnicodeEncodeError:
+                            task = self._create_io_task("Result<Int,String>", expression.location)
+                            self._complete_io_task(task, _TyveraVariant(
+                                "Err", "WebSocket text is not valid UTF-8", "Result", 1,
+                            ))
+                            return task
+                    if expression.method == "send":
+                        payload = arguments[0]
+                        if not isinstance(payload, _TyveraBytes):
+                            raise AssertionError("checked WebSocket.send argument is not Bytes")
+                        return self._websocket_send_task(receiver, payload.value, 2, expression.location)
+                    if expression.method == "receive":
+                        return self._websocket_receive_task(receiver, expression.location)
+                    if expression.method == "receiveWithin":
+                        timeout = arguments[0]
+                        if not isinstance(timeout, _TyveraDuration):
+                            raise AssertionError("checked WebSocket.receiveWithin argument is not Duration")
+                        return self._websocket_receive_task(
+                            receiver, expression.location,
+                            timeout_milliseconds=timeout.milliseconds,
+                        )
                 if receiver.resource_type == "TcpListener" and expression.method == "accept":
                     return self._tcp_accept_task(receiver, expression.location)
-                if receiver.resource_type == "TcpConnection" and expression.method == "read":
+                if receiver.resource_type in {"TcpConnection", "TlsConnection"} and expression.method == "read":
                     return self._tcp_read_task(receiver, arguments[0], expression.location)
-                if receiver.resource_type == "TcpConnection" and expression.method in {"write", "writeAll"}:
+                if receiver.resource_type in {"TcpConnection", "TlsConnection"} and expression.method in {"write", "writeAll"}:
                     payload = arguments[0]
                     if not isinstance(payload, _TyveraBytes):
                         raise AssertionError("checked TCP write argument is not Bytes")
@@ -1484,6 +1544,18 @@ class Interpreter:
                 if expression.method == "toString":
                     host = f"[{receiver.host}]" if receiver.family == "IPv6" else receiver.host
                     return f"{host}:{receiver.port}"
+            if isinstance(receiver, _TyveraWebSocketMessage):
+                if expression.method == "kind":
+                    return "text" if receiver.opcode == 1 else "binary"
+                if expression.method == "bytes":
+                    return _TyveraBytes(receiver.payload)
+                if expression.method == "text":
+                    if receiver.opcode != 1:
+                        return _TyveraVariant("Err", "WebSocket message is binary", "Result", 1)
+                    try:
+                        return _TyveraVariant("Ok", receiver.payload.decode("utf-8", "strict"), "Result", 1)
+                    except UnicodeDecodeError:
+                        return _TyveraVariant("Err", "WebSocket text is not valid UTF-8", "Result", 1)
             if isinstance(receiver, (HttpMethod, HttpUrl, HttpLimits, HttpHeaders,
                                      HttpRequest, HttpResponse, HttpMessageDecoder, HttpRouter)):
                 arguments = self._evaluate_arguments(expression.arguments, variables, depth)
@@ -1907,6 +1979,17 @@ class Interpreter:
             try:
                 self._get_io_backend().unwatch(resource.stream, selectors.EVENT_READ)
                 self._get_io_backend().unwatch(resource.stream, selectors.EVENT_WRITE)
+                if isinstance(resource.stream, ssl.SSLSocket):
+                    try:
+                        # Send TLS close_notify without waiting synchronously for
+                        # the peer's reciprocal shutdown on a non-blocking stream.
+                        resource.stream.unwrap()
+                    except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                        pass
+                    except (ssl.SSLError, OSError):
+                        # The transport must still close if the peer already
+                        # disconnected or the alert could not be drained.
+                        pass
                 resource.stream.close()
             except OSError:
                 return f"cannot close {resource.resource_type}"
@@ -1955,7 +2038,7 @@ class Interpreter:
     @staticmethod
     def _type_contains_resource(type_name: str) -> bool:
         base, arguments = split_type(canonical_type(type_name))
-        resources = {"TextFile", "TextReader", "TextWriter", "TcpConnection", "TcpListener", "HttpServer"}
+        resources = {"TextFile", "TextReader", "TextWriter", "TcpConnection", "TcpListener", "TlsConnection", "WebSocket", "HttpServer"}
         return base in resources or any(Interpreter._type_contains_resource(argument) for argument in arguments)
 
     @staticmethod
@@ -2761,6 +2844,10 @@ class Interpreter:
             if "capacity" in str(error):
                 return "I/O worker capacity is full"
             return "I/O runtime is closed"
+        if isinstance(error, ssl.SSLCertVerificationError):
+            return "TLS certificate verification failed"
+        if isinstance(error, ssl.SSLError):
+            return "TLS operation failed"
         if isinstance(error, socket.gaierror):
             return "DNS resolution failed"
         code = getattr(error, "errno", None)
@@ -2826,19 +2913,25 @@ class Interpreter:
                 values.append(address)
         self._complete_io_task(task, _TyveraVariant("Ok", _TyveraList(values), "Result", 1))
 
-    def _tcp_connect_task(self, host: str, port: int, location: Location) -> _TyveraTask:
-        task = self._create_io_task("Result<TcpConnection,String>", location)
+    def _tcp_connect_task(
+        self, host: str, port: int, location: Location, *, secure: bool = False,
+    ) -> _TyveraTask:
+        resource_type = "TlsConnection" if secure else "TcpConnection"
+        task = self._create_io_task(f"Result<{resource_type},String>", location)
         if not host.strip() or not 1 <= port <= 65535:
             self._complete_io_task(task, _TyveraVariant("Err", "invalid address", "Result", 1))
             return task
-        task_state: dict[str, object] = {"addresses": [], "index": 0, "stream": None, "watch": None}
+        task_state: dict[str, object] = {
+            "addresses": [], "index": 0, "stream": None, "watch": None, "watch_event": None,
+        }
 
         def cancel() -> None:
             stream = task_state.get("stream")
             watch = task_state.get("watch")
+            watch_event = task_state.get("watch_event")
             if isinstance(stream, socket.socket):
-                if callable(watch):
-                    self._get_io_backend().unwatch(stream, selectors.EVENT_WRITE, watch)
+                if callable(watch) and isinstance(watch_event, int):
+                    self._get_io_backend().unwatch(stream, watch_event, watch)
                 try:
                     stream.close()
                 except OSError:
@@ -2924,10 +3017,77 @@ class Interpreter:
             if not self._task_is_active(task):
                 stream.close()
                 return
+            if secure:
+                try:
+                    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+                    stream = context.wrap_socket(
+                        stream, server_hostname=host, do_handshake_on_connect=False,
+                    )
+                    stream.setblocking(False)
+                except (OSError, ValueError, ssl.SSLError) as error:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+                    message = ("TLS certificate verification failed"
+                               if isinstance(error, ssl.SSLCertVerificationError)
+                               else "TLS connection setup failed")
+                    self._complete_io_task(task, _TyveraVariant("Err", message, "Result", 1))
+                    return
+                task_state["stream"] = stream
+                tls_handshake(stream)
+                return
             task_state["stream"] = None
             self._complete_io_task(task, _TyveraVariant(
-                "Ok", _TyveraNetworkResource(stream, "TcpConnection", location=location), "Result", 1,
+                "Ok", _TyveraNetworkResource(stream, resource_type, location=location), "Result", 1,
             ))
+
+        def tls_handshake(stream: ssl.SSLSocket) -> None:
+            if not self._task_is_active(task):
+                stream.close()
+                task_state["stream"] = None
+                return
+            try:
+                stream.do_handshake()
+            except ssl.SSLWantReadError:
+                wait_for_tls(stream, selectors.EVENT_READ)
+            except ssl.SSLWantWriteError:
+                wait_for_tls(stream, selectors.EVENT_WRITE)
+            except ssl.SSLCertVerificationError:
+                stream.close()
+                task_state["stream"] = None
+                self._complete_io_task(task, _TyveraVariant(
+                    "Err", "TLS certificate verification failed", "Result", 1,
+                ))
+            except (ssl.SSLError, OSError):
+                stream.close()
+                task_state["stream"] = None
+                self._complete_io_task(task, _TyveraVariant(
+                    "Err", "TLS handshake failed", "Result", 1,
+                ))
+            else:
+                task_state["stream"] = None
+                self._complete_io_task(task, _TyveraVariant(
+                    "Ok", _TyveraNetworkResource(stream, "TlsConnection", location=location),
+                    "Result", 1,
+                ))
+
+        def wait_for_tls(stream: ssl.SSLSocket, event: int) -> None:
+            def ready() -> None:
+                task_state["watch"] = None
+                task_state["watch_event"] = None
+                tls_handshake(stream)
+
+            task_state["watch"] = ready
+            task_state["watch_event"] = event
+            try:
+                self._get_io_backend().watch(stream, event, ready)
+            except (OSError, RuntimeError) as error:
+                stream.close()
+                task_state["stream"] = None
+                self._complete_io_task(task, _TyveraVariant(
+                    "Err", self._network_error(error), "Result", 1,
+                ))
 
         try:
             future = self._get_io_backend().submit(
@@ -3049,8 +3209,21 @@ class Interpreter:
                 return
             try:
                 data = connection.stream.recv(max_bytes)
+            except ssl.SSLWantReadError:
+                register(selectors.EVENT_READ)
+                return
+            except ssl.SSLWantWriteError:
+                register(selectors.EVENT_WRITE)
+                return
+            except ssl.SSLZeroReturnError:
+                data = b""
             except BlockingIOError:
                 register()
+                return
+            except ssl.SSLEOFError:
+                self._complete_io_task(task, _TyveraVariant(
+                    "Err", "TLS connection closed without close_notify", "Result", 1,
+                ))
                 return
             except OSError as error:
                 self._complete_io_task(task, _TyveraVariant("Err", self._network_error(error), "Result", 1))
@@ -3060,7 +3233,7 @@ class Interpreter:
             )
             self._complete_io_task(task, _TyveraVariant("Ok", value, "Result", 1))
 
-        def register() -> None:
+        def register(event: int = selectors.EVENT_READ) -> None:
             if connection.pending_read:
                 self._complete_io_task(task, _TyveraVariant("Err", "connection already has a pending read", "Result", 1))
                 return
@@ -3072,9 +3245,9 @@ class Interpreter:
                 connection.pending_read_task = None
                 attempt()
 
-            task.io_cancel = lambda: self._cancel_socket_wait(connection, selectors.EVENT_READ, ready, "read", task)
+            task.io_cancel = lambda: self._cancel_socket_wait(connection, event, ready, "read", task)
             try:
-                self._get_io_backend().watch(connection.stream, selectors.EVENT_READ, ready)
+                self._get_io_backend().watch(connection.stream, event, ready)
             except (OSError, RuntimeError) as error:
                 connection.pending_read = False
                 connection.pending_read_task = None
@@ -3099,6 +3272,12 @@ class Interpreter:
                 return
             try:
                 sent = connection.stream.send(payload[offset:])
+            except ssl.SSLWantReadError:
+                register(selectors.EVENT_READ)
+                return
+            except ssl.SSLWantWriteError:
+                register(selectors.EVENT_WRITE)
+                return
             except BlockingIOError:
                 register()
                 return
@@ -3117,7 +3296,7 @@ class Interpreter:
             else:
                 register()
 
-        def register() -> None:
+        def register(event: int = selectors.EVENT_WRITE) -> None:
             if connection.pending_write:
                 self._complete_io_task(task, _TyveraVariant("Err", "connection already has a pending write", "Result", 1))
                 return
@@ -3129,9 +3308,9 @@ class Interpreter:
                 connection.pending_write_task = None
                 attempt()
 
-            task.io_cancel = lambda: self._cancel_socket_wait(connection, selectors.EVENT_WRITE, ready, "write", task)
+            task.io_cancel = lambda: self._cancel_socket_wait(connection, event, ready, "write", task)
             try:
-                self._get_io_backend().watch(connection.stream, selectors.EVENT_WRITE, ready)
+                self._get_io_backend().watch(connection.stream, event, ready)
             except (OSError, RuntimeError) as error:
                 connection.pending_write = False
                 connection.pending_write_task = None
@@ -3142,6 +3321,516 @@ class Interpreter:
         else:
             attempt()
         return task
+
+    def _websocket_connect_task(self, address: str, timeout: _TyveraDuration,
+                                location: Location) -> _TyveraTask:
+        state: dict[str, object] = {
+            "phase": "connect", "operation": None, "url": None, "connection": None,
+            "key": None, "request": None, "decoder": None, "frame_decoder": None,
+            "handshake_bytes": 0, "timeout": timeout.milliseconds, "failure": None,
+        }
+        try:
+            state["url"] = parse_websocket_url(address)
+        except WebSocketProtocolError as error:
+            state["failure"] = str(error)
+        if timeout.milliseconds <= 0:
+            state["failure"] = "WebSocket timeout must be greater than zero"
+        return self._create_native_task(
+            "Result<WebSocket,String>", location,
+            self._advance_websocket_connect_task, state,
+        )
+
+    def _schedule_websocket_connect_io(self, task: _TyveraTask) -> None:
+        state = task.native_state
+        phase = state["phase"]
+        if phase == "connect":
+            url = state["url"]
+            assert isinstance(url, WebSocketUrl)
+            operation = self._tcp_connect_task(
+                url.transport.host, url.transport.port, task.location,
+                secure=url.scheme == "wss",
+            )
+        elif phase == "handshake-write":
+            connection = state["connection"]
+            request = state["request"]
+            assert isinstance(connection, _TyveraNetworkResource) and isinstance(request, bytes)
+            operation = self._tcp_write_task(connection, request, True, task.location)
+        elif phase == "handshake-read":
+            connection = state["connection"]
+            assert isinstance(connection, _TyveraNetworkResource)
+            operation = self._tcp_read_task(connection, 4096, task.location)
+        else:
+            raise AssertionError("unknown WebSocket connection phase")
+        timed = self._timeout_task_for_native_wait(
+            operation, _TyveraDuration(int(state["timeout"])), task.location,
+        )
+        task.native_resources.append(timed)
+        state["operation"] = timed
+        self._native_wait(task, timed)
+
+    def _finish_websocket_connect(self, task: _TyveraTask, result: _TyveraVariant) -> None:
+        state = task.native_state
+        connection = state.get("connection")
+        if isinstance(connection, _TyveraNetworkResource):
+            state["connection"] = None
+            self._close_resource(connection)
+        task.result = result
+        self._complete_task(task)
+
+    def _advance_websocket_connect_task(self, task: _TyveraTask) -> None:
+        state = task.native_state
+        failure = state.get("failure")
+        if isinstance(failure, str):
+            self._finish_websocket_connect(task, _TyveraVariant("Err", failure, "Result", 1))
+            return
+        operation = state.get("operation")
+        if not isinstance(operation, _TyveraTask):
+            self._schedule_websocket_connect_io(task)
+            return
+        ready, value, error = self._take_native_wait(task)
+        if not ready:
+            self._native_wait(task, operation)
+            ready, value, error = self._take_native_wait(task)
+            if not ready:
+                return
+        state["operation"] = None
+        phase = state["phase"]
+        if error is not None:
+            detail = "timed out" if error == "task timed out" else error
+            self._finish_websocket_connect(task, _TyveraVariant(
+                "Err", f"WebSocket {phase} failed: {detail}", "Result", 1,
+            ))
+            return
+        if not isinstance(value, _TyveraVariant) or value.variant != "Ok":
+            detail = str(value.payload) if isinstance(value, _TyveraVariant) else "invalid operation completion"
+            self._finish_websocket_connect(task, _TyveraVariant(
+                "Err", f"WebSocket {phase} failed: {detail}", "Result", 1,
+            ))
+            return
+        result = value.payload
+        if phase == "connect":
+            if not isinstance(result, _TyveraNetworkResource):
+                self._finish_websocket_connect(task, _TyveraVariant(
+                    "Err", "WebSocket transport returned no connection", "Result", 1,
+                ))
+                return
+            url = state["url"]
+            assert isinstance(url, WebSocketUrl)
+            try:
+                key, request = create_client_handshake(url)
+            except WebSocketProtocolError as error:
+                state["connection"] = result
+                self._finish_websocket_connect(task, _TyveraVariant("Err", str(error), "Result", 1))
+                return
+            result.resource_type = "WebSocket"
+            result.operation_timeout_milliseconds = int(state["timeout"])
+            state["connection"] = result
+            state["key"] = key
+            state["request"] = request
+            state["decoder"] = HttpMessageDecoder(
+                HttpLimits(request_line_bytes=2048, header_bytes=16_384,
+                           header_count=64, body_bytes=0, max_connections=1),
+                response=True, request_method="GET",
+            )
+            state["frame_decoder"] = WebSocketFrameDecoder()
+            state["phase"] = "handshake-write"
+            self._advance_websocket_connect_task(task)
+            return
+        if phase == "handshake-write":
+            if not isinstance(result, int):
+                self._finish_websocket_connect(task, _TyveraVariant(
+                    "Err", "WebSocket handshake write failed", "Result", 1,
+                ))
+                return
+            state["phase"] = "handshake-read"
+            self._schedule_websocket_connect_io(task)
+            return
+        if not isinstance(result, _TyveraVariant):
+            self._finish_websocket_connect(task, _TyveraVariant(
+                "Err", "WebSocket handshake read failed", "Result", 1,
+            ))
+            return
+        if result.variant == "None":
+            self._finish_websocket_connect(task, _TyveraVariant(
+                "Err", "WebSocket server closed during handshake", "Result", 1,
+            ))
+            return
+        payload = result.payload
+        if not isinstance(payload, _TyveraBytes):
+            self._finish_websocket_connect(task, _TyveraVariant(
+                "Err", "invalid WebSocket handshake bytes", "Result", 1,
+            ))
+            return
+        received = int(state["handshake_bytes"]) + len(payload.value)
+        if received > MAX_WEBSOCKET_HANDSHAKE_BYTES:
+            self._finish_websocket_connect(task, _TyveraVariant(
+                "Err", "WebSocket handshake exceeds size limit", "Result", 1,
+            ))
+            return
+        state["handshake_bytes"] = received
+        decoder = state["decoder"]
+        key = state["key"]
+        assert isinstance(decoder, HttpMessageDecoder) and isinstance(key, str)
+        try:
+            decoder.feed(payload.value)
+            response = validate_server_handshake(decoder, key)
+        except (HttpProtocolError, WebSocketProtocolError) as protocol_error:
+            self._finish_websocket_connect(task, _TyveraVariant(
+                "Err", str(protocol_error), "Result", 1,
+            ))
+            return
+        if response is None:
+            self._schedule_websocket_connect_io(task)
+            return
+        connection = state.get("connection")
+        frame_decoder = state["frame_decoder"]
+        assert isinstance(connection, _TyveraNetworkResource)
+        assert isinstance(frame_decoder, WebSocketFrameDecoder)
+        try:
+            if decoder.buffer:
+                frame_decoder.feed(bytes(decoder.buffer))
+                decoder.buffer.clear()
+        except WebSocketProtocolError as protocol_error:
+            self._finish_websocket_connect(task, _TyveraVariant(
+                "Err", str(protocol_error), "Result", 1,
+            ))
+            return
+        connection.websocket_decoder = frame_decoder
+        state["connection"] = None
+        self._finish_websocket_connect(task, _TyveraVariant("Ok", connection, "Result", 1))
+
+    def _websocket_send_task(self, connection: _TyveraNetworkResource, payload: bytes,
+                             opcode: int, location: Location) -> _TyveraTask:
+        state: dict[str, object] = {
+            "connection": connection, "payload": payload, "operation": None,
+            "failure": None, "phase": "write",
+        }
+        try:
+            state["frame"] = encode_client_frame(opcode, payload)
+        except WebSocketProtocolError as error:
+            state["failure"] = str(error)
+        return self._create_native_task(
+            "Result<Int,String>", location, self._advance_websocket_send_task, state,
+        )
+
+    def _advance_websocket_send_task(self, task: _TyveraTask) -> None:
+        state = task.native_state
+        failure = state.get("failure")
+        if isinstance(failure, str):
+            task.result = _TyveraVariant("Err", failure, "Result", 1)
+            self._complete_task(task)
+            return
+        operation = state.get("operation")
+        if not isinstance(operation, _TyveraTask):
+            connection, frame = state["connection"], state["frame"]
+            assert isinstance(connection, _TyveraNetworkResource) and isinstance(frame, bytes)
+            writing = self._tcp_write_task(connection, frame, True, task.location)
+            duration = max(1, connection.operation_timeout_milliseconds)
+            timed = self._timeout_task_for_native_wait(writing, _TyveraDuration(duration), task.location)
+            task.native_resources.append(timed)
+            state["operation"] = timed
+            self._native_wait(task, timed)
+            return
+        ready, value, error = self._take_native_wait(task)
+        if not ready:
+            self._native_wait(task, operation)
+            ready, value, error = self._take_native_wait(task)
+            if not ready:
+                return
+        if error is not None:
+            message = "WebSocket write timed out" if error == "task timed out" else f"WebSocket write failed: {error}"
+        elif isinstance(value, _TyveraVariant) and value.variant == "Ok":
+            payload = state["payload"]
+            assert isinstance(payload, bytes)
+            task.result = _TyveraVariant("Ok", len(payload), "Result", 1)
+            self._complete_task(task)
+            return
+        else:
+            message = (f"WebSocket write failed: {value.payload}"
+                       if isinstance(value, _TyveraVariant) else "WebSocket write failed")
+        task.result = _TyveraVariant("Err", message, "Result", 1)
+        self._complete_task(task)
+
+    def _websocket_receive_task(
+        self, connection: _TyveraNetworkResource, location: Location,
+        *, timeout_milliseconds: int | None = None,
+    ) -> _TyveraTask:
+        selected_timeout = (connection.operation_timeout_milliseconds
+                            if timeout_milliseconds is None else timeout_milliseconds)
+        if selected_timeout <= 0:
+            task = self._create_io_task("Result<Option<WebSocketMessage>,String>", location)
+            self._complete_io_task(task, _TyveraVariant(
+                "Err", "WebSocket receive timeout must be greater than zero", "Result", 1,
+            ))
+            return task
+        return self._create_native_task(
+            "Result<Option<WebSocketMessage>,String>", location,
+            self._advance_websocket_receive_task,
+            {"connection": connection, "operation": None, "phase": "read", "failure": None,
+             "timeout_milliseconds": selected_timeout,
+             "keep_open_on_timeout": timeout_milliseconds is not None},
+        )
+
+    def _advance_websocket_receive_task(self, task: _TyveraTask) -> None:
+        state = task.native_state
+        connection = state["connection"]
+        assert isinstance(connection, _TyveraNetworkResource)
+        if isinstance(state.get("failure"), str):
+            task.result = _TyveraVariant("Err", state["failure"], "Result", 1)
+            self._complete_task(task)
+            return
+        operation = state.get("operation")
+        if not isinstance(operation, _TyveraTask):
+            if state["phase"] == "read":
+                decoder = connection.websocket_decoder
+                if decoder is None:
+                    state["failure"] = "WebSocket decoder is unavailable"
+                    self._advance_websocket_receive_task(task)
+                    return
+                try:
+                    event = decoder.next_event()
+                except WebSocketProtocolError as error:
+                    state["failure"] = str(error)
+                    self._advance_websocket_receive_task(task)
+                    return
+                if event is not None:
+                    self._handle_websocket_event(task, event)
+                    return
+                reading = self._tcp_read_task(connection, 65_536, task.location)
+                duration = int(state["timeout_milliseconds"])
+                timed = self._timeout_task_for_native_wait(reading, _TyveraDuration(duration), task.location)
+                task.native_resources.append(timed)
+                state["operation"] = timed
+                self._native_wait(task, timed)
+                return
+            frame = state.get("frame")
+            assert isinstance(frame, bytes)
+            writing = self._tcp_write_task(connection, frame, True, task.location)
+            duration = int(state["timeout_milliseconds"])
+            timed = self._timeout_task_for_native_wait(writing, _TyveraDuration(duration), task.location)
+            task.native_resources.append(timed)
+            state["operation"] = timed
+            self._native_wait(task, timed)
+            return
+        ready, value, error = self._take_native_wait(task)
+        if not ready:
+            self._native_wait(task, operation)
+            ready, value, error = self._take_native_wait(task)
+            if not ready:
+                return
+        state["operation"] = None
+        if error is not None:
+            timed_out = error == "task timed out"
+            if not (timed_out and state.get("keep_open_on_timeout")):
+                self._close_resource(connection)
+            message = ("WebSocket receive timed out" if timed_out and state.get("keep_open_on_timeout")
+                       else "WebSocket operation timed out" if timed_out
+                       else f"WebSocket operation failed: {error}")
+            task.result = _TyveraVariant("Err", message, "Result", 1)
+            self._complete_task(task)
+            return
+        if not isinstance(value, _TyveraVariant) or value.variant != "Ok":
+            self._close_resource(connection)
+            message = (f"WebSocket operation failed: {value.payload}"
+                       if isinstance(value, _TyveraVariant) else "WebSocket operation failed")
+            task.result = _TyveraVariant("Err", message, "Result", 1)
+            self._complete_task(task)
+            return
+        if state["phase"] == "write-close":
+            self._close_resource(connection)
+            close_error = value.variant != "Ok"
+            task.result = (_TyveraVariant("Err", "WebSocket close handshake failed", "Result", 1)
+                           if close_error else _TyveraVariant(
+                               "Ok", _TyveraVariant("None", None, "Option", 1), "Result", 1,
+                           ))
+            self._complete_task(task)
+            return
+        if state["phase"] == "write-control":
+            if value.variant != "Ok":
+                self._close_resource(connection)
+                task.result = _TyveraVariant("Err", "WebSocket control frame write failed", "Result", 1)
+                self._complete_task(task)
+                return
+            state["phase"] = "read"
+            self._advance_websocket_receive_task(task)
+            return
+        received = value.payload
+        if not isinstance(received, _TyveraVariant):
+            task.result = _TyveraVariant("Err", "invalid WebSocket read completion", "Result", 1)
+            self._complete_task(task)
+            return
+        if received.variant == "None":
+            self._close_resource(connection)
+            task.result = _TyveraVariant("Err", "WebSocket connection closed without a close frame", "Result", 1)
+            self._complete_task(task)
+            return
+        payload = received.payload
+        decoder = connection.websocket_decoder
+        assert isinstance(payload, _TyveraBytes) and isinstance(decoder, WebSocketFrameDecoder)
+        try:
+            decoder.feed(payload.value)
+        except WebSocketProtocolError as error:
+            self._close_resource(connection)
+            task.result = _TyveraVariant("Err", str(error), "Result", 1)
+            self._complete_task(task)
+            return
+        state["phase"] = "read"
+        self._advance_websocket_receive_task(task)
+
+    def _handle_websocket_event(self, task: _TyveraTask, event: WebSocketEvent) -> None:
+        state = task.native_state
+        connection = state["connection"]
+        assert isinstance(connection, _TyveraNetworkResource)
+        if event.opcode in {1, 2}:
+            task.result = _TyveraVariant(
+                "Ok", _TyveraVariant("Some", _TyveraWebSocketMessage(event.opcode, event.payload), "Option", 1),
+                "Result", 1,
+            )
+            self._complete_task(task)
+            return
+        if event.opcode == 10:
+            self._advance_websocket_receive_task(task)
+            return
+        if event.opcode == 9:
+            try:
+                state["frame"] = encode_client_frame(10, event.payload)
+            except WebSocketProtocolError as error:
+                task.result = _TyveraVariant("Err", str(error), "Result", 1)
+                self._complete_task(task)
+                return
+            state["phase"] = "write-control"
+            self._advance_websocket_receive_task(task)
+            return
+        if event.opcode == 8:
+            try:
+                state["frame"] = encode_client_frame(8, event.payload)
+            except WebSocketProtocolError:
+                state["frame"] = encode_client_frame(8)
+            state["phase"] = "write-close"
+            self._advance_websocket_receive_task(task)
+
+    def _websocket_close_task(self, connection: _TyveraNetworkResource,
+                              location: Location) -> _TyveraTask:
+        try:
+            frame = encode_client_frame(8, (1000).to_bytes(2, "big"))
+            failure = None
+        except WebSocketProtocolError as error:
+            frame, failure = b"", str(error)
+        return self._create_native_task(
+            "Result<Bool,String>", location,
+            self._advance_websocket_close_task,
+            {"connection": connection, "frame": frame, "operation": None, "failure": failure,
+             "phase": "write-close"},
+        )
+
+    def _advance_websocket_close_task(self, task: _TyveraTask) -> None:
+        state = task.native_state
+        connection = state["connection"]
+        assert isinstance(connection, _TyveraNetworkResource)
+        phase = str(state.get("phase", "write-close"))
+        failure = state.get("failure")
+        if isinstance(failure, str):
+            self._close_resource(connection)
+            task.result = _TyveraVariant("Err", failure, "Result", 1)
+            self._complete_task(task)
+            return
+        operation = state.get("operation")
+        if not isinstance(operation, _TyveraTask):
+            if phase == "read-close":
+                operation = self._tcp_read_task(connection, 65_536, task.location)
+            else:
+                frame = state["frame"]
+                assert isinstance(frame, bytes)
+                operation = self._tcp_write_task(connection, frame, True, task.location)
+            timed = self._timeout_task_for_native_wait(
+                operation, _TyveraDuration(max(1, connection.operation_timeout_milliseconds)), task.location,
+            )
+            task.native_resources.append(timed)
+            state["operation"] = timed
+            self._native_wait(task, timed)
+            return
+        ready, value, error = self._take_native_wait(task)
+        if not ready:
+            self._native_wait(task, operation)
+            ready, value, error = self._take_native_wait(task)
+            if not ready:
+                return
+        if error is not None:
+            self._close_resource(connection)
+            message = "WebSocket close timed out" if error == "task timed out" else f"WebSocket close failed: {error}"
+            task.result = _TyveraVariant("Err", message, "Result", 1)
+            self._complete_task(task)
+            return
+        if not isinstance(value, _TyveraVariant) or value.variant != "Ok":
+            self._close_resource(connection)
+            message = value.payload if isinstance(value, _TyveraVariant) else "WebSocket close failed"
+            task.result = _TyveraVariant("Err", f"WebSocket close failed: {message}", "Result", 1)
+            self._complete_task(task)
+            return
+
+        if phase == "write-close":
+            state["phase"] = "read-close"
+            state["operation"] = None
+            self._advance_websocket_close_task(task)
+            return
+        if phase == "write-pong":
+            state["phase"] = "read-close"
+            state["operation"] = None
+            self._advance_websocket_close_task(task)
+            return
+
+        read_result = value.payload
+        if not isinstance(read_result, _TyveraVariant):
+            self._close_resource(connection)
+            task.result = _TyveraVariant("Err", "invalid WebSocket close read completion", "Result", 1)
+            self._complete_task(task)
+            return
+        if read_result.variant == "None":
+            self._close_resource(connection)
+            task.result = _TyveraVariant("Err", "WebSocket peer closed before completing the close handshake", "Result", 1)
+            self._complete_task(task)
+            return
+        if read_result.variant == "Err":
+            self._close_resource(connection)
+            task.result = _TyveraVariant("Err", f"WebSocket close failed: {read_result.payload}", "Result", 1)
+            self._complete_task(task)
+            return
+        received = read_result.payload
+        decoder = connection.websocket_decoder
+        if not isinstance(received, _TyveraBytes) or not isinstance(decoder, WebSocketFrameDecoder):
+            self._close_resource(connection)
+            task.result = _TyveraVariant("Err", "invalid WebSocket close frame data", "Result", 1)
+            self._complete_task(task)
+            return
+        try:
+            decoder.feed(received.value)
+            event = decoder.next_event()
+            while event is not None and event.opcode not in {8, 9}:
+                event = decoder.next_event()
+        except WebSocketProtocolError as protocol_error:
+            self._close_resource(connection)
+            task.result = _TyveraVariant("Err", str(protocol_error), "Result", 1)
+            self._complete_task(task)
+            return
+        if event is not None and event.opcode == 8:
+            self._close_resource(connection)
+            task.result = _TyveraVariant("Ok", True, "Result", 1)
+            self._complete_task(task)
+            return
+        if event is not None and event.opcode == 9:
+            try:
+                state["frame"] = encode_client_frame(10, event.payload)
+            except WebSocketProtocolError as protocol_error:
+                self._close_resource(connection)
+                task.result = _TyveraVariant("Err", str(protocol_error), "Result", 1)
+                self._complete_task(task)
+                return
+            state["phase"] = "write-pong"
+            state["operation"] = None
+            self._advance_websocket_close_task(task)
+            return
+        state["operation"] = None
+        self._advance_websocket_close_task(task)
 
     def _start_http_server_task(self, server: _TyveraHttpServer, location: Location) -> _TyveraTask:
         task = self._create_native_task(
@@ -3172,7 +3861,9 @@ class Interpreter:
         if phase == "connect":
             url = state["url"]
             assert isinstance(url, HttpUrl)
-            operation = self._tcp_connect_task(url.host, url.port, task.location)
+            operation = self._tcp_connect_task(
+                url.host, url.port, task.location, secure=url.scheme == "https",
+            )
         elif phase == "write":
             connection = state["connection"]
             payload = state["request_bytes"]

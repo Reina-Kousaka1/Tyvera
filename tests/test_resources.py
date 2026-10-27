@@ -650,7 +650,7 @@ fn main() {
     }
 }''', "ownership-metadata.tyv")
         self.assertEqual(checked.resource_types, frozenset({
-            "TextFile", "TextReader", "TextWriter", "TcpConnection", "TcpListener", "HttpServer",
+            "TextFile", "TextReader", "TextWriter", "TcpConnection", "TcpListener", "TlsConnection", "WebSocket", "HttpServer",
         }))
         self.assertTrue(checked.move_sites)
         self.assertTrue(checked.owner_scopes)

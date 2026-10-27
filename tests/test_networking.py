@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import io
+import os
 import socket
+import ssl
+import subprocess
+import shutil
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tyvera.compiler import compile_source
 from tyvera.interpreter import Interpreter
@@ -18,6 +23,57 @@ class AsyncNetworkingTests(unittest.TestCase):
         output = io.StringIO()
         Interpreter(program, output, project_root=root).run()
         return output.getvalue()
+
+    def _make_local_tls_server(self, root: Path, handler, *, include_loopback_ip: bool = False):
+        openssl = shutil.which("openssl")
+        if openssl is None:
+            git_openssl = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/usr/bin/openssl.exe"
+            openssl = str(git_openssl) if git_openssl.is_file() else None
+        if openssl is None:
+            self.skipTest("OpenSSL is required to create a temporary local TLS certificate")
+        certificate, private_key = root / "localhost.crt", root / "localhost.key"
+        subject_alt_name = "DNS:localhost,IP:127.0.0.1" if include_loopback_ip else "DNS:localhost"
+        subprocess.run(
+            [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(private_key),
+             "-out", str(certificate), "-days", "2", "-subj", "/CN=localhost",
+             "-addext", f"subjectAltName={subject_alt_name}"],
+            check=True, capture_output=True, text=True,
+        )
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(str(certificate), str(private_key))
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(5)
+        failures: list[BaseException] = []
+
+        def serve() -> None:
+            connection = None
+            try:
+                connection, _ = listener.accept()
+                connection.settimeout(5)
+                with context.wrap_socket(connection, server_side=True) as secure:
+                    handler(secure)
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                listener.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        return listener.getsockname()[1], certificate, thread, failures
+
+    @staticmethod
+    def _trust_local_certificate(certificate: Path):
+        default_context = ssl.create_default_context
+
+        def make_context(*args, **kwargs):
+            context = default_context(*args, **kwargs)
+            context.load_verify_locations(cafile=str(certificate))
+            return context
+
+        return patch("tyvera.interpreter.ssl.create_default_context", side_effect=make_context)
 
     def test_local_tcp_echo_uses_async_readiness_and_resource_cleanup(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -553,6 +609,140 @@ fn main() {
     runTasks()
 }'''
         self.assertEqual(self.run_source(source), "v6\n")
+
+    def test_tls_validates_trust_and_hostname_and_transfers_binary_data(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tyvera-local-tls-") as temporary:
+            root = Path(temporary)
+            def echo(secure: ssl.SSLSocket) -> None:
+                payload = secure.recv(4)
+                secure.sendall(payload)
+                # Wait for the client's close_notify so this also covers the
+                # orderly TLS resource-close path.
+                while secure.recv(1024):
+                    pass
+
+            port, certificate, thread, errors = self._make_local_tls_server(root, echo)
+            trusted_port = port
+            source = f'''async fn exchange() {{
+    let opened = await tlsConnect("localhost", {port})
+    match move opened {{
+        Err(error) => println(error)
+        Ok(connection) => {{
+            let sent = await connection.writeAll(bytesFromString("ping"))
+            match sent {{
+                Ok(count) => println(count)
+                Err(error) => println(error)
+            }}
+            let received = await connection.read(16)
+            match received {{
+                Err(error) => println(error)
+                Ok(value) => match value {{
+                    None => println("unexpected EOF")
+                    Some(bytes) => {{
+                        let text = bytes.toString()
+                        match text {{
+                            Ok(value) => println(value)
+                            Err(error) => println(error)
+                        }}
+                    }}
+                }}
+            }}
+            connection.close()
+        }}
+    }}
+}}
+fn main() {{ let task = exchange(); runTasks() }}'''
+            with self._trust_local_certificate(certificate):
+                output = self.run_source(source, root=root)
+            thread.join(5)
+            self.assertFalse(thread.is_alive(), "local TLS echo server did not finish")
+            self.assertEqual(output, "4\nping\n")
+            self.assertEqual(errors, [], output)
+
+            def reject_unexpected_payload(secure: ssl.SSLSocket) -> None:
+                secure.recv(1)
+
+            # A trusted certificate for localhost must still fail hostname
+            # verification when the caller connects by the IPv4 literal.
+            port, certificate, thread, errors = self._make_local_tls_server(root, reject_unexpected_payload)
+            wrong_host = source.replace(
+                f'tlsConnect("localhost", {trusted_port})',
+                f'tlsConnect("127.0.0.1", {port})',
+            )
+            with self._trust_local_certificate(certificate):
+                output = self.run_source(wrong_host, root=root)
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(output, "TLS certificate verification failed\n")
+
+    def test_https_client_uses_verified_tls_and_preserves_http_semantics(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tyvera-local-https-") as temporary:
+            root = Path(temporary)
+            server_events: list[str] = []
+
+            def serve_http(secure: ssl.SSLSocket) -> None:
+                server_events.append("handshake complete")
+                request = bytearray()
+                while b"\r\n\r\n" not in request:
+                    part = secure.recv(4096)
+                    if not part:
+                        return
+                    request.extend(part)
+                server_events.append("request received")
+                secure.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecure"
+                )
+
+            port, certificate, thread, errors = self._make_local_tls_server(
+                root, serve_http, include_loopback_ip=True,
+            )
+            source = f'''async fn fetch() {{
+    let parsed = httpUrl("https://127.0.0.1:{port}/health?mode=local")
+    match parsed {{
+        Err(error) => println(error)
+        Ok(url) => {{
+            let response = await httpGet(url, milliseconds(2000))
+            match response {{
+                Err(error) => println(error)
+                Ok(response) => {{
+                    println(response.status())
+                    let text = response.body().toString()
+                    match text {{
+                        Ok(value) => println(value)
+                        Err(error) => println(error)
+                    }}
+                }}
+            }}
+        }}
+    }}
+}}
+fn main() {{ let task = fetch(); runTasks() }}'''
+            with self._trust_local_certificate(certificate):
+                output = self.run_source(source, root=root)
+            thread.join(5)
+            self.assertFalse(thread.is_alive(), "local HTTPS server did not finish")
+            self.assertEqual(errors, [], f"{output}; events={server_events!r}")
+            self.assertEqual(output, "200\nsecure\n")
+
+    def test_tls_rejects_untrusted_local_certificates_by_default(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tyvera-untrusted-tls-") as temporary:
+            root = Path(temporary)
+
+            def wait_for_handshake_failure(secure: ssl.SSLSocket) -> None:
+                secure.recv(1)
+
+            port, _, thread, _ = self._make_local_tls_server(root, wait_for_handshake_failure)
+            source = f'''async fn connect() {{
+    let opened = await tlsConnect("localhost", {port})
+    match move opened {{
+        Err(error) => println(error)
+        Ok(connection) => {{ connection.close(); println("unexpected TLS success") }}
+    }}
+}}
+fn main() {{ let task = connect(); runTasks() }}'''
+            self.assertEqual(self.run_source(source, root=root), "TLS certificate verification failed\n")
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
 
 
 if __name__ == "__main__":

@@ -461,7 +461,8 @@ class _FunctionLowerer:
             if expression.callee in {
                 "byteFromInt", "bytesFromString", "byteBuffer", "readText", "writeText",
                 "readBytes", "writeBytes", "pathJoin", "pathExists", "openText",
-                "openTextReader", "openTextWriter",
+                "openTextReader", "openTextWriter", "hostOS", "hostArchitecture",
+                "monotonicMilliseconds",
             }:
                 return IRBuiltinCall(
                     expression.callee,

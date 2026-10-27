@@ -602,6 +602,9 @@ def _validate_expression(
     if isinstance(expression, IRBuiltinCall):
         argument_types = tuple(_validate_expression(argument, functions, scopes) for argument in expression.arguments)
         signatures: dict[str, tuple[tuple[IRTypeRef, ...], IRTypeRef]] = {
+            "hostOS": ((), IRType.STRING),
+            "hostArchitecture": ((), IRType.STRING),
+            "monotonicMilliseconds": ((), IRType.INT),
             "byteFromInt": ((IRType.INT,), _applied("Result", IRType.BYTE, IRType.STRING)),
             "bytesFromString": ((IRType.STRING,), IRType.BYTES),
             "byteBuffer": ((IRType.INT,), _applied("Result", IRType.BYTE_BUFFER, IRType.STRING)),

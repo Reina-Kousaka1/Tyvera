@@ -119,7 +119,8 @@ class HttpUrl:
     @property
     def authority(self) -> str:
         host = f"[{self.host}]" if ":" in self.host else self.host
-        return host if self.port == 80 else f"{host}:{self.port}"
+        default_port = 443 if self.scheme == "https" else 80
+        return host if self.port == default_port else f"{host}:{self.port}"
 
     def __repr__(self) -> str:
         return "<HttpUrl redacted>"
@@ -175,6 +176,12 @@ class HttpMessageDecoder:
     request_method: str | None = None
     buffer: bytearray = field(default_factory=bytearray)
     eof: bool = False
+    _chunk_cursor: int | None = field(default=None, repr=False)
+    _chunk_body: bytearray = field(default_factory=bytearray, repr=False)
+    _chunk_overhead: int = field(default=0, repr=False)
+    _chunk_trailer_count: int = field(default=0, repr=False)
+    _chunk_phase: str = field(default="size", repr=False)
+    _chunk_remaining: int = field(default=0, repr=False)
 
     def __repr__(self) -> str:
         return "<HttpDecoder>"
@@ -182,7 +189,8 @@ class HttpMessageDecoder:
     def feed(self, payload: bytes) -> None:
         if self.eof:
             raise HttpProtocolError("HTTP decoder is already at end of stream")
-        max_buffer = self.limits.request_line_bytes + self.limits.header_bytes + self.limits.body_bytes + 4
+        max_buffer = (self.limits.request_line_bytes + self.limits.header_bytes
+                      + self.limits.body_bytes + self.limits.header_bytes + 4)
         if len(self.buffer) + len(payload) > max_buffer:
             raise HttpProtocolError("HTTP message exceeds configured size limits")
         self.buffer.extend(payload)
@@ -225,8 +233,10 @@ class HttpMessageDecoder:
         transfer_encoding = headers.values("transfer-encoding")
         if transfer_encoding and content_length is not None:
             raise HttpProtocolError("ambiguous HTTP message framing")
-        if transfer_encoding:
+        transfer_codings = [coding.strip().lower() for value in transfer_encoding for coding in value.split(",")]
+        if transfer_encoding and transfer_codings != ["chunked"]:
             raise HttpProtocolError("unsupported HTTP transfer encoding")
+        chunked = transfer_codings == ["chunked"]
 
         first = lines[0]
         if self.response:
@@ -236,12 +246,46 @@ class HttpMessageDecoder:
                        or status in {204, 304})
             if no_body:
                 body_length = 0
+                message_end = header_end + 4
+                body = b""
+            elif chunked:
+                decoded = self._decode_chunked_body(header_end + 4)
+                if decoded is None:
+                    return None
+                body, message_end = decoded
             elif content_length is None:
                 if not self.eof:
                     return None
                 body_length = len(self.buffer) - header_end - 4
+                if body_length > self.limits.body_bytes:
+                    raise HttpProtocolError("HTTP body exceeds configured size limit")
+                message_end = len(self.buffer)
+                body = bytes(self.buffer[header_end + 4:message_end])
             else:
                 body_length = content_length
+                if body_length > self.limits.body_bytes:
+                    raise HttpProtocolError("HTTP body exceeds configured size limit")
+                message_end = header_end + 4 + body_length
+                if len(self.buffer) < message_end:
+                    if self.eof:
+                        raise HttpProtocolError("connection closed during HTTP body")
+                    return None
+                body = bytes(self.buffer[header_end + 4:message_end])
+            del self.buffer[:message_end]
+            self._reset_chunk_decoder()
+            return HttpResponse(status, headers, body)
+
+        if chunked:
+            decoded = self._decode_chunked_body(header_end + 4)
+            if decoded is None:
+                return None
+            body, message_end = decoded
+        elif content_length is None:
+            body_length = 0
+            message_end = header_end + 4
+            body = b""
+        else:
+            body_length = content_length
             if body_length > self.limits.body_bytes:
                 raise HttpProtocolError("HTTP body exceeds configured size limit")
             message_end = header_end + 4 + body_length
@@ -250,34 +294,22 @@ class HttpMessageDecoder:
                     raise HttpProtocolError("connection closed during HTTP body")
                 return None
             body = bytes(self.buffer[header_end + 4:message_end])
-            del self.buffer[:message_end]
-            return HttpResponse(status, headers, body)
-
-        if content_length is None:
-            body_length = 0
-        else:
-            body_length = content_length
-        if body_length > self.limits.body_bytes:
-            raise HttpProtocolError("HTTP body exceeds configured size limit")
-        message_end = header_end + 4 + body_length
-        if len(self.buffer) < message_end:
-            if self.eof:
-                raise HttpProtocolError("connection closed during HTTP body")
-            return None
         request_line = self._parse_request_line(first)
         method, target, version = request_line
         if version == "HTTP/1.1":
             hosts = headers.values("host")
             if len(hosts) != 1 or not hosts[0].strip():
                 raise HttpProtocolError("HTTP/1.1 request requires one non-empty Host header")
-        body = bytes(self.buffer[header_end + 4:message_end])
         del self.buffer[:message_end]
+        self._reset_chunk_decoder()
         try:
             return HttpRequest(HttpMethod(method), target, headers, body, version)
         except ValueError as error:
             raise HttpProtocolError(str(error)) from error
 
     def _check_incomplete_limits(self) -> None:
+        if self.buffer.find(b"\r\n\r\n") >= 0:
+            return
         first_line_end = self.buffer.find(b"\r\n")
         if first_line_end >= 0 and first_line_end > self.limits.request_line_bytes:
             raise HttpProtocolError("HTTP start line exceeds configured size limit")
@@ -290,6 +322,97 @@ class HttpMessageDecoder:
                 raise HttpProtocolError("HTTP lines must end with CRLF")
             if byte == 13 and index + 1 < len(self.buffer) and self.buffer[index + 1] != 10:
                 raise HttpProtocolError("HTTP lines must end with CRLF")
+
+    def _decode_chunked_body(self, body_start: int) -> tuple[bytes, int] | None:
+        if self._chunk_cursor is None:
+            self._chunk_cursor = body_start
+            self._chunk_body.clear()
+            self._chunk_overhead = 0
+            self._chunk_trailer_count = 0
+            self._chunk_phase = "size"
+            self._chunk_remaining = 0
+
+        while True:
+            cursor = self._chunk_cursor
+            assert cursor is not None
+            if self._chunk_phase in {"size", "trailers"}:
+                line_end = self.buffer.find(b"\r\n", cursor)
+                if line_end < 0:
+                    if self._chunk_overhead + len(self.buffer) - cursor > self.limits.header_bytes:
+                        raise HttpProtocolError("HTTP chunk metadata exceeds configured size limit")
+                    if self.eof:
+                        message = ("connection closed during HTTP chunk metadata"
+                                   if self._chunk_phase == "size"
+                                   else "connection closed during HTTP chunk trailers")
+                        raise HttpProtocolError(message)
+                    return None
+                line = bytes(self.buffer[cursor:line_end])
+                self._chunk_cursor = line_end + 2
+                self._chunk_overhead += len(line) + 2
+                if self._chunk_overhead > self.limits.header_bytes:
+                    raise HttpProtocolError("HTTP chunk metadata exceeds configured size limit")
+                if self._chunk_phase == "size":
+                    size_text = line.partition(b";")[0]
+                    if (any(value < 32 or value > 126 for value in line)
+                            or not size_text or len(size_text) > 16
+                            or any(value not in b"0123456789abcdefABCDEF" for value in size_text)):
+                        raise HttpProtocolError("invalid HTTP chunk size")
+                    size = int(size_text, 16)
+                    if size > self.limits.body_bytes - len(self._chunk_body):
+                        raise HttpProtocolError("HTTP body exceeds configured size limit")
+                    if size == 0:
+                        self._chunk_phase = "trailers"
+                    else:
+                        self._chunk_remaining = size
+                        self._chunk_phase = "data"
+                    continue
+
+                if not line:
+                    body = bytes(self._chunk_body)
+                    message_end = self._chunk_cursor
+                    return body, message_end
+                if line[:1] in {b" ", b"\t"} or b":" not in line:
+                    raise HttpProtocolError("invalid HTTP trailer line")
+                self._chunk_trailer_count += 1
+                if self._chunk_trailer_count > self.limits.header_count:
+                    raise HttpProtocolError("HTTP trailer count exceeds configured limit")
+                name, _, raw_value = line.partition(b":")
+                try:
+                    header_name = name.decode("ascii")
+                    header_value = raw_value.decode("latin-1")
+                    normalized = _validate_header(header_name, header_value)
+                except (UnicodeDecodeError, ValueError) as error:
+                    raise HttpProtocolError("invalid HTTP trailer line") from error
+                if normalized in {"content-length", "transfer-encoding", "host"}:
+                    raise HttpProtocolError("forbidden HTTP trailer field")
+                continue
+
+            if self._chunk_phase == "data":
+                data_end = cursor + self._chunk_remaining
+                if len(self.buffer) < data_end + 2:
+                    if self.eof:
+                        raise HttpProtocolError("connection closed during HTTP chunk data")
+                    return None
+                if self.buffer[data_end:data_end + 2] != b"\r\n":
+                    raise HttpProtocolError("HTTP chunk data must end with CRLF")
+                self._chunk_body.extend(self.buffer[cursor:data_end])
+                self._chunk_overhead += 2
+                if self._chunk_overhead > self.limits.header_bytes:
+                    raise HttpProtocolError("HTTP chunk metadata exceeds configured size limit")
+                self._chunk_cursor = data_end + 2
+                self._chunk_remaining = 0
+                self._chunk_phase = "size"
+                continue
+
+            raise HttpProtocolError("invalid HTTP chunk decoder state")
+
+    def _reset_chunk_decoder(self) -> None:
+        self._chunk_cursor = None
+        self._chunk_body.clear()
+        self._chunk_overhead = 0
+        self._chunk_trailer_count = 0
+        self._chunk_phase = "size"
+        self._chunk_remaining = 0
 
     @staticmethod
     def _content_length(headers: HttpHeaders) -> int | None:
@@ -385,8 +508,9 @@ def parse_url(value: str) -> HttpUrl:
     scheme, separator, remainder = value.partition("://")
     if not separator:
         raise ValueError("HTTP URL must include a scheme and authority")
-    if scheme.lower() != "http":
-        raise ValueError("only the http scheme is implemented; HTTPS is planned")
+    normalized_scheme = scheme.lower()
+    if normalized_scheme not in {"http", "https"}:
+        raise ValueError("HTTP URL scheme must be http or https")
     if "#" in remainder:
         raise ValueError("HTTP request URL must not contain a fragment")
     authority_end = min(
@@ -398,7 +522,7 @@ def parse_url(value: str) -> HttpUrl:
     if not authority or "@" in authority:
         raise ValueError("invalid HTTP URL authority")
 
-    port = 80
+    port = 443 if normalized_scheme == "https" else 80
     if authority.startswith("["):
         closing = authority.find("]")
         if closing < 0:
@@ -434,7 +558,7 @@ def parse_url(value: str) -> HttpUrl:
     else:
         raise ValueError("invalid HTTP URL target")
     split_request_target(target)
-    return HttpUrl("http", host, port, target)
+    return HttpUrl(normalized_scheme, host, port, target)
 
 
 def _parse_url_port(value: str) -> int:
