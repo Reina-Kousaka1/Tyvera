@@ -1407,6 +1407,8 @@ class TypeChecker:
                         "send": (("Bytes",), "Task<Result<Int,String>>"),
                         "receive": ((), "Task<Result<Option<WebSocketMessage>,String>>"),
                         "receiveWithin": (("Duration",), "Task<Result<Option<WebSocketMessage>,String>>"),
+                        "closeCode": ((), "Option<Int>"),
+                        "closeReason": ((), "Option<String>"),
                         "close": ((), "Bool"),
                         "closeGracefully": ((), "Task<Result<Bool,String>>"),
                         "isOpen": ((), "Bool"),

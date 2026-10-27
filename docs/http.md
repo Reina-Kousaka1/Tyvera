@@ -78,6 +78,14 @@ percent-encoded UTF-8. `HttpUrl` accepts ASCII DNS presentation names (IDNs
 must use punycode) and bracketed IPv6 literals; fragments, userinfo, and IPv6
 scope identifiers are rejected.
 
+`WebSocket.receive()` completes with `Ok(None)` after a valid peer close frame
+and the close reply has been sent. The closed WebSocket keeps the peer's close
+metadata available through `closeCode() -> Option<Int>` and
+`closeReason() -> Option<String>`; an absent code/reason remains `None`. An
+abrupt TCP close still returns a controlled `Err` and does not fabricate close
+metadata. This lets protocol clients apply their own typed reconnect policy
+without exposing WebSocket implementation objects.
+
 `HttpRouter.add(method, path, response)` registers a static response. It does
 not retain a callback: Tyvera does not yet have first-class function values.
 Programs that need per-request logic can use the typed decoder, inspect a

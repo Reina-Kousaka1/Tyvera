@@ -338,6 +338,14 @@ fn main() {{ let task = client(); runTasks() }}'''
                     Some(_) => println("unexpected message")
                 }}
             }}
+            match connection.closeCode() {{
+                Some(code) => println(code)
+                None => println("no close code")
+            }}
+            match connection.closeReason() {{
+                Some(reason) => println(reason)
+                None => println("no close reason")
+            }}
             println(connection.isOpen())
         }}
     }}
@@ -353,7 +361,7 @@ fn main() {{ let task = client(); runTasks() }}'''
                 listener.close()
         self.assertFalse(thread.is_alive(), "local WebSocket peer did not finish")
         self.assertEqual(failures, [])
-        self.assertEqual(output.getvalue(), "peer closed\nfalse\n")
+        self.assertEqual(output.getvalue(), "peer closed\n1001\ngoing away\nfalse\n")
 
 
 if __name__ == "__main__":

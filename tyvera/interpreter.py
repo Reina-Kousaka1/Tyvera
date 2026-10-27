@@ -245,6 +245,8 @@ class _TyveraNetworkResource:
     pending_read_task: _TyveraTask | None = None
     pending_write_task: _TyveraTask | None = None
     websocket_decoder: WebSocketFrameDecoder | None = None
+    websocket_close_code: int | None = None
+    websocket_close_reason: str | None = None
     operation_timeout_milliseconds: int = 0
     identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
@@ -1435,6 +1437,12 @@ class Interpreter:
                 if expression.method == "close":
                     was_open = not receiver.closed
                     return was_open and self._close_resource(receiver) is None
+                if receiver.resource_type == "WebSocket" and expression.method == "closeCode":
+                    return (_TyveraVariant("None") if receiver.websocket_close_code is None
+                            else _TyveraVariant("Some", receiver.websocket_close_code))
+                if receiver.resource_type == "WebSocket" and expression.method == "closeReason":
+                    return (_TyveraVariant("None") if receiver.websocket_close_reason is None
+                            else _TyveraVariant("Some", receiver.websocket_close_reason))
                 if receiver.resource_type == "WebSocket" and expression.method == "closeGracefully":
                     return self._websocket_close_task(receiver, expression.location)
                 if receiver.closed:
@@ -3702,6 +3710,12 @@ class Interpreter:
             self._advance_websocket_receive_task(task)
             return
         if event.opcode == 8:
+            try:
+                connection.websocket_close_code, connection.websocket_close_reason = validate_close_payload(event.payload)
+            except WebSocketProtocolError as error:
+                task.result = _TyveraVariant("Err", str(error), "Result", 1)
+                self._complete_task(task)
+                return
             try:
                 state["frame"] = encode_client_frame(8, event.payload)
             except WebSocketProtocolError:
