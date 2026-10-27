@@ -966,7 +966,8 @@ fn main() {
             self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
             self.assertEqual(
                 native.stdout,
-                "invalid address\ninvalid address\nport must be between 1 and 65535\ninvalid listener backlog\n",
+                "invalid address\nport must be between 0 and 65535\n"
+                "port must be between 1 and 65535\nbacklog must be between 1 and 4096\n",
             )
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "native networking tests require Linux")

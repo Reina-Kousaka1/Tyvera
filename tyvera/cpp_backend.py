@@ -927,6 +927,7 @@ struct TaskCancelled final : std::exception {
     const char* what() const noexcept override { return "task was cancelled"; }
 };
 
+inline thread_local std::unique_lock<std::mutex>* active_execution_lock = nullptr;
 constexpr std::size_t MAX_NATIVE_TASKS_PER_RUN = 64;
 struct TaskControl {
     std::atomic<bool> started{false};
@@ -1010,23 +1011,32 @@ struct TaskControl {
     }
     void wait_for_children(bool check_owner) {
         const auto owned = children_snapshot();
-        for (const auto& child : owned) {
-            while (!child->done.load(std::memory_order_acquire)) {
-                std::unique_lock<std::mutex> lock(child->lifecycle_mutex);
-                child->lifecycle_changed.wait_for(lock, std::chrono::milliseconds(50), [&child]() {
-                    return child->done.load(std::memory_order_acquire);
-                });
-                lock.unlock();
-                if (check_owner) check_interruption();
-            }
-            if (!check_owner) continue;
-            check_interruption();
-            const auto message = child->failure_message();
-            if (!message.empty()) {
-                record_child_failure(message);
+        auto* execution_lock = active_execution_lock;
+        const bool resume_serialized = execution_lock && execution_lock->owns_lock();
+        if (resume_serialized) execution_lock->unlock();
+        try {
+            for (const auto& child : owned) {
+                while (!child->done.load(std::memory_order_acquire)) {
+                    std::unique_lock<std::mutex> lock(child->lifecycle_mutex);
+                    child->lifecycle_changed.wait_for(lock, std::chrono::milliseconds(50), [&child]() {
+                        return child->done.load(std::memory_order_acquire);
+                    });
+                    lock.unlock();
+                    if (check_owner) check_interruption();
+                }
+                if (!check_owner) continue;
                 check_interruption();
+                const auto message = child->failure_message();
+                if (!message.empty()) {
+                    record_child_failure(message);
+                    check_interruption();
+                }
             }
+        } catch (...) {
+            if (resume_serialized && !execution_lock->owns_lock()) execution_lock->lock();
+            throw;
         }
+        if (resume_serialized && !execution_lock->owns_lock()) execution_lock->lock();
     }
     void notify_owner_failure() {
         if (!owner) return;
@@ -1047,7 +1057,6 @@ inline NativeScheduler& native_scheduler() {
     static NativeScheduler value;
     return value;
 }
-inline thread_local std::unique_lock<std::mutex>* active_execution_lock = nullptr;
 inline thread_local TaskControl* active_task_control = nullptr;
 class NativeTaskExecution {
     std::unique_lock<std::mutex> lock_;
@@ -2001,7 +2010,7 @@ inline Task<StringResult<std::shared_ptr<ListData<SocketAddress>>>> resolve_host
         if (host.find_first_not_of(" \t\r\n") == std::string::npos)
             return result_error<std::shared_ptr<ListData<SocketAddress>>>("invalid address");
         if (port < 0 || port > 65535)
-            return result_error<std::shared_ptr<ListData<SocketAddress>>>("invalid address");
+            return result_error<std::shared_ptr<ListData<SocketAddress>>>("port must be between 0 and 65535");
 #if defined(__linux__)
         int status = 0;
         addrinfo* addresses = nullptr;
@@ -2111,10 +2120,12 @@ inline Task<StringResult<std::shared_ptr<TcpListener>>> tcp_listen(
     using Output = StringResult<std::shared_ptr<TcpListener>>;
     return make_io_task<Output>([host = std::move(host), port, backlog, file, line, column]() -> Output {
         task_checkpoint();
-        if (host.find_first_not_of(" \t\r\n") == std::string::npos || port < 0 || port > 65535)
+        if (host.find_first_not_of(" \t\r\n") == std::string::npos)
             return result_error<std::shared_ptr<TcpListener>>("invalid address");
+        if (port < 0 || port > 65535)
+            return result_error<std::shared_ptr<TcpListener>>("port must be between 0 and 65535");
         if (backlog < 1 || backlog > 4096)
-            return result_error<std::shared_ptr<TcpListener>>("invalid listener backlog");
+            return result_error<std::shared_ptr<TcpListener>>("backlog must be between 1 and 4096");
 #if defined(__linux__)
         addrinfo hints{};
         hints.ai_family = AF_UNSPEC;
