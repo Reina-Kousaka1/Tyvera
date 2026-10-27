@@ -84,7 +84,11 @@ def ir_type_name(type_ref: IRTypeRef) -> str:
 
 
 def _valid_qualified_name(value: str) -> bool:
-    return bool(value) and all(part.isidentifier() for part in value.split("."))
+    """Validate a declared name after an opaque linked-module path prefix."""
+    if not value or not value.isprintable():
+        return False
+    name = value.rpartition(".")[2]
+    return name.isidentifier()
 
 
 def _applied(name: str, *arguments: IRTypeRef) -> IRAppliedType:
