@@ -145,6 +145,38 @@ fn main() {
         self.assertIn("tyvera_runtime::json_kind", generated)
         self.assertIn("tyvera_runtime::map_put<tyvera_runtime::JsonValue", generated)
 
+    def test_discord_decode_package_lowers_nominal_types_and_task_primitives(self) -> None:
+        entry = REPOSITORY / "libraries" / "discord" / "examples" / "decode.tyv"
+        checked = compile_checked_project(entry, REPOSITORY)
+        module = lower_checked_program(checked)
+        self.assertEqual(len(module.records), 4)
+        self.assertEqual(len(module.enums), 3)
+        self.assertTrue(any(item.name.endswith("GatewayDispatch") for item in module.enums))
+        validate_ir(module)
+
+        generated = emit_cpp(module)
+        self.assertIn("GatewayDispatch", generated)
+        self.assertIn("RestFailure", generated)
+        self.assertIn("tyvera_runtime::SecretString", generated)
+        self.assertIn("tyvera_runtime::sleep_for", generated)
+
+    def test_environment_lowering_keeps_values_secret_wrapped(self) -> None:
+        module = self.lower('''fn main() {
+    match environment("TYVERA_NATIVE_FAKE_TOKEN") {
+        Some(token) => println("present")
+        None => println("missing")
+    }
+}''')
+        call = module.functions[0].body[0].value
+        self.assertIsInstance(call, IRBuiltinCall)
+        self.assertEqual(
+            call.type,
+            IRAppliedType("Option", (IRAppliedType("Secret", (IRType.STRING,)),)),
+        )
+        generated = emit_cpp(module)
+        self.assertIn("tyvera_runtime::environment_value", generated)
+        self.assertIn("std::optional<tyvera_runtime::SecretString>", generated)
+
     def test_transparent_primitive_aliases_lower_to_their_target_type(self) -> None:
         module = self.lower('''type Count = Int
 fn increment(value: Count) -> Count { return value + 1 }
@@ -681,6 +713,68 @@ class NativeExecutionTests(unittest.TestCase):
     def _tyvera_string(value: str) -> str:
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
+
+    def test_native_sleep_for_matches_reference_task_scheduling(self) -> None:
+        source = '''async fn pause() {
+    await sleepFor(milliseconds(0))
+    println("awake")
+}
+fn main() {
+    let pending = pause()
+    let result = runTasks()
+    println("finished")
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-sleep-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "sleep", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+
+    def test_native_environment_keeps_values_secret_wrapped(self) -> None:
+        source = '''fn main() {
+    match environment("TYVERA_NATIVE_FAKE_TOKEN") {
+        Some(token) => println("present")
+        None => println("missing")
+    }
+    match environment("INVALID NAME") {
+        Some(_) => println("invalid name was accepted")
+        None => println("invalid name rejected")
+    }
+}'''
+        with patch.dict(os.environ, {"TYVERA_NATIVE_FAKE_TOKEN": "fake-native-token"}):
+            with tempfile.TemporaryDirectory(prefix="tyvera-native-environment-") as temporary:
+                root = Path(temporary)
+                reference = self._reference_result(source, root)
+                native = self._native_source_result(source, root, root / "environment", root)
+                self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+
+    def test_discord_decode_example_matches_reference_interpreter(self) -> None:
+        entry = REPOSITORY / "libraries" / "discord" / "examples" / "decode.tyv"
+        checked = compile_checked_project(entry, REPOSITORY)
+        output = io.StringIO()
+        errors = io.StringIO()
+        try:
+            ReferenceInterpreterBackend().execute(
+                checked, output=output, error_output=errors, project_root=REPOSITORY,
+            )
+            reference = (0, output.getvalue(), errors.getvalue())
+        except Diagnostic as error:
+            reference = (1, output.getvalue(), error.render() + "\n")
+
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-discord-decode-") as temporary:
+            root = Path(temporary)
+            CppNativeBackend().build(lower_checked_program(checked), root / "discord-decode", project_root=REPOSITORY)
+            environment = os.environ.copy()
+            environment.pop("PYTHONPATH", None)
+            environment.pop("PYTHONHOME", None)
+            if os.name != "nt":
+                environment["PATH"] = ""
+            native = subprocess.run(
+                [str(root / "discord-decode")], cwd=REPOSITORY, capture_output=True,
+                text=True, encoding="utf-8", env=environment, check=False,
+            )
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
 
     def test_native_actor_state_fifo_self_send_and_round_robin_match_reference(self) -> None:
         source = '''actor Counter {

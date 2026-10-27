@@ -25,6 +25,7 @@ from .ast import (
     MemberCall,
     Name,
     Program,
+    RecordPattern,
     ReturnStatement,
     Statement,
     Unary,
@@ -41,6 +42,10 @@ from .ir import (
     IRActorSend,
     IRActorSpawn,
     IRAppliedType,
+    IREnum,
+    IREnumCreate,
+    IREnumPattern,
+    IREnumVariant,
     IRAssign,
     IRAwait,
     IRBinary,
@@ -52,6 +57,7 @@ from .ir import (
     IRCollectionLength,
     IRExpression,
     IRExpressionStatement,
+    IRFieldAccess,
     IRForEach,
     IRFunction,
     IRIf,
@@ -69,9 +75,14 @@ from .ir import (
     IRVariant,
     IRVariantPattern,
     IRReturn,
+    IRRecord,
+    IRRecordCreate,
+    IRRecordField,
+    IRRecordPattern,
     IRUsing,
     IRType,
     IRTypeRef,
+    IRUserType,
     IRUnary,
     IRVariable,
     IRWhile,
@@ -114,7 +125,7 @@ _TYPE_MAP = {
     "Void": IRType.VOID,
     "Unit": IRType.VOID,
 }
-_APPLIED_TYPES = {"Option": 1, "Result": 2, "List": 1, "Map": 2, "Task": 1}
+_APPLIED_TYPES = {"Option": 1, "Result": 2, "List": 1, "Map": 2, "Task": 1, "Secret": 1}
 
 
 def lower_checked_program(checked: CheckedProgram) -> IRModule:
@@ -124,10 +135,15 @@ def lower_checked_program(checked: CheckedProgram) -> IRModule:
         raise Diagnostic(program.classes[0].location, "backend", "native backend does not yet support classes")
     if program.interfaces:
         raise Diagnostic(program.interfaces[0].location, "backend", "native backend does not yet support interfaces")
-    if program.records:
-        raise Diagnostic(program.records[0].location, "backend", "native backend does not yet support records")
-    if program.enums:
-        raise Diagnostic(program.enums[0].location, "backend", "native backend does not yet support enums or pattern matching")
+    generic_nominal = next(
+        (declaration for declaration in (*program.records, *program.enums) if declaration.type_parameters),
+        None,
+    )
+    if generic_nominal is not None:
+        raise Diagnostic(
+            generic_nominal.location, "backend",
+            f"native backend does not yet support generic type '{generic_nominal.name}'",
+        )
     if program.newtypes:
         raise Diagnostic(program.newtypes[0].location, "backend", "native backend does not yet support newtypes")
     if program.imports:
@@ -144,6 +160,27 @@ def lower_checked_program(checked: CheckedProgram) -> IRModule:
         for actor_index, actor in enumerate(program.actors)
     }
     lowerer = _FunctionLowerer(checked, symbols, actor_symbols)
+    records = tuple(
+        IRRecord(
+            declaration.name,
+            tuple(IRRecordField(field.name, lowerer._type(field.type_name, field.location), field.location)
+                  for field in declaration.fields),
+            declaration.location,
+        )
+        for declaration in program.records
+    )
+    enums = tuple(
+        IREnum(
+            declaration.name,
+            tuple(IREnumVariant(
+                variant.name,
+                tuple(lowerer._type(payload, variant.location) for payload in variant.payload_types),
+                variant.location,
+            ) for variant in declaration.variants),
+            declaration.location,
+        )
+        for declaration in program.enums
+    )
     actors: list[IRActor] = []
     actor_functions = []
     for actor in program.actors:
@@ -155,7 +192,7 @@ def lower_checked_program(checked: CheckedProgram) -> IRModule:
     entry = next((function for function in functions if function.name == "main" and function.actor_name is None), None)
     if entry is None:
         raise Diagnostic(program.functions[0].location, "backend", "native backend requires a main function")
-    module = IRModule(tuple(functions), entry.symbol, tuple(actors))
+    module = IRModule(tuple(functions), entry.symbol, tuple(actors), records, enums)
     validate_ir(module)
     return module
 
@@ -168,6 +205,8 @@ class _FunctionLowerer:
         self.checked = checked
         self.symbols = symbols
         self.actor_symbols = actor_symbols or {}
+        self.record_declarations = {record.name: record for record in checked.program.records}
+        self.enum_declarations = {enum.name: enum for enum in checked.program.enums}
         self.scopes: list[dict[str, IRVariable]] = []
         self.actor_name: str | None = None
         self.actor_fields: dict[str, IRVariable] = {}
@@ -260,6 +299,10 @@ class _FunctionLowerer:
         base, arguments = split_type(type_name)
         if base == "ActorRef" and len(arguments) == 1:
             return IRActorRefType(arguments[0])
+        if base in self.record_declarations or base in self.enum_declarations:
+            if arguments:
+                raise Diagnostic(location, "backend", f"native backend does not yet support generic type '{type_name}'")
+            return IRUserType(base)
         result = _TYPE_MAP.get(base) if not arguments else None
         if result is not None:
             return result
@@ -506,7 +549,36 @@ class _FunctionLowerer:
                 lowered_payload = self._pattern(payload, payload_type)
             return IRVariantPattern(pattern.variant, lowered_payload, pattern.location)
         if isinstance(pattern, EnumPattern):
-            raise Diagnostic(pattern.location, "backend", "native backend does not yet support user-defined enum patterns")
+            enum = self.enum_declarations.get(pattern.enum_name)
+            if enum is None or not isinstance(expected_type, IRUserType) or expected_type.name != pattern.enum_name:
+                raise Diagnostic(pattern.location, "backend", "checked enum pattern has an incompatible nominal type")
+            variant_index = next((index for index, item in enumerate(enum.variants)
+                                  if item.name == pattern.variant), None)
+            if variant_index is None:
+                raise Diagnostic(pattern.location, "backend", f"enum '{pattern.enum_name}' has no variant '{pattern.variant}'")
+            payload_types = tuple(self._type(value, pattern.location)
+                                  for value in enum.variants[variant_index].payload_types)
+            if len(payload_types) != len(pattern.payload_patterns):
+                raise Diagnostic(pattern.location, "backend", "checked enum pattern has the wrong payload arity")
+            return IREnumPattern(
+                pattern.enum_name, pattern.variant, variant_index, payload_types,
+                tuple(self._pattern(child, child_type)
+                      for child, child_type in zip(pattern.payload_patterns, payload_types)),
+                pattern.location,
+            )
+        if isinstance(pattern, RecordPattern):
+            record = self.record_declarations.get(pattern.name)
+            if record is None or not isinstance(expected_type, IRUserType) or expected_type.name != pattern.name:
+                raise Diagnostic(pattern.location, "backend", "checked record pattern has an incompatible nominal type")
+            field_types = tuple(self._type(field.type_name, field.location) for field in record.fields)
+            if len(field_types) != len(pattern.fields):
+                raise Diagnostic(pattern.location, "backend", "checked record pattern has the wrong field arity")
+            return IRRecordPattern(
+                pattern.name, field_types,
+                tuple(self._pattern(child, field_type)
+                      for child, field_type in zip(pattern.fields, field_types)),
+                pattern.location,
+            )
         raise Diagnostic(pattern.location, "backend", f"native backend does not yet support {type(pattern).__name__} patterns")
 
     def _expression(self, expression: Expression) -> IRExpression:
@@ -560,6 +632,19 @@ class _FunctionLowerer:
                 expression.location,
             )
         if isinstance(expression, MemberAccess):
+            if isinstance(expression.receiver, Name) and expression.receiver.identifier in self.enum_declarations:
+                enum = self.enum_declarations[expression.receiver.identifier]
+                variant_index = next((index for index, item in enumerate(enum.variants)
+                                      if item.name == expression.member), None)
+                if variant_index is None:
+                    raise Diagnostic(expression.location, "backend", f"enum '{enum.name}' has no variant '{expression.member}'")
+                variant = enum.variants[variant_index]
+                if variant.payload_types:
+                    raise Diagnostic(expression.location, "backend", f"enum variant '{expression.member}' requires arguments")
+                return IREnumCreate(
+                    enum.name, variant.name, variant_index, (), (),
+                    IRUserType(enum.name), expression.location,
+                )
             if (self.actor_name is not None and isinstance(expression.receiver, Name)
                     and expression.receiver.identifier == "self"):
                 variable = self.actor_fields.get(expression.member)
@@ -570,8 +655,31 @@ class _FunctionLowerer:
             if (expression.member == "length" and isinstance(receiver.type, IRAppliedType)
                     and receiver.type.name in {"List", "Map"}):
                 return IRCollectionLength(receiver, expression_type, expression.location)
+            if isinstance(receiver.type, IRUserType):
+                record = self.record_declarations.get(receiver.type.name)
+                if record is not None:
+                    field_index = next((index for index, field in enumerate(record.fields)
+                                        if field.name == expression.member), None)
+                    if field_index is not None:
+                        return IRFieldAccess(receiver, receiver.type.name, field_index,
+                                             expression_type, expression.location)
             raise Diagnostic(expression.location, "backend", "native backend does not yet support this field access")
         if isinstance(expression, MemberCall):
+            if isinstance(expression.receiver, Name) and expression.receiver.identifier in self.enum_declarations:
+                enum = self.enum_declarations[expression.receiver.identifier]
+                variant_index = next((index for index, item in enumerate(enum.variants)
+                                      if item.name == expression.method), None)
+                if variant_index is None:
+                    raise Diagnostic(expression.location, "backend", f"enum '{enum.name}' has no variant '{expression.method}'")
+                variant = enum.variants[variant_index]
+                payload_types = tuple(self._type(value, expression.location) for value in variant.payload_types)
+                if len(expression.arguments) != len(payload_types):
+                    raise Diagnostic(expression.location, "backend", "checked enum constructor has the wrong payload arity")
+                return IREnumCreate(
+                    enum.name, variant.name, variant_index, payload_types,
+                    tuple(self._expression(argument) for argument in expression.arguments),
+                    IRUserType(enum.name), expression.location,
+                )
             checked_receiver_type = self.checked.expression_types.get(expression.receiver.location, "")
             receiver_base, receiver_arguments = split_type(checked_receiver_type)
             if receiver_base == "Supervisor" and expression.method == "start":
@@ -626,6 +734,7 @@ class _FunctionLowerer:
             if not (
                 isinstance(receiver.type, IRAppliedType) and receiver.type.name in {"List", "Map"}
                 or isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Task"
+                or isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Secret"
                 or isinstance(receiver.type, IRActorRefType)
                 or receiver.type in {
                 IRType.JSON, IRType.BYTE, IRType.DURATION, IRType.BYTES, IRType.BYTE_BUFFER,
@@ -673,11 +782,21 @@ class _FunctionLowerer:
                 )
             if expression.callee in {"List", "Map"}:
                 return IRCollectionCreate(expression_type, expression.location)
+            if expression.callee in self.record_declarations:
+                record = self.record_declarations[expression.callee]
+                field_types = tuple(self._type(field.type_name, field.location) for field in record.fields)
+                if len(expression.arguments) != len(field_types):
+                    raise Diagnostic(expression.location, "backend", "checked record constructor has the wrong field arity")
+                return IRRecordCreate(
+                    record.name, field_types,
+                    tuple(self._expression(argument) for argument in expression.arguments),
+                    IRUserType(record.name), expression.location,
+                )
             if expression.callee in {
-                "milliseconds", "seconds", "durationFromSeconds", "byteFromInt", "bytesFromString", "byteBuffer", "readText", "writeText",
+                "milliseconds", "seconds", "durationFromSeconds", "sleepFor", "byteFromInt", "bytesFromString", "byteBuffer", "readText", "writeText",
                 "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool", "jsonNull", "jsonArray", "jsonObject",
                 "readBytes", "writeBytes", "pathJoin", "pathExists", "openText",
-                "openTextReader", "openTextWriter", "hostOS", "hostArchitecture", "runActors",
+                "openTextReader", "openTextWriter", "hostOS", "hostArchitecture", "environment", "runActors",
                 "monotonicMilliseconds", "runTasks", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen",
                 "webSocketUrl", "webSocketConnect", "httpMethod", "httpUrl", "httpHeaders",
                 "httpRequest", "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete",

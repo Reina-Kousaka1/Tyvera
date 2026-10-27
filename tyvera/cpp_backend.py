@@ -28,7 +28,11 @@ from .ir import (
     IRCollectionLength,
     IRExpression,
     IRExpressionStatement,
+    IREnum,
+    IREnumCreate,
+    IREnumPattern,
     IRForEach,
+    IRFieldAccess,
     IRFunction,
     IRIf,
     IRLet,
@@ -42,9 +46,13 @@ from .ir import (
     IRModule,
     IROutput,
     IRReturn,
+    IRRecord,
+    IRRecordCreate,
+    IRRecordPattern,
     IRUsing,
     IRType,
     IRTypeRef,
+    IRUserType,
     IRUnary,
     IRAssign,
     IRVariable,
@@ -124,6 +132,14 @@ def _cpp_actor_identifier(actor_name: str) -> str:
     return f"tyv_actor_{encoded}"
 
 
+def _cpp_user_type_identifier(type_name: str) -> str:
+    encoded = "".join(
+        character if character.isascii() and character.isalnum() else f"_x{ord(character):x}_"
+        for character in type_name
+    )
+    return f"tyv_type_{encoded}"
+
+
 def _find_compiler(location: Location) -> tuple[str, ...]:
     configured = os.environ.get("CXX", "").strip()
     if configured:
@@ -189,6 +205,12 @@ class _CppGenerator:
         self.lines.extend(runtime.splitlines())
         self._line("namespace tyvera_generated {")
         self.indent += 1
+        for declaration in self._ordered_nominal_types():
+            if isinstance(declaration, IRRecord):
+                self._record_declaration(declaration)
+            else:
+                self._enum_declaration(declaration)
+            self._line("")
         for actor in self.module.actors:
             self._actor_declaration(actor)
             self._line("")
@@ -242,6 +264,132 @@ class _CppGenerator:
         self._line("}")
         return "\n".join(self.lines) + "\n"
 
+    def _ordered_nominal_types(self) -> list[IRRecord | IREnum]:
+        declarations: dict[str, IRRecord | IREnum] = {
+            item.name: item for item in (*self.module.records, *self.module.enums)
+        }
+        ordered: list[IRRecord | IREnum] = []
+        visiting: set[str] = set()
+        complete: set[str] = set()
+
+        def type_dependencies(type_ref: IRTypeRef) -> set[str]:
+            if isinstance(type_ref, IRUserType):
+                return {type_ref.name}
+            if isinstance(type_ref, IRAppliedType):
+                dependencies: set[str] = set()
+                for argument in type_ref.arguments:
+                    dependencies.update(type_dependencies(argument))
+                return dependencies
+            return set()
+
+        def visit(name: str) -> None:
+            if name in complete:
+                return
+            declaration = declarations[name]
+            if name in visiting:
+                raise Diagnostic(
+                    declaration.location, "backend",
+                    f"native backend does not yet support recursive record or enum layout '{name}'",
+                )
+            visiting.add(name)
+            if isinstance(declaration, IRRecord):
+                referenced = set().union(*(type_dependencies(field.type) for field in declaration.fields))
+            else:
+                referenced = set().union(*(
+                    type_dependencies(payload)
+                    for variant in declaration.variants for payload in variant.payload_types
+                ))
+            for dependency in sorted(referenced):
+                if dependency == name:
+                    raise Diagnostic(
+                        declaration.location, "backend",
+                        f"native backend does not yet support recursive record or enum layout '{name}'",
+                    )
+                visit(dependency)
+            visiting.remove(name)
+            complete.add(name)
+            ordered.append(declaration)
+
+        for declaration in (*self.module.records, *self.module.enums):
+            visit(declaration.name)
+        return ordered
+
+    def _record_declaration(self, record: IRRecord) -> None:
+        type_name = _cpp_user_type_identifier(record.name)
+        self._line(f"struct {type_name} {{")
+        self.indent += 1
+        for index, field in enumerate(record.fields):
+            self._line(f"{self._cpp_type(field.type)} tyv_field_{index}{{}};")
+        self._line(f"bool operator==(const {type_name}& other) const {{")
+        self.indent += 1
+        if not record.fields:
+            self._line("return true;")
+        else:
+            comparisons = [
+                f"tyvera_runtime::equal(tyv_field_{index}, other.tyv_field_{index})"
+                for index in range(len(record.fields))
+            ]
+            self._line("return " + " && ".join(comparisons) + ";")
+        self.indent -= 1
+        self._line("}")
+        self.indent -= 1
+        self._line("};")
+
+    def _enum_declaration(self, enum: IREnum) -> None:
+        if not enum.variants:
+            raise Diagnostic(enum.location, "backend", f"native backend does not support empty enum '{enum.name}'")
+        type_name = _cpp_user_type_identifier(enum.name)
+        payloads = ", ".join(
+            "std::tuple<" + ", ".join(self._cpp_type(value) for value in variant.payload_types) + ">"
+            for variant in enum.variants
+        )
+        self._line(f"struct {type_name} {{")
+        self.indent += 1
+        self._line(f"using Payload = std::variant<{payloads}>;")
+        self._line("std::size_t tag{};")
+        self._line("Payload payload{};")
+        for index, variant in enumerate(enum.variants):
+            parameters = ", ".join(
+                f"{self._cpp_type(value)} tyv_payload_{payload_index}"
+                for payload_index, value in enumerate(variant.payload_types)
+            )
+            tuple_values = ", ".join(f"tyv_payload_{payload_index}"
+                                      for payload_index in range(len(variant.payload_types)))
+            tuple_types = ", ".join(self._cpp_type(value) for value in variant.payload_types)
+            self._line(f"static {type_name} tyv_make_{index}({parameters}) {{")
+            self.indent += 1
+            self._line(
+                f"return {type_name}{{{index}, Payload{{std::in_place_index<{index}>, "
+                f"std::tuple<{tuple_types}>{{{tuple_values}}}}}}};"
+            )
+            self.indent -= 1
+            self._line("}")
+        self._line(f"bool operator==(const {type_name}& other) const {{")
+        self.indent += 1
+        self._line("if (tag != other.tag) return false;")
+        self._line("switch (tag) {")
+        self.indent += 1
+        for index, variant in enumerate(enum.variants):
+            self._line(f"case {index}:")
+            self.indent += 1
+            if not variant.payload_types:
+                self._line("return true;")
+            else:
+                comparisons = [
+                    f"tyvera_runtime::equal(std::get<{payload_index}>(std::get<{index}>(payload)), "
+                    f"std::get<{payload_index}>(std::get<{index}>(other.payload)))"
+                    for payload_index in range(len(variant.payload_types))
+                ]
+                self._line("return " + " && ".join(comparisons) + ";")
+            self.indent -= 1
+        self._line("default: return false;")
+        self.indent -= 1
+        self._line("}")
+        self.indent -= 1
+        self._line("}")
+        self.indent -= 1
+        self._line("};")
+
     def _line(self, value: str = "") -> None:
         self.lines.append("    " * self.indent + value if value else "")
 
@@ -249,6 +397,8 @@ class _CppGenerator:
     def _cpp_type(type_name: IRTypeRef) -> str:
         if isinstance(type_name, IRActorRefType):
             return "std::shared_ptr<tyvera_runtime::ActorBase>"
+        if isinstance(type_name, IRUserType):
+            return f"tyvera_generated::{_cpp_user_type_identifier(type_name.name)}"
         if type_name == IRType.SUPERVISOR:
             return "std::shared_ptr<tyvera_runtime::Supervisor>"
         if isinstance(type_name, IRAppliedType):
@@ -263,6 +413,8 @@ class _CppGenerator:
                 return f"std::shared_ptr<tyvera_runtime::MapData<{arguments[0]}, {arguments[1]}>>"
             if type_name.name == "Task":
                 return f"tyvera_runtime::Task<{arguments[0]}>"
+            if type_name.name == "Secret":
+                return "tyvera_runtime::SecretString"
             raise ValueError(f"unknown applied Tyvera IR type: {type_name.name}")
         return {
             IRType.INT: "std::int64_t",
@@ -543,6 +695,22 @@ class _CppGenerator:
                     raise ValueError(f"validated {pattern.variant} pattern has no payload")
                 payload = f"std::get<{index}>({value})"
                 return f"(({value}).index() == {index} && ({self._pattern_condition(pattern.payload, payload)}))"
+        if isinstance(pattern, IRRecordPattern):
+            conditions = [
+                self._pattern_condition(child, f"({value}).tyv_field_{index}")
+                for index, child in enumerate(pattern.fields)
+            ]
+            return " && ".join(f"({condition})" for condition in conditions) if conditions else "true"
+        if isinstance(pattern, IREnumPattern):
+            conditions = [
+                self._pattern_condition(
+                    child,
+                    f"std::get<{payload_index}>(std::get<{pattern.variant_index}>(({value}).payload))",
+                )
+                for payload_index, child in enumerate(pattern.payload_patterns)
+            ]
+            tag = f"({value}).tag == {pattern.variant_index}"
+            return " && ".join([tag, *(f"({condition})" for condition in conditions)])
         raise ValueError(f"unhandled IR pattern: {type(pattern).__name__}")
 
     def _pattern_bindings(self, pattern, value: str) -> None:
@@ -557,6 +725,15 @@ class _CppGenerator:
                 self._pattern_bindings(pattern.payload, f"std::get<0>({value})")
             elif pattern.variant == "Err":
                 self._pattern_bindings(pattern.payload, f"std::get<1>({value})")
+        elif isinstance(pattern, IRRecordPattern):
+            for index, child in enumerate(pattern.fields):
+                self._pattern_bindings(child, f"({value}).tyv_field_{index}")
+        elif isinstance(pattern, IREnumPattern):
+            for payload_index, child in enumerate(pattern.payload_patterns):
+                self._pattern_bindings(
+                    child,
+                    f"std::get<{payload_index}>(std::get<{pattern.variant_index}>(({value}).payload))",
+                )
 
     def _output(self, statement: IROutput) -> None:
         stream = "std::cout" if statement.channel == "stdout" else "std::cerr"
@@ -629,6 +806,30 @@ class _CppGenerator:
                 index = 0 if expression.variant == "Ok" else 1
                 return f"{result_type}{{std::in_place_index<{index}>, {self._expression(expression.payload)}}}"
             raise ValueError(f"unsupported variant constructor for {ir_type_name(expression.type)}")
+        if isinstance(expression, IRRecordCreate):
+            values = ", ".join(self._expression(argument) for argument in expression.arguments)
+            return f"{self._cpp_type(expression.type)}{{{values}}}"
+        if isinstance(expression, IRFieldAccess):
+            return f"({self._expression(expression.receiver)}).tyv_field_{expression.field_index}"
+        if isinstance(expression, IREnumCreate):
+            type_name = self._cpp_type(expression.type)
+            factory = f"{type_name}::tyv_make_{expression.variant_index}"
+            if not expression.arguments:
+                return f"{factory}()"
+            temporary = self._new_temporary()
+            tuple_type = "std::tuple<" + ", ".join(
+                self._cpp_type(argument.type) for argument in expression.arguments
+            ) + ">"
+            tuple_values = ", ".join(self._expression(argument) for argument in expression.arguments)
+            parameters = ", ".join(
+                f"std::get<{index}>({temporary})" for index in range(len(expression.arguments))
+            )
+            return "\n".join([
+                "([&]() -> " + type_name + " {",
+                f"    const auto {temporary} = {tuple_type}{{{tuple_values}}};",
+                f"    return {factory}({parameters});",
+                "}())",
+            ])
         if isinstance(expression, IRBuiltinCall):
             runtime_functions = {
                 "oneForOne": "supervisor_one_for_one",
@@ -640,10 +841,12 @@ class _CppGenerator:
                 "exponentialBackoff": "exponential_backoff",
                 "hostOS": "host_os",
                 "hostArchitecture": "host_architecture",
+                "environment": "environment_value",
                 "monotonicMilliseconds": "monotonic_milliseconds",
                 "milliseconds": "duration_milliseconds",
                 "seconds": "duration_seconds",
                 "durationFromSeconds": "duration_from_seconds",
+                "sleepFor": "sleep_for",
                 "byteFromInt": "byte_from_int",
                 "parseJson": "parse_json",
                 "jsonStringify": "json_stringify",
@@ -694,7 +897,7 @@ class _CppGenerator:
                 lines.append(f"    {keyword} {name} = {self._expression(argument)};")
             values = list(temporaries)
             if expression.builtin in {
-                "byteFromInt", "byteBuffer", "seconds", "oneForOne", "oneForAll",
+                "byteFromInt", "byteBuffer", "seconds", "sleepFor", "oneForOne", "oneForAll",
                 "restForOne", "exponentialBackoff",
             }:
                 values.append(_location_args(expression.location))
@@ -826,7 +1029,10 @@ class _CppGenerator:
             compare_operator = {"==": "== 0", "!=": "!= 0", "<": "< 0", "<=": "<= 0", ">": "> 0", ">=": ">= 0"}[operator]
             return f"({comparison} {compare_operator})"
         if operator in {"==", "!=", "<", "<=", ">", ">="}:
-            if operator in {"==", "!="} and (isinstance(left_type, IRAppliedType) or left_type == IRType.JSON):
+            if operator in {"==", "!="} and (
+                isinstance(left_type, IRAppliedType) or isinstance(left_type, IRUserType)
+                or left_type == IRType.JSON
+            ):
                 result = f"tyvera_runtime::equal({left}, {right})"
                 return f"(!{result})" if operator == "!=" else result
             return f"({left} {operator} {right})"
@@ -874,6 +1080,9 @@ class _CppGenerator:
     @staticmethod
     def _method_call_expression(expression: IRMethodCall, receiver: str, arguments: list[str]) -> str:
         method = expression.method
+        if isinstance(expression.receiver.type, IRAppliedType) and expression.receiver.type.name == "Secret":
+            if method == "reveal":
+                return f"({receiver}).reveal()"
         if expression.receiver.type == IRType.JSON:
             functions = {
                 "kind": "json_kind", "isNull": "json_is_null", "asString": "json_as_string",
@@ -1121,6 +1330,7 @@ _RUNTIME = r'''#include <charconv>
 #include <csignal>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -1145,6 +1355,7 @@ _RUNTIME = r'''#include <charconv>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -1306,6 +1517,7 @@ struct TaskControl {
     virtual void start() = 0;
     virtual void join() = 0;
     virtual std::string failure_message() const = 0;
+    virtual bool wait_until(std::chrono::steady_clock::time_point deadline, const TaskControl* waiter) = 0;
     virtual void notify_waiters() noexcept {}
     bool prepare_start() {
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
@@ -1612,7 +1824,7 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
         result.reset();
         return value;
     }
-    bool wait_until(std::chrono::steady_clock::time_point deadline, const TaskControl* waiter) {
+    bool wait_until(std::chrono::steady_clock::time_point deadline, const TaskControl* waiter) override {
         if (!started.load(std::memory_order_acquire)) start();
         std::unique_lock<std::mutex> lock(mutex);
         ready.wait_until(lock, deadline, [this, waiter]() {
@@ -1728,7 +1940,7 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
             catch (const TaskCancelled&) { throw Failure(file, line, column, "task was cancelled"); }
         }
     }
-    bool wait_until(std::chrono::steady_clock::time_point deadline, const TaskControl* waiter) {
+    bool wait_until(std::chrono::steady_clock::time_point deadline, const TaskControl* waiter) override {
         if (!started.load(std::memory_order_acquire)) start();
         std::unique_lock<std::mutex> lock(mutex);
         ready.wait_until(lock, deadline, [this, waiter]() {
@@ -1832,6 +2044,21 @@ template <typename T> inline Task<T> make_io_task_with_cancel(
     state->cancellation_target = cancellation_target;
     register_native_task(state, file, line, column);
     return Task<T>{std::move(state)};
+}
+inline Task<void> sleep_for(Duration duration, const std::string& file, int line, int column) {
+    auto operation = [duration]() {
+        const auto deadline = duration_deadline(duration);
+        auto* control = active_task_control;
+        if (control) {
+            control->wait_until(deadline, nullptr);
+            control->check_interruption();
+        } else {
+            std::this_thread::sleep_until(deadline);
+        }
+    };
+    // Timer waits run outside the serialized execution lock so unrelated
+    // native tasks can continue while this task is suspended.
+    return make_io_task<void>(std::move(operation), file, line, column);
 }
 template <typename T> inline Task<T> task_with_timeout(
     Task<T> source, Duration duration, bool move_result,
@@ -2032,6 +2259,29 @@ struct JsonValue {
     std::vector<JsonValue> array;
     std::vector<std::pair<std::string, std::shared_ptr<JsonValue>>> object;
 };
+
+class SecretString final {
+    std::string value_;
+public:
+    explicit SecretString(std::string value) : value_(std::move(value)) {}
+    std::string reveal() const { return value_; }
+};
+inline std::optional<SecretString> environment_value(const std::string& name) {
+    if (name.empty()) return std::nullopt;
+    const auto valid_first = [](unsigned char ch) {
+        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_';
+    };
+    const auto valid_rest = [&valid_first](unsigned char ch) {
+        return valid_first(ch) || (ch >= '0' && ch <= '9');
+    };
+    if (!valid_first(static_cast<unsigned char>(name.front()))) return std::nullopt;
+    for (std::size_t index = 1; index < name.size(); ++index) {
+        if (!valid_rest(static_cast<unsigned char>(name[index]))) return std::nullopt;
+    }
+    const char* value = std::getenv(name.c_str());
+    if (!value) return std::nullopt;
+    return SecretString(std::string(value));
+}
 
 template <typename T> inline bool equal(const T& left, const T& right);
 inline bool equal(const JsonValue& left, const JsonValue& right);

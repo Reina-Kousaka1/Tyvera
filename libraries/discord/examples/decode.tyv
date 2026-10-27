@@ -1,7 +1,10 @@
 import "../src/gateway.tyv" as gateway
 import "../src/rest.tyv" as rest
+import "../src/client.tyv" as discord
 
 fn main() {
+    let intents = discord.defaultIntents()
+    println(intents.length)
     match gateway.decodeDispatch("{\"t\":\"READY\",\"d\":{\"session_id\":\"demo-session\"}}") {
         Ok(event) => match event {
             gateway.GatewayDispatch.Ready(sessionId) => println(sessionId)

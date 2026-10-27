@@ -63,7 +63,14 @@ class IRActorRefType:
     actor_name: str
 
 
-IRTypeRef: TypeAlias = IRType | IRAppliedType | IRActorRefType
+@dataclass(frozen=True, slots=True)
+class IRUserType:
+    """A checked, non-generic Tyvera record or enum type."""
+
+    name: str
+
+
+IRTypeRef: TypeAlias = IRType | IRAppliedType | IRActorRefType | IRUserType
 
 
 def ir_type_name(type_ref: IRTypeRef) -> str:
@@ -71,6 +78,8 @@ def ir_type_name(type_ref: IRTypeRef) -> str:
         return type_ref.value
     if isinstance(type_ref, IRActorRefType):
         return f"ActorRef<{type_ref.actor_name}>"
+    if isinstance(type_ref, IRUserType):
+        return type_ref.name
     return f"{type_ref.name}<{','.join(ir_type_name(item) for item in type_ref.arguments)}>"
 
 
@@ -83,7 +92,7 @@ def _applied(name: str, *arguments: IRTypeRef) -> IRAppliedType:
 
 
 NUMERIC_TYPES = frozenset({IRType.INT, IRType.FLOAT})
-_APPLIED_ARITIES = {"Option": 1, "Result": 2, "List": 1, "Map": 2, "Task": 1}
+_APPLIED_ARITIES = {"Option": 1, "Result": 2, "List": 1, "Map": 2, "Task": 1, "Secret": 1}
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +190,35 @@ class IRCollectionLength(IRExpression):
 class IRMethodCall(IRExpression):
     receiver: IRExpression
     method: str
+    arguments: tuple[IRExpression, ...]
+    type: IRTypeRef
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
+class IRRecordCreate(IRExpression):
+    record_name: str
+    field_types: tuple[IRTypeRef, ...]
+    arguments: tuple[IRExpression, ...]
+    type: IRTypeRef
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
+class IRFieldAccess(IRExpression):
+    receiver: IRExpression
+    record_name: str
+    field_index: int
+    type: IRTypeRef
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
+class IREnumCreate(IRExpression):
+    enum_name: str
+    variant_name: str
+    variant_index: int
+    payload_types: tuple[IRTypeRef, ...]
     arguments: tuple[IRExpression, ...]
     type: IRTypeRef
     location: Location
@@ -317,6 +355,24 @@ class IRVariantPattern(IRPattern):
 
 
 @dataclass(frozen=True, slots=True)
+class IRRecordPattern(IRPattern):
+    record_name: str
+    field_types: tuple[IRTypeRef, ...]
+    fields: tuple[IRPattern, ...]
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
+class IREnumPattern(IRPattern):
+    enum_name: str
+    variant_name: str
+    variant_index: int
+    payload_types: tuple[IRTypeRef, ...]
+    payload_patterns: tuple[IRPattern, ...]
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
 class IRMatchArm:
     pattern: IRPattern
     body: tuple[IRStatement, ...]
@@ -354,6 +410,7 @@ IRStatementLike: TypeAlias = (
 IRExpressionLike: TypeAlias = (
     IRLiteral | IRLocalRef | IRCall | IRUnary | IRBinary | IRVariant | IRBuiltinCall
     | IRMove | IRCollectionCreate | IRCollectionLength | IRMethodCall
+    | IRRecordCreate | IRFieldAccess | IREnumCreate
     | IRActorSelfRef | IRActorSpawn | IRActorSend
 )
 
@@ -372,6 +429,34 @@ class IRFunction:
 
 
 @dataclass(frozen=True, slots=True)
+class IRRecordField:
+    name: str
+    type: IRTypeRef
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
+class IRRecord:
+    name: str
+    fields: tuple[IRRecordField, ...]
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
+class IREnumVariant:
+    name: str
+    payload_types: tuple[IRTypeRef, ...]
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
+class IREnum:
+    name: str
+    variants: tuple[IREnumVariant, ...]
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
 class IRActor:
     name: str
     fields: tuple[IRVariable, ...]
@@ -385,6 +470,8 @@ class IRModule:
     functions: tuple[IRFunction, ...]
     entry_symbol: str
     actors: tuple[IRActor, ...] = ()
+    records: tuple[IRRecord, ...] = ()
+    enums: tuple[IREnum, ...] = ()
 
 
 def _invalid(location: Location, message: str) -> Diagnostic:
@@ -398,6 +485,10 @@ def _validate_type(type_ref: IRTypeRef, location: Location) -> None:
         if not _valid_qualified_name(type_ref.actor_name):
             raise _invalid(location, "invalid IR ActorRef target")
         return
+    if isinstance(type_ref, IRUserType):
+        if not _valid_qualified_name(type_ref.name):
+            raise _invalid(location, "invalid IR user-defined type name")
+        return
     if not isinstance(type_ref, IRAppliedType):
         raise _invalid(location, "unknown IR type representation")
     expected = _APPLIED_ARITIES.get(type_ref.name)
@@ -409,6 +500,8 @@ def _validate_type(type_ref: IRTypeRef, location: Location) -> None:
             raise _invalid(location, "IR generic type arguments cannot have type Void")
     if type_ref.name == "Map" and not _hashable_key_type(type_ref.arguments[0]):
         raise _invalid(location, f"IR Map key type '{ir_type_name(type_ref.arguments[0])}' is not hashable")
+    if type_ref.name == "Secret" and type_ref.arguments != (IRType.STRING,):
+        raise _invalid(location, "native IR supports only Secret<String>")
 
 
 def _hashable_key_type(type_ref: IRTypeRef) -> bool:
@@ -450,6 +543,8 @@ def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef
             "withTimeout": ((IRType.DURATION,), _applied("Task", receiver.arguments[0])),
         }
         return signatures.get(method)
+    if isinstance(receiver, IRAppliedType) and receiver.name == "Secret":
+        return {"reveal": ((), IRType.STRING)}.get(method)
     if isinstance(receiver, IRType) and receiver == IRType.BYTE:
         return ((), IRType.INT) if method == "toInt" else None
     if isinstance(receiver, IRType) and receiver == IRType.JSON:
@@ -633,6 +728,38 @@ def validate_ir(module: IRModule) -> None:
     actors = {actor.name: actor for actor in module.actors}
     if len(actors) != len(module.actors):
         raise _invalid(module.actors[0].location, "duplicate IR actor declaration")
+    records = {record.name: record for record in module.records}
+    enums = {enum.name: enum for enum in module.enums}
+    if (len(records) != len(module.records) or len(enums) != len(module.enums)
+            or set(records) & set(enums)):
+        location = (module.records or module.enums)[0].location
+        raise _invalid(location, "duplicate IR record or enum declaration")
+    user_type_names = set(records) | set(enums)
+    for declaration in (*module.records, *module.enums):
+        if not _valid_qualified_name(declaration.name):
+            raise _invalid(declaration.location, "invalid IR user-defined type name")
+    for record in module.records:
+        names: set[str] = set()
+        for field in record.fields:
+            _validate_type(field.type, field.location)
+            if field.type == IRType.VOID or field.name in names:
+                raise _invalid(field.location, "invalid or duplicate IR record field")
+            if _contains_resource(field.type) or _contains_task(field.type):
+                raise _invalid(field.location, "IR records cannot contain Resources or Tasks")
+            names.add(field.name)
+    for enum in module.enums:
+        names: set[str] = set()
+        for variant in enum.variants:
+            if variant.name in names:
+                raise _invalid(variant.location, "duplicate IR enum variant")
+            for payload_type in variant.payload_types:
+                _validate_type(payload_type, variant.location)
+                if payload_type == IRType.VOID or _contains_resource(payload_type) or _contains_task(payload_type):
+                    raise _invalid(variant.location, "invalid IR enum payload type")
+            names.add(variant.name)
+    for node in _walk_ir(module):
+        if isinstance(node, IRUserType) and node.name not in user_type_names:
+            raise _invalid(Location("<ir>", 1, 1), f"IR refers to undeclared user type '{node.name}'")
     for actor in module.actors:
         if not _valid_qualified_name(actor.name):
             raise _invalid(actor.location, "invalid IR actor name")
@@ -706,6 +833,37 @@ def validate_ir(module: IRModule) -> None:
                 actor = actors.get(node.actor_name)
                 if actor is None or (node.handler_symbol not in dict(actor.handler_symbols).values()):
                     raise _invalid(node.location, f"IR message refers to unknown handler on '{node.actor_name}'")
+
+    for node in _walk_ir(module):
+        if isinstance(node, IRRecordCreate):
+            record = records.get(node.record_name)
+            if (record is None or node.type != IRUserType(node.record_name)
+                    or tuple(field.type for field in record.fields) != node.field_types):
+                raise _invalid(node.location, f"IR record construction does not match '{node.record_name}'")
+        elif isinstance(node, IRFieldAccess):
+            record = records.get(node.record_name)
+            if (record is None or not 0 <= node.field_index < len(record.fields)
+                    or node.type != record.fields[node.field_index].type):
+                raise _invalid(node.location, f"IR field access does not match '{node.record_name}'")
+        elif isinstance(node, IREnumCreate):
+            enum = enums.get(node.enum_name)
+            if (enum is None or not 0 <= node.variant_index < len(enum.variants)):
+                raise _invalid(node.location, f"IR enum construction refers to an unknown variant of '{node.enum_name}'")
+            variant = enum.variants[node.variant_index]
+            if (node.type != IRUserType(node.enum_name) or variant.name != node.variant_name
+                    or variant.payload_types != node.payload_types):
+                raise _invalid(node.location, f"IR enum construction does not match '{node.enum_name}.{node.variant_name}'")
+        elif isinstance(node, IRRecordPattern):
+            record = records.get(node.record_name)
+            if (record is None or tuple(field.type for field in record.fields) != node.field_types):
+                raise _invalid(node.location, f"IR record pattern does not match '{node.record_name}'")
+        elif isinstance(node, IREnumPattern):
+            enum = enums.get(node.enum_name)
+            if enum is None or not 0 <= node.variant_index < len(enum.variants):
+                raise _invalid(node.location, f"IR enum pattern refers to an unknown variant of '{node.enum_name}'")
+            variant = enum.variants[node.variant_index]
+            if (variant.name != node.variant_name or variant.payload_types != node.payload_types):
+                raise _invalid(node.location, f"IR enum pattern does not match '{node.enum_name}.{node.variant_name}'")
 
     for function in module.functions:
         if function.actor_name is not None:
@@ -914,6 +1072,28 @@ def _validate_expression(
         if not valid:
             raise _invalid(expression.location, f"invalid typed IR binary operation '{operator}'")
         return expression.type
+    if isinstance(expression, IRRecordCreate):
+        if expression.type != IRUserType(expression.record_name) or len(expression.arguments) != len(expression.field_types):
+            raise _invalid(expression.location, "IR record constructor has an invalid nominal type or arity")
+        for field_type, argument in zip(expression.field_types, expression.arguments):
+            _validate_type(field_type, expression.location)
+            if _validate_expression(argument, functions, scopes) != field_type:
+                raise _invalid(argument.location, "IR record field initializer has the wrong type")
+        return expression.type
+    if isinstance(expression, IRFieldAccess):
+        receiver_type = _validate_expression(expression.receiver, functions, scopes)
+        if receiver_type != IRUserType(expression.record_name) or expression.field_index < 0 or expression.type == IRType.VOID:
+            raise _invalid(expression.location, "IR record field access has an invalid receiver or field")
+        return expression.type
+    if isinstance(expression, IREnumCreate):
+        if (expression.type != IRUserType(expression.enum_name) or expression.variant_index < 0
+                or len(expression.arguments) != len(expression.payload_types)):
+            raise _invalid(expression.location, "IR enum constructor has an invalid nominal type or arity")
+        for payload_type, argument in zip(expression.payload_types, expression.arguments):
+            _validate_type(payload_type, expression.location)
+            if _validate_expression(argument, functions, scopes) != payload_type:
+                raise _invalid(argument.location, "IR enum payload has the wrong type")
+        return expression.type
     if isinstance(expression, IRVariant):
         if not isinstance(expression.type, IRAppliedType):
             raise _invalid(expression.location, "IR variant constructor must produce Option or Result")
@@ -952,9 +1132,11 @@ def _validate_expression(
             "hostOS": ((), IRType.STRING),
             "hostArchitecture": ((), IRType.STRING),
             "monotonicMilliseconds": ((), IRType.INT),
+            "environment": ((IRType.STRING,), _applied("Option", _applied("Secret", IRType.STRING))),
             "milliseconds": ((IRType.INT,), IRType.DURATION),
             "seconds": ((IRType.INT,), IRType.DURATION),
             "durationFromSeconds": ((IRType.FLOAT,), _applied("Result", IRType.DURATION, IRType.STRING)),
+            "sleepFor": ((IRType.DURATION,), _applied("Task", IRType.VOID)),
             "byteFromInt": ((IRType.INT,), _applied("Result", IRType.BYTE, IRType.STRING)),
             "bytesFromString": ((IRType.STRING,), IRType.BYTES),
             "byteBuffer": ((IRType.INT,), _applied("Result", IRType.BYTE_BUFFER, IRType.STRING)),
@@ -1261,5 +1443,20 @@ def _validate_pattern(
             _validate_pattern(pattern.payload, payload_type, scopes, seen_ids)
             return
         raise _invalid(pattern.location, "IR variant pattern requires Option or Result")
+    if isinstance(pattern, IRRecordPattern):
+        if expected_type != IRUserType(pattern.record_name) or len(pattern.fields) != len(pattern.field_types):
+            raise _invalid(pattern.location, "IR record pattern has an invalid nominal type or arity")
+        for field_type, child in zip(pattern.field_types, pattern.fields):
+            _validate_type(field_type, pattern.location)
+            _validate_pattern(child, field_type, scopes, seen_ids)
+        return
+    if isinstance(pattern, IREnumPattern):
+        if (expected_type != IRUserType(pattern.enum_name) or pattern.variant_index < 0
+                or len(pattern.payload_patterns) != len(pattern.payload_types)):
+            raise _invalid(pattern.location, "IR enum pattern has an invalid nominal type or arity")
+        for payload_type, child in zip(pattern.payload_types, pattern.payload_patterns):
+            _validate_type(payload_type, pattern.location)
+            _validate_pattern(child, payload_type, scopes, seen_ids)
+        return
     raise _invalid(pattern.location, f"unknown IR pattern {type(pattern).__name__}")
 

@@ -71,12 +71,16 @@ explicit bounded 429 retry function. There is no bucket/global coordinator,
 concurrent request queue, automatic retry by default, API model coverage, or
 REST client Actor. Side-effect requests are only retried after an explicit
 429 rejection, never after a transport failure.
-The Discord package remains interpreter-only and experimental. Native Linux
-has experimental TCP/DNS/TLS, HTTP-client, WebSocket-client, typed Actors, a
-limited Supervisor runtime, and the general opaque `Json` value API. The
-package still depends on user-defined records/enums, event-model conversion,
-and actor/task integration that native lowering does not support; no native
-fallback is used. Do not treat this package as production-ready.
+The package now has an experimental native lowering path for linked source
+modules: non-generic records/enums, typed JSON use, `Secret<String>`, native
+environment lookup, async REST helpers, and the Gateway client can be
+represented in the native C++17 program without Discord-specific backend
+rewrites. The checked-in decoder example is used for interpreter/native
+differential execution. Native Gateway and REST transports have not yet been
+validated against the local fake TLS services; those integration tests still
+exercise the reference runtime. Native actors also do not yet own the Discord
+client lifecycle. There is no interpreter fallback. Do not treat this package
+as production-ready.
 
 When authentication is used, the token remains `Secret<String>` until the
 request header or Identify payload is formed. The library itself never logs it;

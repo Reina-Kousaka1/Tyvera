@@ -199,9 +199,11 @@ declarations, `spawn`, typed fire-and-forget messages, `stop`, `isAlive`,
 `runActors()`, nested supervisors, all three restart strategies and child
 policies, restart-intensity windows, and monotonic exponential backoff.
 Supervised actors that own Resources or Tasks are rejected because their
-reconstruction contract is not yet defined. Classes, records, user-defined
-enums, tuples, generic functions, actor request/reply and timers, monitoring/
-links, HTTP servers/routers/decoders, and WebSocket servers remain
+reconstruction contract is not yet defined. Non-generic immutable records and
+user-defined enums now lower as nominal native values, including construction,
+field access, equality, enum matching, and imported package declarations.
+Generic user-defined types, tuples, classes, actor request/reply and timers,
+monitoring/links, HTTP servers/routers/decoders, and WebSocket servers remain
 interpreter-only. Native actor turns and delayed restarts are driven by
 `runActors()`; actor-owned Tasks and full actor/task scheduling parity are not
 supported. There is no
@@ -270,14 +272,15 @@ does not make C++ part of Tyvera's language.
 | `ByteBuffer` | Shared mutable 64 MiB bounded buffer; checked allocation, length, get/set, and immutable `toBytes` snapshots use `Result` errors. |
 | Synchronous file/path I/O | `readText`, `writeText`, `readBytes`, `writeBytes`, `pathJoin`, and `pathExists`; relative paths use the project root and `.tyvera.secrets` is protected. |
 | Text resources | `TextFile`, `TextReader`, `TextWriter`, `using`, move transfer, `Result`/function transfer, synchronous methods, modes, close/isOpen, and deterministic LIFO cleanup are implemented. |
-| Records, tuples, user-defined enums, classes, interfaces, generic functions | Interpreter-only. |
-| `Task<T>`, async functions, `await`, `runTasks()` | Experimental native subset; task bodies are serialized and I/O waits use bounded worker threads. Cooperative task/child cancellation and monotonic `withTimeout(Duration)` deadlines are supported; `tryResult()`, task groups, and actor ownership remain unsupported. |
+| Non-generic records and user-defined enums | Experimental native nominal values: immutable records, tagged enum payloads, constructors, field access, equality, and checked nested matching. Linked package declarations are lowered together. Generic nominal types and recursive layouts are rejected with a backend diagnostic. |
+| Tuples, classes, interfaces, generic functions | Interpreter-only. |
+| `Task<T>`, async functions, `await`, `sleepFor`, `runTasks()` | Experimental native subset; ordinary task bodies are serialized, while timer and I/O waits use worker tasks. Cooperative task/child cancellation and monotonic `withTimeout(Duration)`/`sleepFor(Duration)` deadlines are supported; `tryResult()`, task groups, and actor ownership remain unsupported. |
 | DNS, TCP, and TLS client | Experimental on native Linux: `resolveHost`, `tcpConnect`, `tcpListen`, `accept`, connection read/write, and verified `tlsConnect` with hostname/IP checks, all as typed `Task<Result<...,String>>` operations. RAII handles close sockets and TLS sessions. |
 | HTTP/WebSocket client | Experimental native Linux subset: typed HTTP values and GET/POST/PUT/DELETE/custom request client; bounded HTTP/1.1 responses; bounded `ws`/verified `wss` client. Native HTTP server/router/general codec and WebSocket server remain interpreter-only. |
 | Actors and `ActorRef<T>` | Experimental native C++17 subset: actor declarations/state, `spawn`, typed fire-and-forget messages, `stop`, `isAlive`, and bounded `runActors()`. Per-actor FIFO mailboxes use round-robin turns; unsupervised handler failures are returned through `Result`. |
 | Supervisors | Experimental native support for nested trees, `oneForOne`/`oneForAll`/`restForOne`, permanent/transient/temporary policies, monotonic restart windows, deterministic exponential backoff, reverse stop order, and start-order restart. Backoff deadlines progress in `runActors()`; supervised actor state cannot own Resources or Tasks. |
 | Actor request/reply, actor timers, monitor/link, actor-owned Tasks | Interpreter-only. Native lowering reports a source diagnostic; no fallback occurs. Native tasks do not await actors or pump actor work. |
-| `hostOS()`, `hostArchitecture()`, `monotonicMilliseconds()` | Native C++17 runtime and reference implementations; OS/architecture names are normalized and elapsed time is monotonic. |
+| `hostOS()`, `hostArchitecture()`, `monotonicMilliseconds()`, `environment(String)` | Native C++17 runtime and reference implementations; environment results remain `Option<Secret<String>>`, and monotonic time is used for elapsed-time decisions. Project-local `.tyvera.secrets` is still read only by the reference secret provider. |
 | Native SIGINT/SIGTERM shutdown | Generated C++17 records the first signal and unwinds at statement/loop safe points; scope resources use RAII cleanup. |
 | Native FFI, stable public ABI, cross-compilation | Planned; no syntax or runtime contract is exposed. |
 

@@ -115,7 +115,7 @@ class DiscordSourcePackageTests(unittest.TestCase):
         program, _ = compile_project(project / "examples" / "decode.tyv", project)
         output = io.StringIO()
         Interpreter(program, output, project_root=project).run()
-        self.assertEqual(output.getvalue(), "demo-session\n429\n0.5\ntrue\n")
+        self.assertEqual(output.getvalue(), "2\ndemo-session\n429\n0.5\ntrue\n")
 
     def test_rest_failure_parser_maps_status_and_rate_limit_metadata(self) -> None:
         output = self._run(r'''fn main() {

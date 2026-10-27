@@ -1040,13 +1040,17 @@ modules, external secret-store provider, native interop, garbage collector
 implementation, and package manager. The native compiler supports the
 scalar/control-flow core, `Option`/`Result` and their supported patterns, typed
 `List`/`Map`, `Byte`/`Bytes`, bounded `ByteBuffer`, synchronous text/binary/path
-I/O, and owned synchronous text-file resources. The experimental Linux path additionally supports async functions, `Task<T>`,
-`await`, `runTasks()`, DNS, TCP, a verified TLS client, cooperative task
-cancellation, and monotonic deadlines. Classes, generic functions, Supervisors,
-task groups, WebSockets, HTTP, and native FFI remain unsupported by the native
-backend. Native actors remain experimental and do not yet support supervisor
-integration, request/reply, timers, monitoring/links, actor-owned tasks, or
-package imports. `await` remains statement-only;
+I/O, owned synchronous text-file resources, and experimental non-generic
+records/enums with checked constructors, field access, equality, and patterns.
+Linked package modules lower together for supported declarations. The
+experimental Linux path additionally supports async functions, `Task<T>`,
+`await`, `sleepFor(Duration)`, `runTasks()`, secret-wrapped `environment`,
+DNS, TCP, a verified TLS client, cooperative task cancellation, and monotonic
+deadlines. Classes, generic functions/types, task groups, WebSockets, HTTP
+servers, and native FFI remain unsupported by the native backend. Native actors
+and Supervisors remain experimental; supervised actor state cannot own
+Resources or Tasks, and request/reply, timers, monitoring/links, and actor-owned
+tasks remain unsupported. `await` remains statement-only;
 synchronous calls are atomic.
 `runActors()` remains non-blocking; `runTasks()` waits for task deadlines.
 Actor request timeouts do not interrupt work. No performance claim is made. No
