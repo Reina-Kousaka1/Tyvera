@@ -26,6 +26,7 @@ from tyvera.ir import (
     IRAppliedType,
     IRActorRefType,
     IRActorSend,
+    IRActorRequest,
     IRActorSpawn,
     IRCall,
     IRCollectionLength,
@@ -253,19 +254,21 @@ fn main() {
         self.assertIsInstance(module.functions[0].body[0].value, IRActorSpawn)
         self.assertIsInstance(module.functions[0].body[1].expression, IRActorSend)
 
-    def test_actor_request_reply_is_reported_as_an_explicit_native_boundary(self) -> None:
-        checked = compile_checked_source('''actor Worker {
+    def test_actor_request_reply_lowers_to_typed_ir(self) -> None:
+        module = self.lower('''actor Worker {
     on get(reply: ReplySender<Int>) { reply.send(1) }
 }
 fn main() {
     let worker = spawn(Worker())
     let response = worker.request(get)
 }
-''', "actor_request.tyv")
-        with self.assertRaises(Diagnostic) as caught:
-            lower_checked_program(checked)
-        self.assertEqual(caught.exception.stage, "backend")
-        self.assertIn("request/reply and timers", caught.exception.message)
+''')
+        request = module.functions[0].body[1].value
+        self.assertIsInstance(request, IRActorRequest)
+        self.assertEqual(request.actor_name, "Worker")
+        self.assertEqual(request.handler_symbol, module.actors[0].handler_symbols[0][1])
+        self.assertEqual(request.type, IRAppliedType("ReplyReceiver", (IRType.INT,)))
+        self.assertIsNone(request.timeout)
 
     def test_supervisor_strategy_and_child_start_lower_to_typed_ir(self) -> None:
         module = self.lower('''actor Worker { on work() {} }
@@ -610,10 +613,12 @@ fn main() {
         with tempfile.TemporaryDirectory(prefix="tyvera-cli-build-") as temporary:
             root = Path(temporary)
             source = root / "unsupported.tyv"
-            source.write_text('''actor Worker { on get(reply: ReplySender<Int>) { reply.send(1) } }
+            source.write_text('''actor Worker {
+    on ping() {}
+}
 fn main() {
     let worker = spawn(Worker())
-    let response = worker.request(get)
+    let timer = worker.sendAfter(milliseconds(1), ping)
 }''', encoding="utf-8")
             output = root / "unsupported"
             stdout = io.StringIO()
@@ -621,7 +626,7 @@ fn main() {
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 result = cli_main(["build", str(source), "--output", str(output)])
             self.assertEqual(result, 1)
-            self.assertIn("native actor request/reply and timers are not yet supported", stderr.getvalue())
+            self.assertIn("native actor timers are not yet supported", stderr.getvalue())
             self.assertFalse(output.exists())
 
     def test_build_cli_typechecks_before_creating_any_artifact(self) -> None:
@@ -806,6 +811,130 @@ fn main() {
             reference = self._reference_result(source, root)
             native = self._native_source_result(source, root, root / "actors", root)
             self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+
+    def test_native_actor_request_reply_fifo_matches_reference(self) -> None:
+        source = '''actor Counter {
+    var value: Int
+    init(start: Int) { self.value = start }
+    on add(amount: Int, reply: ReplySender<Int>) {
+        self.value = self.value + amount
+        reply.send(self.value)
+    }
+}
+fn main() {
+    let counter = spawn(Counter(10))
+    let first = counter.request(add, 3)
+    let second = counter.request(add, 4)
+    println(first.isReady())
+    match runActors() {
+        Ok(count) => println(count)
+        Err(error) => println(error)
+    }
+    match first.tryReceive() {
+        Ok(Some(value)) => println(value)
+        Ok(None) => println("first pending")
+        Err(error) => println(error)
+    }
+    match second.tryReceive() {
+        Ok(Some(value)) => println(value)
+        Ok(None) => println("second pending")
+        Err(error) => println(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-actor-reply-fifo-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actors", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "false\n2\n13\n17\n")
+
+    def test_native_actor_request_timeout_and_cancel_match_reference(self) -> None:
+        source = '''actor Worker {
+    on get(reply: ReplySender<Int>) { reply.send(9) }
+}
+fn main() {
+    let worker = spawn(Worker())
+    let timed = worker.requestWithin(milliseconds(0), get)
+    let cancelled = worker.request(get)
+    println(timed.isReady())
+    println(timed.isTimedOut())
+    println(cancelled.cancel())
+    println(cancelled.isCancelled())
+    match runActors() {
+        Ok(count) => println(count)
+        Err(error) => println(error)
+    }
+    match timed.tryReceive() {
+        Ok(Some(value)) => println(value)
+        Ok(None) => println("timed pending")
+        Err(error) => println(error)
+    }
+    match cancelled.tryReceive() {
+        Ok(Some(value)) => println(value)
+        Ok(None) => println("cancelled empty")
+        Err(error) => println(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-actor-reply-timeout-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actors", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout,
+                             "true\ntrue\ntrue\ntrue\n2\nrequest timed out\ncancelled empty\n")
+
+    def test_native_actor_stop_fails_pending_reply_like_reference(self) -> None:
+        source = '''actor Worker {
+    on get(reply: ReplySender<Int>) { reply.send(9) }
+}
+fn main() {
+    let worker = spawn(Worker())
+    let response = worker.request(get)
+    worker.stop()
+    match response.tryReceive() {
+        Ok(Some(value)) => println(value)
+        Ok(None) => println("pending")
+        Err(error) => println(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-actor-reply-stop-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actors", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "actor stopped before replying\n")
+
+    def test_native_actor_crash_fails_pending_reply_like_reference(self) -> None:
+        source = '''actor Broken {
+    on get(reply: ReplySender<Int>) {
+        let failure: Float = 1 / 0
+        reply.send(9)
+    }
+}
+fn main() {
+    let worker = spawn(Broken())
+    let response = worker.request(get)
+    match runActors() {
+        Ok(count) => println(count)
+        Err(reason) => println(reason)
+    }
+    match response.tryReceive() {
+        Ok(Some(value)) => println(value)
+        Ok(None) => println("pending")
+        Err(error) => println(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-actor-reply-crash-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actors", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertIn("actor 'Broken' crashed at native-io.tyv:", native.stdout)
+            self.assertEqual(native.stdout.splitlines()[0], native.stdout.splitlines()[1])
 
     def test_native_imported_actor_matches_reference(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tyvera-native-imported-actor-") as temporary:

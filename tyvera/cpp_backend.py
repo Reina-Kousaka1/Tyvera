@@ -16,6 +16,7 @@ from .ir import (
     IRActorRefType,
     IRActorSelfRef,
     IRActorSend,
+    IRActorRequest,
     IRActorSpawn,
     IRAppliedType,
     IRAwait,
@@ -415,6 +416,10 @@ class _CppGenerator:
                 return f"tyvera_runtime::Task<{arguments[0]}>"
             if type_name.name == "Secret":
                 return "tyvera_runtime::SecretString"
+            if type_name.name == "ReplySender":
+                return f"tyvera_runtime::ReplySender<{arguments[0]}>"
+            if type_name.name == "ReplyReceiver":
+                return f"tyvera_runtime::ReplyReceiver<{arguments[0]}>"
             raise ValueError(f"unknown applied Tyvera IR type: {type_name.name}")
         return {
             IRType.INT: "std::int64_t",
@@ -976,6 +981,40 @@ class _CppGenerator:
             )
             lines.append("}())")
             return "\n".join(lines)
+        if isinstance(expression, IRActorRequest):
+            target = self._new_temporary()
+            typed_target = self._new_temporary()
+            weak_target = self._new_temporary()
+            arguments = [self._new_temporary() for _ in expression.arguments]
+            actor_type = _cpp_actor_identifier(expression.actor_name)
+            cpp_reply_type = self._cpp_type(expression.type.arguments[0])
+            lines = [f"([&]() -> {self._cpp_type(expression.type)} {{"]
+            lines.append(f"    const auto {target} = {self._expression(expression.receiver)};")
+            timeout_value = "std::nullopt"
+            if expression.timeout is not None:
+                timeout = self._new_temporary()
+                lines.append(f"    const auto {timeout} = {self._expression(expression.timeout)};")
+                timeout_value = f"std::optional<std::int64_t>{{{timeout}.milliseconds}}"
+            for name, argument in zip(arguments, expression.arguments):
+                lines.append(f"    const auto {name} = {self._expression(argument)};")
+            lines.append(f"    auto {typed_target} = std::dynamic_pointer_cast<{actor_type}>({target});")
+            lines.append(
+                f"    if (!{typed_target}) throw tyvera_runtime::Failure({_location_args(expression.location)}, "
+                f"{_cpp_string_literal('actor reference type mismatch')});"
+            )
+            lines.append(f"    const std::weak_ptr<{actor_type}> {weak_target} = {typed_target};")
+            captures = ", ".join([weak_target, *arguments])
+            handler_arguments = ", ".join([*arguments, "reply"])
+            lines.append(
+                f"    return tyvera_runtime::actor_request<{cpp_reply_type}>("
+                f"{target}, {_cpp_string_literal(expression.actor_name)}, {timeout_value}, "
+                f"[{captures}](tyvera_runtime::ReplySender<{cpp_reply_type}> reply) {{ "
+                f"return [{captures}{', ' if captures else ''}reply]() {{ "
+                f"if (auto target = {weak_target}.lock()) target->{expression.handler_symbol}({handler_arguments}); "
+                f"}}; }}, {_location_args(expression.location)});"
+            )
+            lines.append("}())")
+            return "\n".join(lines)
         if isinstance(expression, IRCollectionCreate):
             if not isinstance(expression.type, IRAppliedType):
                 raise ValueError("validated collection constructor has no applied type")
@@ -1083,6 +1122,18 @@ class _CppGenerator:
         if isinstance(expression.receiver.type, IRAppliedType) and expression.receiver.type.name == "Secret":
             if method == "reveal":
                 return f"({receiver}).reveal()"
+        if isinstance(expression.receiver.type, IRAppliedType) and expression.receiver.type.name == "ReplySender":
+            if method == "send":
+                return f"({receiver}).send({arguments[0]})"
+        if isinstance(expression.receiver.type, IRAppliedType) and expression.receiver.type.name == "ReplyReceiver":
+            functions = {
+                "isReady": "is_ready",
+                "isCancelled": "is_cancelled",
+                "isTimedOut": "is_timed_out",
+                "cancel": "cancel",
+                "tryReceive": "try_receive",
+            }
+            return f"({receiver}).{functions[method]}()"
         if expression.receiver.type == IRType.JSON:
             functions = {
                 "kind": "json_kind", "isNull": "json_is_null", "asString": "json_as_string",
@@ -2568,6 +2619,107 @@ template <typename T> inline StringResult<T> result_error(std::string message) {
     return StringResult<T>{std::in_place_index<1>, std::move(message)};
 }
 
+struct ReplyCellBase {
+    virtual ~ReplyCellBase() = default;
+    virtual void fail(const std::string& message) noexcept = 0;
+    virtual bool is_pending() = 0;
+};
+enum class ReplyState { pending, sent, failed, cancelled, timed_out, consumed };
+template <typename T> struct ReplyCell final : ReplyCellBase {
+    mutable std::mutex mutex;
+    ReplyState state = ReplyState::pending;
+    std::optional<T> value;
+    std::string error;
+    std::chrono::steady_clock::time_point started_at = std::chrono::steady_clock::now();
+    std::optional<std::int64_t> timeout_milliseconds;
+
+    explicit ReplyCell(std::optional<std::int64_t> timeout) : timeout_milliseconds(timeout) {}
+    void refresh_locked() {
+        if (state != ReplyState::pending || !timeout_milliseconds) return;
+        const auto elapsed = std::chrono::duration<long double, std::milli>(
+            std::chrono::steady_clock::now() - started_at).count();
+        if (elapsed >= static_cast<long double>(*timeout_milliseconds)) {
+            state = ReplyState::timed_out;
+            error = "request timed out";
+        }
+    }
+    void fail(const std::string& message) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        try {
+            refresh_locked();
+            if (state != ReplyState::pending) return;
+            state = ReplyState::failed;
+            error = message;
+        } catch (...) {
+            state = ReplyState::failed;
+            error.clear();
+        }
+    }
+    bool is_pending() override {
+        std::lock_guard<std::mutex> lock(mutex);
+        refresh_locked();
+        return state == ReplyState::pending;
+    }
+    bool send(T next) {
+        std::lock_guard<std::mutex> lock(mutex);
+        refresh_locked();
+        if (state != ReplyState::pending) return false;
+        value.emplace(std::move(next));
+        state = ReplyState::sent;
+        return true;
+    }
+    bool is_ready() {
+        std::lock_guard<std::mutex> lock(mutex);
+        refresh_locked();
+        return state != ReplyState::pending;
+    }
+    bool is_cancelled() {
+        std::lock_guard<std::mutex> lock(mutex);
+        refresh_locked();
+        return state == ReplyState::cancelled;
+    }
+    bool is_timed_out() {
+        std::lock_guard<std::mutex> lock(mutex);
+        refresh_locked();
+        return state == ReplyState::timed_out;
+    }
+    bool cancel() {
+        std::lock_guard<std::mutex> lock(mutex);
+        refresh_locked();
+        if (state != ReplyState::pending) return false;
+        state = ReplyState::cancelled;
+        return true;
+    }
+    StringResult<std::optional<T>> try_receive() {
+        std::lock_guard<std::mutex> lock(mutex);
+        refresh_locked();
+        if (state == ReplyState::sent) {
+            std::optional<T> received{std::move(*value)};
+            value.reset();
+            state = ReplyState::consumed;
+            return result_ok<std::optional<T>>(std::move(received));
+        }
+        if (state == ReplyState::failed || state == ReplyState::timed_out) {
+            return result_error<std::optional<T>>(error.empty() ? "actor failed before sending a reply" : error);
+        }
+        return result_ok<std::optional<T>>(std::nullopt);
+    }
+};
+template <typename T> struct ReplySender {
+    std::shared_ptr<ReplyCell<T>> cell;
+    bool send(T value) const { return cell && cell->send(std::move(value)); }
+};
+template <typename T> struct ReplyReceiver {
+    std::shared_ptr<ReplyCell<T>> cell;
+    bool is_ready() const { return cell && cell->is_ready(); }
+    bool is_cancelled() const { return cell && cell->is_cancelled(); }
+    bool is_timed_out() const { return cell && cell->is_timed_out(); }
+    bool cancel() const { return cell && cell->cancel(); }
+    StringResult<std::optional<T>> try_receive() const {
+        return cell ? cell->try_receive() : result_error<std::optional<T>>("reply receiver is unavailable");
+    }
+};
+
 inline bool valid_utf8_string(const std::string& value);
 inline constexpr std::size_t MAX_JSON_DOCUMENT_BYTES = 16 * 1024 * 1024;
 inline constexpr std::size_t MAX_JSON_NESTING = 128;
@@ -3057,6 +3209,7 @@ struct ActorBase : std::enable_shared_from_this<ActorBase> {
     std::string actor_name;
     std::string status = "starting";
     std::deque<std::function<void()>> mailbox;
+    std::vector<std::weak_ptr<ReplyCellBase>> pending_replies;
     bool queued = false;
     std::function<void()> tyv_restart;
     std::weak_ptr<Supervisor> supervisor;
@@ -3115,6 +3268,12 @@ struct ActorHandlerScope {
 };
 inline constexpr std::size_t MAX_ACTOR_MAILBOX = 100000;
 inline constexpr std::int64_t MAX_ACTOR_DELIVERIES = 100000;
+inline void fail_actor_replies(const std::shared_ptr<ActorBase>& actor, const std::string& message) noexcept {
+    if (!actor) return;
+    for (const auto& pending : actor->pending_replies)
+        if (const auto cell = pending.lock()) cell->fail(message);
+    actor->pending_replies.clear();
+}
 inline void remove_ready_actor_locked(ActorRuntimeState& state, const ActorBase* actor) {
     state.ready.erase(std::remove_if(state.ready.begin(), state.ready.end(), [actor](const auto& candidate) {
         return candidate.get() == actor;
@@ -3194,6 +3353,7 @@ inline void stop_actor_for_supervisor(const std::shared_ptr<ActorBase>& actor) n
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
     }
+    fail_actor_replies(actor, "actor stopped before replying");
     actor->tyv_clear_state();
     actor_runtime_state().changed.notify_all();
 }
@@ -3523,6 +3683,7 @@ inline void actor_initialization_failed(const std::shared_ptr<ActorBase>& actor)
     actor->mailbox.clear();
     actor->queued = false;
     remove_ready_actor_locked(state, actor.get());
+    fail_actor_replies(actor, "actor initialization failed before replying");
     actor->tyv_clear_state();
 }
 inline void enqueue_actor(
@@ -3555,6 +3716,59 @@ inline void enqueue_actor(
     native_scheduler().changed.notify_all();
     actor_runtime_state().changed.notify_all();
 }
+template <typename T, typename MakeMessage> inline ReplyReceiver<T> actor_request(
+    const std::shared_ptr<ActorBase>& actor, const std::string& actor_name,
+    std::optional<std::int64_t> timeout_milliseconds, MakeMessage&& make_message,
+    const std::string& file, int line, int column) {
+    std::shared_ptr<ReplyCell<T>> cell;
+    std::function<void()> message;
+    try {
+        cell = std::make_shared<ReplyCell<T>>(timeout_milliseconds);
+        message = make_message(ReplySender<T>{cell});
+    } catch (const std::bad_alloc&) {
+        throw Failure(file, line, column, "cannot allocate actor request");
+    }
+    auto& state = actor_runtime_state();
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (!actor || actor->actor_name != actor_name)
+            throw Failure(file, line, column, "actor reference type mismatch");
+        if (actor->status != "alive")
+            throw Failure(file, line, column, "cannot send a message to a " + actor->status + " actor");
+        if (actor->mailbox.size() >= MAX_ACTOR_MAILBOX)
+            throw Failure(file, line, column, "actor mailbox capacity (100000) exceeded");
+        actor->pending_replies.erase(
+            std::remove_if(actor->pending_replies.begin(), actor->pending_replies.end(),
+                [](const auto& pending) {
+                    const auto cell = pending.lock();
+                    return !cell || !cell->is_pending();
+                }),
+            actor->pending_replies.end());
+        bool message_added = false;
+        try {
+            actor->pending_replies.emplace_back(cell);
+            actor->mailbox.push_back(std::move(message));
+            message_added = true;
+            if (!actor->queued) {
+                state.ready.push_back(actor);
+                actor->queued = true;
+            }
+        } catch (const std::bad_alloc&) {
+            if (message_added) actor->mailbox.pop_back();
+            actor->pending_replies.erase(
+                std::remove_if(actor->pending_replies.begin(), actor->pending_replies.end(),
+                    [&cell](const auto& pending) {
+                        const auto candidate = pending.lock();
+                        return !candidate || candidate == cell;
+                    }),
+                actor->pending_replies.end());
+            throw Failure(file, line, column, "cannot enqueue actor request");
+        }
+    }
+    state.changed.notify_all();
+    native_scheduler().changed.notify_all();
+    return ReplyReceiver<T>{std::move(cell)};
+}
 inline bool actor_is_alive(const std::shared_ptr<ActorBase>& actor) noexcept {
     if (!actor) return false;
     auto& state = actor_runtime_state();
@@ -3573,6 +3787,7 @@ inline bool actor_stop(
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
     }
+    fail_actor_replies(actor, "actor stopped before replying");
     actor_runtime_state().changed.notify_all();
     actor->tyv_clear_state();
     const auto failure = supervisor_actor_stopped(actor, file, line, column);
@@ -3583,7 +3798,7 @@ inline std::string actor_crash_message(const ActorBase& actor, const Failure& er
     return "actor '" + actor.actor_name + "' crashed at " + error.file + ":" +
         std::to_string(error.line) + ":" + std::to_string(error.column) + ": " + error.message;
 }
-inline void mark_actor_crashed(const std::shared_ptr<ActorBase>& actor) noexcept {
+inline void mark_actor_crashed(const std::shared_ptr<ActorBase>& actor, const std::string& failure) noexcept {
     if (!actor) return;
     {
         auto& state = actor_runtime_state();
@@ -3594,6 +3809,7 @@ inline void mark_actor_crashed(const std::shared_ptr<ActorBase>& actor) noexcept
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
     }
+    fail_actor_replies(actor, failure);
     actor->tyv_clear_state();
 }
 inline std::string apply_actor_failure(
@@ -3655,9 +3871,10 @@ inline StringResult<std::int64_t> run_actors(
                 was_alive = actor->status == "alive";
             }
             if (was_alive) {
-                mark_actor_crashed(actor);
+                const auto crash = actor_crash_message(*actor, error);
+                mark_actor_crashed(actor, crash);
                 const auto failure = apply_actor_failure(
-                    actor, actor_crash_message(*actor, error), error.file, error.line, error.column);
+                    actor, crash, error.file, error.line, error.column);
                 if (first_crash.empty() && !failure.empty()) first_crash = failure;
             }
         } catch (const std::exception&) {
@@ -3668,10 +3885,9 @@ inline StringResult<std::int64_t> run_actors(
                 was_alive = actor->status == "alive";
             }
             if (was_alive) {
-                mark_actor_crashed(actor);
-                const auto failure = apply_actor_failure(
-                    actor, "actor '" + actor->actor_name + "' crashed: native runtime failure",
-                    "<native>", 1, 1);
+                const std::string crash = "actor '" + actor->actor_name + "' crashed: native runtime failure";
+                mark_actor_crashed(actor, crash);
+                const auto failure = apply_actor_failure(actor, crash, "<native>", 1, 1);
                 if (first_crash.empty() && !failure.empty()) first_crash = failure;
             }
         } catch (...) {
@@ -3682,10 +3898,9 @@ inline StringResult<std::int64_t> run_actors(
                 was_alive = actor->status == "alive";
             }
             if (was_alive) {
-                mark_actor_crashed(actor);
-                const auto failure = apply_actor_failure(
-                    actor, "actor '" + actor->actor_name + "' crashed: native runtime failure",
-                    "<native>", 1, 1);
+                const std::string crash = "actor '" + actor->actor_name + "' crashed: native runtime failure";
+                mark_actor_crashed(actor, crash);
+                const auto failure = apply_actor_failure(actor, crash, "<native>", 1, 1);
                 if (first_crash.empty() && !failure.empty()) first_crash = failure;
             }
         }
@@ -3726,6 +3941,7 @@ inline void shutdown_actors() noexcept {
         (*actor)->status = "stopped";
         (*actor)->mailbox.clear();
         (*actor)->queued = false;
+        fail_actor_replies(*actor, "actor stopped before replying");
         (*actor)->tyv_restart = {};
     }
     for (auto actor = state.actors.rbegin(); actor != state.actors.rend(); ++actor)

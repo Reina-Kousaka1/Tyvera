@@ -92,7 +92,7 @@ def _applied(name: str, *arguments: IRTypeRef) -> IRAppliedType:
 
 
 NUMERIC_TYPES = frozenset({IRType.INT, IRType.FLOAT})
-_APPLIED_ARITIES = {"Option": 1, "Result": 2, "List": 1, "Map": 2, "Task": 1, "Secret": 1}
+_APPLIED_ARITIES = {"Option": 1, "Result": 2, "List": 1, "Map": 2, "Task": 1, "Secret": 1, "ReplySender": 1, "ReplyReceiver": 1}
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +246,17 @@ class IRActorSend(IRExpression):
     actor_name: str
     handler_symbol: str
     arguments: tuple[IRExpression, ...]
+    type: IRTypeRef
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
+class IRActorRequest(IRExpression):
+    receiver: IRExpression
+    actor_name: str
+    handler_symbol: str
+    arguments: tuple[IRExpression, ...]
+    timeout: IRExpression | None
     type: IRTypeRef
     location: Location
 
@@ -531,6 +542,18 @@ def _contains_task(type_ref: IRTypeRef) -> bool:
 
 
 def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef, ...], IRTypeRef] | None:
+    if isinstance(receiver, IRAppliedType) and receiver.name == "ReplySender":
+        return {"send": ((receiver.arguments[0],), IRType.BOOL)}.get(method)
+    if isinstance(receiver, IRAppliedType) and receiver.name == "ReplyReceiver":
+        item = receiver.arguments[0]
+        signatures = {
+            "isReady": ((), IRType.BOOL),
+            "isCancelled": ((), IRType.BOOL),
+            "isTimedOut": ((), IRType.BOOL),
+            "cancel": ((), IRType.BOOL),
+            "tryReceive": ((), _applied("Result", _applied("Option", item), IRType.STRING)),
+        }
+        return signatures.get(method)
     if isinstance(receiver, IRActorRefType):
         return {"isAlive": ((), IRType.BOOL), "stop": ((), IRType.VOID)}.get(method)
     if receiver == IRType.SUPERVISOR:
@@ -833,6 +856,10 @@ def validate_ir(module: IRModule) -> None:
                 actor = actors.get(node.actor_name)
                 if actor is None or (node.handler_symbol not in dict(actor.handler_symbols).values()):
                     raise _invalid(node.location, f"IR message refers to unknown handler on '{node.actor_name}'")
+            if isinstance(node, IRActorRequest):
+                actor = actors.get(node.actor_name)
+                if actor is None or node.handler_symbol not in dict(actor.handler_symbols).values():
+                    raise _invalid(node.location, f"IR request refers to unknown handler on '{node.actor_name}'")
 
     for node in _walk_ir(module):
         if isinstance(node, IRRecordCreate):
@@ -1036,6 +1063,30 @@ def _validate_expression(
         actual = tuple(_validate_expression(argument, functions, scopes) for argument in expression.arguments)
         if actual != expected:
             raise _invalid(expression.location, "IR actor message arguments do not match its handler")
+        return expression.type
+    if isinstance(expression, IRActorRequest):
+        receiver_type = _validate_expression(expression.receiver, functions, scopes)
+        if receiver_type != IRActorRefType(expression.actor_name):
+            raise _invalid(expression.location, "IR actor request receiver type does not match its actor")
+        handler = functions.get(expression.handler_symbol)
+        if (handler is None or handler.actor_name != expression.actor_name or handler.actor_initializer
+                or not handler.name.startswith(expression.actor_name + ".")):
+            raise _invalid(expression.location, "IR actor request has no matching handler")
+        if not handler.parameters:
+            raise _invalid(expression.location, "IR actor request handler must end with ReplySender<T>")
+        sender_type = handler.parameters[-1].type
+        if (not isinstance(sender_type, IRAppliedType) or sender_type.name != "ReplySender"
+                or len(sender_type.arguments) != 1):
+            raise _invalid(expression.location, "IR actor request handler must end with ReplySender<T>")
+        item_type = sender_type.arguments[0]
+        if expression.type != _applied("ReplyReceiver", item_type):
+            raise _invalid(expression.location, "IR actor request result type does not match its reply")
+        if expression.timeout is not None and _validate_expression(expression.timeout, functions, scopes) != IRType.DURATION:
+            raise _invalid(expression.timeout.location, "IR actor request timeout must have Duration type")
+        actual = tuple(_validate_expression(argument, functions, scopes) for argument in expression.arguments)
+        expected = tuple(parameter.type for parameter in handler.parameters[:-1])
+        if actual != expected:
+            raise _invalid(expression.location, "IR actor request arguments do not match its handler")
         return expression.type
     if isinstance(expression, IRUnary):
         operand_type = _validate_expression(expression.operand, functions, scopes)

@@ -40,6 +40,7 @@ from .ir import (
     IRActorRefType,
     IRActorSelfRef,
     IRActorSend,
+    IRActorRequest,
     IRActorSpawn,
     IRAppliedType,
     IREnum,
@@ -125,7 +126,7 @@ _TYPE_MAP = {
     "Void": IRType.VOID,
     "Unit": IRType.VOID,
 }
-_APPLIED_TYPES = {"Option": 1, "Result": 2, "List": 1, "Map": 2, "Task": 1, "Secret": 1}
+_APPLIED_TYPES = {"Option": 1, "Result": 2, "List": 1, "Map": 2, "Task": 1, "Secret": 1, "ReplySender": 1, "ReplyReceiver": 1}
 
 
 def lower_checked_program(checked: CheckedProgram) -> IRModule:
@@ -255,11 +256,6 @@ class _FunctionLowerer:
         initializer_symbol = None
         exposed_handlers: list[tuple[str, str]] = []
         for handler in actor.handlers:
-            if any(split_type(parameter.type_name)[0] == "ReplySender" for parameter in handler.parameters):
-                raise Diagnostic(
-                    handler.location, "backend",
-                    "native actor request/reply and timers are not yet supported",
-                )
             symbol = handler_symbols[handler.name]
             lowered = self.lower_actor_handler(handler, symbol, fields)
             handlers.append(lowered)
@@ -707,10 +703,24 @@ class _FunctionLowerer:
                 and expression.receiver.identifier == "self" else
                 receiver_arguments[0] if receiver_base == "ActorRef" and len(receiver_arguments) == 1 else None
             )
-            if actor_name is not None and expression.method in {"request", "requestWithin", "sendAfter"}:
-                raise Diagnostic(
-                    expression.location, "backend",
-                    "native actor request/reply and timers are not yet supported",
+            if actor_name is not None and expression.method == "sendAfter":
+                raise Diagnostic(expression.location, "backend", "native actor timers are not yet supported")
+            if actor_name is not None and expression.method in {"request", "requestWithin"}:
+                timed = expression.method == "requestWithin"
+                selector_index = 1 if timed else 0
+                if len(expression.arguments) <= selector_index or not isinstance(expression.arguments[selector_index], Name):
+                    raise Diagnostic(expression.location, "backend", "native actor request handler must be named directly")
+                selector = expression.arguments[selector_index]
+                handler_symbol = self.actor_symbols.get(actor_name, {}).get(selector.identifier)
+                if handler_symbol is None:
+                    raise Diagnostic(selector.location, "backend", f"native backend cannot resolve actor handler '{actor_name}.{selector.identifier}'")
+                timeout = self._expression(expression.arguments[0]) if timed else None
+                request_arguments = tuple(
+                    self._expression(argument) for argument in expression.arguments[selector_index + 1:]
+                )
+                return IRActorRequest(
+                    self._expression(expression.receiver), actor_name, handler_symbol,
+                    request_arguments, timeout, self._expression_type(expression), expression.location,
                 )
             if actor_name is not None and expression.method not in {"stop", "isAlive"}:
                 handler_symbol = self.actor_symbols.get(actor_name, {}).get(expression.method)
