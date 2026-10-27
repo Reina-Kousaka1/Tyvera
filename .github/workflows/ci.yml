@@ -162,19 +162,16 @@ jobs:
           fi
 
           user_data="$HOME/.local/share/tyvera-package-smoke"
-          mkdir -p "$user_data/project"
-          cat > "$user_data/project/main.tyv" <<'TYV'
-          fn main() {
-              println("installed Tyvera works")
-          }
-          TYV
-          printf '%s\n' 'preserve-user-project' > "$user_data/project/marker.txt"
-          printf '%s\n' 'fake-local-secret-never-a-real-token' > "$user_data/project/.tyvera.secrets"
+          mkdir -p "$user_data"
+          (cd "$user_data" && tyvera new project)
+          project="$project"
+          printf '%s\n' 'preserve-user-project' > "$project/marker.txt"
+          printf '%s\n' 'fake-local-secret-never-a-real-token' > "$project/.tyvera.secrets"
 
           sudo apt-get install -y "$package_a"
           tyvera --version
-          tyvera check "$user_data/project"
-          tyvera run "$user_data/project"
+          tyvera check "$project"
+          tyvera run "$project"
           test "$(cat "$user_data/project/marker.txt")" = 'preserve-user-project'
           test "$(cat "$user_data/project/.tyvera.secrets")" = 'fake-local-secret-never-a-real-token'
 
@@ -186,8 +183,8 @@ jobs:
           sudo apt-get install -y "$package_b"
           test "$(dpkg-query -W -f='${Version}' tyvera)" = '0.1.0-2'
           sudo apt-get install --reinstall -y "$package_b"
-          tyvera check "$user_data/project"
-          tyvera run "$user_data/project"
+          tyvera check "$project"
+          tyvera run "$project"
 
           sudo apt-get remove -y tyvera
           test -f "$user_data/project/main.tyv"
