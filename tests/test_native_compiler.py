@@ -873,7 +873,10 @@ fn main() {
     first.bump()
     second.bump()
     first.fail()
-    match runActors() { Ok(_) => println("recovered") Err(error) => println(error) }
+    match runActors() {
+        Ok(_) => println("recovered")
+        Err(error) => println(error)
+    }
     first.report()
     second.report()
     runActors()
@@ -929,7 +932,10 @@ fn main() {
     let child = nested.start(Worker(17), transientChildPolicy())
     root.start(nested)
     child.fail()
-    match runActors() { Ok(_) => println("recovered") Err(error) => println(error) }
+    match runActors() {
+        Ok(_) => println("recovered")
+        Err(error) => println(error)
+    }
     println(nested.isAlive())
     println(child.isAlive())
     child.report()
@@ -975,7 +981,10 @@ fn main() {
     child.fail()
     runActors()
     child.fail()
-    match runActors() { Ok(_) => println("recovered") Err(error) => println(error) }
+    match runActors() {
+        Ok(_) => println("recovered")
+        Err(error) => println(error)
+    }
     child.report()
     runActors()
 }
@@ -1032,18 +1041,36 @@ fn main() {
 fn main() {
     let supervisor = oneForOne(2, 1000, exponentialBackoff(1, 4))
     let child = supervisor.start(Worker(23))
+    eprintln("backoff checkpoint: before-stop")
     child.stop()
+    eprintln("backoff checkpoint: after-stop")
     println(child.isAlive())
+    eprintln("backoff checkpoint: before-first-dispatch")
     runActors()
+    eprintln("backoff checkpoint: after-first-dispatch")
     println(child.isAlive())
     child.report()
+    eprintln("backoff checkpoint: before-second-dispatch")
     runActors()
+    eprintln("backoff checkpoint: after-second-dispatch")
 }
 '''
         with tempfile.TemporaryDirectory(prefix="tyvera-native-supervisor-backoff-") as temporary:
             root = Path(temporary)
             reference = self._reference_result(source, root)
-            native = self._native_source_result(source, root, root / "supervisor-backoff", root)
+            try:
+                native = self._native_source_result(source, root, root / "supervisor-backoff", root)
+            except subprocess.TimeoutExpired as error:
+                progress = error.stderr or ""
+                if isinstance(progress, bytes):
+                    progress = progress.decode("utf-8", errors="replace")
+                checkpoints = [
+                    marker for marker in (
+                        "before-stop", "after-stop", "before-first-dispatch",
+                        "after-first-dispatch", "before-second-dispatch", "after-second-dispatch",
+                    ) if marker in progress
+                ]
+                self.fail(f"native supervisor backoff timed out; reached checkpoints: {checkpoints}")
             self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
 
     def test_native_actor_crash_is_isolated_and_reported_like_reference(self) -> None:

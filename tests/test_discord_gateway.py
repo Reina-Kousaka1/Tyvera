@@ -254,7 +254,10 @@ fn main() {
                         secure.sendall(server_close_frame())
                         captured.append(session)
                     except BaseException as error:
-                        failures.append(error)
+                        failures.append(RuntimeError(
+                            f"fake Discord peer failed after {len(captured)} captured interactions: "
+                            f"{type(error).__name__}: {error}"
+                        ))
                         break
                     finally:
                         try:
@@ -343,6 +346,13 @@ fn main() {{ let task = run(); runTasks() }}
                     listener.close()
 
             self.assertFalse(thread.is_alive(), "fake Discord Gateway did not finish")
+            if native_result is not None:
+                self.assertEqual(
+                    (native_result.returncode, native_result.stdout == output.getvalue(),
+                     native_result.stderr == errors.getvalue()),
+                    (0, True, True),
+                    "native Discord output must match the reference interpreter",
+                )
             self.assertEqual(failures, [])
             self.assertEqual(output.getvalue(), "true\ntrue\ntrue\ntrue\n1\n0\n1\n1\n")
             self.assertEqual(errors.getvalue(), "")
@@ -439,7 +449,10 @@ fn main() {{ let task = run(); runTasks() }}
                                 secure.sendall(server_close_frame())
                             secure.close()
                 except BaseException as error:
-                    failures.append(error)
+                    failures.append(RuntimeError(
+                        f"fake Discord peer failed after {len(captured)} captured interactions: "
+                        f"{type(error).__name__}: {error}"
+                    ))
                 finally:
                     listener.close()
 
@@ -522,6 +535,13 @@ fn main() { let task = run(); runTasks() }
                     listener.close()
 
         self.assertFalse(thread.is_alive(), "fake Gateway resume server did not finish")
+        if native_result is not None:
+            self.assertEqual(
+                (native_result.returncode, native_result.stdout == output.getvalue(),
+                 native_result.stderr == errors.getvalue()),
+                (0, True, True),
+                "native Discord output must match the reference interpreter",
+            )
         self.assertEqual(failures, [])
         self.assertEqual(output.getvalue(), "true\ntrue\ntrue\n2\n2\nresume-session\ntrue\n")
         self.assertEqual(errors.getvalue(), "")
@@ -612,7 +632,10 @@ fn main() { let task = run(); runTasks() }
                         except (OSError, ssl.SSLError):
                             pass
                     except BaseException as error:
-                        failures.append(error)
+                        failures.append(RuntimeError(
+                            f"fake Discord peer failed after {len(captured)} captured interactions: "
+                            f"{type(error).__name__}: {error}"
+                        ))
                         break
                     finally:
                         try:
@@ -685,6 +708,13 @@ fn main() { let task = run(); runTasks() }
                     listener.close()
 
         self.assertFalse(thread.is_alive(), "fake Gateway heartbeat peer did not observe connection cleanup")
+        if native_result is not None:
+            self.assertEqual(
+                (native_result.returncode, native_result.stdout == output.getvalue(),
+                 native_result.stderr == errors.getvalue()),
+                (0, True, True),
+                "native Discord output must match the reference interpreter",
+            )
         self.assertEqual(failures, [])
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(errors.getvalue(), "Discord Gateway reconnect limit exceeded\n")
@@ -894,11 +924,14 @@ fn main() { let task = run(); runTasks() }
             self.assertEqual(output.getvalue(),
                              '200\ntrue\ntrue\ntrue\n{"id":"fake-user","username":"test-bot"}\n'
                              '429\ntrue\ntrue\ntrue\n429\ntrue\ntrue\n200\n500\nretry budget rejected\n')
-            self.assertEqual([path for path, _, _ in captured], [
+            expected_paths = [
                 "/api/v10/users/@me", "/api/v10/channels/1/messages",
                 "/api/v10/channels/2/messages", "/api/v10/channels/2/messages",
                 "/api/v10/channels/3/messages",
-            ])
+            ]
+            self.assertEqual(
+                [path for path, _, _ in captured], expected_paths * connection_count,
+            )
             self.assertEqual(retry_attempts, 2)
             self.assertTrue(all(auth == "Bot fake-rest-token" for _, auth, _ in captured))
             self.assertEqual(captured[0][2], b"")
