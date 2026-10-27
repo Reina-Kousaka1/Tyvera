@@ -1662,7 +1662,10 @@ struct TaskControl {
     void record_child_failure(const std::string& message) {
         if (message.empty()) return;
         {
-            std::lock_guard<std::mutex> lock(child_failure_mutex);
+            // is_done() reads child failure while holding lifecycle_mutex. Publish
+            // under the same mutex so a waiter cannot miss this wakeup.
+            std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex);
+            std::lock_guard<std::mutex> failure_lock(child_failure_mutex);
             if (child_failure.empty()) child_failure = message;
         }
         cancel_children();
@@ -2662,7 +2665,14 @@ template <typename T> struct ReplyCell final : ReplyCellBase {
     explicit ReplyCell(std::optional<std::int64_t> timeout) : timeout_milliseconds(timeout) {}
     void notify_waiters_locked() noexcept {
         for (auto* waiter : waiters) {
-            if (waiter) waiter->lifecycle_changed.notify_all();
+            if (!waiter) continue;
+            try {
+                // Reply state is protected by this cell mutex. Pair each notification
+                // with the waiter's lifecycle mutex so a reply cannot notify between
+                // the predicate check and the condition-variable sleep.
+                std::lock_guard<std::mutex> lock(waiter->lifecycle_mutex);
+                waiter->lifecycle_changed.notify_all();
+            } catch (...) {}
         }
         native_scheduler().changed.notify_all();
     }
@@ -2802,18 +2812,16 @@ template <typename T> inline std::optional<T> await_reply(
         for (;;) {
             waiter->check_interruption();
             {
-                std::unique_lock<std::mutex> lock(waiter->lifecycle_mutex);
-                const auto ready = [&]() {
-                    if (waiter->is_done()) return true;
-                    std::lock_guard<std::mutex> cell_lock(cell->mutex);
-                    cell->refresh_locked();
-                    return cell->state != ReplyState::pending;
-                };
-                if (!ready()) {
-                    std::optional<std::chrono::steady_clock::time_point> deadline;
-                    {
-                        std::lock_guard<std::mutex> cell_lock(cell->mutex);
-                        if (cell->state == ReplyState::pending && cell->timeout_milliseconds) {
+                // Lock in the same cell -> lifecycle order used by reply send/fail.
+                // The cell lock guards the reply predicate; the lifecycle lock makes
+                // condition-variable notification atomic with entering the wait.
+                std::unique_lock<std::mutex> cell_lock(cell->mutex);
+                cell->refresh_locked();
+                if (cell->state == ReplyState::pending) {
+                    std::unique_lock<std::mutex> lifecycle_lock(waiter->lifecycle_mutex);
+                    if (!waiter->is_done()) {
+                        std::optional<std::chrono::steady_clock::time_point> deadline;
+                        if (cell->timeout_milliseconds) {
                             const auto maximum = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::time_point::max() - cell->started_at).count();
                             if (*cell->timeout_milliseconds > maximum)
@@ -2822,11 +2830,12 @@ template <typename T> inline std::optional<T> await_reply(
                                 deadline = cell->started_at
                                     + std::chrono::milliseconds(*cell->timeout_milliseconds);
                         }
+                        cell_lock.unlock();
+                        if (deadline)
+                            waiter->lifecycle_changed.wait_until(lifecycle_lock, *deadline);
+                        else
+                            waiter->lifecycle_changed.wait(lifecycle_lock);
                     }
-                    if (deadline)
-                        waiter->lifecycle_changed.wait_until(lock, *deadline, ready);
-                    else
-                        waiter->lifecycle_changed.wait(lock, ready);
                 }
             }
             waiter->check_interruption();

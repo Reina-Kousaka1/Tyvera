@@ -939,6 +939,37 @@ fn main() {
             self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
             self.assertEqual(native.stdout, "27\nfinished\n")
 
+    def test_native_repeated_actor_reply_wakeup_matches_reference(self) -> None:
+        source = '''actor Worker {
+    on get(value: Int, reply: ReplySender<Int>) { reply.send(value + 1) }
+}
+async fn query() {
+    let worker = spawn(Worker())
+    var index: Int = 0
+    var total: Int = 0
+    while index < 48 {
+        let pending = worker.request(get, index)
+        let result = await pending
+        total = total + result
+        index = index + 1
+    }
+    println(total)
+}
+fn main() {
+    let task = query()
+    match runTasks() {
+        Ok(_) => println("finished")
+        Err(error) => println(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-reply-wakeup-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "reply-wakeup", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "1176\nfinished\n")
+
     def test_native_await_reply_timeout_and_deadlock_match_reference(self) -> None:
         programs = (
             '''actor Worker {
