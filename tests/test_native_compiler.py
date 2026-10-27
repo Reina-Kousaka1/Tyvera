@@ -1871,17 +1871,19 @@ fn main() {
             source = f'''async fn client() {{
     match httpUrl("https://localhost:{port}/data") {{
         Err(error) => println(error)
-        Ok(url) => match await httpGet(url, milliseconds(3000)) {{
-            Err(error) => println(error)
-            Ok(response) => {{
-                println(response.status())
-                match response.headers().get("x-secure") {{
-                    None => println("missing")
-                    Some(value) => println(value)
-                }}
-                match response.body().toString() {{
-                    Err(error) => println(error)
-                    Ok(text) => println(text)
+        Ok(url) => {{
+            match await httpGet(url, milliseconds(3000)) {{
+                Err(error) => println(error)
+                Ok(response) => {{
+                    println(response.status())
+                    match response.headers().get("x-secure") {{
+                        None => println("missing")
+                        Some(value) => println(value)
+                    }}
+                    match response.body().toString() {{
+                        Err(error) => println(error)
+                        Ok(text) => println(text)
+                    }}
                 }}
             }}
         }}
@@ -1952,9 +1954,11 @@ fn main() {{
             source = f'''async fn client() {{
     match httpUrl("http://127.0.0.1:{port}/") {{
         Err(error) => println(error)
-        Ok(url) => match await httpGet(url, milliseconds(2000)) {{
-            Err(error) => println(error)
-            Ok(_) => println("unexpected response")
+        Ok(url) => {{
+            match await httpGet(url, milliseconds(2000)) {{
+                Err(error) => println(error)
+                Ok(_) => println("unexpected response")
+            }}
         }}
     }}
 }}

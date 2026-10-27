@@ -488,6 +488,8 @@ class _FunctionLowerer:
                     IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
                     IRType.SOCKET_ADDRESS, IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER,
                     IRType.WEBSOCKET, IRType.WEBSOCKET_URL, IRType.WEBSOCKET_MESSAGE,
+                    IRType.HTTP_METHOD, IRType.HTTP_URL, IRType.HTTP_HEADERS,
+                    IRType.HTTP_REQUEST, IRType.HTTP_RESPONSE,
                 }
             ):
                 raise Diagnostic(expression.location, "backend", f"native backend does not yet support methods on {ir_type_name(receiver.type)}")
