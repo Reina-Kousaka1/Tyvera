@@ -2048,7 +2048,7 @@ fn main() {{
                 expected = self._reference_result(source, root)
                 native = self._native_source_result(source, root, root / "http-limit", root)
                 self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
-                self.assertEqual(native.stdout, "HTTP body exceeds configured size limit\n")
+                self.assertEqual(native.stdout, "HTTP response parse error: HTTP body exceeds configured size limit\n")
                 self.assertTrue(complete.wait(timeout=5), "loopback oversized-response handlers did not finish")
                 self.assertEqual(failures, [])
             finally:
