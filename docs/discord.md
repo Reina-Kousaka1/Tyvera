@@ -1,9 +1,9 @@
 # Tyvera Discord source package
 
 `libraries/discord` is an experimental, repository-local Tyvera source package
-and a real integration example for modules, enums, JSON, `Option`, `Result`,
-and pattern matching. The package manager is not implemented; the directory is
-not published or automatically installed as a dependency.
+and an integration exercise for TLS, WebSockets, JSON, `Secret`, `Option`,
+`Result`, and pattern matching. The package manager is not implemented; the
+directory is not published or automatically installed as a dependency.
 
 ## Implemented slice
 
@@ -12,29 +12,48 @@ not published or automatically installed as a dependency.
 decodes the dispatch envelope, recognizes `READY` and `MESSAGE_CREATE`,
 preserves other event names as `Unknown`, validates required fields, and maps
 malformed or incomplete payloads to generic errors that do not echo the input.
-`src/rest.tyv` exports `decodeFailure(status, body)`, which validates Discord
-REST error JSON and returns a `RestFailure` value with status, optional API
-code, message, retry-after seconds, and global-limit metadata. It requires
-`retry_after` on status 429 and parses metadata only; it never retries a
-request.
-`examples/decode.tyv` is checked and run by CI as a Tyvera project.
+`src/gateway.tyv` exports `GatewayDispatch`, `GatewayEnvelope`, and decoders for
+`READY`, `MESSAGE_CREATE`, unknown dispatches, and the Gateway envelope.
+`src/rest.tyv` provides `requestBot(token, method, endpoint, body, timeout)`.
+It pins requests to `https://discord.com/api/v10/`, uses the verified HTTPS
+client, puts the `Secret<String>` only in the `Authorization: Bot ...` header,
+and returns status, bounded body bytes, and raw rate-limit response metadata.
+`decodeFailure` and `decodeResponseFailure` map Discord error bodies to typed
+`RestFailure` values. Requests are not retried; callers must decide whether an
+operation is safe and honor rate-limit metadata themselves.
 
-The decoder is local and deterministic. It does not read a bot token, make a
-network request, or claim to be a Discord client.
+`src/client.tyv` provides typed `GatewayIntent` values and a bounded
+`runGateway` session pinned to `wss://gateway.discord.gg/`. It performs TLS
+verification, the WebSocket handshake, Hello parsing, Identify, heartbeat
+sends, ACK tracking, sequence updates, READY/session capture, and basic
+MESSAGE_CREATE counting. It does not expose message content to logs or emit a
+user callback. The `bot.tyv` and `rest_client.tyv` examples do nothing networked
+without `DISCORD_TOKEN`; CI checks and runs them without credentials.
 
-## Planned transport and lifecycle
+The local fake Gateway and fake REST integration tests use temporary
+self-signed test certificates, patched test-only DNS/port routing, and a fixed
+fake token. They do not access a Discord account or public service.
 
-The reference runtime currently has TCP, DNS, and experimental HTTP/1.1, but
-no TLS or WebSocket client. The package therefore does not yet implement
-Identify, Hello/heartbeat/ACK, Dispatch over a socket, reconnect/Resume,
-Invalid Session handling, REST transport, rate-limit scheduling, cache actors,
-or a `DiscordSupervisor`. A TLS implementation must use a reviewed platform
-cryptography library with certificate verification enabled by default; Tyvera
-will not implement cryptography itself. A future WebSocket implementation
-must remain a general networking primitive rather than a Discord-specific
-transport.
+## Experimental limits
 
-When authentication is added, tokens must stay in `Secret<String>` until
-passed to the trusted transport. Runtime events and errors must not include
-them. Current tests use only fake payload strings and need no Discord account
-or external network access.
+The Gateway currently handles one bounded connection session. Opcode 7,
+Invalid Session, disconnect, and missing heartbeat ACK produce controlled
+errors; automatic reconnect, session Resume, close-code policy, jittered
+backoff, and Invalid Session retry are not implemented. `resume_gateway_url`
+is captured but not followed. The typed event decoder recognizes READY and
+MESSAGE_CREATE, but the client only counts dispatches; there is no typed event
+subscription API, Actor/Supervisor client tree, cache, or shard coordinator.
+
+REST has one-request transport and rate-limit metadata parsing. There is no
+bucket/global coordinator, bounded request queue, automatic retry, API model
+coverage, or REST client Actor. Side-effect requests are never retried.
+Gateway compression is not negotiated. Networking, TLS, HTTP, WebSockets, and
+this package remain interpreter-only and experimental; generated native
+programs do not yet provide these services. Do not treat this package as
+production-ready.
+
+When authentication is used, the token remains `Secret<String>` until the
+request header or Identify payload is formed. The library itself never logs it;
+HTTP header and request representations are redacted. Callers remain
+responsible for not printing remote response bodies or explicitly revealed
+secrets.

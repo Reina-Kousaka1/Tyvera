@@ -1,0 +1,24 @@
+import "../src/client.tyv" as discord
+
+async fn startGateway(token: Secret<String>) {
+    let result = await discord.runGateway(token, discord.defaultIntents(), 1000, seconds(15))
+    match result {
+        Err(error) => eprintln(error)
+        Ok(summary) => {
+            println(summary.ready)
+            println(summary.dispatchCount)
+            println(summary.messageCount)
+            println(summary.heartbeatCount)
+        }
+    }
+}
+
+fn main() {
+    match environment("DISCORD_TOKEN") {
+        None => println("Set DISCORD_TOKEN to run the experimental Discord Gateway client.")
+        Some(token) => {
+            let task = startGateway(token)
+            runTasks()
+        }
+    }
+}

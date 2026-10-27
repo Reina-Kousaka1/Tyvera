@@ -6,6 +6,89 @@ pub record RestFailure {
     global: Bool
 }
 
+pub record DiscordRestResponse {
+    status: Int
+    body: Bytes
+    rateLimitBucket: Option<String>
+    rateLimitRemaining: Option<String>
+    rateLimitResetAfter: Option<String>
+    retryAfter: Option<String>
+    globalRateLimit: Bool
+}
+
+fn responseFromHttp(response: HttpResponse) -> DiscordRestResponse {
+    let headers = response.headers()
+    var global: Bool = false
+    match headers.get("x-ratelimit-global") {
+        Some(value) => global = value == "true"
+        None => {}
+    }
+    return DiscordRestResponse(response.status(), response.body(), headers.get("x-ratelimit-bucket"), headers.get("x-ratelimit-remaining"), headers.get("x-ratelimit-reset-after"), headers.get("retry-after"), global)
+}
+
+// Sends one request to the fixed, verified HTTPS Discord API origin. The
+// endpoint is relative to /api/v10, so a caller cannot redirect the bot token
+// to an arbitrary host. This primitive never retries: callers must apply an
+// explicit, method-aware policy after inspecting the returned status/headers.
+pub async fn requestBot(token: Secret<String>, methodName: String, endpoint: String, body: Bytes, timeout: Duration) -> Result<DiscordRestResponse, String> {
+    let parsedUrl = httpUrl("https://discord.com/api/v10/" + endpoint)
+    match parsedUrl {
+        Err(_) => return Err<DiscordRestResponse, String>("invalid Discord API endpoint")
+        Ok(url) => {
+            if url.scheme() != "https" || url.host() != "discord.com" {
+                return Err<DiscordRestResponse, String>("Discord REST requires the verified HTTPS API origin")
+            }
+            let parsedMethod = httpMethod(methodName)
+            match parsedMethod {
+                Err(_) => return Err<DiscordRestResponse, String>("invalid Discord REST method")
+                Ok(method) => {
+                    let headers = httpHeaders()
+                    match headers.set("Authorization", "Bot " + token.reveal()) {
+                        Err(_) => return Err<DiscordRestResponse, String>("could not prepare Discord REST authorization")
+                        Ok(_) => {}
+                    }
+                    match headers.set("Accept", "application/json") {
+                        Err(_) => return Err<DiscordRestResponse, String>("could not prepare Discord REST headers")
+                        Ok(_) => {}
+                    }
+                    match headers.set("Content-Type", "application/json") {
+                        Err(_) => return Err<DiscordRestResponse, String>("could not prepare Discord REST headers")
+                        Ok(_) => {}
+                    }
+                    match httpRequest(method, url.target(), headers, body) {
+                        Err(_) => return Err<DiscordRestResponse, String>("could not prepare Discord REST request")
+                        Ok(request) => {
+                            let sent = await httpSend(url, request, timeout)
+                            match sent {
+                                Err(_) => return Err<DiscordRestResponse, String>("Discord REST transport failed")
+                                Ok(response) => return Ok<DiscordRestResponse, String>(responseFromHttp(response))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return Err<DiscordRestResponse, String>("Discord REST request did not start")
+}
+
+// Converts an unsuccessful HTTP response into the existing typed Discord
+// API failure record. Successful 2xx responses produce None. The raw response
+// remains available to callers for endpoint-specific decoding.
+pub fn decodeResponseFailure(response: DiscordRestResponse) -> Result<Option<RestFailure>, String> {
+    if response.status >= 200 && response.status < 300 {
+        return Ok<Option<RestFailure>, String>(None<RestFailure>())
+    }
+    match response.body.toString() {
+        Err(error) => return Err<Option<RestFailure>, String>(error)
+        Ok(text) => match decodeFailure(response.status, text) {
+            Err(error) => return Err<Option<RestFailure>, String>(error)
+            Ok(failure) => return Ok<Option<RestFailure>, String>(Some(failure))
+        }
+    }
+    return Err<Option<RestFailure>, String>("invalid Discord REST response")
+}
+
 fn requiredString(object: Json, key: String) -> Result<String, String> {
     var result: Result<String, String> = Err<String, String>("REST error field is missing")
     match object.objectGet(key) {

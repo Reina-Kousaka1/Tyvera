@@ -4,6 +4,13 @@ pub enum GatewayDispatch {
     Unknown(String)
 }
 
+pub record GatewayEnvelope {
+    opcode: Int
+    sequence: Option<Int>
+    eventName: Option<String>
+    data: Json
+}
+
 fn requiredString(object: Json, key: String) -> Result<String, String> {
     var result: Result<String, String> = Err<String, String>("gateway field is missing")
     match object.objectGet(key) {
@@ -47,6 +54,57 @@ pub fn decodeDispatch(payload: String) -> Result<GatewayDispatch, String> {
             }
                 Err(error) => result = Err<GatewayDispatch, String>(error)
             }
+        }
+        Err(_) => {}
+    }
+    return result
+}
+
+pub fn decodeEnvelope(payload: String) -> Result<GatewayEnvelope, String> {
+    var result: Result<GatewayEnvelope, String> = Err<GatewayEnvelope, String>("invalid gateway envelope")
+    match parseJson(payload) {
+        Ok(root) => match root.objectGet("op") {
+            Some(opValue) => match opValue.asInt() {
+                Some(opcode) => {
+                    var sequence: Option<Int> = None<Int>()
+                    var eventName: Option<String> = None<String>()
+                    var data: Json = jsonNull()
+                    var valid: Bool = true
+                    match root.objectGet("s") {
+                        Some(sequenceValue) => {
+                            if !sequenceValue.isNull() {
+                                match sequenceValue.asInt() {
+                                    Some(value) => sequence = Some(value)
+                                    None => valid = false
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                    match root.objectGet("t") {
+                        Some(eventValue) => {
+                            if !eventValue.isNull() {
+                                match eventValue.asString() {
+                                    Some(value) => eventName = Some(value)
+                                    None => valid = false
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                    match root.objectGet("d") {
+                        Some(value) => data = value
+                        None => {}
+                    }
+                    if valid {
+                        result = Ok<GatewayEnvelope, String>(GatewayEnvelope(opcode, sequence, eventName, data))
+                    } else {
+                        result = Err<GatewayEnvelope, String>("gateway sequence or event name has the wrong type")
+                    }
+                }
+                None => result = Err<GatewayEnvelope, String>("gateway opcode must be an integer")
+            }
+            None => result = Err<GatewayEnvelope, String>("gateway opcode is missing")
         }
         Err(_) => {}
     }

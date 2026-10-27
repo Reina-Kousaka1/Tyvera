@@ -1,0 +1,32 @@
+import "../src/rest.tyv" as discordRest
+
+async fn lookupCurrentBot(token: Secret<String>) {
+    let result = await discordRest.requestBot(token, "GET", "users/@me", bytesFromString(""), seconds(10))
+    match result {
+        Err(error) => eprintln(error)
+        Ok(response) => {
+            println(response.status)
+            if response.status >= 200 && response.status < 300 {
+                match response.body.toString() {
+                    Err(_) => eprintln("Discord returned a non-text response")
+                    Ok(body) => println(body)
+                }
+            } else {
+                match discordRest.decodeResponseFailure(response) {
+                    Err(error) => eprintln(error)
+                    Ok(_) => eprintln("Discord REST request was unsuccessful")
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    match environment("DISCORD_TOKEN") {
+        None => println("Set DISCORD_TOKEN to run the experimental HTTPS REST client.")
+        Some(token) => {
+            let task = lookupCurrentBot(token)
+            runTasks()
+        }
+    }
+}

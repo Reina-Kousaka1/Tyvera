@@ -1,22 +1,22 @@
 # Experimental Tyvera Discord library
 
-This source package currently implements two typed payload adapters:
-`gateway.decodeDispatch` recognizes `READY` and `MESSAGE_CREATE`, returns an
-`Unknown` case for other dispatch names, and reports malformed JSON or
-missing/wrongly typed fields through `Result<GatewayDispatch, String>`.
-`rest.decodeFailure` maps an HTTP status and Discord JSON error body to a
-`RestFailure` record, including optional API code and retry metadata. A 429
-response requires a nonnegative floating-point `retry_after`; this is parsed
-metadata only and does not schedule or retry requests.
+This repository-local source package now has a bounded real HTTPS REST request
+path and WSS Gateway session in the reference runtime. The REST client is pinned
+to Discord's verified HTTPS API origin, uses `Secret<String>` for Bot
+authorization, returns bounded response bytes and rate-limit headers, and
+never retries automatically. `decodeFailure` maps Discord error JSON into a
+typed `RestFailure` record.
 
-Run the local example with `tyvera check libraries/discord` and
-`tyvera run libraries/discord`.
+The Gateway client uses typed intents and implements TLS verification,
+WebSocket handshake, Hello, Identify, heartbeats, ACK tracking, sequence
+updates, and basic READY/MESSAGE_CREATE dispatch counting. `bot.tyv` and
+`rest_client.tyv` require `DISCORD_TOKEN`; without it, they print an
+instruction and do not make a network request. CI checks/runs both without
+credentials. Local integration tests use fake TLS Gateway/REST servers and
+fixed fake tokens, never Discord production.
 
-This is a source package example, not a published package. The repository does
-not yet have a package manager. It does not connect to Discord: the current
-Tyvera runtime has no TLS or WebSocket client, and the native backend does not
-implement networking. Gateway heartbeat, Identify/Resume, reconnect, REST
-transport, rate-limit enforcement, cache, and client Actors are planned. The
-decoder accepts payload text only; callers should obtain credentials through
-Tyvera `Secret` facilities when a transport is added. It never reads or logs a
-bot token.
+Reconnect/Resume, close-code policy, REST rate-limit coordination, safe request
+retries, typed event callbacks, client Actors/cache, and native networking are
+not implemented. The package manager is also not implemented; the package is
+not published. See [the full support status](../../docs/discord.md). This
+software is experimental and not production-ready.

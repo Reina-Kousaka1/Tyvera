@@ -1,0 +1,349 @@
+import "./gateway.tyv" as gateway
+
+pub enum GatewayIntent {
+    Guilds
+    GuildMembers
+    GuildModeration
+    GuildExpressions
+    GuildIntegrations
+    GuildWebhooks
+    GuildInvites
+    GuildVoiceStates
+    GuildPresences
+    GuildMessages
+    GuildMessageReactions
+    GuildMessageTyping
+    DirectMessages
+    DirectMessageReactions
+    DirectMessageTyping
+    MessageContent
+    GuildScheduledEvents
+    AutoModerationConfiguration
+    AutoModerationExecution
+    GuildMessagePolls
+    DirectMessagePolls
+}
+
+pub record GatewayRunSummary {
+    ready: Bool
+    sessionId: Option<String>
+    resumeGatewayUrl: Option<String>
+    lastSequence: Option<Int>
+    dispatchCount: Int
+    messageCount: Int
+    heartbeatCount: Int
+}
+
+fn intentBit(intent: GatewayIntent) -> Int {
+    match intent {
+        GatewayIntent.Guilds => return 1
+        GatewayIntent.GuildMembers => return 2
+        GatewayIntent.GuildModeration => return 4
+        GatewayIntent.GuildExpressions => return 8
+        GatewayIntent.GuildIntegrations => return 16
+        GatewayIntent.GuildWebhooks => return 32
+        GatewayIntent.GuildInvites => return 64
+        GatewayIntent.GuildVoiceStates => return 128
+        GatewayIntent.GuildPresences => return 256
+        GatewayIntent.GuildMessages => return 512
+        GatewayIntent.GuildMessageReactions => return 1024
+        GatewayIntent.GuildMessageTyping => return 2048
+        GatewayIntent.DirectMessages => return 4096
+        GatewayIntent.DirectMessageReactions => return 8192
+        GatewayIntent.DirectMessageTyping => return 16384
+        GatewayIntent.MessageContent => return 32768
+        GatewayIntent.GuildScheduledEvents => return 65536
+        GatewayIntent.AutoModerationConfiguration => return 1048576
+        GatewayIntent.AutoModerationExecution => return 2097152
+        GatewayIntent.GuildMessagePolls => return 16777216
+        GatewayIntent.DirectMessagePolls => return 33554432
+    }
+    return 0
+}
+
+fn intentMask(intents: List<GatewayIntent>) -> Int {
+    var mask: Int = 0
+    let seen: List<GatewayIntent> = List<GatewayIntent>()
+    for intent in intents {
+        if !seen.contains(intent) {
+            seen.append(intent)
+            mask = mask + intentBit(intent)
+        }
+    }
+    return mask
+}
+
+pub fn defaultIntents() -> List<GatewayIntent> {
+    let intents: List<GatewayIntent> = List<GatewayIntent>()
+    intents.append(GatewayIntent.Guilds)
+    intents.append(GatewayIntent.GuildMessages)
+    return intents
+}
+
+fn optionalString(object: Json, key: String) -> Option<String> {
+    var result: Option<String> = None<String>()
+    match object.objectGet(key) {
+        Some(value) => result = value.asString()
+        None => {}
+    }
+    return result
+}
+
+fn helloInterval(message: WebSocketMessage) -> Result<Int, String> {
+    if message.kind() != "text" {
+        return Err<Int, String>("Discord Gateway Hello must be a text message")
+    }
+    var result: Result<Int, String> = Err<Int, String>("invalid Discord Gateway Hello")
+    match message.text() {
+        Err(error) => result = Err<Int, String>(error)
+        Ok(payload) => match gateway.decodeEnvelope(payload) {
+            Err(error) => result = Err<Int, String>(error)
+            Ok(envelope) => {
+                if envelope.opcode != 10 {
+                    result = Err<Int, String>("Discord Gateway expected Hello opcode 10")
+                } else {
+                    match envelope.data.objectGet("heartbeat_interval") {
+                        Some(value) => match value.asInt() {
+                            Some(interval) => {
+                                if interval <= 0 || interval > 2147483647 {
+                                    result = Err<Int, String>("Discord heartbeat interval is out of range")
+                                } else {
+                                    result = Ok<Int, String>(interval)
+                                }
+                            }
+                            None => result = Err<Int, String>("Discord heartbeat_interval must be an integer")
+                        }
+                        None => result = Err<Int, String>("Discord Hello is missing heartbeat_interval")
+                    }
+                }
+            }
+        }
+    }
+    return result
+}
+
+fn heartbeatPayload(sequence: Option<Int>) -> Result<String, String> {
+    let envelope: Map<String, Json> = Map<String, Json>()
+    envelope.put("op", jsonInt(1))
+    match sequence {
+        Some(value) => envelope.put("d", jsonInt(value))
+        None => envelope.put("d", jsonNull())
+    }
+    return jsonStringify(jsonObject(envelope))
+}
+
+fn identifyPayload(token: Secret<String>, intents: List<GatewayIntent>) -> Result<String, String> {
+    let properties: Map<String, Json> = Map<String, Json>()
+    properties.put("$os", jsonString(hostOS()))
+    properties.put("$browser", jsonString("tyvera"))
+    properties.put("$device", jsonString("tyvera"))
+
+    let data: Map<String, Json> = Map<String, Json>()
+    data.put("token", jsonString(token.reveal()))
+    data.put("intents", jsonInt(intentMask(intents)))
+    data.put("properties", jsonObject(properties))
+
+    let envelope: Map<String, Json> = Map<String, Json>()
+    envelope.put("op", jsonInt(2))
+    envelope.put("d", jsonObject(data))
+    return jsonStringify(jsonObject(envelope))
+}
+
+// Runs one bounded Gateway session. maxDispatches bounds the result-free
+// session duration for tests and simple command-line bots; reconnect policy
+// is deliberately handled by the caller in this V1 API.
+pub async fn runGateway(token: Secret<String>, intents: List<GatewayIntent>, maxDispatches: Int, timeout: Duration) -> Result<GatewayRunSummary, String> {
+    if maxDispatches < 1 || maxDispatches > 10000 {
+        return Err<GatewayRunSummary, String>("maxDispatches must be between 1 and 10000")
+    }
+    // Keep authentication pinned to the official Discord Gateway origin.
+    let opened = await webSocketConnect("wss://gateway.discord.gg/?v=10&encoding=json", timeout)
+    match move opened {
+        Err(error) => return Err<GatewayRunSummary, String>(error)
+        Ok(connection) => {
+            let hello = await connection.receiveWithin(timeout)
+            match hello {
+                Err(error) => {
+                    connection.close()
+                    return Err<GatewayRunSummary, String>(error)
+                }
+                Ok(value) => match value {
+                    None => {
+                        connection.close()
+                        return Err<GatewayRunSummary, String>("Discord Gateway closed before Hello")
+                    }
+                    Some(message) => match helloInterval(message) {
+                        Err(error) => {
+                            connection.close()
+                            return Err<GatewayRunSummary, String>(error)
+                        }
+                        Ok(heartbeatInterval) => {
+                            let identify = identifyPayload(token, intents)
+                            match identify {
+                                Err(error) => {
+                                    connection.close()
+                                    return Err<GatewayRunSummary, String>(error)
+                                }
+                                Ok(payload) => {
+                                    let identifySent = await connection.sendText(payload)
+                                    match identifySent {
+                                        Err(error) => {
+                                            connection.close()
+                                            return Err<GatewayRunSummary, String>(error)
+                                        }
+                                        Ok(_) => {}
+                                    }
+                                    var sequence: Option<Int> = None<Int>()
+                                    var sessionId: Option<String> = None<String>()
+                                    var resumeUrl: Option<String> = None<String>()
+                                    var ready: Bool = false
+                                    var dispatches: Int = 0
+                                    var messages: Int = 0
+                                    var heartbeats: Int = 0
+                                    var waitingForAck: Bool = false
+                                    var failed: Option<String> = None<String>()
+                                    var active: Bool = true
+                                    while active && dispatches < maxDispatches {
+                                        let incoming = await connection.receiveWithin(milliseconds(heartbeatInterval))
+                                        match incoming {
+                                            Err(error) => {
+                                                if error == "WebSocket receive timed out" {
+                                                    if waitingForAck {
+                                                        failed = Some("Discord Gateway missed a heartbeat acknowledgement")
+                                                        active = false
+                                                    } else {
+                                                        waitingForAck = true
+                                                        heartbeats = heartbeats + 1
+                                                        match heartbeatPayload(sequence) {
+                                                            Err(payloadError) => {
+                                                                failed = Some(payloadError)
+                                                                active = false
+                                                            }
+                                                            Ok(heartbeatMessage) => {
+                                                                let heartbeatSent = await connection.sendText(heartbeatMessage)
+                                                                match heartbeatSent {
+                                                                    Err(sendError) => {
+                                                                        failed = Some(sendError)
+                                                                        active = false
+                                                                    }
+                                                                    Ok(_) => {}
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                } else {
+                                                    failed = Some(error)
+                                                    active = false
+                                                }
+                                            }
+                                            Ok(value) => match value {
+                                                None => {
+                                                    failed = Some("Discord Gateway disconnected")
+                                                    active = false
+                                                }
+                                                Some(frame) => {
+                                                    if frame.kind() != "text" {
+                                                        failed = Some("Discord Gateway sent a non-text payload")
+                                                        active = false
+                                                    } else {
+                                                        match frame.text() {
+                                                            Err(error) => {
+                                                                failed = Some(error)
+                                                                active = false
+                                                            }
+                                                            Ok(payload) => match gateway.decodeEnvelope(payload) {
+                                                                Err(error) => {
+                                                                    failed = Some(error)
+                                                                    active = false
+                                                                }
+                                                                Ok(envelope) => {
+                                                                    match envelope.sequence {
+                                                                        Some(value) => sequence = Some(value)
+                                                                        None => {}
+                                                                    }
+                                                                    if envelope.opcode == 1 {
+                                                                        if waitingForAck {
+                                                                            failed = Some("Discord Gateway requested a heartbeat before the previous acknowledgement")
+                                                                            active = false
+                                                                        } else {
+                                                                            waitingForAck = true
+                                                                            heartbeats = heartbeats + 1
+                                                                            match heartbeatPayload(sequence) {
+                                                                                Err(payloadError) => {
+                                                                                    failed = Some(payloadError)
+                                                                                    active = false
+                                                                                }
+                                                                                Ok(heartbeatMessage) => {
+                                                                                    let heartbeatSent = await connection.sendText(heartbeatMessage)
+                                                                                    match heartbeatSent {
+                                                                                        Err(sendError) => {
+                                                                                            failed = Some(sendError)
+                                                                                            active = false
+                                                                                        }
+                                                                                        Ok(_) => {}
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    } else if envelope.opcode == 11 {
+                                                                        waitingForAck = false
+                                                                    } else if envelope.opcode == 7 {
+                                                                        failed = Some("Discord Gateway requested a reconnect")
+                                                                        active = false
+                                                                    } else if envelope.opcode == 9 {
+                                                                        failed = Some("Discord Gateway invalidated the session")
+                                                                        active = false
+                                                                    } else if envelope.opcode == 0 {
+                                                                        dispatches = dispatches + 1
+                                                                        match gateway.decodeDispatch(payload) {
+                                                                            Err(error) => {
+                                                                                failed = Some(error)
+                                                                                active = false
+                                                                            }
+                                                                            Ok(event) => match event {
+                                                                                gateway.GatewayDispatch.Ready(value) => {
+                                                                                    ready = true
+                                                                                    sessionId = Some(value)
+                                                                                    resumeUrl = optionalString(envelope.data, "resume_gateway_url")
+                                                                                }
+                                                                                gateway.GatewayDispatch.MessageCreate(_, _, _) => {
+                                                                                    messages = messages + 1
+                                                                                }
+                                                                                gateway.GatewayDispatch.Unknown(_) => {}
+                                                                            }
+                                                                        }
+                                                                    } else if envelope.opcode != 10 {
+                                                                        failed = Some("Discord Gateway sent an unsupported opcode")
+                                                                        active = false
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    match failed {
+                                        Some(error) => {
+                                            connection.close()
+                                            return Err<GatewayRunSummary, String>(error)
+                                        }
+                                        None => {
+                                            let closed = await connection.closeGracefully()
+                                            match closed {
+                                                Err(error) => return Err<GatewayRunSummary, String>(error)
+                                                Ok(_) => return Ok<GatewayRunSummary, String>(GatewayRunSummary(ready, sessionId, resumeUrl, sequence, dispatches, messages, heartbeats))
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return Err<GatewayRunSummary, String>("Discord Gateway session did not start")
+}
