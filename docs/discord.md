@@ -46,8 +46,10 @@ the first heartbeat is currently sent after one full interval, without
 Discord's recommended random initial jitter. There is no reconnect jitter;
 callers should use a small reconnect budget appropriate to their application.
 The checked-in bot example composes this bounded Gateway operation as a Task
-created by a transiently supervised `GatewayRunner` actor; the actor owns its
-cancellation and shutdown.
+created by a transiently supervised `GatewayRunner` actor. Native stop, crash,
+supervised restart, and runtime shutdown cancel and drain other actor-owned
+tasks before state is cleared or rebuilt; a task stopping its own actor unwinds
+at its next interruption point.
 Resume URLs must be
 `wss`, port 443, root-path URLs on `discord.gg` or its subdomains; this prevents
 forwarding the bot token to an arbitrary host. `runGateway` remains a single

@@ -990,6 +990,113 @@ fn main() {
             self.assertNotIn("late", native.stdout)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "native networking tests require Linux")
+    def test_native_actor_crash_and_supervisor_restart_drain_pending_accept(self) -> None:
+        source = '''async fn waitForAccept(ready: ReplySender<Int>) {
+    let opened = await tcpListen("127.0.0.1", 0, 8)
+    match move opened {
+        Err(_) => ready.send(-1)
+        Ok(listener) => match listener.localAddress() {
+            Err(_) => { ready.send(-1); listener.close() }
+            Ok(address) => {
+                ready.send(address.port())
+                let pending = listener.accept()
+                let accepted = await move pending
+                match move accepted {
+                    Err(_) => {}
+                    Ok(connection) => connection.close()
+                }
+                listener.close()
+            }
+        }
+    }
+}
+actor Acceptor {
+    on start(ready: ReplySender<Int>) {
+        let task = waitForAccept(ready)
+    }
+    on fail() {
+        let failure: Float = 1 / 0
+    }
+}
+actor Barrier {
+    on ping(reply: ReplySender<Int>) { reply.send(1) }
+}
+async fn isPortReleased(port: Int) -> Bool {
+    let opened = await tcpListen("127.0.0.1", port, 8)
+    match move opened {
+        Err(_) => return false
+        Ok(listener) => {
+            listener.close()
+            return true
+        }
+    }
+}
+async fn exercise() {
+    let barrier = spawn(Barrier())
+    let unmanaged = spawn(Acceptor())
+    let started = unmanaged.request(start)
+    let port: Int = await started
+    unmanaged.fail()
+    let unmanagedBarrier = barrier.request(ping)
+    let unmanagedAck: Int = await unmanagedBarrier
+    let unmanagedReleased = await isPortReleased(port)
+    println(unmanagedReleased)
+
+    let supervisor = oneForOne(2, 1000)
+    let managed = supervisor.start(Acceptor(), permanentChildPolicy())
+    let supervisedStart = managed.request(start)
+    let supervisedPort: Int = await supervisedStart
+    managed.fail()
+    let supervisedBarrier = barrier.request(ping)
+    let supervisedAck: Int = await supervisedBarrier
+    let supervisedReleased = await isPortReleased(supervisedPort)
+    println(supervisedReleased)
+}
+fn main() {
+    let task = exercise()
+    match runTasks() {
+        Ok(_) => println("tasks finished")
+        Err(_) => println("actor failure observed")
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-actor-failure-network-cleanup-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actor-failure-network-cleanup", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "true\\ntrue\\nactor failure observed\\n")
+
+    def test_native_actor_crash_diagnostics_redact_secret_arguments(self) -> None:
+        source = '''actor Broken {
+    on fail() {
+        match environment("TYVERA_NATIVE_ACTOR_SECRET") {
+            Some(token) => {
+                let failure: Float = 1 / 0
+            }
+            None => {}
+        }
+    }
+}
+fn main() {
+    let broken = spawn(Broken())
+    broken.fail()
+    match runActors() {
+        Ok(_) => println("unexpected success")
+        Err(reason) => eprintln(reason)
+    }
+}
+'''
+        secret = "fake-actor-secret-must-not-appear"
+        with patch.dict(os.environ, {"TYVERA_NATIVE_ACTOR_SECRET": secret}):
+            with tempfile.TemporaryDirectory(prefix="tyvera-native-secret-actor-") as temporary:
+                root = Path(temporary)
+                reference = self._reference_result(source, root)
+                native = self._native_source_result(source, root, root / "secret-actor", root)
+                self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+                self.assertNotIn(secret, native.stdout + native.stderr)
+                self.assertNotIn(secret, reference[1] + reference[2])
+
     def test_native_actor_stop_waits_for_pending_accept_cleanup(self) -> None:
         source = '''async fn waitForAccept(ready: ReplySender<Int>) {
     let opened = await tcpListen("127.0.0.1", 0, 8)
@@ -1000,7 +1107,7 @@ fn main() {
             Ok(address) => {
                 ready.send(address.port())
                 let pending = listener.accept()
-                let accepted = await pending
+                let accepted = await move pending
                 match move accepted {
                     Err(_) => {}
                     Ok(connection) => connection.close()

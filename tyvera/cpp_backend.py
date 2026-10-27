@@ -1559,7 +1559,41 @@ struct TaskCancelled final : std::exception {
     const char* what() const noexcept override { return "task was cancelled"; }
 };
 
-inline thread_local std::unique_lock<std::mutex>* active_execution_lock = nullptr;
+struct NativeExecutionMutex {
+    std::mutex state_mutex;
+    std::condition_variable changed;
+    bool locked = false;
+
+    void lock() {
+        std::unique_lock<std::mutex> lock(state_mutex);
+        changed.wait(lock, [this]() { return !locked; });
+        locked = true;
+    }
+    bool try_lock() {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        if (locked) return false;
+        locked = true;
+        return true;
+    }
+    template <typename Cancelled>
+    bool lock_or_cancel(Cancelled&& cancelled) {
+        std::unique_lock<std::mutex> lock(state_mutex);
+        changed.wait(lock, [this, &cancelled]() { return !locked || cancelled(); });
+        if (cancelled()) return false;
+        locked = true;
+        return true;
+    }
+    void unlock() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            locked = false;
+        }
+        changed.notify_all();
+    }
+    void notify_waiters() noexcept { changed.notify_all(); }
+};
+void notify_execution_waiters() noexcept;
+inline thread_local std::unique_lock<NativeExecutionMutex>* active_execution_lock = nullptr;
 constexpr std::size_t MAX_NATIVE_TASK_VALUES_PER_RUN = 4096;
 constexpr std::size_t MAX_NATIVE_UNFINISHED_TASKS_PER_RUN = 64;
 struct TaskControl {
@@ -1627,6 +1661,7 @@ struct TaskControl {
         for (auto item = owned.rbegin(); item != owned.rend(); ++item) (*item)->request_cancel();
         lifecycle_changed.notify_all();
         notify_waiters();
+        notify_execution_waiters();
         return true;
     }
     bool is_cancelled() const noexcept { return cancellation_requested.load(std::memory_order_acquire); }
@@ -1707,10 +1742,12 @@ struct TaskControl {
                 }
             }
         } catch (...) {
-            if (resume_serialized && !execution_lock->owns_lock()) execution_lock->lock();
+            if (resume_serialized && !execution_lock->owns_lock() && !is_cancelled())
+                execution_lock->lock();
             throw;
         }
-        if (resume_serialized && !execution_lock->owns_lock()) execution_lock->lock();
+        if (resume_serialized && !execution_lock->owns_lock() && !is_cancelled())
+            execution_lock->lock();
     }
     void notify_owner_failure() {
         if (!owner) return;
@@ -1721,7 +1758,7 @@ struct TaskControl {
 inline std::string cleanup_failure_suffix();
 struct NativeScheduler {
     std::mutex mutex;
-    std::mutex execution_mutex;
+    NativeExecutionMutex execution_mutex;
     std::condition_variable changed;
     std::vector<std::shared_ptr<TaskControl>> tasks;
     bool running = false;
@@ -1730,6 +1767,9 @@ struct NativeScheduler {
 inline NativeScheduler& native_scheduler() {
     static NativeScheduler value;
     return value;
+}
+inline void notify_execution_waiters() noexcept {
+    try { native_scheduler().execution_mutex.notify_waiters(); } catch (...) {}
 }
 inline void notify_task_scheduler() noexcept {
     try {
@@ -1742,17 +1782,21 @@ inline void notify_task_scheduler() noexcept {
 }
 inline thread_local TaskControl* active_task_control = nullptr;
 class NativeTaskExecution {
-    std::unique_lock<std::mutex> lock_;
-    std::unique_lock<std::mutex>* previous_;
+    std::unique_lock<NativeExecutionMutex> lock_;
+    std::unique_lock<NativeExecutionMutex>* previous_;
     TaskControl* previous_task_;
 public:
     explicit NativeTaskExecution(TaskControl& task)
-        : lock_(native_scheduler().execution_mutex, std::defer_lock), previous_(active_execution_lock),
-          previous_task_(active_task_control) {
+        : previous_(active_execution_lock), previous_task_(active_task_control) {
         active_task_control = &task;
         if (task.serialized) {
-            lock_.lock();
-            active_execution_lock = &lock_;
+            auto& execution = native_scheduler().execution_mutex;
+            if (execution.lock_or_cancel([&task]() { return task.is_cancelled(); })) {
+                lock_ = std::unique_lock<NativeExecutionMutex>(execution, std::adopt_lock);
+                active_execution_lock = &lock_;
+            } else {
+                active_execution_lock = nullptr;
+            }
         } else {
             active_execution_lock = nullptr;
         }
@@ -1760,8 +1804,8 @@ public:
     ~NativeTaskExecution() { active_execution_lock = previous_; active_task_control = previous_task_; }
 };
 struct ActiveExecutionLockScope {
-    std::unique_lock<std::mutex>* previous;
-    explicit ActiveExecutionLockScope(std::unique_lock<std::mutex>& lock)
+    std::unique_lock<NativeExecutionMutex>* previous;
+    explicit ActiveExecutionLockScope(std::unique_lock<NativeExecutionMutex>& lock)
         : previous(active_execution_lock) { active_execution_lock = &lock; }
     ~ActiveExecutionLockScope() { active_execution_lock = previous; }
 };
@@ -3506,9 +3550,6 @@ inline bool task_tree_contains_active(const TaskControl& task) noexcept {
 }
 inline void wait_for_actor_task(const std::shared_ptr<TaskControl>& task) noexcept {
     if (!task || task_tree_contains_active(*task)) return;
-    auto* execution_lock = active_execution_lock;
-    const bool resume_execution = execution_lock && execution_lock->owns_lock();
-    if (resume_execution) execution_lock->unlock();
     try {
         if (!task->done.load(std::memory_order_acquire)
             && !task->started.load(std::memory_order_acquire))
@@ -3518,9 +3559,6 @@ inline void wait_for_actor_task(const std::shared_ptr<TaskControl>& task) noexce
             return task->done.load(std::memory_order_acquire);
         });
     } catch (...) {}
-    if (resume_execution && !execution_lock->owns_lock()) {
-        try { execution_lock->lock(); } catch (...) {}
-    }
 }
 inline void cancel_actor_tasks(const std::shared_ptr<ActorBase>& actor) noexcept {
     if (!actor) return;
@@ -6085,7 +6123,7 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
             }
         }
         if (pump_actor) {
-            std::unique_lock<std::mutex> actor_turn_lock(scheduler.execution_mutex);
+            std::unique_lock<NativeExecutionMutex> actor_turn_lock(scheduler.execution_mutex);
             ActiveExecutionLockScope actor_execution_scope(actor_turn_lock);
             const auto actor_result = run_actors(file, line, column, false, 1, false);
             if (std::holds_alternative<std::string>(actor_result) && scheduler_failure.empty())

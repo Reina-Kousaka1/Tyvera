@@ -25,7 +25,8 @@ This package has an experimental native C++17 path for linked source
 modules. Linux CI exercises REST and Gateway flows through both the reference
 runtime and native executables against local fake TLS services. The checked-in
 bot example composes the Gateway Task under a transiently supervised
-`GatewayRunner` actor, whose stop/crash lifecycle cancels that Task. The package
+`GatewayRunner` actor. Native lifecycle changes cancel and drain other
+actor-owned Tasks before state is cleared or rebuilt. The package
 does not yet provide a reusable Actor/Supervisor client API, a shared REST
 bucket/global rate-limit coordinator or request queue, a typed event callback,
 cache, or shard coordinator. The package manager is not implemented and this
