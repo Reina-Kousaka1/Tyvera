@@ -21,12 +21,14 @@ host detection and secret-wrapped environment lookup. Ubuntu CI asserts the
 Linux x86-64 host and runs the complete test suite on Python 3.10 and 3.13;
 the separate package job targets Ubuntu 24.04 x86-64.
 Windows and macOS remain host-compatible bootstrap targets where the current
-Python runtime and tests work. The experimental C++17 backend has native TCP
-and DNS only on Linux; those APIs return a controlled unsupported-platform
-`Result` on other native targets. Ubuntu x86-64 is CI-tested. ARM64 remains
-recognized by the platform adapter but native networking has no ARM64 CI
-coverage yet. This native subset does not make Linux-specific details part of
-the language.
+Python runtime and tests work. The experimental C++17 backend has native TCP,
+DNS, and verified TLS client support on Linux. Native TCP/DNS calls return a
+controlled unsupported-platform `Result` on other native targets; the native
+compiler rejects programs using TLS outside Linux. TLS uses OpenSSL and
+requires its development package at build time plus the system OpenSSL runtime
+libraries. Ubuntu x86-64 is CI-tested. ARM64 remains recognized by the platform
+adapter but native networking has no ARM64 CI coverage yet. This native subset
+does not make Linux-specific details part of the language.
 
 ## Cooperative shutdown
 
@@ -46,7 +48,9 @@ grace period or forced termination of arbitrary child-process trees exists.
 ## Security boundary
 
 Environment values and process output are bounded at the adapter. Child
-processes receive an explicit environment mapping; by default it is empty.
+processes receive an explicit environment mapping; by default it is empty. The
+native runtime ignores `SIGPIPE` so a disconnected network peer is handled as
+an I/O failure instead of terminating the process.
 Arguments are separate argv elements, never shell text. Diagnostics omit
 argument and environment contents. The environment intrinsic returns only
 `Secret<String>`. The existing `Secret` redaction and `.tyvera.secrets` file

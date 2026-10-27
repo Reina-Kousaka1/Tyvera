@@ -25,7 +25,7 @@ not import or depend on execution code.
 
 Async I/O intrinsics are checked as typed task results and use the same
 `CheckedProgram.resource_types`, move sites, cleanup points, and ownership
-transfers as files. `TcpConnection` and `TcpListener` are move-only resources;
+transfers as files. `TcpConnection`, `TlsConnection`, and `TcpListener` are move-only resources;
 task results carrying them are consumed once. The reference runtime's
 `tyvera/io_backend.py` is an internal platform adapter for readiness
 registration, worker completion, and wakeup. It does not expose Python socket
@@ -51,10 +51,11 @@ binding scopes and mutability, entry-point shape, loop-control placement, and
 function.
 
 `tyvera/lowering.py` consumes only a checked program; it does not re-run type
-inference. The IR supports async functions, direct task calls, `await`,
-`runTasks`, and the existing TCP/DNS value and method signatures. Actors,
-supervisors, task groups, task cancellation/deadlines, TLS, HTTP, classes,
-interfaces, and generic functions remain rejected by `tyvera build`.
+inference. The IR supports async functions, direct task calls, `await`, `runTasks`,
+and existing TCP/DNS/TLS client value and method signatures. Native task
+cancellation and monotonic deadlines are implemented for the supported task
+subset. Actors, supervisors, task groups, HTTP, classes, interfaces, and generic
+functions remain rejected by `tyvera build`.
 
 ## Three separate contracts
 
@@ -120,8 +121,12 @@ API. Experimental HTTP/1.1 codecs, a typed client, a bounded concurrent
 server, verified TLS client connections, and a bounded WebSocket client use
 that owned byte-stream path in the reference interpreter. TLS uses the host
 trust store, SNI, and hostname verification; Tyvera does not implement
-cryptography. The native C++ backend has an experimental Linux TCP/DNS subset,
-but no native TLS, HTTP, or WebSocket runtime.
+cryptography. The native C++ backend has an experimental Linux TCP/DNS subset and a TLS
+client built on OpenSSL. It verifies the platform trust paths and the requested
+DNS hostname or IP address by default, requires TLS 1.2 or later, and exposes
+no insecure verification mode. Native TLS builds link the host OpenSSL
+libraries, and the executable requires those libraries at runtime. Native V1
+accepts ASCII DNS names and IP literals; other host names return a controlled error. HTTP and WebSocket remain interpreter-only.
 HTTP/2, HTTP/3, TLS server mode, database protocols, and other application
 protocols remain separate work.
 
@@ -238,7 +243,7 @@ does not make C++ part of Tyvera's language.
 | Text resources | `TextFile`, `TextReader`, `TextWriter`, `using`, move transfer, `Result`/function transfer, synchronous methods, modes, close/isOpen, and deterministic LIFO cleanup are implemented. |
 | Records, tuples, user-defined enums, classes, interfaces, generic functions | Interpreter-only. |
 | `Task<T>`, async functions, `await`, `runTasks()` | Experimental native subset; task bodies are serialized and I/O waits use bounded worker threads. Cooperative task/child cancellation and monotonic `withTimeout(Duration)` deadlines are supported; `tryResult()`, task groups, and actor ownership remain unsupported. |
-| DNS and TCP | Experimental on native Linux: `resolveHost`, `tcpConnect`, `tcpListen`, `accept`, `read`, `write`, `writeAll`, address queries, and RAII close. Uses `Result<T,String>`. TLS/HTTP/WebSocket remain interpreter-only. |
+| DNS, TCP, and TLS client | Experimental on native Linux: `resolveHost`, `tcpConnect`, `tcpListen`, `accept`, connection read/write, and verified `tlsConnect` with hostname/IP checks, all as typed `Task<Result<...,String>>` operations. RAII handles close sockets and TLS sessions. HTTP/WebSocket remain interpreter-only. |
 | Actors, Supervisors | Interpreter-only; native lowering rejects these constructs. |
 | `hostOS()`, `hostArchitecture()`, `monotonicMilliseconds()` | Native C++17 runtime and reference implementations; OS/architecture names are normalized and elapsed time is monotonic. |
 | Native SIGINT/SIGTERM shutdown | Generated C++17 records the first signal and unwinds at statement/loop safe points; scope resources use RAII cleanup. |

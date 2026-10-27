@@ -700,20 +700,22 @@ Timeout and I/O cancellation do not change the ownership rules of the resource.
 
 This first version has no user-defined general `Stream` interface. TCP
 connections establish the byte-stream contract and text files keep their
-existing text API. HTTP V1 uses bounded buffering and the TCP byte-stream API;
+existing text API. HTTP V1 uses bounded buffering and the TCP byte-stream API.
 The reference runtime adapts verified TLS client connections through the
 platform TLS implementation; certificate-chain and hostname verification are
 enabled by default. `https://` requests use this adapter. A bounded WebSocket
 client supports `ws://` and verified `wss://`, masking, control frames,
-fragmentation, bounded payloads, and graceful close. These remain experimental
-interpreter-only features; the native backend rejects them. Native TCP and DNS
-are an experimental Linux-only subset. The native backend also accepts async
-functions, `Task<T>`, `await`, `runTasks()`, and cooperative `Task.cancel()`,
-`isCancelled()`, and `isDone()`. Cancellation cascades through owned child tasks
-and is checked at task statement/loop and socket-poll boundaries. A system DNS
-lookup cannot be interrupted mid-call. Native deadlines, task groups, Actors,
-Supervisors, TLS, WebSockets, or HTTP are not implemented. The reference interpreter remains the complete runtime for those
-features.
+fragmentation, bounded payloads, and graceful close. HTTP and WebSocket remain
+experimental interpreter-only features. Native TCP, DNS, and verified TLS
+client operations form an experimental Linux-only subset; native TLS uses
+OpenSSL trust paths and verifies DNS hostnames and IP addresses by default.
+The native backend also accepts async functions, `Task<T>`, `await`,
+`runTasks()`, cooperative `Task.cancel()`, `isCancelled()`, `isDone()`, and
+`withTimeout(Duration)`. Cancellation cascades through owned child tasks and is
+checked at task statement/loop and socket-poll boundaries. A system DNS lookup
+cannot be interrupted mid-call. Native task groups, Actors, Supervisors, HTTP,
+and WebSockets are not implemented. The reference interpreter remains the
+complete runtime for those features.
 
 ## JSON values
 
@@ -1033,11 +1035,11 @@ modules, external secret-store provider, native interop, garbage collector
 implementation, and package manager. The native compiler supports the
 scalar/control-flow core, `Option`/`Result` and their supported patterns, typed
 `List`/`Map`, `Byte`/`Bytes`, bounded `ByteBuffer`, synchronous text/binary/path
-I/O, and owned synchronous text-file resources. The experimental Linux path
-additionally supports async functions, `Task<T>`, `await`, `runTasks()`, DNS,
-TCP, and cooperative task cancellation. Classes, generic functions, Actors,
-Supervisors, task groups, native deadlines, TLS, WebSockets, HTTP, and native FFI remain
-unsupported by the native backend. `await` remains statement-only;
+I/O, and owned synchronous text-file resources. The experimental Linux path additionally supports async functions, `Task<T>`,
+`await`, `runTasks()`, DNS, TCP, a verified TLS client, cooperative task
+cancellation, and monotonic deadlines. Classes, generic functions, Actors,
+Supervisors, task groups, WebSockets, HTTP, and native FFI remain unsupported
+by the native backend. `await` remains statement-only;
 synchronous calls are atomic.
 `runActors()` remains non-blocking; `runTasks()` waits for task deadlines.
 Actor request timeouts do not interrupt work. No performance claim is made. No

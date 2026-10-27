@@ -143,9 +143,10 @@ There is no dynamic route handler, middleware, request/response streaming,
 compression, automatic JSON-to-record codec, or importable `tyvera.http`
 module. Existing `Json` values can be parsed or serialized explicitly. The
 reference WebSocket client uses the same verified TLS connection for `wss://`
-and has bounded framing; networking is still unsupported by the native
-backend. HTTP/2, HTTP/3, TLS server mode, native networking, databases, and
-application-specific protocols remain outside this milestone.
+and has bounded framing. The experimental native backend currently supports a
+Linux TCP/DNS path and a verified TLS client, but does not yet support HTTP or
+WebSockets. HTTP/2, HTTP/3, TLS server mode, databases, and application-specific
+protocols remain outside this milestone.
 
 The reference implementation uses a backend-independent byte codec and the
 existing internal TCP/task adapter. A future native runtime can replace the

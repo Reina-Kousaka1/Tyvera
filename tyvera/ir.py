@@ -30,6 +30,7 @@ class IRType(str, Enum):
     TEXT_WRITER = "TextWriter"
     SOCKET_ADDRESS = "SocketAddress"
     TCP_CONNECTION = "TcpConnection"
+    TLS_CONNECTION = "TlsConnection"
     TCP_LISTENER = "TcpListener"
     VOID = "Void"
 
@@ -354,7 +355,7 @@ def _hashable_key_type(type_ref: IRTypeRef) -> bool:
 def _contains_resource(type_ref: IRTypeRef) -> bool:
     resources = {
         IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
-        IRType.TCP_CONNECTION, IRType.TCP_LISTENER,
+        IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER,
     }
     if type_ref in resources:
         return True
@@ -399,6 +400,17 @@ def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef
         }
         return signatures.get(method)
     if isinstance(receiver, IRType) and receiver == IRType.TCP_CONNECTION:
+        signatures = {
+            "read": ((IRType.INT,), _applied("Task", _applied("Result", _applied("Option", IRType.BYTES), IRType.STRING))),
+            "write": ((IRType.BYTES,), _applied("Task", _applied("Result", IRType.INT, IRType.STRING))),
+            "writeAll": ((IRType.BYTES,), _applied("Task", _applied("Result", IRType.INT, IRType.STRING))),
+            "localAddress": ((), _applied("Result", IRType.SOCKET_ADDRESS, IRType.STRING)),
+            "remoteAddress": ((), _applied("Result", IRType.SOCKET_ADDRESS, IRType.STRING)),
+            "close": ((), IRType.BOOL),
+            "isOpen": ((), IRType.BOOL),
+        }
+        return signatures.get(method)
+    if isinstance(receiver, IRType) and receiver == IRType.TLS_CONNECTION:
         signatures = {
             "read": ((IRType.INT,), _applied("Task", _applied("Result", _applied("Option", IRType.BYTES), IRType.STRING))),
             "write": ((IRType.BYTES,), _applied("Task", _applied("Result", IRType.INT, IRType.STRING))),
@@ -681,6 +693,7 @@ def _validate_expression(
             "runTasks": ((), _applied("Result", IRType.INT, IRType.STRING)),
             "resolveHost": ((IRType.STRING, IRType.INT), _applied("Task", _applied("Result", _applied("List", IRType.SOCKET_ADDRESS), IRType.STRING))),
             "tcpConnect": ((IRType.STRING, IRType.INT), _applied("Task", _applied("Result", IRType.TCP_CONNECTION, IRType.STRING))),
+            "tlsConnect": ((IRType.STRING, IRType.INT), _applied("Task", _applied("Result", IRType.TLS_CONNECTION, IRType.STRING))),
             "tcpListen": ((IRType.STRING, IRType.INT, IRType.INT), _applied("Task", _applied("Result", IRType.TCP_LISTENER, IRType.STRING))),
         }
         signature = signatures.get(expression.builtin)
@@ -771,9 +784,9 @@ def _validate_statements(
             expected_result = _applied("Result", statement.resource.type, IRType.STRING)
             if (statement.resource.type not in {
                     IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
-                    IRType.TCP_CONNECTION, IRType.TCP_LISTENER,
+                    IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER,
                 } or acquisition_type != expected_result):
-                raise _invalid(statement.location, "IR using requires a checked file or TCP Result acquisition")
+                raise _invalid(statement.location, "IR using requires a checked file or network Result acquisition")
             if statement.resource.identifier in seen_ids:
                 raise _invalid(statement.location, "IR reuses a local identifier")
             scopes.append({statement.resource.identifier: statement.resource})

@@ -37,6 +37,11 @@ jobs:
       - name: Verify native C++ toolchain
         run: g++ --version
 
+      - name: Install OpenSSL native TLS dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libssl-dev openssl
+
       - name: Install Tyvera
         run: python -m pip install --editable .
 

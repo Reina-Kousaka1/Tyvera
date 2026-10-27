@@ -228,10 +228,12 @@ byte-stream implementation; text files retain text-oriented methods. The
 experimental HTTP/1.1 codec/client/server operate on bounded `Bytes` messages
 over owned TCP connections. HTTP request/response values are ordinary values;
 `HttpServer`, `TlsConnection`, and `WebSocket` are move-only resources in the
-reference interpreter. TLS client verification uses the platform trust store
-and hostname checks; WebSocket owns its connection and closes on scope unwind.
-`TlsConnection`, `WebSocket`, and `HttpServer` remain interpreter-only. Native
-TCP/DNS is an experimental Linux subset. TLS server mode, native TLS/HTTP/
+reference interpreter. Native Linux also supports an experimental move-only
+`TlsConnection` client using OpenSSL's configured trust paths, TLS 1.2 or later,
+and hostname/IP verification. It owns the TCP handle and TLS session; scope cleanup closes the
+TLS session before the socket, while cancellation releases pending operation
+descriptors. `WebSocket` and `HttpServer` remain interpreter-only. Native
+TCP/DNS/TLS is an experimental Linux subset. TLS server mode, native HTTP/
 WebSockets, session Resume, and protocols beyond HTTP/1.1 are not implemented.
 
 Native FFI is not implemented. A future ABI may pass `Byte` as an unsigned

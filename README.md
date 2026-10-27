@@ -37,12 +37,11 @@ experimental HTTP/1.1 codec, bounded concurrent server, static router, and
 typed HTTP client build on those same TCP tasks and resource rules. See
 [`examples/tcp_echo.tyv`](examples/tcp_echo.tyv) and
 [`examples/http_server.tyv`](examples/http_server.tyv) for local examples.
-The experimental native compiler supports the synchronous core plus selected
-`Option`/`Result`, collection, `Byte`, and immutable `Bytes` operations; see the
-[Backend Architecture](docs/backend-architecture.md) support table. Verified
-TLS client connections, HTTPS requests, and a bounded RFC 6455 WebSocket client
-are implemented in the reference runtime; networking remains unsupported by
-native executables.
+The experimental native compiler supports the documented typed subset and,
+on Linux, an async TCP/DNS/TLS client path; see the
+[Backend Architecture](docs/backend-architecture.md) support table. HTTP/HTTPS
+and WebSocket remain reference-runtime features and are not available in native
+executables.
 
 The deterministic actor runtime supports typed messages, isolated state, FIFO
 mailboxes, crash isolation, nested supervisors, bounded restart intensity,
@@ -229,12 +228,14 @@ and a cooperative task scheduler with nested `await`, scoped cancellation,
 implicit child joining, owner-local task groups, explicit child detachment,
 and task deadlines are implemented. Async text-file I/O, DNS, and TCP V1 are
 implemented. HTTP/1.1 V1 is implemented as an experimental codec, client,
-bounded server, and static router. The experimental native compiler supports
-the typed synchronous core plus selected value and collection features
-documented in [Backend Architecture](docs/backend-architecture.md); Actors,
-Tasks, resources, file I/O, networking, and HTTP remain interpreter-only. True
-parallel execution, native TLS/networking, separate standard-library modules,
-external secret stores, and broader native runtime support remain planned. See
+bounded server, and static router. The experimental native compiler supports the typed synchronous core plus
+selected value and collection features, synchronous file/binary/path I/O,
+owned file resources, and an experimental Linux async TCP/DNS/TLS client subset
+documented in
+[Backend Architecture](docs/backend-architecture.md). Actors, Supervisors,
+native HTTP/WebSockets, and broader runtime support remain interpreter-only or
+planned. True parallel execution, separate standard-library modules, and
+external secret stores remain planned. See
 the [roadmap](docs/roadmap.md) for sequence and scope, and
 [release/versioning notes](docs/release-process.md) for the
 pre-1.0 release approach.

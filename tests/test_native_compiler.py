@@ -6,9 +6,12 @@ import signal
 import shlex
 import shutil
 import socket
+import socketserver
+import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -188,6 +191,29 @@ fn main() {
         generated = emit_cpp(module)
         self.assertIn("duration_seconds", generated)
         self.assertIn("task_with_timeout", generated)
+
+    def test_native_verified_tls_connect_lowers_to_typed_ir(self) -> None:
+        module = self.lower('''async fn connect() {
+    let opened = await tlsConnect("localhost", 443)
+    using connection = move opened {
+        println(connection.isOpen())
+        connection.close()
+    } else error {
+        println(error)
+    }
+}
+fn main() {
+    let task = connect()
+    runTasks()
+}''')
+        using_statement = next(
+            statement for statement in module.functions[0].body if isinstance(statement, IRUsing)
+        )
+        self.assertEqual(using_statement.resource.type, IRType.TLS_CONNECTION)
+        generated = emit_cpp(module)
+        self.assertIn("#define TYVERA_NATIVE_TLS 1", generated)
+        self.assertIn("tyvera_runtime::tls_connect", generated)
+        self.assertIn("tyvera_runtime::tls_is_open", generated)
 
     def test_native_byte_buffer_and_binary_io_lower_to_typed_ir(self) -> None:
         module = self.lower('''fn main() {
@@ -533,6 +559,146 @@ class NativeExecutionTests(unittest.TestCase):
                 native.stdout,
                 "-2\n1500\n1\nDuration seconds must be finite and non-negative\n",
             )
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and HAS_CPP_COMPILER,
+        "native TLS tests require Linux, OpenSSL, and a C++17 compiler",
+    )
+    def test_native_tls_verifies_certificates_and_transfers_bytes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-tls-") as temporary:
+            root = Path(temporary)
+            certificate = root / "server-cert.pem"
+            private_key = root / "server-key.pem"
+            unrelated_certificate = root / "unrelated-cert.pem"
+            unrelated_key = root / "unrelated-key.pem"
+            openssl = shutil.which("openssl")
+            if openssl is None:
+                self.skipTest("OpenSSL command line tools are unavailable")
+            for cert, key in ((certificate, private_key), (unrelated_certificate, unrelated_key)):
+                subprocess.run(
+                    [
+                        openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-keyout", str(key), "-out", str(cert), "-days", "2",
+                        "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+            server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_context.load_cert_chain(certificate, private_key)
+
+            class EchoHandler(socketserver.BaseRequestHandler):
+                def handle(self) -> None:
+                    payload = self.request.recv(64)
+                    if payload:
+                        self.request.sendall(payload.upper())
+
+            class LoopbackTlsServer(socketserver.ThreadingTCPServer):
+                allow_reuse_address = True
+                daemon_threads = True
+
+                def get_request(self):
+                    connection, address = super().get_request()
+                    try:
+                        return server_context.wrap_socket(connection, server_side=True), address
+                    except OSError:
+                        connection.close()
+                        raise
+
+                def handle_error(self, request, client_address) -> None:
+                    return
+
+            server = LoopbackTlsServer(("127.0.0.1", 0), EchoHandler)
+            server_thread = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True,
+            )
+            server_thread.start()
+            port = server.server_address[1]
+            source = f'''async fn connect(host: String, port: Int, echo: Bool) {{
+    let opened = await tlsConnect(host, port)
+    using connection = move opened {{
+        if echo {{
+            let writing = connection.writeAll(bytesFromString("ping"))
+            let written = await move writing
+            match move written {{
+                Ok(count) => println(count)
+                Err(error) => println(error)
+            }}
+            let reading = connection.read(16)
+            let received = await move reading
+            match move received {{
+                Ok(Some(bytes)) => match bytes.toString() {{
+                    Ok(text) => println(text)
+                    Err(error) => println(error)
+                }}
+                Ok(None) => println("unexpected EOF")
+                Err(error) => println(error)
+            }}
+        }} else {{
+            println("unexpected trusted connection")
+        }}
+    }} else error {{
+        println(error)
+    }}
+}}
+fn main() {{
+    let trusted = connect("127.0.0.1", {port}, true)
+    match runTasks() {{
+        Ok(_) => println("TLS exchange finished")
+        Err(error) => println(error)
+    }}
+    let wrong_host = connect("localhost", {port}, false)
+    match runTasks() {{
+        Ok(_) => println("TLS verification check finished")
+        Err(error) => println(error)
+    }}
+}}'''
+            untrusted_source = f'''async fn connect() {{
+    let opened = await tlsConnect("127.0.0.1", {port})
+    using connection = move opened {{
+        connection.close()
+        println("unexpected trusted connection")
+    }} else error {{
+        println(error)
+    }}
+}}
+fn main() {{
+    let task = connect()
+    match runTasks() {{
+        Ok(_) => println("untrusted TLS check finished")
+        Err(error) => println(error)
+    }}
+}}'''
+            try:
+                with patch.dict(os.environ, {"SSL_CERT_FILE": str(certificate)}):
+                    expected = self._reference_result(source, root)
+                    native = self._native_source_result(
+                        source, root, root / "tls-client", root,
+                    )
+                self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+                self.assertEqual(
+                    native.stdout,
+                    "4\nPING\nTLS exchange finished\nTLS certificate verification failed\n"
+                    "TLS verification check finished\n",
+                )
+                with patch.dict(os.environ, {"SSL_CERT_FILE": str(unrelated_certificate)}):
+                    expected_untrusted = self._reference_result(untrusted_source, root)
+                    native_untrusted = self._native_source_result(
+                        untrusted_source, root, root / "tls-untrusted-client", root,
+                    )
+                self.assertEqual(
+                    (native_untrusted.returncode, native_untrusted.stdout, native_untrusted.stderr),
+                    expected_untrusted,
+                )
+                self.assertEqual(
+                    native_untrusted.stdout,
+                    "TLS certificate verification failed\nuntrusted TLS check finished\n",
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=1)
 
     def test_native_task_timeout_cancels_source_and_matches_reference(self) -> None:
         source = '''async fn background() {

@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import sys
+from dataclasses import fields, is_dataclass
 import subprocess
 import tempfile
 from pathlib import Path
@@ -58,6 +60,9 @@ class CppNativeBackend:
 
     def build(self, module: IRModule, output: str | Path, project_root: str | Path | None = None) -> Path:
         validate_ir(module)
+        native_tls = _module_uses_tls(module)
+        if native_tls and not sys.platform.startswith("linux"):
+            raise Diagnostic(module.functions[0].location, "backend", "native TLS is currently supported only on Linux")
         destination = Path(output).expanduser().resolve()
         if destination.exists() and destination.is_dir():
             raise Diagnostic(module.functions[0].location, "backend", "native output path names a directory")
@@ -73,7 +78,7 @@ class CppNativeBackend:
                 source_file = directory / "program.cpp"
                 candidate = directory / ("program.exe" if os.name == "nt" else "program")
                 source_file.write_text(source, encoding="utf-8", newline="\n")
-                command = _compiler_command(compiler, source_file, candidate)
+                command = _compiler_command(compiler, source_file, candidate, native_tls=native_tls)
                 try:
                     result = subprocess.run(
                         command,
@@ -131,12 +136,15 @@ def _find_compiler(location: Location) -> tuple[str, ...]:
     )
 
 
-def _compiler_command(compiler: tuple[str, ...], source: Path, output: Path) -> list[str]:
+def _compiler_command(compiler: tuple[str, ...], source: Path, output: Path, *, native_tls: bool = False) -> list[str]:
     command = list(compiler)
     executable = Path(command[0]).name.lower()
     if executable in {"cl", "cl.exe"}:
         return [*command, "/nologo", "/std:c++17", "/EHsc", str(source), f"/Fe:{output}"]
-    return [*command, "-std=c++17", "-O2", "-pthread", str(source), "-o", str(output)]
+    command.extend(["-std=c++17", "-O2", "-pthread", str(source), "-o", str(output)])
+    if native_tls:
+        command.extend(["-lssl", "-lcrypto"])
+    return command
 
 
 def emit_cpp(module: IRModule, project_root: str | Path | None = None) -> str:
@@ -162,6 +170,8 @@ class _CppGenerator:
             "/*TYVERA_PROJECT_ROOT*/",
             f"inline const std::string project_root_text = std::string({_cpp_byte_string(encoded_root)}, {len(encoded_root)});",
         )
+        if _module_uses_tls(self.module):
+            runtime = "#define TYVERA_NATIVE_TLS 1\n" + runtime
         self.lines.extend(runtime.splitlines())
         self._line("namespace tyvera_generated {")
         self.indent += 1
@@ -232,6 +242,7 @@ class _CppGenerator:
             IRType.BOOL: "bool",
             IRType.STRING: "std::string",
             IRType.BYTE: "std::uint8_t",
+            IRType.TLS_CONNECTION: "std::shared_ptr<tyvera_runtime::TlsConnection>",
             IRType.DURATION: "tyvera_runtime::Duration",
             IRType.BYTES: "std::vector<std::uint8_t>",
             IRType.BYTE_BUFFER: "std::shared_ptr<tyvera_runtime::ByteBuffer>",
@@ -563,6 +574,7 @@ class _CppGenerator:
                 "runTasks": "run_tasks",
                 "resolveHost": "resolve_host",
                 "tcpConnect": "tcp_connect",
+                "tlsConnect": "tls_connect",
                 "tcpListen": "tcp_listen",
             }
             function = runtime_functions.get(expression.builtin)
@@ -585,7 +597,7 @@ class _CppGenerator:
                 values.extend([_location_args(expression.location)])
             elif expression.builtin == "pathJoin":
                 values.append(_location_args(expression.location))
-            elif expression.builtin in {"runTasks", "resolveHost", "tcpConnect", "tcpListen"}:
+            elif expression.builtin in {"runTasks", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen"}:
                 values.append(_location_args(expression.location))
             call = f"tyvera_runtime::{function}({', '.join(values)})"
             lines.append(f"    return {call};")
@@ -745,6 +757,18 @@ class _CppGenerator:
             if method not in {"close", "isOpen"}:
                 values.append(_location_args(expression.location))
             return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
+        if expression.receiver.type == IRType.TLS_CONNECTION:
+            functions = {
+                "read": "tls_read", "write": "tls_write", "writeAll": "tls_write_all",
+                "localAddress": "tls_local_address", "remoteAddress": "tls_remote_address",
+                "close": "tls_close", "isOpen": "tls_is_open",
+            }
+            values = [receiver, *arguments]
+            if method == "write":
+                values.append("false")
+            if method not in {"close", "isOpen"}:
+                values.append(_location_args(expression.location))
+            return f"tyvera_runtime::{functions[method]}({', '.join(values)})"
         if expression.receiver.type == IRType.TCP_LISTENER:
             functions = {
                 "accept": "tcp_accept", "localAddress": "listener_local_address",
@@ -805,10 +829,31 @@ def _cpp_string_literal(value: str) -> str:
 def _ir_contains_resource(type_ref: IRTypeRef) -> bool:
     if type_ref in {
         IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
-        IRType.TCP_CONNECTION, IRType.TCP_LISTENER,
+        IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER,
     }:
         return True
     return isinstance(type_ref, IRAppliedType) and any(_ir_contains_resource(item) for item in type_ref.arguments)
+
+
+def _module_uses_tls(module: IRModule) -> bool:
+    seen: set[int] = set()
+
+    def contains_tls(value) -> bool:
+        if isinstance(value, IRType):
+            return value == IRType.TLS_CONNECTION
+        if isinstance(value, IRAppliedType):
+            return any(contains_tls(argument) for argument in value.arguments)
+        if isinstance(value, (tuple, list)):
+            return any(contains_tls(item) for item in value)
+        if not is_dataclass(value):
+            return False
+        identity = id(value)
+        if identity in seen:
+            return False
+        seen.add(identity)
+        return any(contains_tls(getattr(value, item.name)) for item in fields(value))
+
+    return contains_tls(module)
 
 
 _RUNTIME = r'''#include <charconv>
@@ -851,6 +896,10 @@ _RUNTIME = r'''#include <charconv>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(TYVERA_NATIVE_TLS)
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+#endif
 #endif
 
 namespace tyvera_runtime {
@@ -878,6 +927,10 @@ inline bool install_shutdown_handlers() noexcept {
     if (std::signal(SIGINT, shutdown_signal_handler) == SIG_ERR) return false;
 #ifdef SIGTERM
     if (std::signal(SIGTERM, shutdown_signal_handler) == SIG_ERR) return false;
+#endif
+#ifdef SIGPIPE
+    // TLS BIO writes must report peer disconnects instead of terminating the process.
+    if (std::signal(SIGPIPE, SIG_IGN) == SIG_ERR) return false;
 #endif
     return true;
 }
@@ -2033,6 +2086,56 @@ struct TcpListener {
             record_cleanup_failure(source_file, source_line, source_column, "cannot close TCP listener");
     }
 };
+#if defined(__linux__) && defined(TYVERA_NATIVE_TLS)
+struct TlsSession {
+    SSL_CTX* context = nullptr;
+    SSL* ssl = nullptr;
+    int descriptor = -1;
+    bool closed = false;
+    std::mutex mutex;
+    ~TlsSession() noexcept { close(); }
+    void close() noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (closed) return;
+        closed = true;
+        if (ssl) {
+            (void)SSL_shutdown(ssl);
+            SSL_free(ssl);
+            ssl = nullptr;
+        }
+        if (context) {
+            SSL_CTX_free(context);
+            context = nullptr;
+        }
+        if (descriptor >= 0) {
+            (void)::close(descriptor);
+            descriptor = -1;
+        }
+    }
+};
+struct TlsConnection {
+    std::shared_ptr<SocketHandle> socket;
+    std::shared_ptr<TlsSession> session;
+    SocketAddress local;
+    SocketAddress remote;
+    std::atomic<bool> pending_read{false};
+    std::atomic<bool> pending_write{false};
+    std::string source_file;
+    int source_line = 1;
+    int source_column = 1;
+    bool close() noexcept {
+        if (session) session->close();
+        return socket && socket->close();
+    }
+    bool is_open() const noexcept { return socket && socket->is_open(); }
+    ~TlsConnection() noexcept {
+        if (socket && socket->is_open() && !close())
+            record_cleanup_failure(source_file, source_line, source_column, "cannot close TLS connection");
+        else if (session)
+            session->close();
+    }
+};
+#endif
 
 inline void set_resource_location(const std::shared_ptr<TcpConnection>& resource,
                                   const std::string& file, int line, int column) {
@@ -2041,6 +2144,15 @@ inline void set_resource_location(const std::shared_ptr<TcpConnection>& resource
     resource->source_line = line;
     resource->source_column = column;
 }
+#if defined(__linux__) && defined(TYVERA_NATIVE_TLS)
+inline void set_resource_location(const std::shared_ptr<TlsConnection>& resource,
+                                  const std::string& file, int line, int column) {
+    if (!resource) return;
+    resource->source_file = file;
+    resource->source_line = line;
+    resource->source_column = column;
+}
+#endif
 inline void set_resource_location(const std::shared_ptr<TcpListener>& resource,
                                   const std::string& file, int line, int column) {
     if (!resource) return;
@@ -2272,6 +2384,101 @@ inline Task<StringResult<std::shared_ptr<TcpConnection>>> tcp_connect(
 #endif
     }, file, line, column);
 }
+
+#if defined(__linux__) && defined(TYVERA_NATIVE_TLS)
+inline Task<StringResult<std::shared_ptr<TlsConnection>>> tls_connect(
+    std::string host, std::int64_t port, const std::string& file, int line, int column) {
+    using Output = StringResult<std::shared_ptr<TlsConnection>>;
+    return make_io_task<Output>([host = std::move(host), port, file, line, column]() -> Output {
+        try {
+            task_checkpoint();
+            auto connected = tcp_connect(host, port, file, line, column).await(file, line, column);
+            if (std::holds_alternative<std::string>(connected))
+                return result_error<std::shared_ptr<TlsConnection>>(std::get<1>(std::move(connected)));
+            auto tcp = std::move(std::get<0>(connected));
+            if (!tcp || !tcp->socket || !tcp->socket->is_open())
+                return result_error<std::shared_ptr<TlsConnection>>("resource closed");
+
+            std::unique_ptr<SSL_CTX, decltype(&::SSL_CTX_free)> context(
+                SSL_CTX_new(TLS_client_method()), ::SSL_CTX_free);
+            if (!context || SSL_CTX_set_default_verify_paths(context.get()) != 1 ||
+                SSL_CTX_set_min_proto_version(context.get(), TLS1_2_VERSION) != 1)
+                return result_error<std::shared_ptr<TlsConnection>>("TLS connection setup failed");
+            SSL_CTX_set_verify(context.get(), SSL_VERIFY_PEER, nullptr);
+            std::unique_ptr<SSL, decltype(&::SSL_free)> ssl(SSL_new(context.get()), ::SSL_free);
+            if (!ssl) return result_error<std::shared_ptr<TlsConnection>>("TLS connection setup failed");
+
+            UniqueSocketFd tls_descriptor(tcp->socket->duplicate());
+            if (tls_descriptor.value < 0)
+                return result_error<std::shared_ptr<TlsConnection>>("resource closed");
+            BIO* bio = BIO_new_socket(tls_descriptor.value, BIO_NOCLOSE);
+            if (!bio) return result_error<std::shared_ptr<TlsConnection>>("TLS connection setup failed");
+            SSL_set_bio(ssl.get(), bio, bio);
+
+            std::string verification_host = host;
+            const auto scope = verification_host.find('%');
+            if (scope != std::string::npos) verification_host.resize(scope);
+            in_addr ipv4{};
+            in6_addr ipv6{};
+            const bool is_ip =
+                ::inet_pton(AF_INET, verification_host.c_str(), &ipv4) == 1 ||
+                ::inet_pton(AF_INET6, verification_host.c_str(), &ipv6) == 1;
+            auto* verification = SSL_get0_param(ssl.get());
+            if (is_ip) {
+                if (X509_VERIFY_PARAM_set1_ip_asc(verification, verification_host.c_str()) != 1)
+                    return result_error<std::shared_ptr<TlsConnection>>("TLS connection setup failed");
+            } else {
+                if (!std::all_of(host.begin(), host.end(), [](unsigned char value) { return value < 0x80; }))
+                    return result_error<std::shared_ptr<TlsConnection>>("TLS host name must be ASCII");
+                if (SSL_set_tlsext_host_name(ssl.get(), host.c_str()) != 1 ||
+                    X509_VERIFY_PARAM_set1_host(verification, host.c_str(), 0) != 1)
+                    return result_error<std::shared_ptr<TlsConnection>>("TLS connection setup failed");
+            }
+
+            for (;;) {
+                task_checkpoint();
+                errno = 0;
+                const int status = SSL_connect(ssl.get());
+                if (status == 1) break;
+                const int ssl_error = SSL_get_error(ssl.get(), status);
+                const int system_error = errno;
+                if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                    const short event = ssl_error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT;
+                    if (poll_descriptor(tls_descriptor.value, event, file, line, column) >= 0) continue;
+                    if (system_error != 0)
+                        return result_error<std::shared_ptr<TlsConnection>>(network_error_from_errno(system_error));
+                    return result_error<std::shared_ptr<TlsConnection>>("TLS handshake failed");
+                }
+                if (SSL_get_verify_result(ssl.get()) != X509_V_OK)
+                    return result_error<std::shared_ptr<TlsConnection>>("TLS certificate verification failed");
+                return result_error<std::shared_ptr<TlsConnection>>("TLS handshake failed");
+            }
+
+            auto session = std::make_shared<TlsSession>();
+            session->context = context.release();
+            session->ssl = ssl.release();
+            session->descriptor = tls_descriptor.release();
+            auto result = std::make_shared<TlsConnection>();
+            result->socket = std::move(tcp->socket);
+            result->session = std::move(session);
+            result->local = std::move(tcp->local);
+            result->remote = std::move(tcp->remote);
+            result->source_file = file;
+            result->source_line = line;
+            result->source_column = column;
+            tcp->socket.reset();
+            return result_ok<std::shared_ptr<TlsConnection>>(std::move(result));
+        } catch (const TaskCancelled&) {
+            throw;
+        } catch (const Failure&) {
+            throw;
+        } catch (...) {
+            return result_error<std::shared_ptr<TlsConnection>>("TLS connection setup failed");
+        }
+    }, file, line, column);
+}
+
+#endif
 
 inline Task<StringResult<std::shared_ptr<TcpListener>>> tcp_listen(
     std::string host, std::int64_t port, std::int64_t backlog,
@@ -2520,6 +2727,157 @@ inline Task<StringResult<std::int64_t>> tcp_write(
 #endif
     }, file, line, column);
 }
+#if defined(__linux__) && defined(TYVERA_NATIVE_TLS)
+inline StringResult<SocketAddress> tls_local_address(
+    const std::shared_ptr<TlsConnection>& connection, const std::string&, int, int) {
+    if (!connection || !connection->is_open()) return result_error<SocketAddress>("resource is closed");
+    return result_ok<SocketAddress>(connection->local);
+}
+inline StringResult<SocketAddress> tls_remote_address(
+    const std::shared_ptr<TlsConnection>& connection, const std::string&, int, int) {
+    if (!connection || !connection->is_open()) return result_error<SocketAddress>("resource is closed");
+    return result_ok<SocketAddress>(connection->remote);
+}
+inline bool tls_close(const std::shared_ptr<TlsConnection>& connection) {
+    return connection && connection->close();
+}
+inline bool tls_is_open(const std::shared_ptr<TlsConnection>& connection) {
+    return connection && connection->is_open();
+}
+inline Task<StringResult<std::optional<std::vector<std::uint8_t>>>> tls_read(
+    const std::shared_ptr<TlsConnection>& connection, std::int64_t max_bytes,
+    const std::string& file, int line, int column) {
+    using Output = StringResult<std::optional<std::vector<std::uint8_t>>>;
+    if (!connection || !connection->is_open() || !connection->session)
+        fail(file, line, column, "TlsConnection is closed");
+    if (max_bytes < 1 || max_bytes > 1048576) {
+        return make_io_task<Output>([]() -> Output {
+            return result_error<std::optional<std::vector<std::uint8_t>>>("read size must be between 1 and 1048576 bytes");
+        }, file, line, column);
+    }
+    auto pending = std::make_shared<PendingSocketOperation>(connection->pending_read, connection);
+    if (!pending->acquire()) {
+        return make_io_task<Output>([]() -> Output {
+            return result_error<std::optional<std::vector<std::uint8_t>>>("connection already has a pending read");
+        }, file, line, column);
+    }
+    return make_io_task<Output>([connection, pending, max_bytes, file, line, column]() -> Output {
+        PendingSocketOperationReset pending_reset{pending};
+        if (!connection || !connection->is_open() || !connection->session)
+            return result_error<std::optional<std::vector<std::uint8_t>>>("resource closed");
+        UniqueSocketFd readiness_descriptor(connection->socket->duplicate());
+        if (readiness_descriptor.value < 0)
+            return result_error<std::optional<std::vector<std::uint8_t>>>("resource closed");
+        try {
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(max_bytes));
+            for (;;) {
+                task_checkpoint();
+                int status = 0;
+                int ssl_error = SSL_ERROR_NONE;
+                int system_error = 0;
+                {
+                    std::lock_guard<std::mutex> lock(connection->session->mutex);
+                    if (connection->session->closed || !connection->session->ssl)
+                        return result_error<std::optional<std::vector<std::uint8_t>>>("resource closed");
+                    errno = 0;
+                    status = SSL_read(connection->session->ssl, bytes.data(), static_cast<int>(bytes.size()));
+                    if (status <= 0) {
+                        ssl_error = SSL_get_error(connection->session->ssl, status);
+                        system_error = errno;
+                    }
+                }
+                if (status > 0) {
+                    bytes.resize(static_cast<std::size_t>(status));
+                    return result_ok<std::optional<std::vector<std::uint8_t>>>(std::move(bytes));
+                }
+                if (ssl_error == SSL_ERROR_ZERO_RETURN)
+                    return result_ok<std::optional<std::vector<std::uint8_t>>>(std::nullopt);
+                if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                    const short event = ssl_error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT;
+                    const int ready = poll_socket(connection->socket, readiness_descriptor.value, event, file, line, column);
+                    if (ready == -2) return result_error<std::optional<std::vector<std::uint8_t>>>("resource closed");
+                    if (ready < 0) return result_error<std::optional<std::vector<std::uint8_t>>>("network operation failed");
+                    continue;
+                }
+                if (ssl_error == SSL_ERROR_SYSCALL && system_error != 0)
+                    return result_error<std::optional<std::vector<std::uint8_t>>>(network_error_from_errno(system_error));
+                return result_error<std::optional<std::vector<std::uint8_t>>>("TLS operation failed");
+            }
+        } catch (const TaskCancelled&) {
+            throw;
+        } catch (const Failure&) {
+            throw;
+        } catch (...) {
+            return result_error<std::optional<std::vector<std::uint8_t>>>("TLS operation failed");
+        }
+    }, file, line, column);
+}
+inline Task<StringResult<std::int64_t>> tls_write(
+    const std::shared_ptr<TlsConnection>& connection, std::vector<std::uint8_t> bytes, bool write_all,
+    const std::string& file, int line, int column) {
+    using Output = StringResult<std::int64_t>;
+    if (!connection || !connection->is_open() || !connection->session)
+        fail(file, line, column, "TlsConnection is closed");
+    if (bytes.empty())
+        return make_io_task<Output>([]() -> Output { return result_ok<std::int64_t>(0); }, file, line, column);
+    auto pending = std::make_shared<PendingSocketOperation>(connection->pending_write, connection);
+    if (!pending->acquire()) {
+        return make_io_task<Output>([]() -> Output {
+            return result_error<std::int64_t>("connection already has a pending write");
+        }, file, line, column);
+    }
+    return make_io_task<Output>([connection, pending, bytes = std::move(bytes), write_all, file, line, column]() -> Output {
+        PendingSocketOperationReset pending_reset{pending};
+        if (!connection || !connection->is_open() || !connection->session)
+            return result_error<std::int64_t>("resource closed");
+        UniqueSocketFd readiness_descriptor(connection->socket->duplicate());
+        if (readiness_descriptor.value < 0) return result_error<std::int64_t>("resource closed");
+        std::size_t offset = 0;
+        while (offset < bytes.size()) {
+            task_checkpoint();
+            const auto remaining = std::min<std::size_t>(
+                bytes.size() - offset, static_cast<std::size_t>(std::numeric_limits<int>::max()));
+            int status = 0;
+            int ssl_error = SSL_ERROR_NONE;
+            int system_error = 0;
+            {
+                std::lock_guard<std::mutex> lock(connection->session->mutex);
+                if (connection->session->closed || !connection->session->ssl)
+                    return result_error<std::int64_t>("resource closed");
+                errno = 0;
+                status = SSL_write(connection->session->ssl, bytes.data() + offset, static_cast<int>(remaining));
+                if (status <= 0) {
+                    ssl_error = SSL_get_error(connection->session->ssl, status);
+                    system_error = errno;
+                }
+            }
+            if (status > 0) {
+                offset += static_cast<std::size_t>(status);
+                if (!write_all) break;
+                continue;
+            }
+            if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                const short event = ssl_error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT;
+                const int ready = poll_socket(connection->socket, readiness_descriptor.value, event, file, line, column);
+                if (ready == -2) return result_error<std::int64_t>("resource closed");
+                if (ready < 0) return result_error<std::int64_t>("network operation failed");
+                continue;
+            }
+            if (ssl_error == SSL_ERROR_SYSCALL && system_error != 0)
+                return result_error<std::int64_t>(network_error_from_errno(system_error));
+            return result_error<std::int64_t>("TLS operation failed");
+        }
+        return result_ok<std::int64_t>(static_cast<std::int64_t>(offset));
+    }, file, line, column);
+}
+inline Task<StringResult<std::int64_t>> tls_write_all(
+    const std::shared_ptr<TlsConnection>& connection, std::vector<std::uint8_t> bytes,
+    const std::string& file, int line, int column) {
+    return tls_write(connection, std::move(bytes), true, file, line, column);
+}
+
+#endif
+
 inline Task<StringResult<std::int64_t>> tcp_write_all(
     const std::shared_ptr<TcpConnection>& connection, std::vector<std::uint8_t> bytes,
     const std::string& file, int line, int column) {

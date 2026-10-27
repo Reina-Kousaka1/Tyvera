@@ -91,6 +91,7 @@ _TYPE_MAP = {
     "TextWriter": IRType.TEXT_WRITER,
     "SocketAddress": IRType.SOCKET_ADDRESS,
     "TcpConnection": IRType.TCP_CONNECTION,
+    "TlsConnection": IRType.TLS_CONNECTION,
     "TcpListener": IRType.TCP_LISTENER,
     "Void": IRType.VOID,
     "Unit": IRType.VOID,
@@ -476,7 +477,7 @@ class _FunctionLowerer:
                 or receiver.type in {
                     IRType.BYTE, IRType.DURATION, IRType.BYTES, IRType.BYTE_BUFFER,
                     IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
-                    IRType.SOCKET_ADDRESS, IRType.TCP_CONNECTION, IRType.TCP_LISTENER,
+                    IRType.SOCKET_ADDRESS, IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER,
                 }
             ):
                 raise Diagnostic(expression.location, "backend", f"native backend does not yet support methods on {ir_type_name(receiver.type)}")
@@ -507,7 +508,7 @@ class _FunctionLowerer:
                 "milliseconds", "seconds", "durationFromSeconds", "byteFromInt", "bytesFromString", "byteBuffer", "readText", "writeText",
                 "readBytes", "writeBytes", "pathJoin", "pathExists", "openText",
                 "openTextReader", "openTextWriter", "hostOS", "hostArchitecture",
-                "monotonicMilliseconds", "runTasks", "resolveHost", "tcpConnect", "tcpListen",
+                "monotonicMilliseconds", "runTasks", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen",
             }:
                 return IRBuiltinCall(
                     expression.callee,
