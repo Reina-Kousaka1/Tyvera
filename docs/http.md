@@ -86,6 +86,12 @@ abrupt TCP close still returns a controlled `Err` and does not fabricate close
 metadata. This lets protocol clients apply their own typed reconnect policy
 without exposing WebSocket implementation objects.
 
+`webSocketUrl(String) -> Result<WebSocketUrl, String>` validates and parses a
+WebSocket URL before connection. `WebSocketUrl` exposes `scheme`, `host`,
+`port`, `target`, and `hostEndsWith(String)`. `webSocketConnect` accepts either
+the original URL string or this parsed value; protocol clients can inspect and
+allowlist a host before connecting or attaching credentials.
+
 `HttpRouter.add(method, path, response)` registers a static response. It does
 not retain a callback: Tyvera does not yet have first-class function values.
 Programs that need per-request logic can use the typed decoder, inspect a

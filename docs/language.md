@@ -550,10 +550,12 @@ grant access to actor state.
 ### Durations and timers
 
 `milliseconds(Int)` and `seconds(Int)` construct signed, 64-bit `Duration`
-values in millisecond resolution. `Duration` supports addition, subtraction,
-comparisons, and `inMilliseconds()`. Arithmetic and unit conversion are
-checked for overflow. `timerAfter(Duration)` creates a one-shot `Timer` using
-the runtime's monotonic clock. Timers expose `isReady()`, `remaining()`,
+values in millisecond resolution. `durationFromSeconds(Float)` returns a
+`Result<Duration,String>`, rounds fractional milliseconds up, and rejects
+negative, non-finite, or out-of-range values. `Duration` supports addition,
+subtraction, comparisons, and `inMilliseconds()`. Arithmetic and unit
+conversion are checked for overflow. `timerAfter(Duration)` creates a one-shot
+`Timer` using the runtime's monotonic clock. Timers expose `isReady()`, `remaining()`,
 `cancel()`, and `isCancelled()`; cancelling an elapsed timer returns `false`.
 `ActorRef.sendAfter(duration, handlerName, arguments...) -> Timer` schedules a
 typed actor message for one-shot delivery after the duration. The selected

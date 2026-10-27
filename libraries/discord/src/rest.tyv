@@ -72,6 +72,59 @@ pub async fn requestBot(token: Secret<String>, methodName: String, endpoint: Str
     return Err<DiscordRestResponse, String>("Discord REST request did not start")
 }
 
+fn boundedRetryDelay(response: DiscordRestResponse) -> Option<Duration> {
+    match response.body.toString() {
+        Err(_) => return None<Duration>()
+        Ok(text) => match decodeFailure(response.status, text) {
+            Err(_) => return None<Duration>()
+            Ok(failure) => match failure.retryAfterSeconds {
+                None => return None<Duration>()
+                Some(retryDelaySeconds) => {
+                    if retryDelaySeconds > 120.0 {
+                        return None<Duration>()
+                    }
+                    match durationFromSeconds(retryDelaySeconds) {
+                        Err(_) => return None<Duration>()
+                        Ok(delay) => return Some(delay)
+                    }
+                }
+            }
+        }
+    }
+    return None<Duration>()
+}
+
+// Retries only an explicit Discord 429 rejection. Transport failures and
+// other HTTP statuses are returned unchanged, so side-effecting operations
+// are never replayed after an ambiguous network failure. This per-call policy
+// is bounded; shared bucket/global coordination is not implemented yet.
+pub async fn requestBotWithRetries(token: Secret<String>, methodName: String, endpoint: String, body: Bytes, timeout: Duration, maxRetries: Int) -> Result<DiscordRestResponse, String> {
+    if maxRetries < 0 || maxRetries > 5 {
+        return Err<DiscordRestResponse, String>("Discord REST retry count must be between 0 and 5")
+    }
+    var retryCount: Int = 0
+    while retryCount <= maxRetries {
+        let result = await requestBot(token, methodName, endpoint, body, timeout)
+        match result {
+            Err(error) => return Err<DiscordRestResponse, String>(error)
+            Ok(response) => {
+                if response.status != 429 || retryCount == maxRetries {
+                    return Ok<DiscordRestResponse, String>(response)
+                }
+                match boundedRetryDelay(response) {
+                    None => return Ok<DiscordRestResponse, String>(response)
+                    Some(delay) => {
+                        let timer = sleepFor(delay)
+                        await timer
+                        retryCount = retryCount + 1
+                    }
+                }
+            }
+        }
+    }
+    return Err<DiscordRestResponse, String>("Discord REST retry loop stopped unexpectedly")
+}
+
 // Converts an unsuccessful HTTP response into the existing typed Discord
 // API failure record. Successful 2xx responses produce None. The raw response
 // remains available to callers for endpoint-specific decoding.

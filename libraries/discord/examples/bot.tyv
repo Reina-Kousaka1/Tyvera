@@ -1,7 +1,8 @@
 import "../src/client.tyv" as discord
+import "../src/gateway.tyv" as gateway
 
 async fn startGateway(token: Secret<String>) {
-    let result = await discord.runGateway(token, discord.defaultIntents(), 1000, seconds(15))
+    let result = await discord.runGatewayReliable(token, discord.defaultIntents(), 1000, seconds(15), 3, 250, 5000)
     match result {
         Err(error) => eprintln(error)
         Ok(summary) => {
@@ -9,6 +10,13 @@ async fn startGateway(token: Secret<String>) {
             println(summary.dispatchCount)
             println(summary.messageCount)
             println(summary.heartbeatCount)
+            for event in summary.events {
+                match event {
+                    gateway.GatewayDispatch.Ready(_) => println("Gateway session ready")
+                    gateway.GatewayDispatch.MessageCreate(_, channelId, _) => println("Message event in " + channelId)
+                    gateway.GatewayDispatch.Unknown(name) => println("Ignored event " + name)
+                }
+            }
         }
     }
 }
@@ -18,7 +26,10 @@ fn main() {
         None => println("Set DISCORD_TOKEN to run the experimental Discord Gateway client.")
         Some(token) => {
             let task = startGateway(token)
-            runTasks()
+            match runTasks() {
+                Ok(_) => {}
+                Err(error) => eprintln(error)
+            }
         }
     }
 }

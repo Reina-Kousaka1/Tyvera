@@ -1021,6 +1021,15 @@ class Interpreter:
             if expression.callee == "runTasks":
                 return self._run_tasks(expression.location, depth)
             arguments = self._evaluate_arguments(expression.arguments, variables, depth)
+            if expression.callee == "durationFromSeconds":
+                seconds = arguments[0]
+                if not math.isfinite(seconds) or seconds < 0:
+                    return _TyveraVariant("Err", "Duration seconds must be finite and non-negative", "Result", 1)
+                milliseconds_value = seconds * 1000.0
+                if not math.isfinite(milliseconds_value) or milliseconds_value >= float(INT_MAX):
+                    return _TyveraVariant("Err", "Duration seconds exceed the supported range", "Result", 1)
+                milliseconds = math.ceil(milliseconds_value)
+                return _TyveraVariant("Ok", _TyveraDuration(milliseconds), "Result", 1)
             if expression.callee == "milliseconds":
                 return self._make_duration(arguments[0], expression.location)
             if expression.callee == "seconds":
@@ -1059,6 +1068,11 @@ class Interpreter:
                 try:
                     return _TyveraVariant("Ok", parse_url(arguments[0]), "Result", 1)
                 except ValueError as error:
+                    return _TyveraVariant("Err", str(error), "Result", 1)
+            if expression.callee == "webSocketUrl":
+                try:
+                    return _TyveraVariant("Ok", parse_websocket_url(arguments[0]), "Result", 1)
+                except WebSocketProtocolError as error:
                     return _TyveraVariant("Err", str(error), "Result", 1)
             if expression.callee == "httpLimits":
                 try:
@@ -1564,7 +1578,7 @@ class Interpreter:
                         return _TyveraVariant("Ok", receiver.payload.decode("utf-8", "strict"), "Result", 1)
                     except UnicodeDecodeError:
                         return _TyveraVariant("Err", "WebSocket text is not valid UTF-8", "Result", 1)
-            if isinstance(receiver, (HttpMethod, HttpUrl, HttpLimits, HttpHeaders,
+            if isinstance(receiver, (HttpMethod, HttpUrl, WebSocketUrl, HttpLimits, HttpHeaders,
                                      HttpRequest, HttpResponse, HttpMessageDecoder, HttpRouter)):
                 arguments = self._evaluate_arguments(expression.arguments, variables, depth)
                 if isinstance(receiver, HttpMethod):
@@ -1582,6 +1596,17 @@ class Interpreter:
                         host = f"[{receiver.host}]" if ":" in receiver.host else receiver.host
                         default_port = 80 if receiver.scheme == "http" else 443
                         return host if receiver.port == default_port else f"{host}:{receiver.port}"
+                if isinstance(receiver, WebSocketUrl):
+                    if expression.method == "hostEndsWith":
+                        return receiver.transport.host.endswith(arguments[0])
+                    if expression.method == "scheme":
+                        return receiver.scheme
+                    if expression.method == "host":
+                        return receiver.transport.host
+                    if expression.method == "port":
+                        return receiver.transport.port
+                    if expression.method == "target":
+                        return receiver.transport.target
                 if isinstance(receiver, HttpLimits):
                     return {
                         "requestLineBytes": receiver.request_line_bytes,
@@ -3330,17 +3355,20 @@ class Interpreter:
             attempt()
         return task
 
-    def _websocket_connect_task(self, address: str, timeout: _TyveraDuration,
+    def _websocket_connect_task(self, address: str | WebSocketUrl, timeout: _TyveraDuration,
                                 location: Location) -> _TyveraTask:
         state: dict[str, object] = {
             "phase": "connect", "operation": None, "url": None, "connection": None,
             "key": None, "request": None, "decoder": None, "frame_decoder": None,
             "handshake_bytes": 0, "timeout": timeout.milliseconds, "failure": None,
         }
-        try:
-            state["url"] = parse_websocket_url(address)
-        except WebSocketProtocolError as error:
-            state["failure"] = str(error)
+        if isinstance(address, WebSocketUrl):
+            state["url"] = address
+        else:
+            try:
+                state["url"] = parse_websocket_url(address)
+            except WebSocketProtocolError as error:
+                state["failure"] = str(error)
         if timeout.milliseconds <= 0:
             state["failure"] = "WebSocket timeout must be greater than zero"
         return self._create_native_task(

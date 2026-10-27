@@ -21,6 +21,34 @@ class TimeAndReplyTests(unittest.TestCase):
         self.assertEqual(caught.exception.stage, "type")
         return caught.exception
 
+    def test_float_seconds_convert_to_bounded_monotonic_duration(self) -> None:
+        output = self.run_source('''fn main() {
+    match durationFromSeconds(0.0) {
+        Ok(value) => println(value.inMilliseconds())
+        Err(_) => println("zero rejected")
+    }
+    match durationFromSeconds(0.0001) {
+        Ok(value) => println(value.inMilliseconds())
+        Err(_) => println("fraction rejected")
+    }
+    match durationFromSeconds(1.25) {
+        Ok(value) => println(value.inMilliseconds())
+        Err(_) => println("retry delay rejected")
+    }
+    match durationFromSeconds(-0.25) {
+        Ok(_) => println("negative accepted")
+        Err(_) => println("negative rejected")
+    }
+    match durationFromSeconds(100000000000000000000000000000000000000000000000000000.0) {
+        Ok(_) => println("overflow accepted")
+        Err(_) => println("overflow rejected")
+    }
+}''')
+        self.assertEqual(output, "0\n1\n1250\nnegative rejected\noverflow rejected\n")
+
+    def test_float_seconds_duration_conversion_is_statically_typed(self) -> None:
+        self.reject('fn main() { durationFromSeconds(2) }', "expects Float, found Int")
+
     def test_actor_request_returns_typed_one_shot_reply(self) -> None:
         output = self.run_source('''actor Counter {
     var value: Int

@@ -54,14 +54,14 @@ from .type_names import make_type, split_type, substitute_type
 _BUILTIN_TYPES = {
     "Int", "Float", "Bool", "String", "Byte", "Void", "Unit", "List", "Map", "Option", "Result",
     "Secret", "Json", "Tuple", "ActorRef", "Supervisor", "RestartPolicy", "SupervisorBackoff", "Duration", "Timer", "ReplySender", "ReplyReceiver", "Task", "TaskGroup", "TextFile", "TextReader", "TextWriter", "Bytes", "ByteBuffer", "SocketAddress", "TcpConnection", "TcpListener", "TlsConnection", "WebSocket", "WebSocketMessage",
-    "HttpMethod", "HttpUrl", "HttpLimits", "HttpHeaders", "HttpRequest", "HttpResponse", "HttpDecoder", "HttpRouter", "HttpServer",
+    "WebSocketUrl", "HttpMethod", "HttpUrl", "HttpLimits", "HttpHeaders", "HttpRequest", "HttpResponse", "HttpDecoder", "HttpRouter", "HttpServer",
 }
 _BUILTIN_FUNCTIONS = {
-    "println", "eprintln", "readText", "writeText", "readBytes", "writeBytes", "openText", "openTextReader", "openTextWriter", "openTextAsync", "bytesFromString", "byteFromInt", "byteBuffer", "resolveHost", "tcpConnect", "tcpListen", "tlsConnect", "webSocketConnect", "pathJoin", "pathExists",
+    "println", "eprintln", "readText", "writeText", "readBytes", "writeBytes", "openText", "openTextReader", "openTextWriter", "openTextAsync", "bytesFromString", "byteFromInt", "byteBuffer", "resolveHost", "tcpConnect", "tcpListen", "tlsConnect", "webSocketUrl", "webSocketConnect", "pathJoin", "pathExists",
     "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool",
     "jsonNull", "jsonArray", "jsonObject", "spawn", "runActors", "oneForOne", "oneForAll", "restForOne",
     "permanentChildPolicy", "transientChildPolicy", "temporaryChildPolicy", "exponentialBackoff", "hostOS", "hostArchitecture", "monotonicMilliseconds", "environment",
-    "milliseconds", "seconds", "timerAfter", "sleepFor", "runTasks", "taskGroup",
+    "milliseconds", "seconds", "durationFromSeconds", "timerAfter", "sleepFor", "runTasks", "taskGroup",
     "httpMethod", "httpUrl", "httpLimits", "httpDefaultLimits", "httpHeaders", "httpRequest", "httpResponse",
     "httpTextResponse", "httpJsonResponse", "httpRouter", "httpRequestDecoder", "httpResponseDecoder", "httpEncodeRequest", "httpEncodeResponse", "httpServer", "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete",
 }
@@ -1033,6 +1033,7 @@ class TypeChecker:
                 self._check_arguments(expression.arguments, argument_types, ("Int",), expression.location, "byteBuffer")
                 return "Result<ByteBuffer,String>"
             http_signatures = {
+                "webSocketUrl": (("String",), "Result<WebSocketUrl,String>"),
                 "httpMethod": (("String",), "Result<HttpMethod,String>"),
                 "httpUrl": (("String",), "Result<HttpUrl,String>"),
                 "httpLimits": (("Int", "Int", "Int", "Int", "Int"), "Result<HttpLimits,String>"),
@@ -1053,7 +1054,6 @@ class TypeChecker:
                 "httpPost": (("HttpUrl", "HttpHeaders", "Bytes", "Duration"), "Task<Result<HttpResponse,String>>"),
                 "httpPut": (("HttpUrl", "HttpHeaders", "Bytes", "Duration"), "Task<Result<HttpResponse,String>>"),
                 "httpDelete": (("HttpUrl", "Duration"), "Task<Result<HttpResponse,String>>"),
-                "webSocketConnect": (("String", "Duration"), "Task<Result<WebSocket,String>>"),
             }
             if expression.callee in http_signatures:
                 if expression.type_arguments:
@@ -1062,6 +1062,15 @@ class TypeChecker:
                 expected, result = http_signatures[expression.callee]
                 self._check_arguments(expression.arguments, argument_types, expected, expression.location, expression.callee)
                 return result
+            if expression.callee == "webSocketConnect":
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'webSocketConnect' does not accept type arguments")
+                argument_types = [self._expression_type(argument, variables, owner) for argument in expression.arguments]
+                if len(argument_types) != 2 or argument_types[0] not in {"String", "WebSocketUrl"} or argument_types[1] != "Duration":
+                    found = ", ".join(argument_types)
+                    raise Diagnostic(expression.location, "type",
+                                     f"webSocketConnect expects (String|WebSocketUrl, Duration), found ({found})")
+                return "Task<Result<WebSocket,String>>"
             if expression.callee == "resolveHost":
                 expected = ("String", "Int")
                 if expression.type_arguments:
@@ -1170,6 +1179,12 @@ class TypeChecker:
                 if expression.type_arguments:
                     raise Diagnostic(expression.location, "type", f"'{expression.callee}' does not accept type arguments")
                 return "Duration"
+            if expression.callee == "durationFromSeconds":
+                self._check_arguments(expression.arguments, argument_types, ("Float",),
+                                      expression.location, expression.callee)
+                if expression.type_arguments:
+                    raise Diagnostic(expression.location, "type", "'durationFromSeconds' does not accept type arguments")
+                return "Result<Duration,String>"
             if expression.callee == "timerAfter":
                 self._check_arguments(expression.arguments, argument_types, ("Duration",),
                                       expression.location, "timerAfter")
@@ -1626,6 +1641,11 @@ class TypeChecker:
                 "HttpUrl": {
                     "scheme": ((), "String"), "host": ((), "String"), "port": ((), "Int"),
                     "target": ((), "String"), "authority": ((), "String"),
+                },
+                "WebSocketUrl": {
+                    "scheme": ((), "String"), "host": ((), "String"),
+                    "port": ((), "Int"), "target": ((), "String"),
+                    "hostEndsWith": (("String",), "Bool"),
                 },
                 "WebSocketMessage": {
                     "kind": ((), "String"), "bytes": ((), "Bytes"),

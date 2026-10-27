@@ -32,6 +32,10 @@ pub record GatewayRunSummary {
     dispatchCount: Int
     messageCount: Int
     heartbeatCount: Int
+    recoveryAction: gateway.GatewayRecoveryAction
+    recoveryReason: Option<String>
+    closeCode: Option<Int>
+    events: List<gateway.GatewayDispatch>
 }
 
 fn intentBit(intent: GatewayIntent) -> Int {
@@ -149,15 +153,105 @@ fn identifyPayload(token: Secret<String>, intents: List<GatewayIntent>) -> Resul
     return jsonStringify(jsonObject(envelope))
 }
 
-// Runs one bounded Gateway session. maxDispatches bounds the result-free
-// session duration for tests and simple command-line bots; reconnect policy
-// is deliberately handled by the caller in this V1 API.
-pub async fn runGateway(token: Secret<String>, intents: List<GatewayIntent>, maxDispatches: Int, timeout: Duration) -> Result<GatewayRunSummary, String> {
+fn resumeConnectUrl(value: String) -> Result<String, String> {
+    match webSocketUrl(value) {
+        Err(_) => return Err<String, String>("Discord Gateway resume URL is invalid")
+        Ok(url) => {
+            let host = url.host()
+            let trustedHost = host == "discord.gg" || url.hostEndsWith(".discord.gg")
+            if url.scheme() != "wss" || url.port() != 443 || !trustedHost || url.target() != "/" {
+                return Err<String, String>("Discord Gateway resume URL is not a trusted Gateway origin")
+            }
+            return Ok<String, String>("wss://" + host + "/?v=10&encoding=json")
+        }
+    }
+    return Err<String, String>("Discord Gateway resume URL is invalid")
+}
+
+fn sessionCanResume(sessionId: Option<String>, resumeUrl: Option<String>, sequence: Option<Int>) -> Bool {
+    var hasSession: Bool = false
+    match sessionId {
+        None => return false
+        Some(_) => hasSession = true
+    }
+    match sequence {
+        None => return false
+        Some(_) => {}
+    }
+    match resumeUrl {
+        None => return false
+        Some(value) => match resumeConnectUrl(value) {
+            Err(_) => return false
+            Ok(_) => return hasSession
+        }
+    }
+    return false
+}
+
+fn recoveryForClose(closeCode: Option<Int>, sessionId: Option<String>, resumeUrl: Option<String>, sequence: Option<Int>) -> gateway.GatewayRecoveryAction {
+    return gateway.closeCodeAction(closeCode, sessionCanResume(sessionId, resumeUrl, sequence), false)
+}
+
+fn resumePayload(token: Secret<String>, sessionId: String, sequence: Int) -> Result<String, String> {
+    let data: Map<String, Json> = Map<String, Json>()
+    data.put("token", jsonString(token.reveal()))
+    data.put("session_id", jsonString(sessionId))
+    data.put("seq", jsonInt(sequence))
+    let envelope: Map<String, Json> = Map<String, Json>()
+    envelope.put("op", jsonInt(6))
+    envelope.put("d", jsonObject(data))
+    return jsonStringify(jsonObject(envelope))
+}
+
+// One transport session. Reconnect policy is kept in runGatewayReliable so
+// the session itself remains bounded and its transitions are easy to test.
+async fn runGatewaySession(token: Secret<String>, intents: List<GatewayIntent>, maxDispatches: Int, timeout: Duration, previous: Option<GatewayRunSummary>) -> Result<GatewayRunSummary, String> {
     if maxDispatches < 1 || maxDispatches > 10000 {
         return Err<GatewayRunSummary, String>("maxDispatches must be between 1 and 10000")
     }
-    // Keep authentication pinned to the official Discord Gateway origin.
-    let opened = await webSocketConnect("wss://gateway.discord.gg/?v=10&encoding=json", timeout)
+    var connectUrl: String = "wss://gateway.discord.gg/?v=10&encoding=json"
+    var shouldResume: Bool = false
+    var sequence: Option<Int> = None<Int>()
+    var sessionId: Option<String> = None<String>()
+    var resumeUrl: Option<String> = None<String>()
+    var ready: Bool = false
+    var dispatches: Int = 0
+    var messages: Int = 0
+    var heartbeats: Int = 0
+    var events: List<gateway.GatewayDispatch> = List<gateway.GatewayDispatch>()
+    match previous {
+        None => {}
+        Some(prior) => {
+            dispatches = prior.dispatchCount
+            messages = prior.messageCount
+            heartbeats = prior.heartbeatCount
+            events = prior.events
+            if prior.recoveryAction == gateway.GatewayRecoveryAction.Resume {
+                match prior.sessionId {
+                    None => return Err<GatewayRunSummary, String>("Discord Gateway session cannot be resumed without a session ID")
+                    Some(value) => sessionId = Some(value)
+                }
+                match prior.lastSequence {
+                    None => return Err<GatewayRunSummary, String>("Discord Gateway session cannot be resumed without a sequence")
+                    Some(value) => sequence = Some(value)
+                }
+                match prior.resumeGatewayUrl {
+                    None => return Err<GatewayRunSummary, String>("Discord Gateway session cannot be resumed without a resume URL")
+                    Some(value) => match resumeConnectUrl(value) {
+                        Err(error) => return Err<GatewayRunSummary, String>(error)
+                        Ok(value) => {
+                            connectUrl = value
+                            shouldResume = true
+                        }
+                    }
+                }
+                ready = prior.ready
+                resumeUrl = prior.resumeGatewayUrl
+            }
+        }
+    }
+    // Initial sessions use Discord's canonical origin; resume URLs are separately allowlisted.
+    let opened = await webSocketConnect(connectUrl, timeout)
     match move opened {
         Err(error) => return Err<GatewayRunSummary, String>(error)
         Ok(connection) => {
@@ -178,8 +272,19 @@ pub async fn runGateway(token: Secret<String>, intents: List<GatewayIntent>, max
                             return Err<GatewayRunSummary, String>(error)
                         }
                         Ok(heartbeatInterval) => {
-                            let identify = identifyPayload(token, intents)
-                            match identify {
+                            var initialPayload: Result<String, String> = Err<String, String>("invalid Discord Gateway session state")
+                            if shouldResume {
+                                match sessionId {
+                                    None => {}
+                                    Some(value) => match sequence {
+                                        None => {}
+                                        Some(lastSequence) => initialPayload = resumePayload(token, value, lastSequence)
+                                    }
+                                }
+                            } else {
+                                initialPayload = identifyPayload(token, intents)
+                            }
+                            match initialPayload {
                                 Err(error) => {
                                     connection.close()
                                     return Err<GatewayRunSummary, String>(error)
@@ -193,44 +298,51 @@ pub async fn runGateway(token: Secret<String>, intents: List<GatewayIntent>, max
                                         }
                                         Ok(_) => {}
                                     }
-                                    var sequence: Option<Int> = None<Int>()
-                                    var sessionId: Option<String> = None<String>()
-                                    var resumeUrl: Option<String> = None<String>()
-                                    var ready: Bool = false
-                                    var dispatches: Int = 0
-                                    var messages: Int = 0
-                                    var heartbeats: Int = 0
                                     var waitingForAck: Bool = false
                                     var failed: Option<String> = None<String>()
+                                    var recoveryAction: gateway.GatewayRecoveryAction = gateway.GatewayRecoveryAction.Stop
+                                    var recoveryReason: Option<String> = None<String>()
+                                    var closeCode: Option<Int> = None<Int>()
                                     var active: Bool = true
+                                    var nextHeartbeatAt: Int = monotonicMilliseconds() + heartbeatInterval
                                     while active && dispatches < maxDispatches {
-                                        let incoming = await connection.receiveWithin(milliseconds(heartbeatInterval))
+                                        let now = monotonicMilliseconds()
+                                        if now >= nextHeartbeatAt {
+                                            if waitingForAck {
+                                                recoveryAction = recoveryForClose(None<Int>(), sessionId, resumeUrl, sequence)
+                                                recoveryReason = Some("Discord Gateway missed a heartbeat acknowledgement")
+                                                active = false
+                                            } else {
+                                                waitingForAck = true
+                                                heartbeats = heartbeats + 1
+                                                match heartbeatPayload(sequence) {
+                                                    Err(payloadError) => {
+                                                        failed = Some(payloadError)
+                                                        active = false
+                                                    }
+                                                    Ok(heartbeatMessage) => {
+                                                        let heartbeatSent = await connection.sendText(heartbeatMessage)
+                                                        match heartbeatSent {
+                                                            Err(sendError) => {
+                                                                failed = Some(sendError)
+                                                                active = false
+                                                            }
+                                                            Ok(_) => {}
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            nextHeartbeatAt = monotonicMilliseconds() + heartbeatInterval
+                                        }
+                                        if !active {
+                                            continue
+                                        }
+                                        let waitMilliseconds = nextHeartbeatAt - monotonicMilliseconds()
+                                        let incoming = await connection.receiveWithin(milliseconds(waitMilliseconds))
                                         match incoming {
                                             Err(error) => {
                                                 if error == "WebSocket receive timed out" {
-                                                    if waitingForAck {
-                                                        failed = Some("Discord Gateway missed a heartbeat acknowledgement")
-                                                        active = false
-                                                    } else {
-                                                        waitingForAck = true
-                                                        heartbeats = heartbeats + 1
-                                                        match heartbeatPayload(sequence) {
-                                                            Err(payloadError) => {
-                                                                failed = Some(payloadError)
-                                                                active = false
-                                                            }
-                                                            Ok(heartbeatMessage) => {
-                                                                let heartbeatSent = await connection.sendText(heartbeatMessage)
-                                                                match heartbeatSent {
-                                                                    Err(sendError) => {
-                                                                        failed = Some(sendError)
-                                                                        active = false
-                                                                    }
-                                                                    Ok(_) => {}
-                                                                }
-                                                            }
-                                                        }
-                                                    }
+                                                    {}
                                                 } else {
                                                     failed = Some(error)
                                                     active = false
@@ -238,7 +350,9 @@ pub async fn runGateway(token: Secret<String>, intents: List<GatewayIntent>, max
                                             }
                                             Ok(value) => match value {
                                                 None => {
-                                                    failed = Some("Discord Gateway disconnected")
+                                                    closeCode = connection.closeCode()
+                                                    recoveryAction = recoveryForClose(closeCode, sessionId, resumeUrl, sequence)
+                                                    recoveryReason = Some("Discord Gateway disconnected")
                                                     active = false
                                                 }
                                                 Some(frame) => {
@@ -262,37 +376,43 @@ pub async fn runGateway(token: Secret<String>, intents: List<GatewayIntent>, max
                                                                         None => {}
                                                                     }
                                                                     if envelope.opcode == 1 {
-                                                                        if waitingForAck {
-                                                                            failed = Some("Discord Gateway requested a heartbeat before the previous acknowledgement")
-                                                                            active = false
-                                                                        } else {
-                                                                            waitingForAck = true
-                                                                            heartbeats = heartbeats + 1
-                                                                            match heartbeatPayload(sequence) {
-                                                                                Err(payloadError) => {
-                                                                                    failed = Some(payloadError)
-                                                                                    active = false
-                                                                                }
-                                                                                Ok(heartbeatMessage) => {
-                                                                                    let heartbeatSent = await connection.sendText(heartbeatMessage)
-                                                                                    match heartbeatSent {
-                                                                                        Err(sendError) => {
-                                                                                            failed = Some(sendError)
-                                                                                            active = false
-                                                                                        }
-                                                                                        Ok(_) => {}
+                                                                        waitingForAck = true
+                                                                        heartbeats = heartbeats + 1
+                                                                        nextHeartbeatAt = monotonicMilliseconds() + heartbeatInterval
+                                                                        match heartbeatPayload(sequence) {
+                                                                            Err(payloadError) => {
+                                                                                failed = Some(payloadError)
+                                                                                active = false
+                                                                            }
+                                                                            Ok(heartbeatMessage) => {
+                                                                                let heartbeatSent = await connection.sendText(heartbeatMessage)
+                                                                                match heartbeatSent {
+                                                                                    Err(sendError) => {
+                                                                                        failed = Some(sendError)
+                                                                                        active = false
                                                                                     }
+                                                                                    Ok(_) => {}
                                                                                 }
                                                                             }
                                                                         }
                                                                     } else if envelope.opcode == 11 {
                                                                         waitingForAck = false
                                                                     } else if envelope.opcode == 7 {
-                                                                        failed = Some("Discord Gateway requested a reconnect")
+                                                                        recoveryAction = gateway.reconnectRequestAction(sessionCanResume(sessionId, resumeUrl, sequence))
+                                                                        recoveryReason = Some("Discord Gateway requested a reconnect")
                                                                         active = false
                                                                     } else if envelope.opcode == 9 {
-                                                                        failed = Some("Discord Gateway invalidated the session")
-                                                                        active = false
+                                                                        match envelope.data.asBool() {
+                                                                            None => {
+                                                                                failed = Some("Discord Gateway Invalid Session payload must be a boolean")
+                                                                                active = false
+                                                                            }
+                                                                            Some(resumable) => {
+                                                                                recoveryAction = gateway.invalidSessionAction(resumable, sessionCanResume(sessionId, resumeUrl, sequence))
+                                                                                recoveryReason = Some("Discord Gateway Invalid Session")
+                                                                                active = false
+                                                                            }
+                                                                        }
                                                                     } else if envelope.opcode == 0 {
                                                                         dispatches = dispatches + 1
                                                                         match gateway.decodeDispatch(payload) {
@@ -302,14 +422,16 @@ pub async fn runGateway(token: Secret<String>, intents: List<GatewayIntent>, max
                                                                             }
                                                                             Ok(event) => match event {
                                                                                 gateway.GatewayDispatch.Ready(value) => {
+                                                                                    events.append(event)
                                                                                     ready = true
                                                                                     sessionId = Some(value)
                                                                                     resumeUrl = optionalString(envelope.data, "resume_gateway_url")
                                                                                 }
                                                                                 gateway.GatewayDispatch.MessageCreate(_, _, _) => {
+                                                                                    events.append(event)
                                                                                     messages = messages + 1
                                                                                 }
-                                                                                gateway.GatewayDispatch.Unknown(_) => {}
+                                                                                gateway.GatewayDispatch.Unknown(_) => events.append(event)
                                                                             }
                                                                         }
                                                                     } else if envelope.opcode != 10 {
@@ -330,11 +452,15 @@ pub async fn runGateway(token: Secret<String>, intents: List<GatewayIntent>, max
                                             return Err<GatewayRunSummary, String>(error)
                                         }
                                         None => {
-                                            let closed = await connection.closeGracefully()
-                                            match closed {
-                                                Err(error) => return Err<GatewayRunSummary, String>(error)
-                                                Ok(_) => return Ok<GatewayRunSummary, String>(GatewayRunSummary(ready, sessionId, resumeUrl, sequence, dispatches, messages, heartbeats))
+                                            if recoveryAction == gateway.GatewayRecoveryAction.Stop {
+                                                let closed = await connection.closeGracefully()
+                                                match closed {
+                                                    Err(error) => return Err<GatewayRunSummary, String>(error)
+                                                    Ok(_) => return Ok<GatewayRunSummary, String>(GatewayRunSummary(ready, sessionId, resumeUrl, sequence, dispatches, messages, heartbeats, recoveryAction, recoveryReason, closeCode, events))
+                                                }
                                             }
+                                            connection.close()
+                                            return Ok<GatewayRunSummary, String>(GatewayRunSummary(ready, sessionId, resumeUrl, sequence, dispatches, messages, heartbeats, recoveryAction, recoveryReason, closeCode, events))
                                         }
                                     }
                                 }
@@ -346,4 +472,60 @@ pub async fn runGateway(token: Secret<String>, intents: List<GatewayIntent>, max
         }
     }
     return Err<GatewayRunSummary, String>("Discord Gateway session did not start")
+}
+
+pub async fn runGateway(token: Secret<String>, intents: List<GatewayIntent>, maxDispatches: Int, timeout: Duration) -> Result<GatewayRunSummary, String> {
+    let result = await runGatewaySession(token, intents, maxDispatches, timeout, None<GatewayRunSummary>())
+    return result
+}
+
+pub async fn runGatewayReliable(token: Secret<String>, intents: List<GatewayIntent>, maxDispatches: Int, timeout: Duration, maxReconnects: Int, baseBackoffMilliseconds: Int, maximumBackoffMilliseconds: Int) -> Result<GatewayRunSummary, String> {
+    if maxDispatches < 1 || maxDispatches > 10000 {
+        return Err<GatewayRunSummary, String>("maxDispatches must be between 1 and 10000")
+    }
+    if maxReconnects < 0 || maxReconnects > 32 {
+        return Err<GatewayRunSummary, String>("maxReconnects must be between 0 and 32")
+    }
+    if baseBackoffMilliseconds < 0 || baseBackoffMilliseconds > 60000 || maximumBackoffMilliseconds < baseBackoffMilliseconds || maximumBackoffMilliseconds > 120000 {
+        return Err<GatewayRunSummary, String>("Gateway backoff must be bounded between 0 and 120000 milliseconds")
+    }
+    var previous: Option<GatewayRunSummary> = None<GatewayRunSummary>()
+    var reconnects: Int = 0
+    var delay: Int = baseBackoffMilliseconds
+    var active: Bool = true
+    while active {
+        let result = await runGatewaySession(token, intents, maxDispatches, timeout, previous)
+        match result {
+            Err(error) => return Err<GatewayRunSummary, String>(error)
+            Ok(summary) => {
+                if summary.dispatchCount >= maxDispatches || summary.recoveryAction == gateway.GatewayRecoveryAction.Stop {
+                    return Ok<GatewayRunSummary, String>(summary)
+                }
+                if summary.recoveryAction == gateway.GatewayRecoveryAction.Fatal {
+                    match summary.recoveryReason {
+                        Some(error) => return Err<GatewayRunSummary, String>(error)
+                        None => return Err<GatewayRunSummary, String>("Discord Gateway closed with a fatal status")
+                    }
+                }
+                if reconnects >= maxReconnects {
+                    return Err<GatewayRunSummary, String>("Discord Gateway reconnect limit exceeded")
+                }
+                let timer = sleepFor(milliseconds(delay))
+                await timer
+                previous = Some(summary)
+                reconnects = reconnects + 1
+                if delay > 0 {
+                    if delay > maximumBackoffMilliseconds / 2 {
+                        delay = maximumBackoffMilliseconds
+                    } else {
+                        delay = delay * 2
+                    }
+                    if delay > maximumBackoffMilliseconds {
+                        delay = maximumBackoffMilliseconds
+                    }
+                }
+            }
+        }
+    }
+    return Err<GatewayRunSummary, String>("Discord Gateway reliability loop stopped unexpectedly")
 }

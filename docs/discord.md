@@ -7,28 +7,47 @@ directory is not published or automatically installed as a dependency.
 
 ## Implemented slice
 
-`src/gateway.tyv` exports `GatewayDispatch` and
-`decodeDispatch(payload: String) -> Result<GatewayDispatch, String>`. It
-decodes the dispatch envelope, recognizes `READY` and `MESSAGE_CREATE`,
-preserves other event names as `Unknown`, validates required fields, and maps
-malformed or incomplete payloads to generic errors that do not echo the input.
 `src/gateway.tyv` exports `GatewayDispatch`, `GatewayEnvelope`, and decoders for
-`READY`, `MESSAGE_CREATE`, unknown dispatches, and the Gateway envelope.
+`READY`, `MESSAGE_CREATE`, unknown dispatches, and the Gateway envelope. It
+validates required fields and maps malformed or incomplete payloads to generic
+errors that do not echo the input.
 `src/rest.tyv` provides `requestBot(token, method, endpoint, body, timeout)`.
 It pins requests to `https://discord.com/api/v10/`, uses the verified HTTPS
 client, puts the `Secret<String>` only in the `Authorization: Bot ...` header,
 and returns status, bounded body bytes, and raw rate-limit response metadata.
 `decodeFailure` and `decodeResponseFailure` map Discord error bodies to typed
-`RestFailure` values. Requests are not retried; callers must decide whether an
-operation is safe and honor rate-limit metadata themselves.
+`RestFailure` values. `requestBotWithRetries(..., maxRetries)` optionally
+retries an explicit Discord 429 response only, with a caller budget of at most
+five retries and a maximum accepted wait of 120 seconds. It honors the
+`retry_after` body field through a monotonic scheduler timer. Transport errors,
+other statuses, malformed 429 bodies, and over-limit delays are returned
+without retry. This avoids replay after an ambiguous side-effecting request,
+but does not coordinate concurrent requests across buckets or global limits.
 
 `src/client.tyv` provides typed `GatewayIntent` values and a bounded
 `runGateway` session pinned to `wss://gateway.discord.gg/`. It performs TLS
 verification, the WebSocket handshake, Hello parsing, Identify, heartbeat
 sends, ACK tracking, sequence updates, READY/session capture, and basic
-MESSAGE_CREATE counting. It does not expose message content to logs or emit a
-user callback. The `bot.tyv` and `rest_client.tyv` examples do nothing networked
-without `DISCORD_TOKEN`; CI checks and runs them without credentials.
+MESSAGE_CREATE counting. `runGatewayReliable` adds a caller-bounded reconnect
+loop with deterministic capped exponential backoff and returns the typed
+dispatches observed in `GatewayRunSummary.events`. It resumes with the saved
+session ID, resume URL, and last sequence after Opcode 7, resumable Invalid
+Session, missed heartbeat ACK, or resumable peer disconnect; non-resumable
+Invalid Session and close codes 4007/4009 start a new Identify session.
+`GatewayRecoveryAction` centralizes close-code handling: 1000 stops, 1001 and
+4000/4001/4002/4003/4005/4008 reconnect, 4004 and 4010–4014 are fatal, and
+unrecognized codes fail closed. Reconnects are capped at 32, dispatches at 10,000, and the
+backoff arguments at 120 seconds. Heartbeats use monotonic fixed deadlines;
+the first heartbeat is currently sent after one full interval, without
+Discord's recommended random initial jitter. There is no reconnect jitter;
+callers should use a small reconnect budget appropriate to their application.
+Resume URLs must be
+`wss`, port 443, root-path URLs on `discord.gg` or its subdomains; this prevents
+forwarding the bot token to an arbitrary host. `runGateway` remains a single
+session API and returns the recovery action for its caller. The client does not
+expose message content to logs or emit a user callback. The `bot.tyv` and
+`rest_client.tyv` examples do nothing networked without `DISCORD_TOKEN`; CI
+checks and runs them without credentials.
 
 The local fake Gateway and fake REST integration tests use temporary
 self-signed test certificates, patched test-only DNS/port routing, and a fixed
@@ -36,21 +55,23 @@ fake token. They do not access a Discord account or public service.
 
 ## Experimental limits
 
-The Gateway currently handles one bounded connection session. Opcode 7,
-Invalid Session, disconnect, and missing heartbeat ACK produce controlled
-errors; automatic reconnect, session Resume, close-code policy, jittered
-backoff, and Invalid Session retry are not implemented. `resume_gateway_url`
-is captured but not followed. The typed event decoder recognizes READY and
-MESSAGE_CREATE, but the client only counts dispatches; there is no typed event
-subscription API, Actor/Supervisor client tree, cache, or shard coordinator.
+The reliable Gateway client is still experimental. Reconnect backoff is
+deterministic and has no jitter, the retry budget is supplied by the caller,
+and DNS/connect/Hello failures before a session is established return a
+controlled error rather than being retried. There is no automatic resume after
+process restart or durable session store. The typed event decoder recognizes
+READY and MESSAGE_CREATE and returns these typed values in the run summary;
+there is no callback/subscription API, Actor/Supervisor client tree, cache, or
+shard coordinator. Gateway compression is not negotiated.
 
-REST has one-request transport and rate-limit metadata parsing. There is no
-bucket/global coordinator, bounded request queue, automatic retry, API model
-coverage, or REST client Actor. Side-effect requests are never retried.
-Gateway compression is not negotiated. Networking, TLS, HTTP, WebSockets, and
-this package remain interpreter-only and experimental; generated native
-programs do not yet provide these services. Do not treat this package as
-production-ready.
+REST has one-request transport and rate-limit metadata parsing plus the
+explicit bounded 429 retry function. There is no bucket/global coordinator,
+concurrent request queue, automatic retry by default, API model coverage, or
+REST client Actor. Side-effect requests are only retried after an explicit
+429 rejection, never after a transport failure.
+Networking, TLS, HTTP, WebSockets, and this package remain interpreter-only
+and experimental; generated native programs do not yet provide these services.
+Do not treat this package as production-ready.
 
 When authentication is used, the token remains `Secret<String>` until the
 request header or Identify payload is formed. The library itself never logs it;
