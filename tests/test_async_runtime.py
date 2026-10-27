@@ -379,7 +379,7 @@ fn main() {
         Err(_) => println("stale failure")
     }
 }''')
-        self.assertEqual(output, "first run failed\\nlater task ran\\nsecond run succeeded\\n")
+        self.assertEqual(output, "first run failed\nlater task ran\nsecond run succeeded\n")
 
     def test_task_failure_from_recursive_scheduler_call_is_contained(self) -> None:
         output = self.run_source('''async fn invalid() {

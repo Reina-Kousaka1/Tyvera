@@ -531,7 +531,7 @@ class NativeExecutionTests(unittest.TestCase):
             self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
             self.assertEqual(
                 native.stdout,
-                "-2\\n1500\\n1\\nDuration seconds must be finite and non-negative\\n",
+                "-2\n1500\n1\nDuration seconds must be finite and non-negative\n",
             )
 
     def test_native_task_timeout_cancels_source_and_matches_reference(self) -> None:
@@ -553,7 +553,7 @@ fn main() {
             expected = self._reference_result(source, root)
             native = self._native_source_result(source, root, root / "timeout-app", root)
             self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
-            self.assertEqual(native.stdout, "timed out\\ntrue\\ntrue\\n")
+            self.assertEqual(native.stdout, "timed out\ntrue\ntrue\n")
 
     def test_native_negative_timeout_prevents_unstarted_source_body(self) -> None:
         source = '''async fn sideEffect() {
@@ -573,7 +573,7 @@ fn main() {
             expected = self._reference_result(source, root)
             native = self._native_source_result(source, root, root / "negative-timeout-app", root)
             self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
-            self.assertEqual(native.stdout, "task timed out\\ntrue\\n")
+            self.assertEqual(native.stdout, "task timed out\ntrue\n")
 
     def test_native_completed_task_wins_over_an_expired_timeout(self) -> None:
         source = '''async fn immediate() -> Int { return 7 }
@@ -596,7 +596,7 @@ fn main() {
             expected = self._reference_result(source, root)
             native = self._native_source_result(source, root, root / "timeout-complete", root)
             self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
-            self.assertEqual(native.stdout, "14\\nok\\n")
+            self.assertEqual(native.stdout, "14\nok\n")
 
     def test_native_cancelling_timeout_wrapper_cancels_source(self) -> None:
         source = '''async fn background() {
@@ -617,7 +617,7 @@ fn main() {
             expected = self._reference_result(source, root)
             native = self._native_source_result(source, root, root / "timeout-cancel", root)
             self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
-            self.assertEqual(native.stdout, "true\\ntrue\\ncancelled\\n")
+            self.assertEqual(native.stdout, "true\ntrue\ncancelled\n")
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "native networking timeout tests require Linux")
     def test_native_timeout_cancels_pending_accept_and_matches_reference(self) -> None:
@@ -647,7 +647,7 @@ fn main() {
             expected = self._reference_result(source, root)
             native = self._native_source_result(source, root, root / "accept-timeout", root)
             self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
-            self.assertEqual(native.stdout, "timed out\\n")
+            self.assertEqual(native.stdout, "timed out\n")
 
     def test_native_owned_child_task_cancellation_matches_reference(self) -> None:
         source = '''async fn background() {
