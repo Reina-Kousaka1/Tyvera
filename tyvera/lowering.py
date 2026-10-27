@@ -749,7 +749,7 @@ class _FunctionLowerer:
                 isinstance(receiver.type, IRAppliedType) and receiver.type.name in {"List", "Map"}
                 or isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Task"
                 or isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Secret"
-                or isinstance(receiver.type, IRAppliedType) and receiver.type.name == "ReplySender"
+                or isinstance(receiver.type, IRAppliedType) and receiver.type.name in {"ReplySender", "ReplyReceiver"}
                 or isinstance(receiver.type, IRActorRefType)
                 or receiver.type in {
                 IRType.JSON, IRType.BYTE, IRType.DURATION, IRType.BYTES, IRType.BYTE_BUFFER,
