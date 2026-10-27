@@ -189,7 +189,7 @@ jobs:
           sudo apt-get remove -y tyvera
           test -f "$project/src/main.tyv"
           test -f "$user_data/project/.tyvera.secrets"
-          sudo apt-get purge -y tyvera
+          sudo dpkg --purge tyvera
           test -f "$project/src/main.tyv"
           test -f "$user_data/project/marker.txt"
           test -f "$user_data/project/.tyvera.secrets"
