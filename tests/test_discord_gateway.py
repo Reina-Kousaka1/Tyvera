@@ -137,6 +137,8 @@ def server_close_frame() -> bytes:
 
 class DiscordGatewayIntegrationTests(unittest.TestCase):
     def test_close_code_policy_and_resume_url_validation(self) -> None:
+        native_available = _native_cpp_available()
+        native_result = None
         with tempfile.TemporaryDirectory(prefix=".tyvera-discord-policy-", dir=DISCORD_ROOT) as temporary:
             entry = Path(temporary) / "policy.tyv"
             entry.write_text(r'''import "../src/gateway.tyv" as gateway
@@ -173,8 +175,25 @@ fn main() {
             errors = io.StringIO()
             ReferenceInterpreterBackend().execute(checked, output=output, error_output=errors,
                                                   project_root=DISCORD_ROOT)
+            if native_available:
+                executable = Path(temporary) / "policy-native"
+                CppNativeBackend().build(lower_checked_program(checked), executable, project_root=DISCORD_ROOT)
+                environment = os.environ.copy()
+                environment.pop("PYTHONPATH", None)
+                environment.pop("PYTHONHOME", None)
+                environment.pop("DISCORD_TOKEN", None)
+                native_result = subprocess.run(
+                    [str(executable)], cwd=DISCORD_ROOT, capture_output=True, text=True,
+                    encoding="utf-8", env=environment, check=False, timeout=60,
+                )
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(output.getvalue(), "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\nfalse\nuserinfo rejected\n")
+        expected_output = "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\nfalse\nuserinfo rejected\n"
+        self.assertEqual(output.getvalue(), expected_output)
+        if native_result is not None:
+            self.assertEqual(
+                (native_result.returncode, native_result.stdout, native_result.stderr),
+                (0, expected_output, ""),
+            )
 
     def test_local_verified_wss_identify_heartbeat_ack_and_ready(self) -> None:
         native_available = _native_cpp_available()
