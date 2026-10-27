@@ -24,6 +24,9 @@ from tyvera.compiler import compile_checked_project, compile_checked_source
 from tyvera.cpp_backend import CppNativeBackend, emit_cpp
 from tyvera.ir import (
     IRAppliedType,
+    IRActorRefType,
+    IRActorSend,
+    IRActorSpawn,
     IRCall,
     IRCollectionLength,
     IRBuiltinCall,
@@ -144,13 +147,66 @@ fn main() { println(increment(4)) }
             self.assertEqual(call.type, IRType.INT)
             self.assertIn(call.function, {function.symbol for function in module.functions})
 
-    def test_unsupported_actor_path_is_a_source_diagnostic(self) -> None:
-        checked = compile_checked_source("actor Worker { on ping() {} }\nfn main() {}", "actor.tyv")
+    def test_actor_spawn_state_and_mailbox_sends_lower_to_typed_ir(self) -> None:
+        module = self.lower('''actor Counter {
+    var value: Int
+    init(start: Int) { self.value = start }
+    on add(amount: Int) { self.value = self.value + amount }
+    on report() { println(self.value) }
+}
+fn main() {
+    let counter: ActorRef<Counter> = spawn(Counter(10))
+    counter.add(2)
+    counter.report()
+    let result = runActors()
+}
+''')
+        self.assertEqual(module.actors[0].name, "Counter")
+        self.assertEqual(module.actors[0].fields[0].type, IRType.INT)
+        self.assertEqual(module.actors[0].initializer_symbol, "tyv_actor_0_handler_0")
+        self.assertEqual(module.functions[0].body[0].value.type, IRActorRefType("Counter"))
+        self.assertIsInstance(module.functions[0].body[0].value, IRActorSpawn)
+        self.assertIsInstance(module.functions[0].body[1].expression, IRActorSend)
+
+    def test_actor_request_reply_is_reported_as_an_explicit_native_boundary(self) -> None:
+        checked = compile_checked_source('''actor Worker {
+    on get(reply: ReplySender<Int>) { reply.send(1) }
+}
+fn main() {
+    let worker = spawn(Worker())
+    let response = worker.request(get)
+}
+''', "actor_request.tyv")
         with self.assertRaises(Diagnostic) as caught:
             lower_checked_program(checked)
         self.assertEqual(caught.exception.stage, "backend")
-        self.assertIn("does not yet support actors", caught.exception.message)
-        self.assertEqual(caught.exception.location.filename, "actor.tyv")
+        self.assertIn("request/reply and timers", caught.exception.message)
+
+    def test_supervisor_runtime_is_reported_as_an_explicit_native_boundary(self) -> None:
+        checked = compile_checked_source('''actor Worker { on work() {} }
+fn main() {
+    let supervisor = oneForOne(2, 1000)
+    let worker = supervisor.start(Worker())
+}
+''', "native_supervisor.tyv")
+        with self.assertRaises(Diagnostic) as caught:
+            lower_checked_program(checked)
+        self.assertEqual(caught.exception.stage, "backend")
+        self.assertIn("native Supervisor V2 runtime is not yet supported", caught.exception.message)
+
+    def test_actor_owned_tasks_are_reported_as_an_explicit_native_boundary(self) -> None:
+        checked = compile_checked_source('''async fn background() {}
+actor Worker { on start() { let task = background() } }
+fn main() {
+    let worker = spawn(Worker())
+    worker.start()
+    runActors()
+}
+''', "native_actor_task.tyv")
+        with self.assertRaises(Diagnostic) as caught:
+            lower_checked_program(checked)
+        self.assertEqual(caught.exception.stage, "backend")
+        self.assertIn("native actor-owned Tasks are not yet supported", caught.exception.message)
 
     def test_native_task_cancellation_methods_lower_to_typed_ir(self) -> None:
         module = self.lower('''async fn background() {}
@@ -398,6 +454,35 @@ fn main() { println(add(1, 2)); println("Tyvera") }
         self.assertNotIn("python", source.lower())
         self.assertNotIn("PyObject", source)
 
+    def test_generated_actor_runtime_uses_bounded_round_robin_mailboxes(self) -> None:
+        module = self.lower('''actor Worker {
+    var value: Int
+    init(start: Int) { self.value = start }
+    on add(amount: Int) { self.value = self.value + amount }
+    on again() { self.add(1) }
+}
+fn main() {
+    let worker = spawn(Worker(0))
+    worker.add(2)
+    worker.again()
+    let result = runActors()
+}
+''')
+        source = emit_cpp(module)
+        self.assertIn("MAX_ACTOR_MAILBOX = 100000", source)
+        self.assertIn("MAX_ACTOR_DELIVERIES = 100000", source)
+        self.assertIn("std::deque<std::function<void()>> mailbox", source)
+        self.assertIn("std::vector<std::shared_ptr<ActorBase>> actors", source)
+        self.assertIn("actor_handler_active()", source)
+        self.assertIn("runActors cannot be called from an actor message handler", source)
+        self.assertIn("void tyv_clear_state() noexcept override", source)
+        self.assertIn("actor->tyv_clear_state();", source)
+        self.assertIn("actor->mailbox.pop_back()", source)
+        self.assertIn("class tyv_actor_Worker final : public tyvera_runtime::ActorBase", source)
+        self.assertIn("std::weak_ptr<tyv_actor_Worker>", source)
+        self.assertIn("run_actors", source)
+        self.assertNotIn("PyObject", source)
+
     def test_new_native_examples_lower_and_emit_cpp_without_python_bridge(self) -> None:
         for name in (
             "native_sum_types.tyv", "native_collections.tyv", "native_bytes.tyv", "byte_buffers.tyv",
@@ -438,14 +523,18 @@ fn main() { println(add(1, 2)); println("Tyvera") }
         with tempfile.TemporaryDirectory(prefix="tyvera-cli-build-") as temporary:
             root = Path(temporary)
             source = root / "unsupported.tyv"
-            source.write_text("actor Worker { on ping() {} }\nfn main() {}", encoding="utf-8")
+            source.write_text('''actor Worker { on get(reply: ReplySender<Int>) { reply.send(1) } }
+fn main() {
+    let worker = spawn(Worker())
+    let response = worker.request(get)
+}''', encoding="utf-8")
             output = root / "unsupported"
             stdout = io.StringIO()
             stderr = io.StringIO()
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 result = cli_main(["build", str(source), "--output", str(output)])
             self.assertEqual(result, 1)
-            self.assertIn("native backend does not yet support actors", stderr.getvalue())
+            self.assertIn("native actor request/reply and timers are not yet supported", stderr.getvalue())
             self.assertFalse(output.exists())
 
     def test_build_cli_typechecks_before_creating_any_artifact(self) -> None:
@@ -537,6 +626,122 @@ class NativeExecutionTests(unittest.TestCase):
     def _tyvera_string(value: str) -> str:
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
+
+    def test_native_actor_state_fifo_self_send_and_round_robin_match_reference(self) -> None:
+        source = '''actor Counter {
+    var value: Int
+    init(start: Int) { self.value = start }
+    on add(amount: Int) { self.value = self.value + amount }
+    on report() { println(self.value) }
+}
+actor Marker {
+    on begin() { println("begin"); self.finish() }
+    on finish() { println("finish") }
+}
+fn main() {
+    let counter = spawn(Counter(5))
+    let marker = spawn(Marker())
+    counter.add(2)
+    counter.add(3)
+    counter.report()
+    marker.begin()
+    marker.finish()
+    match runActors() {
+        Ok(count) => println(count)
+        Err(error) => println(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-actors-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actors", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+
+    def test_native_actor_crash_is_isolated_and_reported_like_reference(self) -> None:
+        source = '''actor Broken {
+    on fail() { let failure: Float = 1 / 0 }
+}
+actor Healthy {
+    on work() { println("healthy") }
+}
+fn main() {
+    let broken = spawn(Broken())
+    let healthy = spawn(Healthy())
+    broken.fail()
+    broken.fail()
+    healthy.work()
+    match runActors() {
+        Ok(count) => println(count)
+        Err(reason) => println(reason)
+    }
+    println(broken.isAlive())
+    println(healthy.isAlive())
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-actor-crash-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actors", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+
+    def test_native_actor_stop_clears_pending_messages_and_rejects_later_send(self) -> None:
+        source = '''actor Worker {
+    on work() { println("unexpected") }
+}
+fn main() {
+    let worker = spawn(Worker())
+    worker.work()
+    worker.stop()
+    println(worker.isAlive())
+    worker.work()
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-actor-stop-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actors", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "false\n")
+
+    def test_native_runtime_retains_actors_after_actor_ref_scope_ends(self) -> None:
+        source = '''actor Worker { on ping() { println("alive") } }
+fn main() {
+    {
+        let worker = spawn(Worker())
+        worker.ping()
+    }
+    match runActors() {
+        Ok(_) => println("complete")
+        Err(error) => println(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-actor-runtime-owner-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actors", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "alive\ncomplete\n")
+
+    def test_native_actor_mailbox_capacity_matches_reference(self) -> None:
+        source = '''actor Worker { on work() {} }
+fn main() {
+    let worker = spawn(Worker())
+    var index = 0
+    while index < 100001 {
+        worker.work()
+        index = index + 1
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-actor-mailbox-limit-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actors", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.returncode, 1)
+            self.assertIn("actor mailbox capacity (100000) exceeded", native.stderr)
 
     def test_native_duration_conversions_match_reference(self) -> None:
         source = '''fn main() {

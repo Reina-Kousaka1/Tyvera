@@ -8,7 +8,7 @@ so later backends do not need to infer language semantics from generated C++.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields, is_dataclass
 from enum import Enum
 from typing import TypeAlias
 
@@ -40,6 +40,7 @@ class IRType(str, Enum):
     HTTP_HEADERS = "HttpHeaders"
     HTTP_REQUEST = "HttpRequest"
     HTTP_RESPONSE = "HttpResponse"
+    ACTOR_REF = "ActorRef"
     VOID = "Void"
 
 
@@ -51,13 +52,26 @@ class IRAppliedType:
     arguments: tuple[IRTypeRef, ...]
 
 
-IRTypeRef: TypeAlias = IRType | IRAppliedType
+@dataclass(frozen=True, slots=True)
+class IRActorRefType:
+    """A statically typed reference to one checked actor declaration."""
+
+    actor_name: str
+
+
+IRTypeRef: TypeAlias = IRType | IRAppliedType | IRActorRefType
 
 
 def ir_type_name(type_ref: IRTypeRef) -> str:
     if isinstance(type_ref, IRType):
         return type_ref.value
+    if isinstance(type_ref, IRActorRefType):
+        return f"ActorRef<{type_ref.actor_name}>"
     return f"{type_ref.name}<{','.join(ir_type_name(item) for item in type_ref.arguments)}>"
+
+
+def _valid_qualified_name(value: str) -> bool:
+    return bool(value) and all(part.isidentifier() for part in value.split("."))
 
 
 def _applied(name: str, *arguments: IRTypeRef) -> IRAppliedType:
@@ -163,6 +177,31 @@ class IRCollectionLength(IRExpression):
 class IRMethodCall(IRExpression):
     receiver: IRExpression
     method: str
+    arguments: tuple[IRExpression, ...]
+    type: IRTypeRef
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
+class IRActorSelfRef(IRExpression):
+    type: IRTypeRef
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
+class IRActorSpawn(IRExpression):
+    actor_name: str
+    initializer_symbol: str | None
+    arguments: tuple[IRExpression, ...]
+    type: IRTypeRef
+    location: Location
+
+
+@dataclass(frozen=True, slots=True)
+class IRActorSend(IRExpression):
+    receiver: IRExpression
+    actor_name: str
+    handler_symbol: str
     arguments: tuple[IRExpression, ...]
     type: IRTypeRef
     location: Location
@@ -310,6 +349,7 @@ IRStatementLike: TypeAlias = (
 IRExpressionLike: TypeAlias = (
     IRLiteral | IRLocalRef | IRCall | IRUnary | IRBinary | IRVariant | IRBuiltinCall
     | IRMove | IRCollectionCreate | IRCollectionLength | IRMethodCall
+    | IRActorSelfRef | IRActorSpawn | IRActorSend
 )
 
 
@@ -322,12 +362,24 @@ class IRFunction:
     body: tuple[IRStatement, ...]
     location: Location
     is_async: bool = False
+    actor_name: str | None = None
+    actor_initializer: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class IRActor:
+    name: str
+    fields: tuple[IRVariable, ...]
+    handler_symbols: tuple[tuple[str, str], ...]
+    initializer_symbol: str | None
+    location: Location
 
 
 @dataclass(frozen=True, slots=True)
 class IRModule:
     functions: tuple[IRFunction, ...]
     entry_symbol: str
+    actors: tuple[IRActor, ...] = ()
 
 
 def _invalid(location: Location, message: str) -> Diagnostic:
@@ -336,6 +388,10 @@ def _invalid(location: Location, message: str) -> Diagnostic:
 
 def _validate_type(type_ref: IRTypeRef, location: Location) -> None:
     if isinstance(type_ref, IRType):
+        return
+    if isinstance(type_ref, IRActorRefType):
+        if not _valid_qualified_name(type_ref.actor_name):
+            raise _invalid(location, "invalid IR ActorRef target")
         return
     if not isinstance(type_ref, IRAppliedType):
         raise _invalid(location, "unknown IR type representation")
@@ -371,6 +427,8 @@ def _contains_resource(type_ref: IRTypeRef) -> bool:
 
 
 def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef, ...], IRTypeRef] | None:
+    if isinstance(receiver, IRActorRefType):
+        return {"isAlive": ((), IRType.BOOL), "stop": ((), IRType.VOID)}.get(method)
     if isinstance(receiver, IRAppliedType) and receiver.name == "Task":
         signatures = {
             "isDone": ((), IRType.BOOL),
@@ -544,6 +602,24 @@ def validate_ir(module: IRModule) -> None:
         raise _invalid(Location("<ir>", 1, 1), "IR module has no functions")
     symbols: dict[str, IRFunction] = {}
     entries: list[IRFunction] = []
+    actors = {actor.name: actor for actor in module.actors}
+    if len(actors) != len(module.actors):
+        raise _invalid(module.actors[0].location, "duplicate IR actor declaration")
+    for actor in module.actors:
+        if not _valid_qualified_name(actor.name):
+            raise _invalid(actor.location, "invalid IR actor name")
+        fields_by_name: set[str] = set()
+        fields_by_id: set[int] = set()
+        for field in actor.fields:
+            _validate_type(field.type, field.location)
+            if isinstance(field.type, IRActorRefType) and field.type.actor_name not in actors:
+                raise _invalid(field.location, f"IR actor field refers to unknown actor '{field.type.actor_name}'")
+            if field.type == IRType.VOID or field.name in fields_by_name or field.identifier in fields_by_id:
+                raise _invalid(field.location, "invalid or duplicate IR actor state field")
+            if field.identifier >= 0:
+                raise _invalid(field.location, "IR actor state field identifiers must be negative")
+            fields_by_name.add(field.name)
+            fields_by_id.add(field.identifier)
     for function in module.functions:
         if function.symbol in symbols:
             raise _invalid(function.location, f"duplicate IR function symbol '{function.symbol}'")
@@ -568,14 +644,70 @@ def validate_ir(module: IRModule) -> None:
     if module.entry_symbol not in symbols:
         raise _invalid(module.functions[0].location, "IR entry symbol does not exist")
 
+    for actor in module.actors:
+        declared: set[str] = set()
+        symbols_for_handlers: set[str] = set()
+        for method_name, symbol in actor.handler_symbols:
+            function = symbols.get(symbol)
+            if (method_name == "init" or method_name in declared or symbol in symbols_for_handlers
+                    or function is None or function.actor_name != actor.name or function.actor_initializer):
+                raise _invalid(actor.location, f"IR actor handler '{method_name}' has an invalid definition")
+            declared.add(method_name)
+            symbols_for_handlers.add(symbol)
+        if actor.initializer_symbol is not None:
+            initializer = symbols.get(actor.initializer_symbol)
+            if (initializer is None or initializer.actor_name != actor.name
+                    or not initializer.actor_initializer):
+                raise _invalid(actor.location, "IR actor initializer has an invalid definition")
+
     for function in module.functions:
-        scopes: list[dict[int, IRVariable]] = [{
-            parameter.identifier: parameter for parameter in function.parameters
-        }]
+        for node in _walk_ir(function):
+            if isinstance(node, IRActorRefType) and node.actor_name not in actors:
+                raise _invalid(function.location, f"IR refers to unknown actor '{node.actor_name}'")
+            if isinstance(node, IRActorSpawn):
+                actor = actors.get(node.actor_name)
+                if actor is None or node.initializer_symbol != actor.initializer_symbol:
+                    raise _invalid(node.location, f"IR spawn refers to unknown actor '{node.actor_name}'")
+            if isinstance(node, IRActorSend):
+                actor = actors.get(node.actor_name)
+                if actor is None or (node.handler_symbol not in dict(actor.handler_symbols).values()):
+                    raise _invalid(node.location, f"IR message refers to unknown handler on '{node.actor_name}'")
+
+    for function in module.functions:
+        if function.actor_name is not None:
+            actor = actors.get(function.actor_name)
+            if actor is None or function.is_async or function.return_type != IRType.VOID:
+                raise _invalid(function.location, "IR actor handler has an invalid owner or signature")
+            is_initializer = function.symbol == actor.initializer_symbol
+            if function.actor_initializer != is_initializer:
+                raise _invalid(function.location, "IR actor initializer metadata does not match its declaration")
+            fields = {field.identifier: field for field in actor.fields}
+            parameters = {parameter.identifier: parameter for parameter in function.parameters}
+            if set(fields) & set(parameters):
+                raise _invalid(function.location, "IR actor parameter identifier collides with a state field")
+            scopes = [fields, parameters]
+            seen_ids = set(fields) | set(parameters)
+            _validate_statements(function.body, IRType.VOID, symbols, scopes, seen_ids, 0, False)
+            continue
+        scopes = [{parameter.identifier: parameter for parameter in function.parameters}]
         seen_ids = set(scopes[0])
         _validate_statements(function.body, function.return_type, symbols, scopes, seen_ids, 0, function.is_async)
         if function.return_type != IRType.VOID and "next" in _flow_outcomes(function.body):
             raise _invalid(function.location, f"IR function '{function.name}' can fall through without returning {function.return_type.value}")
+
+
+def _walk_ir(value):
+    """Yield nodes in an IR dataclass tree for module-level reference checks."""
+    if isinstance(value, tuple):
+        for item in value:
+            yield from _walk_ir(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk_ir(item)
+    elif is_dataclass(value):
+        yield value
+        for field in dataclass_fields(value):
+            yield from _walk_ir(getattr(value, field.name))
 
 
 def _flow_outcomes(statements: tuple[IRStatement, ...]) -> set[str]:
@@ -675,6 +807,39 @@ def _validate_expression(
         if expression.type != expected_result:
             raise _invalid(expression.location, f"IR call result for '{function.name}' has the wrong type")
         return expression.type
+    if isinstance(expression, IRActorSelfRef):
+        if not isinstance(expression.type, IRActorRefType):
+            raise _invalid(expression.location, "IR actor self reference must have ActorRef type")
+        return expression.type
+    if isinstance(expression, IRActorSpawn):
+        if not isinstance(expression.type, IRActorRefType) or expression.type.actor_name != expression.actor_name:
+            raise _invalid(expression.location, "IR actor spawn result type does not match its actor")
+        if expression.initializer_symbol is None:
+            if expression.arguments:
+                raise _invalid(expression.location, "IR actor without an initializer cannot receive constructor arguments")
+        else:
+            initializer = functions.get(expression.initializer_symbol)
+            if (initializer is None or initializer.actor_name != expression.actor_name
+                    or not initializer.actor_initializer):
+                raise _invalid(expression.location, "IR actor spawn has no matching initializer")
+            expected = tuple(parameter.type for parameter in initializer.parameters)
+            actual = tuple(_validate_expression(argument, functions, scopes) for argument in expression.arguments)
+            if actual != expected:
+                raise _invalid(expression.location, "IR actor constructor arguments do not match its initializer")
+        return expression.type
+    if isinstance(expression, IRActorSend):
+        receiver_type = _validate_expression(expression.receiver, functions, scopes)
+        if receiver_type != IRActorRefType(expression.actor_name) or expression.type != IRType.VOID:
+            raise _invalid(expression.location, "IR actor message receiver or result type is invalid")
+        handler = functions.get(expression.handler_symbol)
+        if (handler is None or handler.actor_name != expression.actor_name or handler.actor_initializer
+                or not handler.name.startswith(expression.actor_name + ".")):
+            raise _invalid(expression.location, "IR actor message has no matching handler")
+        expected = tuple(parameter.type for parameter in handler.parameters)
+        actual = tuple(_validate_expression(argument, functions, scopes) for argument in expression.arguments)
+        if actual != expected:
+            raise _invalid(expression.location, "IR actor message arguments do not match its handler")
+        return expression.type
     if isinstance(expression, IRUnary):
         operand_type = _validate_expression(expression.operand, functions, scopes)
         if expression.operator == "!" and operand_type == expression.type == IRType.BOOL:
@@ -758,6 +923,7 @@ def _validate_expression(
             "openTextReader": ((IRType.STRING,), _applied("Result", IRType.TEXT_READER, IRType.STRING)),
             "openTextWriter": ((IRType.STRING, IRType.STRING), _applied("Result", IRType.TEXT_WRITER, IRType.STRING)),
             "runTasks": ((), _applied("Result", IRType.INT, IRType.STRING)),
+            "runActors": ((), _applied("Result", IRType.INT, IRType.STRING)),
             "resolveHost": ((IRType.STRING, IRType.INT), _applied("Task", _applied("Result", _applied("List", IRType.SOCKET_ADDRESS), IRType.STRING))),
             "tcpConnect": ((IRType.STRING, IRType.INT), _applied("Task", _applied("Result", IRType.TCP_CONNECTION, IRType.STRING))),
             "tlsConnect": ((IRType.STRING, IRType.INT), _applied("Task", _applied("Result", IRType.TLS_CONNECTION, IRType.STRING))),

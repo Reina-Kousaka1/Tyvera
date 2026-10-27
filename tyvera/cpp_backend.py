@@ -12,6 +12,11 @@ import tempfile
 from pathlib import Path
 
 from .ir import (
+    IRActor,
+    IRActorRefType,
+    IRActorSelfRef,
+    IRActorSend,
+    IRActorSpawn,
     IRAppliedType,
     IRAwait,
     IRBinary,
@@ -111,6 +116,14 @@ class CppNativeBackend:
         return destination
 
 
+def _cpp_actor_identifier(actor_name: str) -> str:
+    encoded = "".join(
+        character if character.isascii() and character.isalnum() else f"_x{ord(character):x}_"
+        for character in actor_name
+    )
+    return f"tyv_actor_{encoded}"
+
+
 def _find_compiler(location: Location) -> tuple[str, ...]:
     configured = os.environ.get("CXX", "").strip()
     if configured:
@@ -163,6 +176,7 @@ class _CppGenerator:
         self.indent = 0
         self.temporary = 0
         self.async_context = False
+        self.actor_context: IRActor | None = None
 
     def generate(self) -> str:
         encoded_root = self.project_root.as_posix().encode("utf-8")
@@ -175,11 +189,20 @@ class _CppGenerator:
         self.lines.extend(runtime.splitlines())
         self._line("namespace tyvera_generated {")
         self.indent += 1
-        for function in self.module.functions:
-            self._line(self._function_signature(function) + ";")
-        for function in self.module.functions:
+        for actor in self.module.actors:
+            self._actor_declaration(actor)
             self._line("")
-            self._function(function)
+        for function in self.module.functions:
+            if function.actor_name is None:
+                self._line(self._function_signature(function) + ";")
+        for function in self.module.functions:
+            if function.actor_name is None:
+                self._line("")
+                self._function(function)
+        for function in self.module.functions:
+            if function.actor_name is not None:
+                self._line("")
+                self._function(function)
         self.indent -= 1
         self._line("}")
         self._line("")
@@ -191,6 +214,7 @@ class _CppGenerator:
         self._line("return static_cast<int>(tyvera_runtime::ExitCode::initialization_failure);")
         self.indent -= 1
         self._line("}")
+        self._line("tyvera_runtime::ActorRuntimeScope actor_runtime_scope;")
         self._line("try {")
         self.indent += 1
         self._line(f"tyvera_generated::{self.module.entry_symbol}();")
@@ -223,6 +247,8 @@ class _CppGenerator:
 
     @staticmethod
     def _cpp_type(type_name: IRTypeRef) -> str:
+        if isinstance(type_name, IRActorRefType):
+            return "std::shared_ptr<tyvera_runtime::ActorBase>"
         if isinstance(type_name, IRAppliedType):
             arguments = [_CppGenerator._cpp_type(argument) for argument in type_name.arguments]
             if type_name.name == "Option":
@@ -271,12 +297,44 @@ class _CppGenerator:
         result_type = self._cpp_type(function.return_type)
         if function.is_async:
             result_type = f"tyvera_runtime::Task<{result_type}>"
+        if function.actor_name is not None:
+            return f"void {_cpp_actor_identifier(function.actor_name)}::{function.symbol}({parameters})"
         return f"{result_type} {function.symbol}({parameters})"
+
+    def _actor_declaration(self, actor: IRActor) -> None:
+        self._line(f"class {_cpp_actor_identifier(actor.name)} final : public tyvera_runtime::ActorBase {{")
+        self.indent += 1
+        self._line("public:")
+        self.indent += 1
+        for field in actor.fields:
+            self._line(f"{self._cpp_type(field.type)} tyv_field_{abs(field.identifier)}{{}};")
+        self._line("void tyv_clear_state() noexcept override {")
+        self.indent += 1
+        for field in actor.fields:
+            self._line(f"tyv_field_{abs(field.identifier)} = {{}};")
+        self.indent -= 1
+        self._line("}")
+        methods = ([actor.initializer_symbol] if actor.initializer_symbol is not None else [])
+        methods.extend(symbol for _, symbol in actor.handler_symbols)
+        for symbol in methods:
+            function = self.function_symbols[symbol]
+            parameters = ", ".join(
+                f"{self._cpp_type(parameter.type)} tyv_argument_{parameter.identifier}"
+                for parameter in function.parameters
+            )
+            self._line(f"void {symbol}({parameters});")
+        self.indent -= 1
+        self.indent -= 1
+        self._line("};")
 
     def _function(self, function: IRFunction) -> None:
         self.temporary = 0
         previous_async_context = self.async_context
+        previous_actor_context = self.actor_context
         self.async_context = function.is_async
+        self.actor_context = next(
+            (actor for actor in self.module.actors if actor.name == function.actor_name), None,
+        )
         self._line(self._function_signature(function) + " {")
         self.indent += 1
         if function.is_async:
@@ -306,6 +364,12 @@ class _CppGenerator:
         self.indent -= 1
         self._line("}")
         self.async_context = previous_async_context
+        self.actor_context = previous_actor_context
+
+    def _local_name(self, identifier: int) -> str:
+        if identifier < 0 and self.actor_context is not None:
+            return f"this->tyv_field_{abs(identifier)}"
+        return f"tyv_local_{identifier}"
 
     def _statement(self, statement) -> None:
         if self.async_context:
@@ -317,7 +381,7 @@ class _CppGenerator:
                 f"{self._expression(statement.value)};"
             )
         elif isinstance(statement, IRAssign):
-            self._line(f"tyv_local_{statement.variable_id} = {self._expression(statement.value)};")
+            self._line(f"{self._local_name(statement.variable_id)} = {self._expression(statement.value)};")
         elif isinstance(statement, IRExpressionStatement):
             self._line(f"(void)({self._expression(statement.expression)});")
         elif isinstance(statement, IROutput):
@@ -521,7 +585,7 @@ class _CppGenerator:
                 return "(std::numeric_limits<std::int64_t>::min())"
             return f"(static_cast<std::int64_t>({expression.value}LL))"
         if isinstance(expression, IRLocalRef):
-            return f"tyv_local_{expression.variable_id}"
+            return self._local_name(expression.variable_id)
         if isinstance(expression, IRMove):
             return f"std::move({self._expression(expression.operand)})"
         if isinstance(expression, IRCall):
@@ -580,6 +644,7 @@ class _CppGenerator:
                 "openTextReader": "open_text_reader",
                 "openTextWriter": "open_text_writer",
                 "runTasks": "run_tasks",
+                "runActors": "run_actors",
                 "resolveHost": "resolve_host",
                 "tcpConnect": "tcp_connect",
                 "tlsConnect": "tls_connect",
@@ -616,11 +681,60 @@ class _CppGenerator:
                 values.extend([_location_args(expression.location)])
             elif expression.builtin == "pathJoin":
                 values.append(_location_args(expression.location))
-            elif expression.builtin in {"runTasks", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen",
+            elif expression.builtin in {"runTasks", "runActors", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen",
                                          "webSocketConnect", "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete"}:
                 values.append(_location_args(expression.location))
             call = f"tyvera_runtime::{function}({', '.join(values)})"
             lines.append(f"    return {call};")
+            lines.append("}())")
+            return "\n".join(lines)
+        if isinstance(expression, IRActorSelfRef):
+            return "shared_from_this()"
+        if isinstance(expression, IRActorSpawn):
+            temporaries = [self._new_temporary() for _ in expression.arguments]
+            result_type = self._cpp_type(expression.type)
+            lines = [f"([&]() -> {result_type} {{"]
+            for name, argument in zip(temporaries, expression.arguments):
+                lines.append(f"    const auto {name} = {self._expression(argument)};")
+            actor_type = _cpp_actor_identifier(expression.actor_name)
+            lines.append(
+                f"    auto tyv_actor = tyvera_runtime::spawn_actor<{actor_type}>("
+                f"{_cpp_string_literal(expression.actor_name)}, {_location_args(expression.location)});"
+            )
+            if expression.initializer_symbol is not None:
+                lines.append("    try {")
+                lines.append(f"        tyv_actor->{expression.initializer_symbol}({', '.join(temporaries)});")
+                lines.append("    } catch (...) {")
+                lines.append("        tyvera_runtime::actor_initialization_failed(tyv_actor);")
+                lines.append("        throw;")
+                lines.append("    }")
+            lines.append("    tyvera_runtime::actor_started(tyv_actor);")
+            lines.append("    return std::static_pointer_cast<tyvera_runtime::ActorBase>(std::move(tyv_actor));")
+            lines.append("}())")
+            return "\n".join(lines)
+        if isinstance(expression, IRActorSend):
+            target = self._new_temporary()
+            typed_target = self._new_temporary()
+            weak_target = self._new_temporary()
+            arguments = [self._new_temporary() for _ in expression.arguments]
+            actor_type = _cpp_actor_identifier(expression.actor_name)
+            lines = ["([&]() -> void {"]
+            lines.append(f"    const auto {target} = {self._expression(expression.receiver)};")
+            for name, argument in zip(arguments, expression.arguments):
+                lines.append(f"    const auto {name} = {self._expression(argument)};")
+            lines.append(f"    auto {typed_target} = std::dynamic_pointer_cast<{actor_type}>({target});")
+            lines.append(
+                f"    if (!{typed_target}) throw tyvera_runtime::Failure({_location_args(expression.location)}, "
+                f"\"actor reference type mismatch\");"
+            )
+            lines.append(f"    const std::weak_ptr<{actor_type}> {weak_target} = {typed_target};")
+            captures = ", ".join([weak_target, *arguments])
+            args = ", ".join(arguments)
+            lines.append(
+                f"    tyvera_runtime::enqueue_actor({target}, {_cpp_string_literal(expression.actor_name)}, "
+                f"[{captures}]() {{ if (auto target = {weak_target}.lock()) target->{expression.handler_symbol}({args}); }}, "
+                f"{_location_args(expression.location)});"
+            )
             lines.append("}())")
             return "\n".join(lines)
         if isinstance(expression, IRCollectionCreate):
@@ -724,6 +838,11 @@ class _CppGenerator:
     @staticmethod
     def _method_call_expression(expression: IRMethodCall, receiver: str, arguments: list[str]) -> str:
         method = expression.method
+        if isinstance(expression.receiver.type, IRActorRefType):
+            if method == "isAlive":
+                return f"tyvera_runtime::actor_is_alive({receiver})"
+            if method == "stop":
+                return f"tyvera_runtime::actor_stop({receiver})"
         if isinstance(expression.receiver.type, IRAppliedType) and expression.receiver.type.name == "Task":
             if method == "withTimeout":
                 move_result = "true" if _ir_contains_resource(expression.type) else "false"
@@ -947,6 +1066,7 @@ _RUNTIME = r'''#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -2077,6 +2197,218 @@ template <typename T> inline StringResult<T> result_ok(T value) {
 template <typename T> inline StringResult<T> result_error(std::string message) {
     return StringResult<T>{std::in_place_index<1>, std::move(message)};
 }
+struct ActorBase : std::enable_shared_from_this<ActorBase> {
+    std::string actor_name;
+    std::string status = "starting";
+    std::deque<std::function<void()>> mailbox;
+    bool queued = false;
+    virtual void tyv_clear_state() noexcept {}
+    virtual ~ActorBase() = default;
+};
+struct ActorRuntimeState {
+    std::mutex mutex;
+    std::deque<std::shared_ptr<ActorBase>> ready;
+    std::vector<std::shared_ptr<ActorBase>> actors;
+};
+inline ActorRuntimeState& actor_runtime_state() {
+    static ActorRuntimeState state;
+    return state;
+}
+inline bool& actor_handler_active() {
+    static thread_local bool active = false;
+    return active;
+}
+struct ActorHandlerScope {
+    bool previous = actor_handler_active();
+    ActorHandlerScope() { actor_handler_active() = true; }
+    ~ActorHandlerScope() { actor_handler_active() = previous; }
+};
+inline constexpr std::size_t MAX_ACTOR_MAILBOX = 100000;
+inline constexpr std::int64_t MAX_ACTOR_DELIVERIES = 100000;
+inline void remove_ready_actor_locked(ActorRuntimeState& state, const ActorBase* actor) {
+    state.ready.erase(std::remove_if(state.ready.begin(), state.ready.end(), [actor](const auto& candidate) {
+        return candidate.get() == actor;
+    }), state.ready.end());
+}
+template <typename T> inline std::shared_ptr<T> spawn_actor(
+    std::string actor_name, const std::string& file, int line, int column) {
+    try {
+        auto actor = std::make_shared<T>();
+        actor->actor_name = std::move(actor_name);
+        auto& state = actor_runtime_state();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.actors.push_back(actor);
+        return actor;
+    } catch (const std::bad_alloc&) {
+        throw Failure(file, line, column, "cannot allocate actor state");
+    }
+}
+inline void actor_started(const std::shared_ptr<ActorBase>& actor) {
+    if (!actor) return;
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    actor->status = "alive";
+}
+inline void actor_initialization_failed(const std::shared_ptr<ActorBase>& actor) noexcept {
+    if (!actor) return;
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    actor->status = "crashed";
+    actor->mailbox.clear();
+    actor->queued = false;
+    remove_ready_actor_locked(state, actor.get());
+    actor->tyv_clear_state();
+}
+inline void enqueue_actor(
+    const std::shared_ptr<ActorBase>& actor, const std::string& actor_name,
+    std::function<void()> message, const std::string& file, int line, int column) {
+    auto& state = actor_runtime_state();
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (!actor || actor->actor_name != actor_name)
+            throw Failure(file, line, column, "actor reference type mismatch");
+        if (actor->status != "alive")
+            throw Failure(file, line, column, "cannot send a message to a " + actor->status + " actor");
+        if (actor->mailbox.size() >= MAX_ACTOR_MAILBOX)
+            throw Failure(file, line, column, "actor mailbox capacity (100000) exceeded");
+        try {
+            actor->mailbox.push_back(std::move(message));
+            if (!actor->queued) {
+                try {
+                    state.ready.push_back(actor);
+                    actor->queued = true;
+                } catch (...) {
+                    actor->mailbox.pop_back();
+                    throw;
+                }
+            }
+        } catch (const std::bad_alloc&) {
+            throw Failure(file, line, column, "cannot enqueue actor message");
+        }
+    }
+    native_scheduler().changed.notify_all();
+}
+inline bool actor_is_alive(const std::shared_ptr<ActorBase>& actor) noexcept {
+    if (!actor) return false;
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return actor->status == "alive";
+}
+inline bool actor_stop(const std::shared_ptr<ActorBase>& actor) noexcept {
+    if (!actor) return false;
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (actor->status != "alive") return false;
+    actor->status = "stopped";
+    actor->mailbox.clear();
+    actor->queued = false;
+    remove_ready_actor_locked(state, actor.get());
+    return true;
+}
+inline std::string actor_crash_message(const ActorBase& actor, const Failure& error) {
+    return "actor '" + actor.actor_name + "' crashed at " + error.file + ":" +
+        std::to_string(error.line) + ":" + std::to_string(error.column) + ": " + error.message;
+}
+inline StringResult<std::int64_t> run_actors(
+    const std::string& file, int line, int column) {
+    if (actor_handler_active())
+        throw Failure(file, line, column, "runActors cannot be called from an actor message handler");
+    std::int64_t processed = 0;
+    std::string first_crash;
+    while (processed < MAX_ACTOR_DELIVERIES) {
+        check_shutdown(file, line, column);
+        std::shared_ptr<ActorBase> actor;
+        std::function<void()> message;
+        {
+            auto& state = actor_runtime_state();
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (state.ready.empty()) break;
+            actor = std::move(state.ready.front());
+            state.ready.pop_front();
+            actor->queued = false;
+            if (actor->status != "alive" || actor->mailbox.empty()) continue;
+            message = std::move(actor->mailbox.front());
+            actor->mailbox.pop_front();
+        }
+        ++processed;
+        try {
+            ActorHandlerScope handler_scope;
+            message();
+        } catch (const SignalShutdown&) {
+            throw;
+        } catch (const Failure& error) {
+            auto& state = actor_runtime_state();
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (actor->status == "alive") {
+                actor->status = "crashed";
+                actor->mailbox.clear();
+                actor->queued = false;
+                remove_ready_actor_locked(state, actor.get());
+                if (first_crash.empty()) first_crash = actor_crash_message(*actor, error);
+            }
+        } catch (const std::exception&) {
+            auto& state = actor_runtime_state();
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (actor->status == "alive") {
+                actor->status = "crashed";
+                actor->mailbox.clear();
+                actor->queued = false;
+                remove_ready_actor_locked(state, actor.get());
+                if (first_crash.empty())
+                    first_crash = "actor '" + actor->actor_name + "' crashed: native runtime failure";
+            }
+        } catch (...) {
+            auto& state = actor_runtime_state();
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (actor->status == "alive") {
+                actor->status = "crashed";
+                actor->mailbox.clear();
+                actor->queued = false;
+                remove_ready_actor_locked(state, actor.get());
+                if (first_crash.empty())
+                    first_crash = "actor '" + actor->actor_name + "' crashed: native runtime failure";
+            }
+        }
+        {
+            auto& state = actor_runtime_state();
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (actor->status == "alive" && !actor->mailbox.empty() && !actor->queued) {
+                try {
+                    state.ready.push_back(actor);
+                    actor->queued = true;
+                } catch (const std::bad_alloc&) {
+                    actor->status = "crashed";
+                    actor->mailbox.clear();
+                    if (first_crash.empty())
+                        first_crash = "actor '" + actor->actor_name + "' crashed: native runtime failure";
+                }
+            }
+        }
+    }
+    {
+        auto& state = actor_runtime_state();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (processed >= MAX_ACTOR_DELIVERIES && !state.ready.empty() && first_crash.empty())
+            first_crash = "actor scheduler reached the 100000-message safety limit; messages remain queued";
+    }
+    if (!first_crash.empty()) return result_error<std::int64_t>(std::move(first_crash));
+    return result_ok<std::int64_t>(processed);
+}
+inline void shutdown_actors() noexcept {
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    for (auto actor = state.actors.rbegin(); actor != state.actors.rend(); ++actor) {
+        (*actor)->status = "stopped";
+        (*actor)->mailbox.clear();
+        (*actor)->queued = false;
+    }
+    for (const auto& actor : state.actors) actor->tyv_clear_state();
+    state.ready.clear();
+    state.actors.clear();
+}
+struct ActorRuntimeScope {
+    ~ActorRuntimeScope() { shutdown_actors(); }
+};
 inline StringResult<Duration> duration_from_seconds(double seconds) {
     if (!std::isfinite(seconds) || seconds < 0.0)
         return result_error<Duration>("Duration seconds must be finite and non-negative");
@@ -3812,6 +4144,8 @@ inline Task<StringResult<bool>> websocket_close_gracefully(
 #endif
 
 inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, int column) {
+    if (actor_handler_active())
+        throw Failure(file, line, column, "runTasks cannot be called from an actor message handler");
     auto& scheduler = native_scheduler();
     {
         std::lock_guard<std::mutex> lock(scheduler.mutex);

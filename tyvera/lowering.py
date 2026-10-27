@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .ast import (
+    ActorDeclaration,
     Assignment,
     AwaitStatement,
     BindingPattern,
@@ -34,6 +35,11 @@ from .ast import (
 )
 from .compiler import CheckedProgram
 from .ir import (
+    IRActor,
+    IRActorRefType,
+    IRActorSelfRef,
+    IRActorSend,
+    IRActorSpawn,
     IRAppliedType,
     IRAssign,
     IRAwait,
@@ -114,8 +120,6 @@ def lower_checked_program(checked: CheckedProgram) -> IRModule:
         raise Diagnostic(program.classes[0].location, "backend", "native backend does not yet support classes")
     if program.interfaces:
         raise Diagnostic(program.interfaces[0].location, "backend", "native backend does not yet support interfaces")
-    if program.actors:
-        raise Diagnostic(program.actors[0].location, "backend", "native backend does not yet support actors")
     if program.records:
         raise Diagnostic(program.records[0].location, "backend", "native backend does not yet support records")
     if program.enums:
@@ -128,21 +132,41 @@ def lower_checked_program(checked: CheckedProgram) -> IRModule:
         raise Diagnostic(Location("<program>", 1, 1), "backend", "native backend requires a main function")
 
     symbols = {function.name: f"tyv_fn_{index}" for index, function in enumerate(program.functions)}
-    lowerer = _FunctionLowerer(checked, symbols)
-    functions = tuple(lowerer.lower(function) for function in program.functions)
-    entry = next((function for function in functions if function.name == "main"), None)
+    actor_symbols = {
+        actor.name: {
+            method.name: f"tyv_actor_{actor_index}_handler_{handler_index}"
+            for handler_index, method in enumerate(actor.handlers)
+        }
+        for actor_index, actor in enumerate(program.actors)
+    }
+    lowerer = _FunctionLowerer(checked, symbols, actor_symbols)
+    actors: list[IRActor] = []
+    actor_functions = []
+    for actor in program.actors:
+        lowered_actor, handlers = lowerer.lower_actor(actor, actor_symbols[actor.name])
+        actors.append(lowered_actor)
+        actor_functions.extend(handlers)
+    functions = [lowerer.lower(function) for function in program.functions]
+    functions.extend(actor_functions)
+    entry = next((function for function in functions if function.name == "main" and function.actor_name is None), None)
     if entry is None:
         raise Diagnostic(program.functions[0].location, "backend", "native backend requires a main function")
-    module = IRModule(functions, entry.symbol)
+    module = IRModule(tuple(functions), entry.symbol, tuple(actors))
     validate_ir(module)
     return module
 
 
 class _FunctionLowerer:
-    def __init__(self, checked: CheckedProgram, symbols: dict[str, str]) -> None:
+    def __init__(
+        self, checked: CheckedProgram, symbols: dict[str, str],
+        actor_symbols: dict[str, dict[str, str]] | None = None,
+    ) -> None:
         self.checked = checked
         self.symbols = symbols
+        self.actor_symbols = actor_symbols or {}
         self.scopes: list[dict[str, IRVariable]] = []
+        self.actor_name: str | None = None
+        self.actor_fields: dict[str, IRVariable] = {}
         self.next_local_id = 0
         self.return_type = IRType.VOID
         self.loop_depth = 0
@@ -174,6 +198,50 @@ class _FunctionLowerer:
             function.is_async,
         )
 
+    def lower_actor(
+        self, actor: ActorDeclaration, handler_symbols: dict[str, str],
+    ) -> tuple[IRActor, list[IRFunction]]:
+        fields = tuple(
+            IRVariable(-(index + 1), field.name, self._type(field.type_name, field.location),
+                       field.mutable, field.location)
+            for index, field in enumerate(actor.fields)
+        )
+        self.actor_name = actor.name
+        self.actor_fields = {field.name: field for field in fields}
+        handlers: list[IRFunction] = []
+        initializer_symbol = None
+        exposed_handlers: list[tuple[str, str]] = []
+        for handler in actor.handlers:
+            if any(split_type(parameter.type_name)[0] == "ReplySender" for parameter in handler.parameters):
+                raise Diagnostic(
+                    handler.location, "backend",
+                    "native actor request/reply and timers are not yet supported",
+                )
+            symbol = handler_symbols[handler.name]
+            lowered = self.lower_actor_handler(handler, symbol, fields)
+            handlers.append(lowered)
+            if handler.name == "init":
+                initializer_symbol = symbol
+            else:
+                exposed_handlers.append((handler.name, symbol))
+        self.actor_name = None
+        self.actor_fields = {}
+        return IRActor(actor.name, fields, tuple(exposed_handlers), initializer_symbol, actor.location), handlers
+
+    def lower_actor_handler(self, method, symbol: str, fields: tuple[IRVariable, ...]) -> IRFunction:
+        self.scopes = [{field.name: field for field in fields}, {}]
+        self.next_local_id = 0
+        parameters = tuple(
+            self._new_variable(parameter.name, parameter.type_name, mutable=False, location=parameter.location)
+            for parameter in method.parameters
+        )
+        self.return_type = IRType.VOID
+        body = self._statements(method.body)
+        return IRFunction(
+            f"{self.actor_name}.{method.name}", symbol, parameters, IRType.VOID, body,
+            method.location, False, self.actor_name, method.name == "init",
+        )
+
     def _type(self, type_name: str, location: Location) -> IRTypeRef:
         seen: set[str] = set()
         while True:
@@ -186,6 +254,8 @@ class _FunctionLowerer:
             seen.add(base)
             type_name = target
         base, arguments = split_type(type_name)
+        if base == "ActorRef" and len(arguments) == 1:
+            return IRActorRefType(arguments[0])
         result = _TYPE_MAP.get(base) if not arguments else None
         if result is not None:
             return result
@@ -248,8 +318,16 @@ class _FunctionLowerer:
             )
             return IRLet(variable, value, statement.location)
         if isinstance(statement, Assignment):
+            if isinstance(statement.target, MemberAccess):
+                if (self.actor_name is None or not isinstance(statement.target.receiver, Name)
+                        or statement.target.receiver.identifier != "self"):
+                    raise Diagnostic(statement.location, "backend", "native backend supports actor state assignment only through self")
+                variable = self.actor_fields.get(statement.target.member)
+                if variable is None:
+                    raise Diagnostic(statement.location, "backend", f"native backend cannot resolve actor field '{statement.target.member}'")
+                return IRAssign(variable.identifier, self._expression(statement.value), statement.location)
             if not isinstance(statement.target, str):
-                raise Diagnostic(statement.location, "backend", "native backend does not yet support field assignment")
+                raise Diagnostic(statement.location, "backend", "native backend does not support this assignment target")
             variable = self._lookup(statement.target, statement.location)
             return IRAssign(variable.identifier, self._expression(statement.value), statement.location)
         if isinstance(statement, ReturnStatement):
@@ -428,6 +506,14 @@ class _FunctionLowerer:
         raise Diagnostic(pattern.location, "backend", f"native backend does not yet support {type(pattern).__name__} patterns")
 
     def _expression(self, expression: Expression) -> IRExpression:
+        if isinstance(expression, Call) and expression.callee in {
+            "oneForOne", "oneForAll", "restForOne", "permanentChildPolicy",
+            "transientChildPolicy", "temporaryChildPolicy", "exponentialBackoff",
+        }:
+            raise Diagnostic(
+                expression.location, "backend",
+                "native Supervisor V2 runtime is not yet supported",
+            )
         if isinstance(expression, Unary) and expression.operator == "move":
             if not isinstance(expression.operand, Name):
                 raise Diagnostic(expression.location, "backend", "native move requires a local resource binding")
@@ -440,9 +526,23 @@ class _FunctionLowerer:
                 expression.location,
             )
         if isinstance(expression, Name):
+            if expression.identifier == "self" and self.actor_name is not None:
+                return IRActorSelfRef(IRActorRefType(self.actor_name), expression.location)
             variable = self._lookup(expression.identifier, expression.location)
+            if (self.actor_name is not None and isinstance(variable.type, IRAppliedType)
+                    and variable.type.name == "Task"):
+                raise Diagnostic(
+                    expression.location, "backend",
+                    "native actor-owned Tasks are not yet supported",
+                )
             return IRLocalRef(variable.identifier, variable.type, expression.location)
         expression_type = self._expression_type(expression)
+        if (self.actor_name is not None and isinstance(expression_type, IRAppliedType)
+                and expression_type.name == "Task"):
+            raise Diagnostic(
+                expression.location, "backend",
+                "native actor-owned Tasks are not yet supported",
+            )
         if isinstance(expression, Literal):
             return IRLiteral(expression.value, expression_type, expression.location)
         if isinstance(expression, Unary):
@@ -464,12 +564,39 @@ class _FunctionLowerer:
                 expression.location,
             )
         if isinstance(expression, MemberAccess):
+            if (self.actor_name is not None and isinstance(expression.receiver, Name)
+                    and expression.receiver.identifier == "self"):
+                variable = self.actor_fields.get(expression.member)
+                if variable is None:
+                    raise Diagnostic(expression.location, "backend", f"native backend cannot resolve actor field '{expression.member}'")
+                return IRLocalRef(variable.identifier, variable.type, expression.location)
             receiver = self._expression(expression.receiver)
             if (expression.member == "length" and isinstance(receiver.type, IRAppliedType)
                     and receiver.type.name in {"List", "Map"}):
                 return IRCollectionLength(receiver, expression_type, expression.location)
             raise Diagnostic(expression.location, "backend", "native backend does not yet support this field access")
         if isinstance(expression, MemberCall):
+            checked_receiver_type = self.checked.expression_types.get(expression.receiver.location, "")
+            receiver_base, receiver_arguments = split_type(checked_receiver_type)
+            actor_name = (
+                self.actor_name if isinstance(expression.receiver, Name)
+                and expression.receiver.identifier == "self" else
+                receiver_arguments[0] if receiver_base == "ActorRef" and len(receiver_arguments) == 1 else None
+            )
+            if actor_name is not None and expression.method in {"request", "requestWithin", "sendAfter"}:
+                raise Diagnostic(
+                    expression.location, "backend",
+                    "native actor request/reply and timers are not yet supported",
+                )
+            if actor_name is not None and expression.method not in {"stop", "isAlive"}:
+                handler_symbol = self.actor_symbols.get(actor_name, {}).get(expression.method)
+                if handler_symbol is None:
+                    raise Diagnostic(expression.location, "backend", f"native backend cannot resolve actor handler '{actor_name}.{expression.method}'")
+                return IRActorSend(
+                    self._expression(expression.receiver), actor_name, handler_symbol,
+                    tuple(self._expression(argument) for argument in expression.arguments),
+                    self._expression_type(expression), expression.location,
+                )
             receiver = self._expression(expression.receiver)
             if expression.type_arguments:
                 raise Diagnostic(expression.location, "backend", "native backend does not yet support generic method calls")
@@ -483,6 +610,7 @@ class _FunctionLowerer:
             if not (
                 isinstance(receiver.type, IRAppliedType) and receiver.type.name in {"List", "Map"}
                 or isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Task"
+                or isinstance(receiver.type, IRActorRefType)
                 or receiver.type in {
                     IRType.BYTE, IRType.DURATION, IRType.BYTES, IRType.BYTE_BUFFER,
                     IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
@@ -514,12 +642,25 @@ class _FunctionLowerer:
             if expression.callee in {"Some", "None", "Ok", "Err"}:
                 payload = None if expression.callee == "None" else self._expression(expression.arguments[0])
                 return IRVariant(expression.callee, payload, expression_type, expression.location)
+            if expression.callee == "spawn":
+                if len(expression.arguments) != 1 or not isinstance(expression.arguments[0], Call):
+                    raise Diagnostic(expression.location, "backend", "native spawn requires one actor construction")
+                construction = expression.arguments[0]
+                actor_name = construction.callee
+                handler_symbols = self.actor_symbols.get(actor_name)
+                if handler_symbols is None:
+                    raise Diagnostic(construction.location, "backend", f"native backend does not know actor '{actor_name}'")
+                return IRActorSpawn(
+                    actor_name, handler_symbols.get("init"),
+                    tuple(self._expression(argument) for argument in construction.arguments),
+                    expression_type, expression.location,
+                )
             if expression.callee in {"List", "Map"}:
                 return IRCollectionCreate(expression_type, expression.location)
             if expression.callee in {
                 "milliseconds", "seconds", "durationFromSeconds", "byteFromInt", "bytesFromString", "byteBuffer", "readText", "writeText",
                 "readBytes", "writeBytes", "pathJoin", "pathExists", "openText",
-                "openTextReader", "openTextWriter", "hostOS", "hostArchitecture",
+                "openTextReader", "openTextWriter", "hostOS", "hostArchitecture", "runActors",
                 "monotonicMilliseconds", "runTasks", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen",
                 "webSocketUrl", "webSocketConnect", "httpMethod", "httpUrl", "httpHeaders",
                 "httpRequest", "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete",

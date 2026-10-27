@@ -54,9 +54,11 @@ function.
 inference. The IR supports async functions, direct task calls, `await`, `runTasks`,
 and the supported TCP/DNS/TLS, HTTP client, and WebSocket client value and
 method signatures. Native task cancellation and monotonic deadlines are
-implemented for the supported task subset. Actors, supervisors, task groups,
-HTTP servers/routers/decoders, classes, interfaces, and generic functions remain
-rejected by `tyvera build`.
+implemented for the supported task subset. A limited native actor core is
+lowered for actor state, typed fire-and-forget messages, and actor lifecycle
+calls. Supervisors, actor request/reply and timers, monitoring/links,
+actor-owned tasks, task groups, HTTP servers/routers/decoders, classes,
+interfaces, and generic functions remain rejected by `tyvera build`.
 
 ## Three separate contracts
 
@@ -179,10 +181,12 @@ This is a private V1 code-generation contract, not a stable public C ABI or an
 FFI. These representations are private compiler details, not a public ABI.
 Generated executables do not embed or invoke Python. Synchronous file and
 binary I/O, `ByteBuffer`, text-file resources, and experimental Linux async
-TCP/DNS/TLS, HTTP-client, and WebSocket-client paths are supported. Classes,
-records, user-defined enums, tuples, generic functions, Actors, Supervisors,
-HTTP servers/routers/decoders, and WebSocket servers remain interpreter-only.
-No native actor or public error ABI is implemented. There is no
+TCP/DNS/TLS, HTTP-client, and WebSocket-client paths are supported. The
+experimental native actor subset supports stateful actor declarations,
+`spawn`, typed fire-and-forget messages, `stop`, `isAlive`, and `runActors()`.
+Classes, records, user-defined enums, tuples, generic functions, Supervisors,
+actor request/reply and timers, monitoring/links, HTTP servers/routers/decoders,
+and WebSocket servers remain interpreter-only. There is no
 `unsafe` or FFI declaration syntax. Any later FFI must define ownership,
 lifetimes, mutability, and error conversion explicitly; a native crash cannot
 become a recoverable Tyvera `Result`. See the [Memory Model](memory-model.md)
@@ -252,7 +256,8 @@ does not make C++ part of Tyvera's language.
 | `Task<T>`, async functions, `await`, `runTasks()` | Experimental native subset; task bodies are serialized and I/O waits use bounded worker threads. Cooperative task/child cancellation and monotonic `withTimeout(Duration)` deadlines are supported; `tryResult()`, task groups, and actor ownership remain unsupported. |
 | DNS, TCP, and TLS client | Experimental on native Linux: `resolveHost`, `tcpConnect`, `tcpListen`, `accept`, connection read/write, and verified `tlsConnect` with hostname/IP checks, all as typed `Task<Result<...,String>>` operations. RAII handles close sockets and TLS sessions. |
 | HTTP/WebSocket client | Experimental native Linux subset: typed HTTP values and GET/POST/PUT/DELETE/custom request client; bounded HTTP/1.1 responses; bounded `ws`/verified `wss` client. Native HTTP server/router/general codec and WebSocket server remain interpreter-only. |
-| Actors, Supervisors | Interpreter-only; native lowering rejects these constructs. |
+| Actors and `ActorRef<T>` | Experimental native C++17 subset: actor declarations and state, `spawn`, typed fire-and-forget messages, `stop`, `isAlive`, and `runActors()`. Per-actor FIFO mailboxes and round-robin turns are bounded; handler failures are isolated and reported through the existing `Result`. Native support remains Linux-CI-gated until the C++ runner validates this change. |
+| Supervisors, request/reply, actor timers, monitor/link, actor-owned Tasks | Interpreter-only. Native lowering reports a source diagnostic; no fallback occurs. |
 | `hostOS()`, `hostArchitecture()`, `monotonicMilliseconds()` | Native C++17 runtime and reference implementations; OS/architecture names are normalized and elapsed time is monotonic. |
 | Native SIGINT/SIGTERM shutdown | Generated C++17 records the first signal and unwinds at statement/loop safe points; scope resources use RAII cleanup. |
 | Native FFI, stable public ABI, cross-compilation | Planned; no syntax or runtime contract is exposed. |

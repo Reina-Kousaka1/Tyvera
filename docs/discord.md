@@ -71,11 +71,12 @@ explicit bounded 429 retry function. There is no bucket/global coordinator,
 concurrent request queue, automatic retry by default, API model coverage, or
 REST client Actor. Side-effect requests are only retried after an explicit
 429 rejection, never after a transport failure.
-The Discord package remains interpreter-only and experimental, even though
-native Linux now has separate experimental TCP/DNS/TLS, HTTP-client, and
-WebSocket-client primitives. Package imports, JSON/model paths, and its
-Actor/Supervisor lifecycle are not yet supported by native lowering; no native
-fallback is used. Do not treat this package as production-ready.
+The Discord package remains interpreter-only and experimental. Native Linux
+now has experimental TCP/DNS/TLS, HTTP-client, WebSocket-client, and a limited
+typed Actor core, but package imports, native typed JSON/model paths, TLS/HTTP/
+WebSocket integration with actors, and native Supervisor lifecycle are not yet
+supported by lowering; no native fallback is used. Do not treat this package as
+production-ready.
 
 When authentication is used, the token remains `Secret<String>` until the
 request header or Identify payload is formed. The library itself never logs it;

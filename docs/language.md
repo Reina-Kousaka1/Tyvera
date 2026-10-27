@@ -713,9 +713,12 @@ The native backend also accepts async functions, `Task<T>`, `await`,
 `runTasks()`, cooperative `Task.cancel()`, `isCancelled()`, `isDone()`, and
 `withTimeout(Duration)`. Cancellation cascades through owned child tasks and is
 checked at task statement/loop and socket-poll boundaries. A system DNS lookup
-cannot be interrupted mid-call. Native task groups, Actors, Supervisors, HTTP,
-and WebSockets are not implemented. The reference interpreter remains the
-complete runtime for those features.
+cannot be interrupted mid-call. Native task groups, Supervisors, HTTP, and
+WebSockets are not implemented. Native Actors have an experimental subset for
+typed fire-and-forget messages, FIFO mailboxes, round-robin `runActors()`,
+`stop`, `isAlive`, and isolated handler failures. Actor request/reply, timers,
+monitoring/links, and actor-owned Tasks remain interpreter-only. The reference
+interpreter remains the complete runtime for those features.
 
 ## JSON values
 
@@ -873,8 +876,11 @@ The experimental C++17 backend implements this synchronous slice directly:
 buffer/binary limit, project-root-relative file paths, checked `Result`
 errors, secret-path protection, move-only resource transfers, and LIFO cleanup.
 The generated executable uses private C++ runtime storage and does not invoke
-Python. Async file operations, HTTP, actors, and native FFI remain
-interpreter-only or planned. The experimental native Linux subset also supports
+Python. Async file operations, HTTP, native FFI, and actor supervision or
+request/reply remain interpreter-only or planned. The experimental native
+Linux actor subset supports typed fire-and-forget messages, FIFO mailboxes,
+round-robin dispatch, stop/alive checks, and isolated handler failure. The
+experimental native Linux subset also supports
 bounded `Task<T>`, `await`, `runTasks()`, DNS, TCP, and cooperative task
 cancellation, including owned-child propagation and pending socket waits.
 Native deadlines and cancellation during a blocking system DNS call remain
@@ -1037,9 +1043,11 @@ scalar/control-flow core, `Option`/`Result` and their supported patterns, typed
 `List`/`Map`, `Byte`/`Bytes`, bounded `ByteBuffer`, synchronous text/binary/path
 I/O, and owned synchronous text-file resources. The experimental Linux path additionally supports async functions, `Task<T>`,
 `await`, `runTasks()`, DNS, TCP, a verified TLS client, cooperative task
-cancellation, and monotonic deadlines. Classes, generic functions, Actors,
-Supervisors, task groups, WebSockets, HTTP, and native FFI remain unsupported
-by the native backend. `await` remains statement-only;
+cancellation, and monotonic deadlines. Classes, generic functions, Supervisors,
+task groups, WebSockets, HTTP, and native FFI remain unsupported by the native
+backend. Native actors remain experimental and do not yet support supervisor
+integration, request/reply, timers, monitoring/links, actor-owned tasks, or
+package imports. `await` remains statement-only;
 synchronous calls are atomic.
 `runActors()` remains non-blocking; `runTasks()` waits for task deadlines.
 Actor request timeouts do not interrupt work. No performance claim is made. No

@@ -242,10 +242,23 @@ serializes Tyvera task bodies so shared mutable values are not accessed in
 parallel. Native task cancellation is cooperative at statement/loop and socket
 poll checkpoints; owned children are cancelled on owner cancellation/failure
 and joined before owner completion. A blocking native DNS lookup cannot be
-interrupted mid-call. Native task groups and Actors remain unsupported. The Linux native backend
-also has experimental HTTP and WebSocket client subsets; native HTTP server,
-router/general codec, and WebSocket server remain unsupported. Native Linux TLS client operations use the same task cancellation
-and monotonic-deadline behavior as the supported TCP operations.
+interrupted mid-call. Native task groups and actor-owned tasks remain
+unsupported. The experimental native C++17 actor subset supports typed
+fire-and-forget messages, FIFO delivery per actor, round-robin actor turns,
+`stop`, `isAlive`, bounded mailboxes, and `runActors()` error results. Actor
+handler failures stop that actor, discard its queued messages, and allow other
+actors to continue. Supervisors, request/reply, timers, monitoring/links, and
+Task/Actor ownership integration remain interpreter-only. Generated actor
+references use shared runtime handles; queued callbacks hold weak target
+references, and runtime shutdown clears mailboxes and actor state to break
+reference cycles. The native runtime retains spawned actors until process
+shutdown even when user `ActorRef` values leave scope. Calling `runActors()` or
+`runTasks()` from a native actor handler raises the same controlled runtime
+failure as the reference runtime. The Linux native backend also has experimental HTTP and
+WebSocket client subsets; native HTTP server, router/general codec, and
+WebSocket server remain unsupported. Native Linux TLS client operations use
+the same task cancellation and monotonic-deadline behavior as the supported
+TCP operations.
 Native `runTasks()` reports completed task values; the reference runtime
 reports continuation steps, so that progress count is not portable. The
 reference runtime provides TCP, verified TLS/HTTPS, bounded WebSockets, async
