@@ -198,10 +198,13 @@ selectors and a bounded worker pool, but those mechanisms do not define the
 language contract.
 
 The native Linux subset has a separate implementation boundary. `async fn`,
-`await`, and `runTasks()` use a bounded registry of at most 64 task values per
-run. Task bodies are serialized; each pending DNS or socket operation runs in
-a worker so another Tyvera task can proceed. DNS uses the platform resolver
-and cannot be interrupted while that call is in progress. Sockets are
+`await`, and `runTasks()` use a bounded registry of at most 4,096 Task values
+per call. Completed values remain registered until the call ends; at most 64
+registered tasks can be unfinished at once. This includes tasks registered
+before `runTasks()` starts. Task bodies are serialized; each pending DNS or
+socket operation runs in a worker so another Tyvera task can proceed. DNS uses
+the platform resolver and cannot be interrupted while that call is in progress.
+Sockets are
 non-blocking and wait through `poll`; only one accept, read, or write may be
 pending on a given resource at a time. A read can be partial and EOF is
 `Ok(None)`. `writeAll` retains one bounded `Bytes` value while it waits.

@@ -1494,7 +1494,8 @@ struct TaskCancelled final : std::exception {
 };
 
 inline thread_local std::unique_lock<std::mutex>* active_execution_lock = nullptr;
-constexpr std::size_t MAX_NATIVE_TASKS_PER_RUN = 64;
+constexpr std::size_t MAX_NATIVE_TASK_VALUES_PER_RUN = 4096;
+constexpr std::size_t MAX_NATIVE_UNFINISHED_TASKS_PER_RUN = 64;
 struct TaskControl {
     std::atomic<bool> started{false};
     std::atomic<bool> done{false};
@@ -1683,8 +1684,14 @@ inline void register_native_task(const std::shared_ptr<TaskControl>& task,
     bool start_now = false;
     {
         std::lock_guard<std::mutex> lock(scheduler.mutex);
-        if (scheduler.tasks.size() >= MAX_NATIVE_TASKS_PER_RUN)
-            throw Failure(file, line, column, "native task capacity exceeded (maximum 64 tasks per run)");
+        if (scheduler.tasks.size() >= MAX_NATIVE_TASK_VALUES_PER_RUN)
+            throw Failure(file, line, column, "native task capacity exceeded (maximum 4096 Task values per run)");
+        const auto unfinished_tasks = std::count_if(
+            scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& registered) {
+                return !registered->done.load(std::memory_order_acquire);
+            });
+        if (unfinished_tasks >= MAX_NATIVE_UNFINISHED_TASKS_PER_RUN)
+            throw Failure(file, line, column, "native task capacity exceeded (maximum 64 unfinished tasks per run)");
         if (active_task_control) active_task_control->add_child(task);
         scheduler.tasks.push_back(task);
         start_now = scheduler.running;

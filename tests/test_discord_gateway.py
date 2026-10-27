@@ -298,7 +298,13 @@ async fn run() {{
         }}
     }}
 }}
-fn main() {{ let task = run(); runTasks() }}
+fn main() {{
+    let task = run()
+    match runTasks() {{
+        Ok(_) => {{}}
+        Err(error) => eprintln("runTasks failed: " + error)
+    }}
+}}
 ''',
                 encoding="utf-8",
             )
@@ -492,7 +498,13 @@ async fn run() {
         }
     }
 }
-fn main() { let task = run(); runTasks() }
+fn main() {
+    let task = run()
+    match runTasks() {
+        Ok(_) => {}
+        Err(error) => eprintln("runTasks failed: " + error)
+    }
+}
 ''', encoding="utf-8")
             checked = compile_checked_project(entry, DISCORD_ROOT)
             output = io.StringIO()
@@ -673,7 +685,13 @@ async fn run() {
         }
     }
 }
-fn main() { let task = run(); runTasks() }
+fn main() {
+    let task = run()
+    match runTasks() {
+        Ok(_) => {}
+        Err(error) => eprintln("runTasks failed: " + error)
+    }
+}
 ''', encoding="utf-8")
             checked = compile_checked_project(entry, DISCORD_ROOT)
             output = io.StringIO()
@@ -888,7 +906,13 @@ async fn run() {
         }
     }
 }
-fn main() { let task = run(); runTasks() }
+fn main() {
+    let task = run()
+    match runTasks() {
+        Ok(_) => {}
+        Err(error) => eprintln("runTasks failed: " + error)
+    }
+}
 ''', encoding="utf-8")
             checked = compile_checked_project(entry, DISCORD_ROOT)
             output = io.StringIO()

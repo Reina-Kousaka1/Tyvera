@@ -1321,6 +1321,57 @@ fn main() {{
                 server.server_close()
                 server_thread.join(timeout=1)
 
+    def test_native_task_registry_allows_more_than_64_sequential_tasks(self) -> None:
+        source = '''async fn pulse() {
+    await sleepFor(milliseconds(0))
+}
+async fn runMany() {
+    var completed = 0
+    while completed < 80 {
+        let pending = pulse()
+        await pending
+        completed = completed + 1
+    }
+    println(completed)
+}
+fn main() {
+    let task = runMany()
+    match runTasks() {
+        Ok(_) => {}
+        Err(error) => eprintln(error)
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-task-registry-") as temporary:
+            root = Path(temporary)
+            expected = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "task-registry-app", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            self.assertEqual(native.stdout, "80\n")
+
+    def test_native_task_registry_limits_unfinished_tasks(self) -> None:
+        source = '''async fn waitLong() {
+    await sleepFor(seconds(60))
+}
+async fn createTooMany() {
+    var created = 0
+    while created < 80 {
+        let pending = waitLong()
+        created = created + 1
+    }
+}
+fn main() {
+    let task = createTooMany()
+    match runTasks() {
+        Ok(_) => println("unexpected success")
+        Err(error) => eprintln(error)
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-task-active-limit-") as temporary:
+            root = Path(temporary)
+            native = self._native_source_result(source, root, root / "task-active-limit-app", root)
+            self.assertEqual(native.returncode, 1, native.stderr)
+            self.assertIn("native task capacity exceeded (maximum 64 unfinished tasks per run)", native.stderr)
+
     def test_native_task_timeout_cancels_source_and_matches_reference(self) -> None:
         source = '''async fn background() {
     while true {}

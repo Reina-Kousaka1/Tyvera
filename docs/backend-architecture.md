@@ -86,8 +86,10 @@ uses `selectors.DefaultSelector` for TCP and a bounded worker pool for DNS and
 file work. Native C++17 now has an experimental Linux-only async slice for
 `Task<T>`, `await`, `runTasks`, DNS, and TCP. Tyvera task bodies are serialized;
 blocking DNS/socket waits run in separate workers so they do not hold the task
-execution lock. A run accepts at most 64 registered native Task values in
-total, including tasks created before `runTasks()` starts. Linux sockets use
+execution lock. Each `runTasks()` call accepts at most 4,096 registered
+native Task values in total, including completed values retained until the
+call ends, and at most 64 unfinished values at a time. The unfinished limit
+includes tasks registered before `runTasks()` starts. Linux sockets use
 private RAII handles. Each in-flight operation duplicates the descriptor;
 closing its owner shuts down the shared socket, wakes the wait, and releases
 the duplicate on task completion. Resource-returning tasks move their result
