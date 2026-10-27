@@ -284,19 +284,21 @@ fn main() {
         self.assertIsInstance(start.arguments[0], IRActorSpawn)
         self.assertTrue(start.arguments[0].restartable)
 
-    def test_actor_owned_tasks_are_reported_as_an_explicit_native_boundary(self) -> None:
-        checked = compile_checked_source('''async fn background() {}
+    def test_actor_owned_tasks_lower_to_typed_ir(self) -> None:
+        module = self.lower('''async fn background() {}
 actor Worker { on start() { let task = background() } }
 fn main() {
     let worker = spawn(Worker())
     worker.start()
     runActors()
 }
-''', "native_actor_task.tyv")
-        with self.assertRaises(Diagnostic) as caught:
-            lower_checked_program(checked)
-        self.assertEqual(caught.exception.stage, "backend")
-        self.assertIn("native actor-owned Tasks are not yet supported", caught.exception.message)
+''')
+        handler = next(function for function in module.functions if function.actor_name == "Worker")
+        self.assertEqual(handler.body[0].variable.type, IRAppliedType("Task", (IRType.VOID,)))
+        self.assertEqual(handler.body[0].value.type, IRAppliedType("Task", (IRType.VOID,)))
+        generated = emit_cpp(module)
+        self.assertIn("ActorHandlerScope", generated)
+        self.assertIn("attach_task_to_current_actor", generated)
 
     def test_native_task_cancellation_methods_lower_to_typed_ir(self) -> None:
         module = self.lower('''async fn background() {}
@@ -938,6 +940,54 @@ fn main() {
             native = self._native_source_result(source, root, root / "await-bare-reply", root)
             self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
             self.assertEqual(native.stdout, "27\nfinished\n")
+
+    def test_native_actor_stop_and_supervisor_restart_cancel_owned_tasks(self) -> None:
+        source = '''async fn delayed() {
+    await sleepFor(seconds(3))
+    println("late")
+}
+actor Worker {
+    on launch(reply: ReplySender<Int>) {
+        let task = delayed()
+        reply.send(1)
+    }
+    on fail(reply: ReplySender<Int>) {
+        let task = delayed()
+        reply.send(2)
+        let failure: Float = 1 / 0
+    }
+}
+async fn exercise() {
+    let worker = spawn(Worker())
+    let launched = worker.request(launch)
+    let launch_value = await launched
+    println(launch_value)
+    worker.stop()
+
+    let supervisor = oneForOne(2, 1000)
+    let crashing = supervisor.start(Worker())
+    let crashed = crashing.request(fail)
+    let crash_value = await crashed
+    println(crash_value)
+    println(crashing.isAlive())
+    crashing.stop()
+}
+fn main() {
+    let task = exercise()
+    let result = runTasks()
+    match result {
+        Ok(_) => println("tasks finished")
+        Err(_) => println("actor failure observed")
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-actor-task-owner-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actor-task-owner", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "1\n2\ntrue\ntasks finished\n")
+            self.assertNotIn("late", native.stdout)
 
     def test_native_repeated_actor_reply_wakeup_matches_reference(self) -> None:
         source = '''actor Worker {

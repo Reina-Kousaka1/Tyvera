@@ -262,13 +262,15 @@ async task may await a ReplyReceiver; `runTasks()` pumps one queued actor turn
 while a reply is pending, and the task releases serialized execution until the
 reply, timeout, cancellation, or actor failure. An unanswered reply with no
 queued actor work or deadline is reported as a controlled scheduler deadlock.
-`sendAfter` timers, monitoring/links, actor-owned Tasks, and supervised actors
-owning Resources or Tasks remain unsupported natively. Generated actor
-references use shared runtime handles; queued callbacks hold weak target
-references, and runtime
-shutdown clears mailboxes, supervisors, and actor state to break reference
-cycles. The native runtime retains spawned actors until process shutdown even
-when user `ActorRef` values leave scope. Calling `runActors()` or `runTasks()`
+Native actor-owned Tasks are bound to the actor instance that creates them;
+stop, crash, supervised restart, and runtime shutdown request cancellation.
+The native task scheduler drains their cancellation and resource cleanup before
+`runTasks()` completes. `sendAfter` timers, monitoring/links, task groups, and
+supervised actors owning move-only Resources remain unsupported natively.
+Generated actor references use shared runtime handles; queued callbacks hold
+weak target references, and runtime shutdown clears mailboxes, supervisors,
+and actor state to break reference cycles. The native runtime retains spawned
+actors until process shutdown even when user `ActorRef` values leave scope. Calling `runActors()` or `runTasks()`
 from a native actor handler raises the same controlled runtime failure as the
 reference runtime. The Linux native backend also has experimental HTTP and
 WebSocket client subsets; native HTTP server, router/general codec, and

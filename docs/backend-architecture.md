@@ -58,10 +58,11 @@ and the supported TCP/DNS/TLS, HTTP client, and WebSocket client value and
 method signatures. Native task cancellation and monotonic deadlines are
 implemented for the supported task subset. A limited native actor core is
 lowered for actor state, typed fire-and-forget messages, and actor lifecycle
-calls. Nested supervisors, actor request/reply, and restart policies use the
-native runtime; actor timers, monitoring/links, actor-owned tasks, task groups,
-HTTP servers/routers/decoders, classes, interfaces, and generic functions
-remain rejected by `tyvera build`.
+calls. Nested supervisors, actor request/reply, restart policies, and cancellation of
+actor-owned Tasks use the native runtime. Actor timers, monitoring/links, task
+groups, supervised ownership of move-only Resources, HTTP
+servers/routers/decoders, classes, interfaces, and generic functions remain
+rejected by `tyvera build`.
 
 ## Three separate contracts
 
@@ -209,7 +210,8 @@ Generic user-defined types, tuples, classes, actor timers, monitoring/links,
 HTTP servers/routers/decoders, and WebSocket servers remain interpreter-only.
 Native actor turns and delayed restarts are driven by `runActors()`; pending
 request replies can also drive one actor turn from `runTasks()`. Actor-owned
-Tasks and full actor/task scheduling parity remain unsupported. There is no
+Tasks are cancelled on stop, crash, restart, and runtime shutdown; task groups
+and full actor/task scheduling parity remain unsupported. There is no
 `unsafe` or FFI declaration syntax. Any later FFI must define ownership,
 lifetimes, mutability, and error conversion explicitly; a native crash cannot
 become a recoverable Tyvera `Result`. See the [Memory Model](memory-model.md)

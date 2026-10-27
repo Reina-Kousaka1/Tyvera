@@ -949,6 +949,7 @@ class _CppGenerator:
             )
             if expression.initializer_symbol is not None:
                 lines.append("    try {")
+                lines.append("        tyvera_runtime::ActorHandlerScope actor_scope(tyv_actor);")
                 lines.append(f"        tyv_actor->{expression.initializer_symbol}({', '.join(temporaries)});")
                 lines.append("    } catch (...) {")
                 lines.append("        tyvera_runtime::actor_initialization_failed(tyv_actor);")
@@ -963,6 +964,7 @@ class _CppGenerator:
                 lines.append(f"        auto target = {weak_actor}.lock();")
                 lines.append("        if (!target) throw std::runtime_error(\"supervised actor expired\");")
                 if expression.initializer_symbol is not None:
+                    lines.append("        tyvera_runtime::ActorHandlerScope actor_scope(target);")
                     lines.append(f"        target->{expression.initializer_symbol}({', '.join(temporaries)});")
                 lines.append("    };")
             lines.append("    tyvera_runtime::actor_started(tyv_actor);")
@@ -1766,8 +1768,11 @@ inline void task_checkpoint() {
     execution_lock->lock();
     if (active_task_control) active_task_control->check_interruption();
 }
+inline void attach_task_to_current_actor(const std::shared_ptr<TaskControl>& task,
+                                         const std::string& file, int line, int column);
 inline void register_native_task(const std::shared_ptr<TaskControl>& task,
                                  const std::string& file, int line, int column) {
+    attach_task_to_current_actor(task, file, line, column);
     auto& scheduler = native_scheduler();
     bool start_now = false;
     {
@@ -3384,6 +3389,8 @@ struct ActorBase : std::enable_shared_from_this<ActorBase> {
     std::function<void()> tyv_restart;
     std::weak_ptr<Supervisor> supervisor;
     RestartPolicy restart_policy = RestartPolicy::permanent;
+    std::mutex owned_tasks_mutex;
+    std::vector<std::weak_ptr<TaskControl>> owned_tasks;
     virtual void tyv_clear_state() noexcept {}
     virtual ~ActorBase() = default;
 };
@@ -3431,11 +3438,70 @@ inline bool& actor_handler_active() {
     static thread_local bool active = false;
     return active;
 }
+inline std::weak_ptr<ActorBase>& active_actor_context() {
+    static thread_local std::weak_ptr<ActorBase> actor;
+    return actor;
+}
 struct ActorHandlerScope {
     bool previous = actor_handler_active();
-    ActorHandlerScope() { actor_handler_active() = true; }
-    ~ActorHandlerScope() { actor_handler_active() = previous; }
+    std::weak_ptr<ActorBase> previous_actor = active_actor_context();
+    explicit ActorHandlerScope(const std::shared_ptr<ActorBase>& actor) {
+        actor_handler_active() = true;
+        active_actor_context() = actor;
+    }
+    ~ActorHandlerScope() {
+        active_actor_context() = previous_actor;
+        actor_handler_active() = previous;
+    }
 };
+inline constexpr std::size_t MAX_ACTOR_OWNED_TASKS = 4096;
+inline void attach_task_to_current_actor(
+    const std::shared_ptr<TaskControl>& task, const std::string& file, int line, int column) {
+    if (!actor_handler_active()) return;
+    const auto actor = active_actor_context().lock();
+    if (!actor) return;
+    bool cancel_now = false;
+    try {
+        auto& state = actor_runtime_state();
+        {
+            std::lock_guard<std::mutex> state_lock(state.mutex);
+            if (actor->status != "alive" && actor->status != "starting"
+                && actor->status != "restarting") {
+                cancel_now = true;
+            } else {
+                std::lock_guard<std::mutex> tasks_lock(actor->owned_tasks_mutex);
+                auto& tasks = actor->owned_tasks;
+                tasks.erase(std::remove_if(tasks.begin(), tasks.end(), [](const auto& weak) {
+                    const auto current = weak.lock();
+                    return !current || current->done.load(std::memory_order_acquire);
+                }), tasks.end());
+                if (tasks.size() >= MAX_ACTOR_OWNED_TASKS)
+                    throw Failure(file, line, column, "actor-owned task capacity exceeded (maximum 4096)");
+                tasks.emplace_back(task);
+            }
+        }
+    } catch (const Failure&) {
+        throw;
+    } catch (const std::bad_alloc&) {
+        throw Failure(file, line, column, "cannot register actor-owned task");
+    } catch (const std::length_error&) {
+        throw Failure(file, line, column, "cannot register actor-owned task");
+    }
+    if (cancel_now) task->request_cancel();
+}
+inline void cancel_actor_tasks(const std::shared_ptr<ActorBase>& actor) noexcept {
+    if (!actor) return;
+    try {
+        std::lock_guard<std::mutex> lock(actor->owned_tasks_mutex);
+        for (auto task = actor->owned_tasks.rbegin(); task != actor->owned_tasks.rend(); ++task) {
+            try {
+                if (const auto owned = task->lock()) owned->request_cancel();
+            } catch (...) {}
+        }
+        actor->owned_tasks.clear();
+    } catch (...) {}
+    notify_task_scheduler();
+}
 inline constexpr std::size_t MAX_ACTOR_MAILBOX = 100000;
 inline constexpr std::int64_t MAX_ACTOR_DELIVERIES = 100000;
 inline void fail_actor_replies(const std::shared_ptr<ActorBase>& actor, const std::string& message) noexcept {
@@ -3523,6 +3589,7 @@ inline void stop_actor_for_supervisor(const std::shared_ptr<ActorBase>& actor) n
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
     }
+    cancel_actor_tasks(actor);
     fail_actor_replies(actor, "actor stopped before replying");
     actor->tyv_clear_state();
     actor_runtime_state().changed.notify_all();
@@ -3562,6 +3629,8 @@ inline std::string restart_actor_for_supervisor(
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
     }
+    cancel_actor_tasks(actor);
+    fail_actor_replies(actor, "actor restarted before replying");
     actor->tyv_clear_state();
     try {
         check_shutdown(file, line, column);
@@ -3855,6 +3924,7 @@ inline void actor_initialization_failed(const std::shared_ptr<ActorBase>& actor)
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
     }
+    cancel_actor_tasks(actor);
     fail_actor_replies(actor, "actor initialization failed before replying");
     actor->tyv_clear_state();
     notify_task_scheduler();
@@ -3960,6 +4030,7 @@ inline bool actor_stop(
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
     }
+    cancel_actor_tasks(actor);
     fail_actor_replies(actor, "actor stopped before replying");
     actor_runtime_state().changed.notify_all();
     actor->tyv_clear_state();
@@ -3982,6 +4053,7 @@ inline void mark_actor_crashed(const std::shared_ptr<ActorBase>& actor, const st
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
     }
+    cancel_actor_tasks(actor);
     fail_actor_replies(actor, failure);
     actor->tyv_clear_state();
 }
@@ -4033,7 +4105,7 @@ inline StringResult<std::int64_t> run_actors(
         if (!actor) break;
         ++processed;
         try {
-            ActorHandlerScope handler_scope;
+            ActorHandlerScope handler_scope(actor);
             message();
         } catch (const SignalShutdown&) {
             throw;
@@ -4112,24 +4184,30 @@ inline bool native_actor_message_ready() {
 inline void shutdown_actors() noexcept {
     auto& state = actor_runtime_state();
     std::lock_guard<std::recursive_mutex> supervision_lock(state.supervision_mutex);
-    std::lock_guard<std::mutex> lock(state.mutex);
-    for (auto supervisor = state.supervisors.rbegin(); supervisor != state.supervisors.rend(); ++supervisor) {
-        (*supervisor)->status = "stopped";
-        (*supervisor)->children.clear();
+    std::vector<std::shared_ptr<ActorBase>> actors;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        for (auto supervisor = state.supervisors.rbegin(); supervisor != state.supervisors.rend(); ++supervisor) {
+            (*supervisor)->status = "stopped";
+            (*supervisor)->children.clear();
+        }
+        actors.swap(state.actors);
+        for (auto actor = actors.rbegin(); actor != actors.rend(); ++actor) {
+            (*actor)->status = "stopped";
+            (*actor)->mailbox.clear();
+            (*actor)->queued = false;
+        }
+        state.ready.clear();
+        state.pending_restarts.clear();
+        state.supervisors.clear();
     }
-    for (auto actor = state.actors.rbegin(); actor != state.actors.rend(); ++actor) {
-        (*actor)->status = "stopped";
-        (*actor)->mailbox.clear();
-        (*actor)->queued = false;
+    for (auto actor = actors.rbegin(); actor != actors.rend(); ++actor) {
+        cancel_actor_tasks(*actor);
         fail_actor_replies(*actor, "actor stopped before replying");
         (*actor)->tyv_restart = {};
-    }
-    for (auto actor = state.actors.rbegin(); actor != state.actors.rend(); ++actor)
         (*actor)->tyv_clear_state();
-    state.ready.clear();
-    state.pending_restarts.clear();
-    state.actors.clear();
-    state.supervisors.clear();
+    }
+    state.changed.notify_all();
 }
 struct ActorRuntimeScope {
     ~ActorRuntimeScope() { shutdown_actors(); }
