@@ -21,8 +21,10 @@ and returns status, bounded body bytes, and raw rate-limit response metadata.
 `RestFailure` values. `requestBotWithRetries(..., maxRetries)` optionally
 retries an explicit Discord 429 response only, with a caller budget of at most
 five retries and a maximum accepted wait of 120 seconds. It honors the
-`retry_after` body field through a monotonic scheduler timer. Transport errors,
-other statuses, malformed 429 bodies, and over-limit delays are returned
+`retry_after` body field through a monotonic scheduler timer, and falls back to a numeric
+`Retry-After` delta-seconds header only when that body value is unavailable or malformed.
+Both forms are capped at 120 seconds; HTTP-date headers are not parsed. Transport errors,
+other statuses, and missing, malformed, negative, or over-limit delays are returned
 without retry. This avoids replay after an ambiguous side-effecting request,
 but does not coordinate concurrent requests across buckets or global limits.
 

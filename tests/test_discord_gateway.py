@@ -786,6 +786,8 @@ fn main() {
             server_context.load_cert_chain(str(certificate), str(private_key))
             captured: list[tuple[str, str | None, bytes]] = []
             retry_attempts = 0
+            header_retry_attempts = 0
+            integer_retry_attempts = 0
 
             class Handler(BaseHTTPRequestHandler):
                 protocol_version = "HTTP/1.1"
@@ -818,7 +820,7 @@ fn main() {
                         self._reply(404, b'{"message":"unknown endpoint"}', {"Content-Type": "application/json"})
 
                 def do_POST(self) -> None:
-                    nonlocal retry_attempts
+                    nonlocal retry_attempts, header_retry_attempts, integer_retry_attempts
                     if self.path == "/api/v10/channels/3/messages":
                         self._reply(500, b'{"message":"temporary failure"}', {
                             "Content-Type": "application/json",
@@ -830,6 +832,35 @@ fn main() {
                             self._reply(200, b'{"id":"retry-success"}', {"Content-Type": "application/json"})
                             return
                         retry_body = b'{"message":"slow down","retry_after":0.0,"global":true}'
+                    elif self.path == "/api/v10/channels/5/messages":
+                        header_retry_attempts += 1
+                        if header_retry_attempts == 2:
+                            self._reply(200, b'{"id":"header-retry-success"}', {"Content-Type": "application/json"})
+                            return
+                        self._reply(429, b'{"message":"slow down"}', {
+                            "Content-Type": "application/json", "Retry-After": "0.0",
+                        })
+                        return
+                    elif self.path == "/api/v10/channels/6/messages":
+                        self._reply(429, b'{"message":"slow down"}', {
+                            "Content-Type": "application/json", "Retry-After": "120.1",
+                        })
+                        return
+                    elif self.path == "/api/v10/channels/7/messages":
+                        integer_retry_attempts += 1
+                        if integer_retry_attempts == 2:
+                            self._reply(200, b'{"id":"integer-retry-success"}', {"Content-Type": "application/json"})
+                            return
+                        self._reply(429, b'{"message":"slow down"}', {
+                            "Content-Type": "application/json", "Retry-After": "0",
+                        })
+                        return
+                    elif self.path == "/api/v10/channels/8/messages":
+                        self._reply(429, b'{"message":"slow down"}', {
+                            "Content-Type": "application/json",
+                            "Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT",
+                        })
+                        return
                     else:
                         retry_body = b'{"message":"slow down","retry_after":0.5,"global":true}'
                     self._reply(429, retry_body, {
@@ -837,7 +868,7 @@ fn main() {
                         "X-RateLimit-Bucket": "local-bucket",
                         "X-RateLimit-Remaining": "0",
                         "X-RateLimit-Reset-After": "0.5",
-                        "Retry-After": "0.5",
+                        "Retry-After": "120.1" if self.path == "/api/v10/channels/2/messages" else "0.5",
                         "X-RateLimit-Global": "true",
                     })
 
@@ -898,6 +929,26 @@ async fn run() {
                 Err(_) => println("unexpected transport failure")
                 Ok(response) => println(response.status)
             }
+            let headerRetried = await rest.requestBotWithRetries(token, "POST", "channels/5/messages", bytesFromString("{}"), seconds(3), 2)
+            match headerRetried {
+                Err(_) => println("header retry failed")
+                Ok(response) => println(response.status)
+            }
+            let overLimitHeader = await rest.requestBotWithRetries(token, "POST", "channels/6/messages", bytesFromString("{}"), seconds(3), 2)
+            match overLimitHeader {
+                Err(_) => println("header limit request failed")
+                Ok(response) => println(response.status)
+            }
+            let integerHeaderRetried = await rest.requestBotWithRetries(token, "POST", "channels/7/messages", bytesFromString("{}"), seconds(3), 2)
+            match integerHeaderRetried {
+                Err(_) => println("integer header retry failed")
+                Ok(response) => println(response.status)
+            }
+            let dateHeaderNotRetried = await rest.requestBotWithRetries(token, "POST", "channels/8/messages", bytesFromString("{}"), seconds(3), 2)
+            match dateHeaderNotRetried {
+                Err(_) => println("date header request failed")
+                Ok(response) => println(response.status)
+            }
             let badBudget = await rest.requestBotWithRetries(token, "POST", "channels/4/messages", bytesFromString("{}"), seconds(3), 6)
             match badBudget {
                 Err(_) => println("retry budget rejected")
@@ -949,6 +1000,8 @@ fn main() {
                 native_result = None
                 if native_available:
                     retry_attempts = 0
+                    header_retry_attempts = 0
+                    integer_retry_attempts = 0
                     native_result = _native_discord_run(
                         checked, directory / "rest", directory, local_port, certificate,
                         {"TYVERA_FAKE_DISCORD_REST_TOKEN": "fake-rest-token"},
@@ -962,16 +1015,22 @@ fn main() {
             self.assertEqual(errors.getvalue(), "")
             self.assertEqual(output.getvalue(),
                              '200\ntrue\ntrue\ntrue\n{"id":"fake-user","username":"test-bot"}\n'
-                             '429\ntrue\ntrue\ntrue\n429\ntrue\ntrue\n200\n500\nretry budget rejected\n')
+                             '429\ntrue\ntrue\ntrue\n429\ntrue\ntrue\n200\n500\n200\n429\n200\n429\nretry budget rejected\n')
             expected_paths = [
                 "/api/v10/users/@me", "/api/v10/channels/1/messages",
                 "/api/v10/channels/2/messages", "/api/v10/channels/2/messages",
                 "/api/v10/channels/3/messages",
+                "/api/v10/channels/5/messages", "/api/v10/channels/5/messages",
+                "/api/v10/channels/6/messages",
+                "/api/v10/channels/7/messages", "/api/v10/channels/7/messages",
+                "/api/v10/channels/8/messages",
             ]
             self.assertEqual(
                 [path for path, _, _ in captured], expected_paths * (2 if native_result is not None else 1),
             )
-            self.assertEqual(retry_attempts, 2)
+            self.assertEqual(retry_attempts, 2 * (2 if native_result is not None else 1))
+            self.assertEqual(header_retry_attempts, 2 * (2 if native_result is not None else 1))
+            self.assertEqual(integer_retry_attempts, 2 * (2 if native_result is not None else 1))
             self.assertTrue(all(auth == "Bot fake-rest-token" for _, auth, _ in captured))
             self.assertEqual(captured[0][2], b"")
             self.assertEqual(captured[1][2], b'{"content":"hello"}')
@@ -981,7 +1040,7 @@ fn main() {
                     (native_result.returncode, native_result.stdout, native_result.stderr),
                     reference_result,
                 )
-                self.assertEqual(captured[5:], captured[:5])
+                self.assertEqual(captured[11:], captured[:11])
                 self.assertNotIn("fake-rest-token", native_result.stdout + native_result.stderr)
 
 

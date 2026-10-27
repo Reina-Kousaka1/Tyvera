@@ -5,8 +5,11 @@ path and WSS Gateway session in the reference runtime. The REST client is pinned
 to Discord's verified HTTPS API origin, uses `Secret<String>` for Bot
 authorization, returns bounded response bytes and rate-limit headers, and
 never retries by default. `requestBotWithRetries` can retry a bounded number
-of explicit HTTP 429 rejections using Discord's `retry_after` delay; it does
-not retry transport failures or other statuses. `decodeFailure` maps Discord
+of explicit HTTP 429 rejections, preferring Discord's `retry_after` body
+value and falling back to a numeric `Retry-After` delta-seconds header when
+the body value is missing or invalid. Delays are capped at 120 seconds;
+HTTP-date headers are not parsed. It does not retry
+transport failures or other statuses. `decodeFailure` maps Discord
 error JSON into a typed `RestFailure` record.
 
 The Gateway client uses typed intents and implements TLS verification,

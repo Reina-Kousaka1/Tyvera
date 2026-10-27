@@ -72,22 +72,47 @@ pub async fn requestBot(token: Secret<String>, methodName: String, endpoint: Str
     return Err<DiscordRestResponse, String>("Discord REST request did not start")
 }
 
-fn boundedRetryDelay(response: DiscordRestResponse) -> Option<Duration> {
-    match response.body.toString() {
+fn boundedRetryDelayFromSeconds(retryDelaySeconds: Float) -> Option<Duration> {
+    if retryDelaySeconds < 0.0 || retryDelaySeconds > 120.0 {
+        return None<Duration>()
+    }
+    match durationFromSeconds(retryDelaySeconds) {
         Err(_) => return None<Duration>()
-        Ok(text) => match decodeFailure(response.status, text) {
+        Ok(delay) => return Some(delay)
+    }
+    return None<Duration>()
+}
+
+fn boundedRetryDelayFromHeader(header: Option<String>) -> Option<Duration> {
+    match header {
+        None => return None<Duration>()
+        Some(value) => match parseJson(value) {
             Err(_) => return None<Duration>()
-            Ok(failure) => match failure.retryAfterSeconds {
-                None => return None<Duration>()
-                Some(retryDelaySeconds) => {
-                    if retryDelaySeconds > 120.0 {
-                        return None<Duration>()
-                    }
-                    match durationFromSeconds(retryDelaySeconds) {
-                        Err(_) => return None<Duration>()
-                        Ok(delay) => return Some(delay)
+            Ok(json) => match json.asFloat() {
+                Some(retryDelaySeconds) => return boundedRetryDelayFromSeconds(retryDelaySeconds)
+                None => match json.asInt() {
+                    None => return None<Duration>()
+                    Some(retryDelaySeconds) => {
+                        if retryDelaySeconds < 0 || retryDelaySeconds > 120 {
+                            return None<Duration>()
+                        }
+                        return Some(seconds(retryDelaySeconds))
                     }
                 }
+            }
+        }
+    }
+    return None<Duration>()
+}
+
+fn boundedRetryDelay(response: DiscordRestResponse) -> Option<Duration> {
+    match response.body.toString() {
+        Err(_) => return boundedRetryDelayFromHeader(response.retryAfter)
+        Ok(text) => match decodeFailure(response.status, text) {
+            Err(_) => return boundedRetryDelayFromHeader(response.retryAfter)
+            Ok(failure) => match failure.retryAfterSeconds {
+                None => return boundedRetryDelayFromHeader(response.retryAfter)
+                Some(retryDelaySeconds) => return boundedRetryDelayFromSeconds(retryDelaySeconds)
             }
         }
     }
