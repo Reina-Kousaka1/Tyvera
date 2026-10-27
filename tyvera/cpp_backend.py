@@ -1759,6 +1759,12 @@ public:
     }
     ~NativeTaskExecution() { active_execution_lock = previous_; active_task_control = previous_task_; }
 };
+struct ActiveExecutionLockScope {
+    std::unique_lock<std::mutex>* previous;
+    explicit ActiveExecutionLockScope(std::unique_lock<std::mutex>& lock)
+        : previous(active_execution_lock) { active_execution_lock = &lock; }
+    ~ActiveExecutionLockScope() { active_execution_lock = previous; }
+};
 inline void task_checkpoint() {
     if (active_task_control) active_task_control->check_interruption();
     auto* execution_lock = active_execution_lock;
@@ -3489,17 +3495,50 @@ inline void attach_task_to_current_actor(
     }
     if (cancel_now) task->request_cancel();
 }
+inline bool task_tree_contains_active(const TaskControl& task) noexcept {
+    if (&task == active_task_control) return true;
+    try {
+        std::lock_guard<std::mutex> lock(task.children_mutex);
+        for (const auto& child : task.children)
+            if (child && task_tree_contains_active(*child)) return true;
+    } catch (...) {}
+    return false;
+}
+inline void wait_for_actor_task(const std::shared_ptr<TaskControl>& task) noexcept {
+    if (!task || task_tree_contains_active(*task)) return;
+    auto* execution_lock = active_execution_lock;
+    const bool resume_execution = execution_lock && execution_lock->owns_lock();
+    if (resume_execution) execution_lock->unlock();
+    try {
+        if (!task->done.load(std::memory_order_acquire)
+            && !task->started.load(std::memory_order_acquire))
+            task->start();
+        std::unique_lock<std::mutex> lock(task->lifecycle_mutex);
+        task->lifecycle_changed.wait(lock, [&task]() {
+            return task->done.load(std::memory_order_acquire);
+        });
+    } catch (...) {}
+    if (resume_execution && !execution_lock->owns_lock()) {
+        try { execution_lock->lock(); } catch (...) {}
+    }
+}
 inline void cancel_actor_tasks(const std::shared_ptr<ActorBase>& actor) noexcept {
     if (!actor) return;
+    std::vector<std::weak_ptr<TaskControl>> tasks;
     try {
         std::lock_guard<std::mutex> lock(actor->owned_tasks_mutex);
-        for (auto task = actor->owned_tasks.rbegin(); task != actor->owned_tasks.rend(); ++task) {
-            try {
-                if (const auto owned = task->lock()) owned->request_cancel();
-            } catch (...) {}
-        }
-        actor->owned_tasks.clear();
-    } catch (...) {}
+        tasks.swap(actor->owned_tasks);
+    } catch (...) { return; }
+    for (auto task = tasks.rbegin(); task != tasks.rend(); ++task) {
+        try {
+            if (const auto owned = task->lock()) owned->request_cancel();
+        } catch (...) {}
+    }
+    for (auto task = tasks.rbegin(); task != tasks.rend(); ++task) {
+        try {
+            if (const auto owned = task->lock()) wait_for_actor_task(owned);
+        } catch (...) {}
+    }
     notify_task_scheduler();
 }
 inline constexpr std::size_t MAX_ACTOR_MAILBOX = 100000;
@@ -6047,6 +6086,7 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
         }
         if (pump_actor) {
             std::unique_lock<std::mutex> actor_turn_lock(scheduler.execution_mutex);
+            ActiveExecutionLockScope actor_execution_scope(actor_turn_lock);
             const auto actor_result = run_actors(file, line, column, false, 1, false);
             if (std::holds_alternative<std::string>(actor_result) && scheduler_failure.empty())
                 scheduler_failure = std::get<1>(actor_result);

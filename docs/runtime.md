@@ -36,7 +36,7 @@ resources in reverse acquisition order; cleanup itself does not suspend.
 | --- | --- | --- | --- |
 | Synchronous code in `main` | Runtime root | The scheduler runs it only when `runTasks()` is called. Runtime shutdown cancels unfinished work. | Runtime shutdown cancels it. A root failure is returned from `runTasks()`. |
 | An async task | Creating task | The parent joins every unfinished child before it completes. | Parent cancellation/failure cancels descendants. A child failure fails its owners and cancels sibling work. |
-| An actor constructor or message handler | Actor instance | It runs as a root task when `runTasks()` pumps it. | Actor stop, crash, supervisor restart, or runtime shutdown cancels the actor's unfinished tasks. |
+| An actor constructor or message handler | Actor instance | It runs as a root task when `runTasks()` pumps it. | Actor stop, crash, supervisor restart, or runtime shutdown cancels and drains other unfinished actor tasks before clearing or rebuilding state. A task stopping its own actor unwinds cooperatively at its next checkpoint. |
 | Explicitly detached child | Runtime root | It no longer delays the former parent or appears in that parent's task groups. `runTasks()` still drives it. | It is no longer cancelled by its former owner; runtime shutdown still cancels it. Its failure remains visible in `runTasks()`. |
 
 `TaskGroup` is a view of registered direct children, not an ownership transfer.

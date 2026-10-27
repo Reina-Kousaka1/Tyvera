@@ -989,6 +989,75 @@ fn main() {
             self.assertEqual(native.stdout, "1\n2\ntrue\ntasks finished\n")
             self.assertNotIn("late", native.stdout)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "native networking tests require Linux")
+    def test_native_actor_stop_waits_for_pending_accept_cleanup(self) -> None:
+        source = '''async fn waitForAccept(ready: ReplySender<Int>) {
+    let opened = await tcpListen("127.0.0.1", 0, 8)
+    match move opened {
+        Err(_) => ready.send(-1)
+        Ok(listener) => match listener.localAddress() {
+            Err(_) => { ready.send(-1); listener.close() }
+            Ok(address) => {
+                ready.send(address.port())
+                let pending = listener.accept()
+                let accepted = await pending
+                match move accepted {
+                    Err(_) => {}
+                    Ok(connection) => connection.close()
+                }
+                listener.close()
+            }
+        }
+    }
+}
+actor Acceptor {
+    on start(ready: ReplySender<Int>) {
+        let task = waitForAccept(ready)
+    }
+}
+async fn checkOne() -> Bool {
+    let worker = spawn(Acceptor())
+    let pending = worker.request(start)
+    let port: Int = await pending
+    if port <= 0 {
+        worker.stop()
+        return false
+    }
+    worker.stop()
+    let reopened = await tcpListen("127.0.0.1", port, 8)
+    match move reopened {
+        Err(_) => return false
+        Ok(listener) => {
+            listener.close()
+            return true
+        }
+    }
+}
+async fn verifyCleanup() {
+    var count: Int = 0
+    var released: Int = 0
+    while count < 4 {
+        let result = await checkOne()
+        if result { released = released + 1 }
+        count = count + 1
+    }
+    println(released)
+}
+fn main() {
+    let task = verifyCleanup()
+    match runTasks() {
+        Ok(_) => println("tasks finished")
+        Err(error) => println(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-actor-network-cleanup-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actor-network-cleanup", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "4\ntasks finished\n")
+
     def test_native_repeated_actor_reply_wakeup_matches_reference(self) -> None:
         source = '''actor Worker {
     on get(value: Int, reply: ReplySender<Int>) { reply.send(value + 1) }
