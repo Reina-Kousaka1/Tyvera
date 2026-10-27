@@ -1872,7 +1872,8 @@ fn main() {
     match httpUrl("https://localhost:{port}/data") {{
         Err(error) => println(error)
         Ok(url) => {{
-            match await httpGet(url, milliseconds(3000)) {{
+            let response = await httpGet(url, milliseconds(3000))
+            match response {{
                 Err(error) => println(error)
                 Ok(response) => {{
                     println(response.status())
@@ -1955,7 +1956,8 @@ fn main() {{
     match httpUrl("http://127.0.0.1:{port}/") {{
         Err(error) => println(error)
         Ok(url) => {{
-            match await httpGet(url, milliseconds(2000)) {{
+            let response = await httpGet(url, milliseconds(2000))
+            match response {{
                 Err(error) => println(error)
                 Ok(_) => println("unexpected response")
             }}
