@@ -600,6 +600,10 @@ class _FunctionLowerer:
                     "native actor-owned Tasks are not yet supported",
                 )
             return IRLocalRef(variable.identifier, variable.type, expression.location)
+        if isinstance(expression, MemberCall) and expression.method == "sendAfter":
+            receiver_type = self.checked.expression_types.get(expression.receiver.location, "")
+            if split_type(receiver_type)[0] == "ActorRef":
+                raise Diagnostic(expression.location, "backend", "native actor timers are not yet supported")
         expression_type = self._expression_type(expression)
         if (self.actor_name is not None and isinstance(expression_type, IRAppliedType)
                 and expression_type.name == "Task"):
@@ -745,6 +749,7 @@ class _FunctionLowerer:
                 isinstance(receiver.type, IRAppliedType) and receiver.type.name in {"List", "Map"}
                 or isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Task"
                 or isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Secret"
+                or isinstance(receiver.type, IRAppliedType) and receiver.type.name == "ReplySender"
                 or isinstance(receiver.type, IRActorRefType)
                 or receiver.type in {
                 IRType.JSON, IRType.BYTE, IRType.DURATION, IRType.BYTES, IRType.BYTE_BUFFER,
