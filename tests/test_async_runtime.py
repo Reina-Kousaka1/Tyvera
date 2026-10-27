@@ -360,6 +360,27 @@ fn main() {
         self.assertEqual(output, "timeout propagated\ntask failed\n")
         self.assertGreaterEqual(now[0], 10.004)
 
+    def test_run_tasks_does_not_repeat_a_failure_reported_by_an_earlier_run(self) -> None:
+        output = self.run_source('''async fn invalid() {
+    let zero = 1 / 0
+}
+async fn later() {
+    println("later task ran")
+}
+fn main() {
+    let first = invalid()
+    match runTasks() {
+        Ok(_) => println("unexpected first success")
+        Err(_) => println("first run failed")
+    }
+    let second = later()
+    match runTasks() {
+        Ok(_) => println("second run succeeded")
+        Err(_) => println("stale failure")
+    }
+}''')
+        self.assertEqual(output, "first run failed\\nlater task ran\\nsecond run succeeded\\n")
+
     def test_task_failure_from_recursive_scheduler_call_is_contained(self) -> None:
         output = self.run_source('''async fn invalid() {
     runTasks()

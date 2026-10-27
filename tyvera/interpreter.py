@@ -4432,6 +4432,7 @@ class Interpreter:
         if self._running_tasks:
             raise Diagnostic(location, "runtime", "runTasks cannot be called recursively")
 
+        previously_failed = {id(task) for task in self._tasks if task.state == "failed"}
         self._running_tasks = True
         self._scheduler_state = "running"
         steps = 0
@@ -4546,7 +4547,11 @@ class Interpreter:
                     failure = failure or "task scheduler is deadlocked: pending tasks have no runnable or timed work"
                 break
 
-            failed_task = next((task for task in self._tasks if task.state == "failed"), None)
+            failed_task = next(
+                (task for task in self._tasks
+                 if task.state == "failed" and id(task) not in previously_failed),
+                None,
+            )
             if failed_task is not None:
                 failure = failure or failed_task.error or "async task failed"
             if failure is not None:

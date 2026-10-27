@@ -22,6 +22,7 @@ class IRType(str, Enum):
     BOOL = "Bool"
     STRING = "String"
     BYTE = "Byte"
+    DURATION = "Duration"
     BYTES = "Bytes"
     BYTE_BUFFER = "ByteBuffer"
     TEXT_FILE = "TextFile"
@@ -341,7 +342,7 @@ def _validate_type(type_ref: IRTypeRef, location: Location) -> None:
 
 
 def _hashable_key_type(type_ref: IRTypeRef) -> bool:
-    if type_ref in {IRType.INT, IRType.FLOAT, IRType.BOOL, IRType.STRING, IRType.BYTE}:
+    if type_ref in {IRType.INT, IRType.FLOAT, IRType.BOOL, IRType.STRING, IRType.BYTE, IRType.DURATION}:
         return True
     if isinstance(type_ref, IRAppliedType) and type_ref.name == "Option":
         return _hashable_key_type(type_ref.arguments[0])
@@ -366,10 +367,13 @@ def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef
             "isDone": ((), IRType.BOOL),
             "isCancelled": ((), IRType.BOOL),
             "cancel": ((), IRType.BOOL),
+            "withTimeout": ((IRType.DURATION,), _applied("Task", receiver.arguments[0])),
         }
         return signatures.get(method)
     if isinstance(receiver, IRType) and receiver == IRType.BYTE:
         return ((), IRType.INT) if method == "toInt" else None
+    if isinstance(receiver, IRType) and receiver == IRType.DURATION:
+        return ((), IRType.INT) if method == "inMilliseconds" else None
     if isinstance(receiver, IRType) and receiver == IRType.BYTES:
         signatures: dict[str, tuple[tuple[IRTypeRef, ...], IRTypeRef]] = {
             "length": ((), IRType.INT),
@@ -610,13 +614,18 @@ def _validate_expression(
         elif operator in {"+", "-", "*", "/", "%"} and left_type in NUMERIC_TYPES and right_type in NUMERIC_TYPES:
             expected = IRType.FLOAT if operator == "/" or IRType.FLOAT in {left_type, right_type} else IRType.INT
             valid = expression.type == expected
+        elif operator in {"+", "-"} and left_type == right_type == expression.type == IRType.DURATION:
+            valid = True
         elif operator in {"==", "!="}:
             valid = expression.type == IRType.BOOL and (
                 left_type == right_type and left_type != IRType.VOID
                 or left_type in NUMERIC_TYPES and right_type in NUMERIC_TYPES
             )
         elif operator in {"<", "<=", ">", ">="}:
-            valid = expression.type == IRType.BOOL and left_type in NUMERIC_TYPES and right_type in NUMERIC_TYPES
+            valid = expression.type == IRType.BOOL and (
+                left_type in NUMERIC_TYPES and right_type in NUMERIC_TYPES
+                or left_type == right_type == IRType.DURATION
+            )
         else:
             valid = False
         if not valid:
@@ -654,6 +663,9 @@ def _validate_expression(
             "hostOS": ((), IRType.STRING),
             "hostArchitecture": ((), IRType.STRING),
             "monotonicMilliseconds": ((), IRType.INT),
+            "milliseconds": ((IRType.INT,), IRType.DURATION),
+            "seconds": ((IRType.INT,), IRType.DURATION),
+            "durationFromSeconds": ((IRType.FLOAT,), _applied("Result", IRType.DURATION, IRType.STRING)),
             "byteFromInt": ((IRType.INT,), _applied("Result", IRType.BYTE, IRType.STRING)),
             "bytesFromString": ((IRType.STRING,), IRType.BYTES),
             "byteBuffer": ((IRType.INT,), _applied("Result", IRType.BYTE_BUFFER, IRType.STRING)),

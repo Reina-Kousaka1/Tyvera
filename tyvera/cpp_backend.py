@@ -232,6 +232,7 @@ class _CppGenerator:
             IRType.BOOL: "bool",
             IRType.STRING: "std::string",
             IRType.BYTE: "std::uint8_t",
+            IRType.DURATION: "tyvera_runtime::Duration",
             IRType.BYTES: "std::vector<std::uint8_t>",
             IRType.BYTE_BUFFER: "std::shared_ptr<tyvera_runtime::ByteBuffer>",
             IRType.TEXT_FILE: "std::shared_ptr<tyvera_runtime::TextFile>",
@@ -544,6 +545,9 @@ class _CppGenerator:
                 "hostOS": "host_os",
                 "hostArchitecture": "host_architecture",
                 "monotonicMilliseconds": "monotonic_milliseconds",
+                "milliseconds": "duration_milliseconds",
+                "seconds": "duration_seconds",
+                "durationFromSeconds": "duration_from_seconds",
                 "byteFromInt": "byte_from_int",
                 "bytesFromString": "bytes_from_string",
                 "byteBuffer": "byte_buffer",
@@ -571,7 +575,7 @@ class _CppGenerator:
                 keyword = "auto" if _ir_contains_resource(argument.type) else "const auto"
                 lines.append(f"    {keyword} {name} = {self._expression(argument)};")
             values = list(temporaries)
-            if expression.builtin in {"byteFromInt", "byteBuffer"}:
+            if expression.builtin in {"byteFromInt", "byteBuffer", "seconds"}:
                 values.append(_location_args(expression.location))
             elif expression.builtin == "openText":
                 values.extend([_cpp_string_literal("TextFile"), _location_args(expression.location)])
@@ -646,6 +650,9 @@ class _CppGenerator:
             return f"({left} {operator} {right})"
         if expression.type == IRType.STRING:
             return f"({left} + {right})"
+        if expression.type == IRType.DURATION:
+            helper = {"+": "duration_add", "-": "duration_sub"}[operator]
+            return f"tyvera_runtime::{helper}({left}, {right}, {location})"
         if expression.type == IRType.INT:
             helpers = {
                 "+": "checked_add",
@@ -686,8 +693,16 @@ class _CppGenerator:
     def _method_call_expression(expression: IRMethodCall, receiver: str, arguments: list[str]) -> str:
         method = expression.method
         if isinstance(expression.receiver.type, IRAppliedType) and expression.receiver.type.name == "Task":
+            if method == "withTimeout":
+                move_result = "true" if _ir_contains_resource(expression.type) else "false"
+                return (
+                    f"tyvera_runtime::task_with_timeout(std::move({receiver}), {arguments[0]}, "
+                    f"{move_result}, {_location_args(expression.location)})"
+                )
             functions = {"cancel": "cancel", "isCancelled": "is_cancelled", "isDone": "is_done"}
             return f"({receiver}).{functions[method]}()"
+        if expression.receiver.type == IRType.DURATION and method == "inMilliseconds":
+            return f"({receiver}).milliseconds"
         if expression.receiver.type == IRType.BYTE and method == "toInt":
             return f"static_cast<std::int64_t>({receiver})"
         if expression.receiver.type == IRType.BYTES:
@@ -823,6 +838,7 @@ _RUNTIME = r'''#include <charconv>
 #include <string>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -891,6 +907,27 @@ inline std::int64_t monotonic_milliseconds() noexcept {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+struct Duration {
+    std::int64_t milliseconds = 0;
+    friend constexpr bool operator==(Duration left, Duration right) noexcept {
+        return left.milliseconds == right.milliseconds;
+    }
+    friend constexpr bool operator!=(Duration left, Duration right) noexcept { return !(left == right); }
+    friend constexpr bool operator<(Duration left, Duration right) noexcept {
+        return left.milliseconds < right.milliseconds;
+    }
+    friend constexpr bool operator<=(Duration left, Duration right) noexcept { return !(right < left); }
+    friend constexpr bool operator>(Duration left, Duration right) noexcept { return right < left; }
+    friend constexpr bool operator>=(Duration left, Duration right) noexcept { return !(left < right); }
+};
+inline std::chrono::steady_clock::time_point duration_deadline(Duration duration) noexcept {
+    const auto now = std::chrono::steady_clock::now();
+    if (duration.milliseconds <= 0) return now;
+    const auto available = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::time_point::max() - now).count();
+    if (duration.milliseconds > available) return std::chrono::steady_clock::time_point::max();
+    return now + std::chrono::milliseconds(duration.milliseconds);
+}
 inline std::string host_os() {
 #if defined(__linux__)
     return "linux";
@@ -933,7 +970,10 @@ struct TaskControl {
     std::atomic<bool> started{false};
     std::atomic<bool> done{false};
     std::atomic<bool> cancellation_requested{false};
+    std::atomic<bool> deadline_cancellation{false};
     bool serialized = true;
+    std::optional<std::chrono::steady_clock::time_point> start_deadline;
+    std::weak_ptr<TaskControl> cancellation_target;
     std::string source_file;
     int source_line = 1;
     int source_column = 1;
@@ -948,8 +988,26 @@ struct TaskControl {
     virtual void start() = 0;
     virtual void join() = 0;
     virtual std::string failure_message() const = 0;
-    bool request_cancel() {
+    virtual void notify_waiters() noexcept {}
+    bool prepare_start() {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        bool expected = false;
+        if (!started.compare_exchange_strong(expected, true)) return false;
+        if (start_deadline && std::chrono::steady_clock::now() >= *start_deadline
+            && !cancellation_requested.load(std::memory_order_acquire)) {
+            deadline_cancellation.store(true, std::memory_order_release);
+            cancellation_requested.store(true, std::memory_order_release);
+        }
+        return true;
+    }
+    void defer_start_until(std::chrono::steady_clock::time_point deadline) {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        if (started.load(std::memory_order_acquire) || done.load(std::memory_order_acquire)) return;
+        if (!start_deadline || deadline < *start_deadline) start_deadline = deadline;
+    }
+    bool request_cancel(bool due_to_deadline = false) {
         std::vector<std::shared_ptr<TaskControl>> owned;
+        std::shared_ptr<TaskControl> linked;
         {
             std::lock_guard<std::mutex> lock(lifecycle_mutex);
             if (done.load(std::memory_order_acquire) || cancellation_requested.load(std::memory_order_acquire))
@@ -958,12 +1016,16 @@ struct TaskControl {
                 std::lock_guard<std::mutex> failure_lock(child_failure_mutex);
                 if (!child_failure.empty()) return false;
             }
+            if (due_to_deadline) deadline_cancellation.store(true, std::memory_order_release);
             cancellation_requested.store(true, std::memory_order_release);
+            linked = cancellation_target.lock();
             std::lock_guard<std::mutex> children_lock(children_mutex);
             owned = children;
         }
+        if (linked) linked->request_cancel();
         for (auto item = owned.rbegin(); item != owned.rend(); ++item) (*item)->request_cancel();
         lifecycle_changed.notify_all();
+        notify_waiters();
         return true;
     }
     bool is_cancelled() const noexcept { return cancellation_requested.load(std::memory_order_acquire); }
@@ -1118,8 +1180,7 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
         this->source_column = source_column;
     }
     void start() override {
-        bool expected = false;
-        if (!started.compare_exchange_strong(expected, true)) return;
+        if (!prepare_start()) return;
         auto self = this->shared_from_this();
         try {
             worker = std::thread([self]() {
@@ -1233,6 +1294,16 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
         result.reset();
         return value;
     }
+    bool wait_until(std::chrono::steady_clock::time_point deadline, const TaskControl* waiter) {
+        if (!started.load(std::memory_order_acquire)) start();
+        std::unique_lock<std::mutex> lock(mutex);
+        ready.wait_until(lock, deadline, [this, waiter]() {
+            return done.load(std::memory_order_acquire) || is_cancelled()
+                || (waiter && waiter->is_cancelled());
+        });
+        return done.load(std::memory_order_acquire);
+    }
+    void notify_waiters() noexcept override { ready.notify_all(); }
     void join() override { if (worker.joinable()) worker.join(); }
     std::string failure_message() const override {
         std::lock_guard<std::mutex> lock(mutex);
@@ -1263,8 +1334,7 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
         this->source_column = source_column;
     }
     void start() override {
-        bool expected = false;
-        if (!started.compare_exchange_strong(expected, true)) return;
+        if (!prepare_start()) return;
         auto self = this->shared_from_this();
         try {
             worker = std::thread([self]() {
@@ -1340,6 +1410,16 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
             catch (const TaskCancelled&) { throw Failure(file, line, column, "task was cancelled"); }
         }
     }
+    bool wait_until(std::chrono::steady_clock::time_point deadline, const TaskControl* waiter) {
+        if (!started.load(std::memory_order_acquire)) start();
+        std::unique_lock<std::mutex> lock(mutex);
+        ready.wait_until(lock, deadline, [this, waiter]() {
+            return done.load(std::memory_order_acquire) || is_cancelled()
+                || (waiter && waiter->is_cancelled());
+        });
+        return done.load(std::memory_order_acquire);
+    }
+    void notify_waiters() noexcept override { ready.notify_all(); }
     void join() override { if (worker.joinable()) worker.join(); }
     std::string failure_message() const override {
         std::lock_guard<std::mutex> lock(mutex);
@@ -1427,6 +1507,52 @@ template <typename T> inline Task<T> make_io_task(std::function<T()> operation,
                                                   const std::string& file, int line, int column) {
     return make_task_with_mode<T>(std::move(operation), false, file, line, column);
 }
+template <typename T> inline Task<T> make_io_task_with_cancel(
+    std::function<T()> operation, const std::shared_ptr<TaskControl>& cancellation_target,
+    const std::string& file, int line, int column) {
+    auto state = std::make_shared<TaskState<T>>(std::move(operation), false, file, line, column);
+    state->cancellation_target = cancellation_target;
+    register_native_task(state, file, line, column);
+    return Task<T>{std::move(state)};
+}
+template <typename T> inline Task<T> task_with_timeout(
+    Task<T> source, Duration duration, bool move_result,
+    const std::string& file, int line, int column) {
+    if (!source.state) throw Failure(file, line, column, "cannot time out an empty Task");
+    const auto target = source.state;
+    const auto deadline = duration_deadline(duration);
+    if (!target->done.load(std::memory_order_acquire)) {
+        if (duration.milliseconds <= 0) target->request_cancel(true);
+        else target->defer_start_until(deadline);
+    }
+    auto operation = [source = std::move(source), target, deadline, move_result, file, line, column]() mutable -> T {
+        if (!target->wait_until(deadline, active_task_control)) {
+            if (active_task_control) active_task_control->check_interruption();
+            if (!target->done.load(std::memory_order_acquire)
+                && !target->is_cancelled()
+                && std::chrono::steady_clock::now() >= deadline)
+                target->request_cancel(true);
+        }
+        if (active_task_control) active_task_control->check_interruption();
+        try {
+            if constexpr (std::is_void_v<T>) {
+                source.await(file, line, column);
+                return;
+            } else if (move_result) {
+                return source.await_move(file, line, column);
+            } else {
+                return source.await(file, line, column);
+            }
+        } catch (const Failure&) {
+            if (target->deadline_cancellation.load(std::memory_order_acquire))
+                throw Failure(file, line, column, "task timed out");
+            if (target->is_cancelled())
+                throw Failure(file, line, column, "timed task was cancelled");
+            throw;
+        }
+    };
+    return make_io_task_with_cancel<T>(std::move(operation), target, file, line, column);
+}
 
 struct CleanupFailure { std::string file; int line; int column; std::string message; };
 inline std::vector<CleanupFailure>& cleanup_failures() {
@@ -1489,6 +1615,30 @@ inline bool report_cleanup_failures() {
     throw Failure(file, line, column, message);
 }
 
+inline Duration duration_milliseconds(std::int64_t value) noexcept { return Duration{value}; }
+inline Duration duration_seconds(std::int64_t value, const std::string& file, int line, int column) {
+    constexpr auto minimum = std::numeric_limits<std::int64_t>::min();
+    constexpr auto maximum = std::numeric_limits<std::int64_t>::max();
+    if (value > maximum / 1000 || value < minimum / 1000)
+        fail(file, line, column, "Duration overflow: value is outside signed 64-bit milliseconds");
+    return Duration{value * 1000};
+}
+inline Duration duration_add(Duration left, Duration right, const std::string& file, int line, int column) {
+    const auto minimum = std::numeric_limits<std::int64_t>::min();
+    const auto maximum = std::numeric_limits<std::int64_t>::max();
+    if ((right.milliseconds > 0 && left.milliseconds > maximum - right.milliseconds)
+        || (right.milliseconds < 0 && left.milliseconds < minimum - right.milliseconds))
+        fail(file, line, column, "Duration overflow: result is outside signed 64-bit milliseconds");
+    return Duration{left.milliseconds + right.milliseconds};
+}
+inline Duration duration_sub(Duration left, Duration right, const std::string& file, int line, int column) {
+    const auto minimum = std::numeric_limits<std::int64_t>::min();
+    const auto maximum = std::numeric_limits<std::int64_t>::max();
+    if ((right.milliseconds < 0 && left.milliseconds > maximum + right.milliseconds)
+        || (right.milliseconds > 0 && left.milliseconds < minimum + right.milliseconds))
+        fail(file, line, column, "Duration overflow: result is outside signed 64-bit milliseconds");
+    return Duration{left.milliseconds - right.milliseconds};
+}
 inline std::int64_t checked_add(std::int64_t left, std::int64_t right, const std::string& file, int line, int column) {
     const auto minimum = std::numeric_limits<std::int64_t>::min();
     const auto maximum = std::numeric_limits<std::int64_t>::max();
@@ -1791,6 +1941,15 @@ template <typename T> inline StringResult<T> result_ok(T value) {
 }
 template <typename T> inline StringResult<T> result_error(std::string message) {
     return StringResult<T>{std::in_place_index<1>, std::move(message)};
+}
+inline StringResult<Duration> duration_from_seconds(double seconds) {
+    if (!std::isfinite(seconds) || seconds < 0.0)
+        return result_error<Duration>("Duration seconds must be finite and non-negative");
+    const double milliseconds = seconds * 1000.0;
+    if (!std::isfinite(milliseconds)
+        || milliseconds >= static_cast<double>(std::numeric_limits<std::int64_t>::max()))
+        return result_error<Duration>("Duration seconds exceed the supported range");
+    return result_ok<Duration>(Duration{static_cast<std::int64_t>(std::ceil(milliseconds))});
 }
 
 struct SocketAddress {

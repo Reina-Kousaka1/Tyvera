@@ -96,8 +96,10 @@ Tasks created by an async task are owned children: cancellation and failure
 cascade through descendants, normal return joins children, and a child failure
 fails its owner. Cancellation is checked at Tyvera statement/loop checkpoints
 and during bounded socket polling; an in-progress system DNS lookup cannot be
-interrupted until the resolver returns. `withTimeout`, `tryResult`, task groups,
-and actor-owned tasks remain unsupported natively. Native `runTasks()` currently
+interrupted until the resolver returns. Native `Task.withTimeout(Duration)` uses a
+steady monotonic deadline, cancels its source operation, and waits for source
+cleanup before reporting timeout; completion published at the deadline wins.
+`tryResult`, task groups, and actor-owned tasks remain unsupported natively. Native `runTasks()` currently
 reports completed native tasks, while the reference runtime reports
 continuation steps; that progress count is not portable yet. The native C++17
 subset also implements synchronous file/path/ByteBuffer APIs. Neither backend
@@ -235,7 +237,7 @@ does not make C++ part of Tyvera's language.
 | Synchronous file/path I/O | `readText`, `writeText`, `readBytes`, `writeBytes`, `pathJoin`, and `pathExists`; relative paths use the project root and `.tyvera.secrets` is protected. |
 | Text resources | `TextFile`, `TextReader`, `TextWriter`, `using`, move transfer, `Result`/function transfer, synchronous methods, modes, close/isOpen, and deterministic LIFO cleanup are implemented. |
 | Records, tuples, user-defined enums, classes, interfaces, generic functions | Interpreter-only. |
-| `Task<T>`, async functions, `await`, `runTasks()` | Experimental native subset; task bodies are serialized and I/O waits use bounded worker threads. Cooperative task/child cancellation is supported; deadlines, `withTimeout`, task groups, and actor ownership remain unsupported. |
+| `Task<T>`, async functions, `await`, `runTasks()` | Experimental native subset; task bodies are serialized and I/O waits use bounded worker threads. Cooperative task/child cancellation and monotonic `withTimeout(Duration)` deadlines are supported; `tryResult()`, task groups, and actor ownership remain unsupported. |
 | DNS and TCP | Experimental on native Linux: `resolveHost`, `tcpConnect`, `tcpListen`, `accept`, `read`, `write`, `writeAll`, address queries, and RAII close. Uses `Result<T,String>`. TLS/HTTP/WebSocket remain interpreter-only. |
 | Actors, Supervisors | Interpreter-only; native lowering rejects these constructs. |
 | `hostOS()`, `hostArchitecture()`, `monotonicMilliseconds()` | Native C++17 runtime and reference implementations; OS/architecture names are normalized and elapsed time is monotonic. |

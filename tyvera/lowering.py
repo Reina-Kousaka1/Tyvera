@@ -83,6 +83,7 @@ _TYPE_MAP = {
     "Bool": IRType.BOOL,
     "String": IRType.STRING,
     "Byte": IRType.BYTE,
+    "Duration": IRType.DURATION,
     "Bytes": IRType.BYTES,
     "ByteBuffer": IRType.BYTE_BUFFER,
     "TextFile": IRType.TEXT_FILE,
@@ -463,7 +464,7 @@ class _FunctionLowerer:
             if expression.type_arguments:
                 raise Diagnostic(expression.location, "backend", "native backend does not yet support generic method calls")
             if isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Task" and expression.method not in {
-                "cancel", "isCancelled", "isDone",
+                "cancel", "isCancelled", "isDone", "withTimeout",
             }:
                 raise Diagnostic(
                     expression.location, "backend",
@@ -473,12 +474,25 @@ class _FunctionLowerer:
                 isinstance(receiver.type, IRAppliedType) and receiver.type.name in {"List", "Map"}
                 or isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Task"
                 or receiver.type in {
-                    IRType.BYTE, IRType.BYTES, IRType.BYTE_BUFFER,
+                    IRType.BYTE, IRType.DURATION, IRType.BYTES, IRType.BYTE_BUFFER,
                     IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
                     IRType.SOCKET_ADDRESS, IRType.TCP_CONNECTION, IRType.TCP_LISTENER,
                 }
             ):
                 raise Diagnostic(expression.location, "backend", f"native backend does not yet support methods on {ir_type_name(receiver.type)}")
+            if (
+                isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Task"
+                and expression.method == "withTimeout"
+                and self.checked.move_sites.get(expression.location) is not None
+            ):
+                if not isinstance(expression.receiver, Name):
+                    raise Diagnostic(expression.location, "backend", "native Task.withTimeout requires a local Task binding")
+                source = self._lookup(expression.receiver.identifier, expression.receiver.location)
+                receiver = IRMove(
+                    IRLocalRef(source.identifier, source.type, expression.receiver.location),
+                    source.type,
+                    expression.location,
+                )
             arguments = tuple(self._expression(argument) for argument in expression.arguments)
             return IRMethodCall(receiver, expression.method, arguments, expression_type, expression.location)
         if isinstance(expression, Call):
@@ -490,7 +504,7 @@ class _FunctionLowerer:
             if expression.callee in {"List", "Map"}:
                 return IRCollectionCreate(expression_type, expression.location)
             if expression.callee in {
-                "byteFromInt", "bytesFromString", "byteBuffer", "readText", "writeText",
+                "milliseconds", "seconds", "durationFromSeconds", "byteFromInt", "bytesFromString", "byteBuffer", "readText", "writeText",
                 "readBytes", "writeBytes", "pathJoin", "pathExists", "openText",
                 "openTextReader", "openTextWriter", "hostOS", "hostArchitecture",
                 "monotonicMilliseconds", "runTasks", "resolveHost", "tcpConnect", "tcpListen",

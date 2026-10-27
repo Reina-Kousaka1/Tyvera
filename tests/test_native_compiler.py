@@ -169,6 +169,26 @@ fn main() {
         self.assertIn(".cancel()", generated)
         self.assertIn(".is_cancelled()", generated)
 
+    def test_native_duration_and_task_timeout_lower_to_typed_ir(self) -> None:
+        module = self.lower('''async fn value() -> Int { return 7 }
+fn main() {
+    let duration = seconds(2) - milliseconds(500)
+    println(duration.inMilliseconds())
+    let task = value()
+    let timed = task.withTimeout(milliseconds(20))
+}
+''')
+        calls = [
+            statement.value for statement in module.functions[1].body
+            if isinstance(statement, IROutput)
+        ]
+        self.assertIsInstance(calls[0], IRMethodCall)
+        self.assertEqual(calls[0].receiver.type, IRType.DURATION)
+        self.assertEqual(calls[0].method, "inMilliseconds")
+        generated = emit_cpp(module)
+        self.assertIn("duration_seconds", generated)
+        self.assertIn("task_with_timeout", generated)
+
     def test_native_byte_buffer_and_binary_io_lower_to_typed_ir(self) -> None:
         module = self.lower('''fn main() {
     let buffer = byteBuffer(4)
@@ -490,6 +510,144 @@ class NativeExecutionTests(unittest.TestCase):
     def _tyvera_string(value: str) -> str:
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
+
+    def test_native_duration_conversions_match_reference(self) -> None:
+        source = '''fn main() {
+    println(milliseconds(-2).inMilliseconds())
+    println((seconds(2) - milliseconds(500)).inMilliseconds())
+    match durationFromSeconds(0.0001) {
+        Ok(value) => println(value.inMilliseconds())
+        Err(error) => println(error)
+    }
+    match durationFromSeconds(-1.0) {
+        Ok(_) => println("unexpected duration")
+        Err(error) => println(error)
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-duration-") as temporary:
+            root = Path(temporary)
+            expected = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "duration-app", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            self.assertEqual(
+                native.stdout,
+                "-2\\n1500\\n1\\nDuration seconds must be finite and non-negative\\n",
+            )
+
+    def test_native_task_timeout_cancels_source_and_matches_reference(self) -> None:
+        source = '''async fn background() {
+    while true {}
+}
+fn main() {
+    let source = background()
+    let timed = source.withTimeout(milliseconds(20))
+    match runTasks() {
+        Ok(_) => println("unexpected success")
+        Err(_) => println("timed out")
+    }
+    println(source.isCancelled())
+    println(timed.isDone())
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-timeout-") as temporary:
+            root = Path(temporary)
+            expected = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "timeout-app", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            self.assertEqual(native.stdout, "timed out\\ntrue\\ntrue\\n")
+
+    def test_native_negative_timeout_prevents_unstarted_source_body(self) -> None:
+        source = '''async fn sideEffect() {
+    println("source started")
+}
+fn main() {
+    let source = sideEffect()
+    let timed = source.withTimeout(milliseconds(-1))
+    match runTasks() {
+        Ok(_) => println("unexpected success")
+        Err(_) => println("task timed out")
+    }
+    println(source.isCancelled())
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-negative-timeout-") as temporary:
+            root = Path(temporary)
+            expected = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "negative-timeout-app", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            self.assertEqual(native.stdout, "task timed out\\ntrue\\n")
+
+    def test_native_completed_task_wins_over_an_expired_timeout(self) -> None:
+        source = '''async fn immediate() -> Int { return 7 }
+async fn run() {
+    let original = immediate()
+    let first = await original
+    let timed = original.withTimeout(milliseconds(-1))
+    let second = await timed
+    println(first + second)
+}
+fn main() {
+    let task = run()
+    match runTasks() {
+        Ok(_) => println("ok")
+        Err(_) => println("failed")
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-timeout-complete-") as temporary:
+            root = Path(temporary)
+            expected = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "timeout-complete", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            self.assertEqual(native.stdout, "14\\nok\\n")
+
+    def test_native_cancelling_timeout_wrapper_cancels_source(self) -> None:
+        source = '''async fn background() {
+    while true {}
+}
+fn main() {
+    let source = background()
+    let timed = source.withTimeout(seconds(10))
+    println(timed.cancel())
+    println(source.isCancelled())
+    match runTasks() {
+        Ok(_) => println("cancelled")
+        Err(_) => println("failed")
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-timeout-cancel-") as temporary:
+            root = Path(temporary)
+            expected = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "timeout-cancel", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            self.assertEqual(native.stdout, "true\\ntrue\\ncancelled\\n")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "native networking timeout tests require Linux")
+    def test_native_timeout_cancels_pending_accept_and_matches_reference(self) -> None:
+        source = '''async fn waitForPeer() {
+    let opened = await tcpListen("127.0.0.1", 0, 8)
+    using listener = move opened {
+        let pending = listener.accept()
+        let timed = pending.withTimeout(milliseconds(30))
+        let accepted = await move timed
+        match move accepted {
+            Ok(connection) => connection.close()
+            Err(error) => println(error)
+        }
+    } else error {
+        println(error)
+    }
+}
+fn main() {
+    let task = waitForPeer()
+    match runTasks() {
+        Ok(_) => println("unexpected success")
+        Err(_) => println("timed out")
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-accept-timeout-") as temporary:
+            root = Path(temporary)
+            expected = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "accept-timeout", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            self.assertEqual(native.stdout, "timed out\\n")
 
     def test_native_owned_child_task_cancellation_matches_reference(self) -> None:
         source = '''async fn background() {
