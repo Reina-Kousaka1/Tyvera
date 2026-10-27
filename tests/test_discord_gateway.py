@@ -821,6 +821,22 @@ fn main() {
 
                 def do_POST(self) -> None:
                     nonlocal retry_attempts, header_retry_attempts, integer_retry_attempts
+                    status_responses = {
+                        "/api/v10/channels/9/messages": (204, b""),
+                        "/api/v10/channels/10/messages": (400, b'{"message":"bad request","code":400}'),
+                        "/api/v10/channels/11/messages": (401, b'{"message":"unauthorized","code":401}'),
+                        "/api/v10/channels/12/messages": (403, b'{"message":"forbidden","code":403}'),
+                        "/api/v10/channels/13/messages": (404, b'{"message":"not found","code":404}'),
+                        "/api/v10/channels/14/messages": (429, b'{"message":"rate limited","retry_after":0.25,"global":true}'),
+                        "/api/v10/channels/15/messages": (500, b'{"message":"server error","code":500}'),
+                        "/api/v10/channels/16/messages": (502, b'{"message":"bad gateway","code":502}'),
+                        "/api/v10/channels/17/messages": (503, b'{"message":"unavailable","code":503}'),
+                        "/api/v10/channels/18/messages": (502, b'{not-json'),
+                    }
+                    if self.path in status_responses:
+                        status, response_body = status_responses[self.path]
+                        self._reply(status, response_body, {"Content-Type": "application/json"})
+                        return
                     if self.path == "/api/v10/channels/3/messages":
                         self._reply(500, b'{"message":"temporary failure"}', {
                             "Content-Type": "application/json",
@@ -880,6 +896,25 @@ fn main() {
             thread.start()
             entry = directory / "rest-test.tyv"
             entry.write_text(r'''import "../src/rest.tyv" as rest
+async fn inspectFailure(token: Secret<String>, endpoint: String) {
+    let result = await rest.requestBot(token, "POST", endpoint, bytesFromString("{}"), seconds(3))
+    match result {
+        Err(_) => println("transport failed")
+        Ok(response) => {
+            println(response.status)
+            match rest.decodeResponseFailure(response) {
+                Err(_) => println("decode rejected")
+                Ok(failure) => match failure {
+                    None => println("no failure")
+                    Some(value) => {
+                        println(value.status)
+                        println(value.message)
+                    }
+                }
+            }
+        }
+    }
+}
 async fn run() {
     match environment("TYVERA_FAKE_DISCORD_REST_TOKEN") {
         None => println("missing token")
@@ -949,6 +984,16 @@ async fn run() {
                 Err(_) => println("date header request failed")
                 Ok(response) => println(response.status)
             }
+            await inspectFailure(token, "channels/9/messages")
+            await inspectFailure(token, "channels/10/messages")
+            await inspectFailure(token, "channels/11/messages")
+            await inspectFailure(token, "channels/12/messages")
+            await inspectFailure(token, "channels/13/messages")
+            await inspectFailure(token, "channels/14/messages")
+            await inspectFailure(token, "channels/15/messages")
+            await inspectFailure(token, "channels/16/messages")
+            await inspectFailure(token, "channels/17/messages")
+            await inspectFailure(token, "channels/18/messages")
             let badBudget = await rest.requestBotWithRetries(token, "POST", "channels/4/messages", bytesFromString("{}"), seconds(3), 6)
             match badBudget {
                 Err(_) => println("retry budget rejected")
@@ -1015,7 +1060,8 @@ fn main() {
             self.assertEqual(errors.getvalue(), "")
             self.assertEqual(output.getvalue(),
                              '200\ntrue\ntrue\ntrue\n{"id":"fake-user","username":"test-bot"}\n'
-                             '429\ntrue\ntrue\ntrue\n429\ntrue\ntrue\n200\n500\n200\n429\n200\n429\nretry budget rejected\n')
+                             '429\ntrue\ntrue\ntrue\n429\ntrue\ntrue\n200\n500\n200\n429\n200\n429\nretry budget rejected\n'
+                             '204\nno failure\n400\n400\nbad request\n401\n401\nunauthorized\n403\n403\nforbidden\n404\n404\nnot found\n429\n429\nrate limited\n500\n500\nserver error\n502\n502\nbad gateway\n503\n503\nunavailable\n502\ndecode rejected\n')
             expected_paths = [
                 "/api/v10/users/@me", "/api/v10/channels/1/messages",
                 "/api/v10/channels/2/messages", "/api/v10/channels/2/messages",
@@ -1024,6 +1070,16 @@ fn main() {
                 "/api/v10/channels/6/messages",
                 "/api/v10/channels/7/messages", "/api/v10/channels/7/messages",
                 "/api/v10/channels/8/messages",
+                "/api/v10/channels/9/messages",
+                "/api/v10/channels/10/messages",
+                "/api/v10/channels/11/messages",
+                "/api/v10/channels/12/messages",
+                "/api/v10/channels/13/messages",
+                "/api/v10/channels/14/messages",
+                "/api/v10/channels/15/messages",
+                "/api/v10/channels/16/messages",
+                "/api/v10/channels/17/messages",
+                "/api/v10/channels/18/messages",
             ]
             self.assertEqual(
                 [path for path, _, _ in captured], expected_paths * (2 if native_result is not None else 1),
@@ -1040,7 +1096,7 @@ fn main() {
                     (native_result.returncode, native_result.stdout, native_result.stderr),
                     reference_result,
                 )
-                self.assertEqual(captured[11:], captured[:11])
+                self.assertEqual(captured[21:], captured[:21])
                 self.assertNotIn("fake-rest-token", native_result.stdout + native_result.stderr)
 
 
