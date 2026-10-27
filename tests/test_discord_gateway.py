@@ -7,6 +7,7 @@ import shutil
 import socket
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -16,13 +17,83 @@ from unittest.mock import patch
 
 from tyvera.compiler import compile_checked_project
 from tyvera.backend import ReferenceInterpreterBackend
+from tyvera.cpp_backend import CppNativeBackend
 from tyvera.http_protocol import HttpUrl
 from tyvera.interpreter import Interpreter
+from tyvera.lowering import lower_checked_program
 from tyvera.websocket_protocol import make_accept_value
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DISCORD_ROOT = ROOT / "libraries" / "discord"
+
+
+def _native_cpp_available() -> bool:
+    return sys.platform.startswith("linux") and any(
+        shutil.which(command) for command in ("clang++", "g++", "c++")
+    ) and shutil.which("cc") is not None
+
+
+def _native_local_route_override(directory: Path) -> Path:
+    """Build a test-only DNS route shim for native fake Discord services."""
+    source = directory / "discord_local_route.c"
+    library = directory / "discord_local_route.so"
+    source.write_text(r'''#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <netdb.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef int (*getaddrinfo_fn)(const char *, const char *,
+                              const struct addrinfo *, struct addrinfo **);
+
+int getaddrinfo(const char *node, const char *service,
+                const struct addrinfo *hints, struct addrinfo **result) {
+    static getaddrinfo_fn real_getaddrinfo = NULL;
+    if (real_getaddrinfo == NULL) {
+        real_getaddrinfo = (getaddrinfo_fn)dlsym(RTLD_NEXT, "getaddrinfo");
+    }
+    const char *port = getenv("TYVERA_TEST_DISCORD_PORT");
+    if (node != NULL && port != NULL &&
+        (strcmp(node, "discord.com") == 0 ||
+         strcmp(node, "gateway.discord.gg") == 0 ||
+         strcmp(node, "gateway-us-east1-b.discord.gg") == 0)) {
+        return real_getaddrinfo("127.0.0.1", port, hints, result);
+    }
+    return real_getaddrinfo(node, service, hints, result);
+}
+''', encoding="utf-8")
+    compiler = shutil.which("cc")
+    if compiler is None:
+        raise unittest.SkipTest("a C compiler is required for native Discord route tests")
+    subprocess.run(
+        [compiler, "-shared", "-fPIC", str(source), "-o", str(library), "-ldl"],
+        check=True, capture_output=True, text=True,
+    )
+    return library
+
+
+def _native_discord_run(
+    checked, output: Path, directory: Path, port: int, certificate: Path,
+    runtime_environment: dict[str, str],
+):
+    native_executable = directory / (output.name + "-native")
+    CppNativeBackend().build(
+        lower_checked_program(checked), native_executable, project_root=DISCORD_ROOT,
+    )
+    route_library = _native_local_route_override(directory)
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    environment.pop("PYTHONHOME", None)
+    environment.pop("DISCORD_TOKEN", None)
+    environment["TYVERA_TEST_DISCORD_PORT"] = str(port)
+    environment["SSL_CERT_FILE"] = str(certificate)
+    environment["LD_PRELOAD"] = str(route_library)
+    environment.update(runtime_environment)
+    return subprocess.run(
+        [str(native_executable)], cwd=DISCORD_ROOT, capture_output=True,
+        text=True, encoding="utf-8", env=environment, check=False, timeout=60,
+    )
 
 
 def read_exact(stream: ssl.SSLSocket, length: int) -> bytes:
@@ -106,6 +177,7 @@ fn main() {
         self.assertEqual(output.getvalue(), "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\nfalse\nuserinfo rejected\n")
 
     def test_local_verified_wss_identify_heartbeat_ack_and_ready(self) -> None:
+        native_available = _native_cpp_available()
         openssl = shutil.which("openssl")
         if openssl is None:
             git_openssl = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/usr/bin/openssl.exe"
@@ -129,65 +201,70 @@ fn main() {
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind(("127.0.0.1", 0))
-            listener.listen(1)
-            listener.settimeout(5)
+            connection_count = 2 if native_available else 1
+            listener.listen(connection_count)
+            listener.settimeout(60)
             port = listener.getsockname()[1]
-            captured: dict[str, object] = {}
+            captured: list[dict[str, object]] = []
             failures: list[BaseException] = []
 
             def serve() -> None:
-                raw = None
-                secure = None
-                try:
-                    raw, _ = listener.accept()
-                    raw.settimeout(5)
-                    secure = server_context.wrap_socket(raw, server_side=True)
-                    secure.settimeout(5)
-                    request = bytearray()
-                    while b"\r\n\r\n" not in request:
-                        request.extend(secure.recv(4096))
-                    header_lines = bytes(request).split(b"\r\n")
-                    headers: dict[str, str] = {}
-                    for line in header_lines[1:]:
-                        if not line:
-                            break
-                        name, _, value = line.partition(b":")
-                        headers[name.decode("ascii").lower()] = value.strip().decode("ascii")
-                    captured["request_target"] = header_lines[0]
-                    captured["authorization_header"] = headers.get("authorization")
-                    key = headers["sec-websocket-key"]
-                    secure.sendall(
-                        ("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
-                         "Upgrade: websocket\r\n"
-                         f"Sec-WebSocket-Accept: {make_accept_value(key)}\r\n\r\n").encode("ascii")
-                    )
-                    secure.sendall(server_frame(b'{"op":10,"d":{"heartbeat_interval":150}}'))
-                    opcode, identify_payload = read_client_frame(secure)
-                    captured["identify_opcode"] = opcode
-                    identify = json.loads(identify_payload.decode("utf-8"))
-                    captured["identify"] = identify
-                    heartbeat_opcode, heartbeat_payload = read_client_frame(secure)
-                    captured["heartbeat_opcode"] = heartbeat_opcode
-                    captured["heartbeat"] = json.loads(heartbeat_payload.decode("utf-8"))
-                    ready = (b'{"op":0,"s":41,"t":"READY","d":{"session_id":"fake-session",'
-                             b'"resume_gateway_url":"wss://gateway.example.invalid"}}')
-                    secure.sendall(
-                        server_frame(b'{"op":11,"d":null}') + server_frame(ready)
-                    )
-                    close_opcode, close_payload = read_client_frame(secure)
-                    captured["close"] = (close_opcode, close_payload)
-                    secure.sendall(server_close_frame())
-                except BaseException as error:
-                    failures.append(error)
-                finally:
+                for _ in range(connection_count):
+                    raw = None
+                    secure = None
+                    session: dict[str, object] = {}
                     try:
-                        if secure is not None:
-                            secure.close()
-                        elif raw is not None:
-                            raw.close()
-                    except OSError:
-                        pass
-                    listener.close()
+                        raw, _ = listener.accept()
+                        raw.settimeout(10)
+                        secure = server_context.wrap_socket(raw, server_side=True)
+                        secure.settimeout(10)
+                        request = bytearray()
+                        while b"\r\n\r\n" not in request:
+                            request.extend(secure.recv(4096))
+                        header_lines = bytes(request).split(b"\r\n")
+                        headers: dict[str, str] = {}
+                        for line in header_lines[1:]:
+                            if not line:
+                                break
+                            name, _, value = line.partition(b":")
+                            headers[name.decode("ascii").lower()] = value.strip().decode("ascii")
+                        session["request_target"] = header_lines[0]
+                        session["authorization_header"] = headers.get("authorization")
+                        key = headers["sec-websocket-key"]
+                        secure.sendall(
+                            ("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
+                             "Upgrade: websocket\r\n"
+                             f"Sec-WebSocket-Accept: {make_accept_value(key)}\r\n\r\n").encode("ascii")
+                        )
+                        secure.sendall(server_frame(b'{"op":10,"d":{"heartbeat_interval":150}}'))
+                        opcode, identify_payload = read_client_frame(secure)
+                        session["identify_opcode"] = opcode
+                        identify = json.loads(identify_payload.decode("utf-8"))
+                        session["identify"] = identify
+                        heartbeat_opcode, heartbeat_payload = read_client_frame(secure)
+                        session["heartbeat_opcode"] = heartbeat_opcode
+                        session["heartbeat"] = json.loads(heartbeat_payload.decode("utf-8"))
+                        ready = (b'{"op":0,"s":41,"t":"READY","d":{"session_id":"fake-session",'
+                                 b'"resume_gateway_url":"wss://gateway.example.invalid"}}')
+                        secure.sendall(
+                            server_frame(b'{"op":11,"d":null}') + server_frame(ready)
+                        )
+                        close_opcode, close_payload = read_client_frame(secure)
+                        session["close"] = (close_opcode, close_payload)
+                        secure.sendall(server_close_frame())
+                        captured.append(session)
+                    except BaseException as error:
+                        failures.append(error)
+                        break
+                    finally:
+                        try:
+                            if secure is not None:
+                                secure.close()
+                            elif raw is not None:
+                                raw.close()
+                        except OSError:
+                            pass
+                listener.close()
 
             thread = threading.Thread(target=serve, daemon=True)
             thread.start()
@@ -254,8 +331,14 @@ fn main() {{ let task = run(); runTasks() }}
                     ReferenceInterpreterBackend().execute(
                         checked, output=output, error_output=errors, project_root=DISCORD_ROOT,
                     )
+                native_result = None
+                if native_available:
+                    native_result = _native_discord_run(
+                        checked, directory / "gateway", directory, port, certificate,
+                        {"TYVERA_FAKE_DISCORD_TOKEN": "fake-gateway-token"},
+                    )
             finally:
-                thread.join(7)
+                thread.join(30)
                 if thread.is_alive():
                     listener.close()
 
@@ -263,18 +346,25 @@ fn main() {{ let task = run(); runTasks() }}
             self.assertEqual(failures, [])
             self.assertEqual(output.getvalue(), "true\ntrue\ntrue\ntrue\n1\n0\n1\n1\n")
             self.assertEqual(errors.getvalue(), "")
-            self.assertEqual(captured.get("authorization_header"), None)
-            self.assertEqual(captured.get("identify_opcode"), 1)
-            self.assertEqual(captured.get("identify", {}).get("op"), 2)
-            self.assertEqual(captured.get("identify", {}).get("d", {}).get("token"), "fake-gateway-token")
-            self.assertEqual(captured.get("identify", {}).get("d", {}).get("intents"), 33281)
-            self.assertEqual(captured.get("heartbeat_opcode"), 1)
-            self.assertEqual(captured.get("heartbeat"), {"op": 1, "d": None})
-            self.assertEqual(captured.get("close", (None,))[0], 8)
+            self.assertEqual(len(captured), connection_count)
+            for session in captured:
+                self.assertEqual(session.get("authorization_header"), None)
+                self.assertEqual(session.get("identify_opcode"), 1)
+                self.assertEqual(session.get("identify", {}).get("op"), 2)
+                self.assertEqual(session.get("identify", {}).get("d", {}).get("token"), "fake-gateway-token")
+                self.assertEqual(session.get("identify", {}).get("d", {}).get("intents"), 33281)
+                self.assertEqual(session.get("heartbeat_opcode"), 1)
+                self.assertEqual(session.get("heartbeat"), {"op": 1, "d": None})
+                self.assertEqual(session.get("close", (None,))[0], 8)
             rendered = output.getvalue() + errors.getvalue()
             self.assertNotIn("fake-gateway-token", rendered)
+            if native_result is not None:
+                self.assertEqual((native_result.returncode, native_result.stdout, native_result.stderr),
+                                 (0, output.getvalue(), errors.getvalue()))
+                self.assertNotIn("fake-gateway-token", native_result.stdout + native_result.stderr)
 
     def test_local_gateway_reconnect_resumes_then_reidentifies_invalid_session(self) -> None:
+        native_available = _native_cpp_available()
         openssl = shutil.which("openssl")
         if openssl is None:
             git_openssl = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/usr/bin/openssl.exe"
@@ -297,55 +387,57 @@ fn main() {{ let task = run(); runTasks() }}
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind(("127.0.0.1", 0))
-            listener.listen(3)
-            listener.settimeout(5)
+            connection_count = 2 if native_available else 1
+            listener.listen(3 * connection_count)
+            listener.settimeout(60)
             port = listener.getsockname()[1]
             captured: list[dict[str, object]] = []
             failures: list[BaseException] = []
 
             def serve() -> None:
                 try:
-                    for index in range(3):
-                        raw, _ = listener.accept()
-                        raw.settimeout(5)
-                        secure = server_context.wrap_socket(raw, server_side=True)
-                        secure.settimeout(5)
-                        request = bytearray()
-                        while b"\r\n\r\n" not in request:
-                            request.extend(secure.recv(4096))
-                        header_lines = bytes(request).split(b"\r\n")
-                        headers: dict[str, str] = {}
-                        for line in header_lines[1:]:
-                            if not line:
-                                break
-                            name, _, value = line.partition(b":")
-                            headers[name.decode("ascii").lower()] = value.strip().decode("ascii")
-                        key = headers["sec-websocket-key"]
-                        secure.sendall(
-                            ("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
-                             "Upgrade: websocket\r\n"
-                             f"Sec-WebSocket-Accept: {make_accept_value(key)}\r\n\r\n").encode("ascii")
-                        )
-                        secure.sendall(server_frame(b'{"op":10,"d":{"heartbeat_interval":5000}}'))
-                        opcode, payload = read_client_frame(secure)
-                        captured.append({"opcode": opcode, "payload": json.loads(payload.decode("utf-8"))})
-                        if index == 0:
-                            secure.sendall(server_frame(
-                                b'{"op":0,"s":41,"t":"READY","d":{"session_id":"resume-session",'
-                                b'"resume_gateway_url":"wss://gateway-us-east1-b.discord.gg"}}'
-                            ))
-                            secure.sendall(server_frame(b'{"op":7,"d":null}'))
-                        elif index == 1:
-                            secure.sendall(server_frame(b'{"op":9,"d":false}'))
-                        else:
-                            secure.sendall(server_frame(
-                                b'{"op":0,"s":42,"t":"READY","d":{"session_id":"new-session",'
-                                b'"resume_gateway_url":"wss://gateway.discord.gg"}}'
-                            ))
-                            close_opcode, close_payload = read_client_frame(secure)
-                            captured.append({"close": (close_opcode, close_payload)})
-                            secure.sendall(server_close_frame())
-                        secure.close()
+                    for _ in range(connection_count):
+                        for index in range(3):
+                            raw, _ = listener.accept()
+                            raw.settimeout(10)
+                            secure = server_context.wrap_socket(raw, server_side=True)
+                            secure.settimeout(10)
+                            request = bytearray()
+                            while b"\r\n\r\n" not in request:
+                                request.extend(secure.recv(4096))
+                            header_lines = bytes(request).split(b"\r\n")
+                            headers: dict[str, str] = {}
+                            for line in header_lines[1:]:
+                                if not line:
+                                    break
+                                name, _, value = line.partition(b":")
+                                headers[name.decode("ascii").lower()] = value.strip().decode("ascii")
+                            key = headers["sec-websocket-key"]
+                            secure.sendall(
+                                ("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
+                                 "Upgrade: websocket\r\n"
+                                 f"Sec-WebSocket-Accept: {make_accept_value(key)}\r\n\r\n").encode("ascii")
+                            )
+                            secure.sendall(server_frame(b'{"op":10,"d":{"heartbeat_interval":5000}}'))
+                            opcode, payload = read_client_frame(secure)
+                            captured.append({"opcode": opcode, "payload": json.loads(payload.decode("utf-8"))})
+                            if index == 0:
+                                secure.sendall(server_frame(
+                                    b'{"op":0,"s":41,"t":"READY","d":{"session_id":"resume-session",'
+                                    b'"resume_gateway_url":"wss://gateway-us-east1-b.discord.gg"}}'
+                                ))
+                                secure.sendall(server_frame(b'{"op":7,"d":null}'))
+                            elif index == 1:
+                                secure.sendall(server_frame(b'{"op":9,"d":false}'))
+                            else:
+                                secure.sendall(server_frame(
+                                    b'{"op":0,"s":42,"t":"READY","d":{"session_id":"new-session",'
+                                    b'"resume_gateway_url":"wss://gateway.discord.gg"}}'
+                                ))
+                                close_opcode, close_payload = read_client_frame(secure)
+                                captured.append({"close": (close_opcode, close_payload)})
+                                secure.sendall(server_close_frame())
+                            secure.close()
                 except BaseException as error:
                     failures.append(error)
                 finally:
@@ -417,8 +509,15 @@ fn main() { let task = run(); runTasks() }
                     ReferenceInterpreterBackend().execute(
                         checked, output=output, error_output=errors, project_root=DISCORD_ROOT,
                     )
+                reference_result = (0, output.getvalue(), errors.getvalue())
+                native_result = None
+                if native_available:
+                    native_result = _native_discord_run(
+                        checked, directory / "gateway-resume", directory, port, certificate,
+                        {"TYVERA_FAKE_DISCORD_TOKEN": "fake-resume-token"},
+                    )
             finally:
-                thread.join(8)
+                thread.join(45)
                 if thread.is_alive():
                     listener.close()
 
@@ -426,7 +525,8 @@ fn main() { let task = run(); runTasks() }
         self.assertEqual(failures, [])
         self.assertEqual(output.getvalue(), "true\ntrue\ntrue\n2\n2\nresume-session\ntrue\n")
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(len(captured), 4)
+        per_run = 4
+        self.assertEqual(len(captured), per_run * connection_count)
         self.assertEqual(captured[0]["opcode"], 1)
         self.assertEqual(captured[0]["payload"]["op"], 2)
         self.assertEqual(captured[1]["opcode"], 1)
@@ -438,8 +538,16 @@ fn main() { let task = run(); runTasks() }
         self.assertEqual(captured[2]["payload"]["op"], 2)
         self.assertIn("close", captured[3])
         self.assertNotIn("fake-resume-token", output.getvalue() + errors.getvalue())
+        if native_result is not None:
+            self.assertEqual(
+                (native_result.returncode, native_result.stdout, native_result.stderr),
+                reference_result,
+            )
+            self.assertEqual(captured[per_run:], captured[:per_run])
+            self.assertNotIn("fake-resume-token", native_result.stdout + native_result.stderr)
 
     def test_missing_heartbeat_ack_terminates_connection_and_respects_retry_budget(self) -> None:
+        native_available = _native_cpp_available()
         openssl = shutil.which("openssl")
         if openssl is None:
             git_openssl = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/usr/bin/openssl.exe"
@@ -462,53 +570,59 @@ fn main() { let task = run(); runTasks() }
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind(("127.0.0.1", 0))
-            listener.listen(1)
-            listener.settimeout(5)
+            connection_count = 2 if native_available else 1
+            listener.listen(connection_count)
+            listener.settimeout(60)
             port = listener.getsockname()[1]
             captured: list[dict[str, object]] = []
             failures: list[BaseException] = []
 
             def serve() -> None:
-                raw = None
-                secure = None
-                try:
-                    raw, _ = listener.accept()
-                    raw.settimeout(5)
-                    secure = server_context.wrap_socket(raw, server_side=True)
-                    secure.settimeout(5)
-                    request = bytearray()
-                    while b"\r\n\r\n" not in request:
-                        request.extend(secure.recv(4096))
-                    headers: dict[str, str] = {}
-                    for line in bytes(request).split(b"\r\n")[1:]:
-                        if not line:
-                            break
-                        name, _, value = line.partition(b":")
-                        headers[name.decode("ascii").lower()] = value.strip().decode("ascii")
-                    key = headers["sec-websocket-key"]
-                    secure.sendall(
-                        ("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
-                         "Upgrade: websocket\r\n"
-                         f"Sec-WebSocket-Accept: {make_accept_value(key)}\r\n\r\n").encode("ascii")
-                    )
-                    secure.sendall(server_frame(b'{"op":10,"d":{"heartbeat_interval":150}}'))
-                    opcode, payload = read_client_frame(secure)
-                    captured.append({"opcode": opcode, "payload": json.loads(payload.decode("utf-8"))})
-                    opcode, payload = read_client_frame(secure)
-                    captured.append({"opcode": opcode, "payload": json.loads(payload.decode("utf-8"))})
+                for _ in range(connection_count):
+                    raw = None
+                    secure = None
                     try:
-                        while secure.recv(4096):
+                        raw, _ = listener.accept()
+                        raw.settimeout(15)
+                        secure = server_context.wrap_socket(raw, server_side=True)
+                        secure.settimeout(15)
+                        request = bytearray()
+                        while b"\r\n\r\n" not in request:
+                            request.extend(secure.recv(4096))
+                        headers: dict[str, str] = {}
+                        for line in bytes(request).split(b"\r\n")[1:]:
+                            if not line:
+                                break
+                            name, _, value = line.partition(b":")
+                            headers[name.decode("ascii").lower()] = value.strip().decode("ascii")
+                        key = headers["sec-websocket-key"]
+                        secure.sendall(
+                            ("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
+                             "Upgrade: websocket\r\n"
+                             f"Sec-WebSocket-Accept: {make_accept_value(key)}\r\n\r\n").encode("ascii")
+                        )
+                        secure.sendall(server_frame(b'{"op":10,"d":{"heartbeat_interval":500}}'))
+                        opcode, payload = read_client_frame(secure)
+                        captured.append({"opcode": opcode, "payload": json.loads(payload.decode("utf-8"))})
+                        opcode, payload = read_client_frame(secure)
+                        captured.append({"opcode": opcode, "payload": json.loads(payload.decode("utf-8"))})
+                        try:
+                            while secure.recv(4096):
+                                pass
+                        except (OSError, ssl.SSLError):
                             pass
-                    except (OSError, ssl.SSLError):
-                        pass
-                except BaseException as error:
-                    failures.append(error)
-                finally:
-                    if secure is not None:
-                        secure.close()
-                    elif raw is not None:
-                        raw.close()
-                    listener.close()
+                    except BaseException as error:
+                        failures.append(error)
+                        break
+                    finally:
+                        try:
+                            if secure is not None:
+                                secure.close()
+                            elif raw is not None:
+                                raw.close()
+                        except OSError:
+                            pass
+                listener.close()
 
             thread = threading.Thread(target=serve, daemon=True)
             thread.start()
@@ -531,6 +645,7 @@ fn main() { let task = run(); runTasks() }
             checked = compile_checked_project(entry, DISCORD_ROOT)
             output = io.StringIO()
             errors = io.StringIO()
+            native_result = None
             original_connect = Interpreter._websocket_connect_task
             original_getaddrinfo = socket.getaddrinfo
             default_context = ssl.create_default_context
@@ -559,8 +674,13 @@ fn main() { let task = run(); runTasks() }
                     ReferenceInterpreterBackend().execute(
                         checked, output=output, error_output=errors, project_root=DISCORD_ROOT,
                     )
+                if native_available:
+                    native_result = _native_discord_run(
+                        checked, directory / "missing-ack", directory, port, certificate,
+                        {"TYVERA_FAKE_DISCORD_TOKEN": "fake-heartbeat-token"},
+                    )
             finally:
-                thread.join(6)
+                thread.join(30)
                 if thread.is_alive():
                     listener.close()
 
@@ -571,8 +691,17 @@ fn main() { let task = run(); runTasks() }
         self.assertEqual(captured[0]["payload"]["op"], 2)
         self.assertEqual(captured[1], {"opcode": 1, "payload": {"op": 1, "d": None}})
         self.assertNotIn("fake-heartbeat-token", output.getvalue() + errors.getvalue())
+        self.assertEqual(len(captured), 2 * connection_count)
+        if native_result is not None:
+            self.assertEqual(
+                (native_result.returncode, native_result.stdout, native_result.stderr),
+                (0, output.getvalue(), errors.getvalue()),
+            )
+            self.assertEqual(captured[2:], captured[:2])
+            self.assertNotIn("fake-heartbeat-token", native_result.stdout + native_result.stderr)
 
     def test_local_verified_rest_transport_maps_rate_limits_without_retries(self) -> None:
+        native_available = _native_cpp_available()
         openssl = shutil.which("openssl")
         if openssl is None:
             git_openssl = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/usr/bin/openssl.exe"
@@ -747,6 +876,14 @@ fn main() { let task = run(); runTasks() }
                     ReferenceInterpreterBackend().execute(
                         checked, output=output, error_output=errors, project_root=DISCORD_ROOT,
                     )
+                reference_result = (0, output.getvalue(), errors.getvalue())
+                native_result = None
+                if native_available:
+                    retry_attempts = 0
+                    native_result = _native_discord_run(
+                        checked, directory / "rest", directory, local_port, certificate,
+                        {"TYVERA_FAKE_DISCORD_REST_TOKEN": "fake-rest-token"},
+                    )
             finally:
                 server.shutdown()
                 server.server_close()
@@ -767,6 +904,13 @@ fn main() { let task = run(); runTasks() }
             self.assertEqual(captured[0][2], b"")
             self.assertEqual(captured[1][2], b'{"content":"hello"}')
             self.assertNotIn("fake-rest-token", output.getvalue() + errors.getvalue())
+            if native_result is not None:
+                self.assertEqual(
+                    (native_result.returncode, native_result.stdout, native_result.stderr),
+                    reference_result,
+                )
+                self.assertEqual(captured[5:], captured[:5])
+                self.assertNotIn("fake-rest-token", native_result.stdout + native_result.stderr)
 
 
 if __name__ == "__main__":

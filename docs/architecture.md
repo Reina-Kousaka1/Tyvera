@@ -176,9 +176,13 @@ CI-tested target. Generated executables do not require Python. `Option`/
 `ByteBuffer`, opaque `Json`, synchronous text/binary file and path operations,
 and owned text-file resources are part of the native subset. Linux also has
 experimental async DNS/TCP/TLS, HTTP/WebSocket clients, and actor/supervisor
-subsets. Classes, records, user-defined enums, generic functions, task groups,
-actor monitoring/links, and the full Discord package remain interpreter-only.
-The full boundary and backend evaluation are in
+subsets. Non-generic records and user-defined enums have an experimental
+native path for checked constructors, fields, patterns, and linked package
+declarations. Classes, generic functions, task groups, and actor monitoring/
+links remain unsupported natively. Selected Discord package decoder, Gateway,
+and REST flows compile and run against local fake services through the general
+native path; this is not full native support for the library. The full boundary
+and backend evaluation are in
 [Backend Architecture](backend-architecture.md); Tyvera's value and resource
 rules are in the [Memory Model](memory-model.md).
 

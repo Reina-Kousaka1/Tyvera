@@ -76,11 +76,15 @@ modules: non-generic records/enums, typed JSON use, `Secret<String>`, native
 environment lookup, async REST helpers, and the Gateway client can be
 represented in the native C++17 program without Discord-specific backend
 rewrites. The checked-in decoder example is used for interpreter/native
-differential execution. Native Gateway and REST transports have not yet been
-validated against the local fake TLS services; those integration tests still
-exercise the reference runtime. Native actors also do not yet own the Discord
-client lifecycle. There is no interpreter fallback. Do not treat this package
-as production-ready.
+differential execution. Linux CI also runs the same Gateway and REST examples
+through both the reference runtime and a native C++17 executable against local
+fake TLS services. Coverage includes Identify, heartbeat ACK, READY, reconnect,
+resume, invalid-session re-identification, REST response metadata, bounded
+429 retries, and token-redaction checks. A test-only resolver shim routes only
+the native test process to loopback; the Tyvera package keeps its fixed,
+verified Discord origins. This does not yet provide an Actor/Supervisor-owned
+Discord lifecycle, a shared REST bucket coordinator, or production readiness.
+There is no interpreter fallback.
 
 When authentication is used, the token remains `Secret<String>` until the
 request header or Identify payload is formed. The library itself never logs it;

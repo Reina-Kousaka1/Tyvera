@@ -706,7 +706,7 @@ class NativeExecutionTests(unittest.TestCase):
             environment["PATH"] = ""
         return subprocess.run(
             [str(output)], cwd=cwd, capture_output=True, text=True,
-            encoding="utf-8", env=environment, check=False,
+            encoding="utf-8", env=environment, check=False, timeout=30,
         )
 
     @staticmethod
