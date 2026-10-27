@@ -282,8 +282,7 @@ class _CppGenerator:
             if function.return_type == IRType.VOID:
                 self._line("return;")
             self.indent -= 1
-            self._line("}")
-            self._line(");")
+            self._line(f"}}, {_location_args(function.location)});")
         self.indent -= 1
         self._line("}")
         self.async_context = previous_async_context
