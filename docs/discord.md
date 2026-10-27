@@ -8,9 +8,11 @@ directory is not published or automatically installed as a dependency.
 ## Implemented slice
 
 `src/gateway.tyv` exports `GatewayDispatch`, `GatewayEnvelope`, and decoders for
-`READY`, `MESSAGE_CREATE`, unknown dispatches, and the Gateway envelope. It
-validates required fields and maps malformed or incomplete payloads to generic
-errors that do not echo the input.
+`READY`, `MESSAGE_CREATE`, unknown dispatches, and the Gateway envelope. A
+message's content is represented as `Option<String>` because Discord may omit
+it when Message Content access is unavailable. The decoder validates required
+identifiers and rejects a present non-string content field; malformed payloads
+map to generic errors that do not echo the input.
 `src/rest.tyv` provides `requestBot(token, method, endpoint, body, timeout)`.
 It pins requests to `https://discord.com/api/v10/`, uses the verified HTTPS
 client, puts the `Secret<String>` only in the `Authorization: Bot ...` header,

@@ -1,6 +1,6 @@
 pub enum GatewayDispatch {
     Ready(String)
-    MessageCreate(String, String, String)
+    MessageCreate(String, String, Option<String>)
     Unknown(String)
 }
 
@@ -94,9 +94,12 @@ pub fn decodeDispatch(payload: String) -> Result<GatewayDispatch, String> {
                     } else if eventName == "MESSAGE_CREATE" {
                         match requiredString(data, "id") {
                             Ok(messageId) => match requiredString(data, "channel_id") {
-                                Ok(channelId) => match requiredString(data, "content") {
-                                    Ok(content) => result = Ok<GatewayDispatch, String>(GatewayDispatch.MessageCreate(messageId, channelId, content))
-                                    Err(error) => result = Err<GatewayDispatch, String>(error)
+                                Ok(channelId) => match data.objectGet("content") {
+                                    Some(contentValue) => match contentValue.asString() {
+                                        Some(content) => result = Ok<GatewayDispatch, String>(GatewayDispatch.MessageCreate(messageId, channelId, Some(content)))
+                                        None => result = Err<GatewayDispatch, String>("MESSAGE_CREATE content must be a string")
+                                    }
+                                    None => result = Ok<GatewayDispatch, String>(GatewayDispatch.MessageCreate(messageId, channelId, None<String>()))
                                 }
                                 Err(error) => result = Err<GatewayDispatch, String>(error)
                             }

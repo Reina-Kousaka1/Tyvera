@@ -47,7 +47,10 @@ class DiscordSourcePackageTests(unittest.TestCase):
             gateway.GatewayDispatch.MessageCreate(id, channel, content) => {
                 println(id)
                 println(channel)
-                println(content)
+                match content {
+                    Some(text) => println(text)
+                    None => println("no content")
+                }
             }
             gateway.GatewayDispatch.Unknown(_) => println("wrong")
         }
@@ -61,8 +64,19 @@ class DiscordSourcePackageTests(unittest.TestCase):
         }
         Err(_) => println("wrong")
     }
+    match gateway.decodeDispatch("{\"t\":\"MESSAGE_CREATE\",\"d\":{\"id\":\"m-3\",\"channel_id\":\"c-3\"}}") {
+        Ok(event) => match event {
+            gateway.GatewayDispatch.MessageCreate(_, _, content) => match content {
+                Some(_) => println("wrong")
+                None => println("content omitted")
+            }
+            gateway.GatewayDispatch.Ready(_) => println("wrong")
+            gateway.GatewayDispatch.Unknown(_) => println("wrong")
+        }
+        Err(_) => println("wrong")
+    }
 }''')
-        self.assertEqual(output, "s-1\nm-2\nc-3\nhello\nPRESENCE_UPDATE\n")
+        self.assertEqual(output, "s-1\nm-2\nc-3\nhello\nPRESENCE_UPDATE\ncontent omitted\n")
 
     def test_gateway_dispatch_errors_are_result_values_without_echoing_payload(self) -> None:
         output = self._run(r'''fn main() {
@@ -82,13 +96,18 @@ class DiscordSourcePackageTests(unittest.TestCase):
         Ok(_) => println("wrong")
         Err(error) => println(error)
     }
+    match gateway.decodeDispatch("{\"t\":\"MESSAGE_CREATE\",\"d\":{\"id\":\"m-4\",\"channel_id\":\"c-4\",\"content\":4}}") {
+        Ok(_) => println("wrong")
+        Err(error) => println(error)
+    }
 }''')
         self.assertEqual(
             output,
             "invalid gateway JSON payload\n"
             "gateway field must be a string\n"
             "gateway field is missing\n"
-            "gateway dispatch data is missing\n",
+            "gateway dispatch data is missing\n"
+            "MESSAGE_CREATE content must be a string\n",
         )
 
     def test_checked_in_decoder_project_checks_and_runs(self) -> None:
