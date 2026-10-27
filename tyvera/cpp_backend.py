@@ -4239,13 +4239,11 @@ inline std::string format_float(double value) {
 }
 
 inline bool http_token_character(unsigned char value) {
-    return (value >= '0' && value <= '9') || (value >= 'A' && value <= 'Z')
-        || (value >= 'a' && value <= 'z') || value == '!' || value == '#' || value == '
-
-
-        || value == '%' || value == '&' || value == 39 || value == '*' || value == '+'
-        || value == '-' || value == '.' || value == '^' || value == '_' || value == 96
-        || value == '|' || value == '~';
+    return (value >= 48 && value <= 57) || (value >= 65 && value <= 90)
+        || (value >= 97 && value <= 122) || value == 33 || value == 35 || value == 36
+        || value == 37 || value == 38 || value == 39 || value == 42 || value == 43
+        || value == 45 || value == 46 || value == 94 || value == 95 || value == 96
+        || value == 124 || value == 126;
 }
 inline std::string http_lower_ascii(std::string value) {
     for (auto& character : value) {
@@ -4266,8 +4264,9 @@ inline bool http_header_name_valid(const std::string& name) {
     });
 }
 inline std::vector<std::uint32_t> http_utf8_codepoints(const std::string& value, bool& valid) {
+    std::vector<std::uint8_t> bytes(value.begin(), value.end());
     std::vector<std::uint32_t> result;
-    valid = valid_utf8(value);
+    valid = valid_utf8(bytes);
     if (!valid) return result;
     for (std::size_t i = 0; i < value.size();) {
         const auto first = static_cast<unsigned char>(value[i]);
@@ -4306,34 +4305,35 @@ inline std::string http_latin1_to_utf8(const std::string& value) {
     }
     return result;
 }
-inline StringResult<std::string> http_utf8_to_latin1(const std::string& value) {
+inline bool http_utf8_to_latin1(const std::string& value, std::string& result, std::string& error) {
     bool valid = false;
     const auto codepoints = http_utf8_codepoints(value, valid);
-    if (!valid) return result_error<std::string>("HTTP header value must use the ISO-8859-1 range");
-    std::string result;
+    if (!valid) { error = "HTTP header value must use the ISO-8859-1 range"; return false; }
+    result.clear();
     result.reserve(codepoints.size());
     for (const auto cp : codepoints) {
-        if (cp > 255) return result_error<std::string>("HTTP header value must use the ISO-8859-1 range");
+        if (cp > 255) { error = "HTTP header value must use the ISO-8859-1 range"; return false; }
         result.push_back(static_cast<char>(cp));
     }
-    return result_ok<std::string>(std::move(result));
+    return true;
 }
-inline StringResult<std::string> http_validate_header(const std::string& name, const std::string& value) {
-    if (!http_header_name_valid(name)) return result_error<std::string>("invalid HTTP header name");
+inline bool http_validate_header(const std::string& name, const std::string& value,
+                                 std::string& normalized, std::string& error) {
+    if (!http_header_name_valid(name)) { error = "invalid HTTP header name"; return false; }
     if (!http_header_value_valid(value)) {
         bool valid = false; (void)http_utf8_codepoints(value, valid);
-        return result_error<std::string>(valid ? "invalid HTTP header value"
-                                                : "HTTP header value must use the ISO-8859-1 range");
+        error = valid ? "invalid HTTP header value" : "HTTP header value must use the ISO-8859-1 range";
+        return false;
     }
-    return result_ok<std::string>(http_lower_ascii(name));
+    normalized = http_lower_ascii(name);
+    return true;
 }
 inline StringResult<bool> http_headers_add_internal(
     const std::shared_ptr<HttpHeaders>& headers, const std::string& name, const std::string& value) {
     if (!headers) return result_error<bool>("invalid HTTP headers");
-    auto normalized = http_validate_header(name, value);
-    if (std::holds_alternative<std::string>(normalized))
-        return result_error<bool>(std::get<1>(std::move(normalized)));
-    headers->entries.emplace_back(std::get<0>(std::move(normalized)), http_trim_ows(value));
+    std::string normalized, error;
+    if (!http_validate_header(name, value, normalized, error)) return result_error<bool>(std::move(error));
+    headers->entries.emplace_back(std::move(normalized), http_trim_ows(value));
     return result_ok<bool>(true);
 }
 inline std::int64_t http_headers_remove_internal(
@@ -4346,10 +4346,8 @@ inline std::int64_t http_headers_remove_internal(
 }
 inline StringResult<bool> http_headers_set_internal(
     const std::shared_ptr<HttpHeaders>& headers, const std::string& name, const std::string& value) {
-    auto normalized = http_validate_header(name, value);
-    if (std::holds_alternative<std::string>(normalized))
-        return result_error<bool>(std::get<1>(std::move(normalized)));
-    const auto key = std::get<0>(normalized);
+    std::string key, error;
+    if (!http_validate_header(name, value, key, error)) return result_error<bool>(std::move(error));
     http_headers_remove_internal(headers, key);
     return http_headers_add_internal(headers, name, value);
 }
@@ -4366,12 +4364,10 @@ inline StringResult<bool> http_headers_set(
 inline std::vector<std::string> http_headers_values_internal(
     const std::shared_ptr<HttpHeaders>& headers, const std::string& name,
     const std::string& file, int line, int column) {
-    auto normalized = http_validate_header(name, "");
-    if (std::holds_alternative<std::string>(normalized))
-        fail(file, line, column, std::get<1>(std::move(normalized)));
+    std::string key, error;
+    if (!http_validate_header(name, "", key, error)) fail(file, line, column, error);
     std::vector<std::string> result;
     if (!headers) return result;
-    const auto& key = std::get<0>(normalized);
     for (const auto& entry : headers->entries)
         if (entry.first == key) result.push_back(entry.second);
     return result;
@@ -4379,10 +4375,9 @@ inline std::vector<std::string> http_headers_values_internal(
 inline std::int64_t http_headers_remove(
     const std::shared_ptr<HttpHeaders>& headers, const std::string& name,
     const std::string& file, int line, int column) {
-    auto normalized = http_validate_header(name, "");
-    if (std::holds_alternative<std::string>(normalized))
-        fail(file, line, column, std::get<1>(std::move(normalized)));
-    return http_headers_remove_internal(headers, std::get<0>(std::move(normalized)));
+    std::string key, error;
+    if (!http_validate_header(name, "", key, error)) fail(file, line, column, error);
+    return http_headers_remove_internal(headers, key);
 }
 inline std::optional<std::string> http_headers_get(
     const std::shared_ptr<HttpHeaders>& headers, const std::string& name,
@@ -4412,9 +4407,9 @@ inline std::int64_t http_headers_length(const std::shared_ptr<HttpHeaders>& head
 }
 inline std::string http_method_name(const HttpMethod& method) { return method.name; }
 inline bool http_method_is_standard(const HttpMethod& method) {
-    static const std::set<std::string> standard{"GET", "HEAD", "POST", "PUT", "DELETE",
-        "PATCH", "OPTIONS", "CONNECT", "TRACE"};
-    return standard.find(method.name) != standard.end();
+    static const std::array<std::string, 9> standard{
+        "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "CONNECT", "TRACE"};
+    return std::find(standard.begin(), standard.end(), method.name) != standard.end();
 }
 inline std::shared_ptr<HttpHeaders> http_headers() { return std::make_shared<HttpHeaders>(); }
 inline StringResult<HttpMethod> http_method(const std::string& value) {
@@ -4850,9 +4845,10 @@ inline StringResult<std::vector<std::uint8_t>> http_encode_request(const HttpReq
     for (const auto& entry : headers->entries) {
         if (!http_header_name_valid(entry.first) || !http_header_value_valid(entry.second))
             return result_error<std::vector<std::uint8_t>>("invalid HTTP header line");
-        auto latin = http_utf8_to_latin1(entry.second);
-        if (std::holds_alternative<std::string>(latin)) return result_error<std::vector<std::uint8_t>>(std::get<1>(std::move(latin)));
-        encoded_headers += entry.first + ": " + std::get<0>(std::move(latin)) + "\r\n";
+        std::string latin, error;
+        if (!http_utf8_to_latin1(entry.second, latin, error))
+            return result_error<std::vector<std::uint8_t>>(std::move(error));
+        encoded_headers += entry.first + ": " + latin + "\r\n";
     }
     if (encoded_headers.size() > HTTP_HEADER_BYTES_LIMIT)
         return result_error<std::vector<std::uint8_t>>("HTTP headers exceed configured size limit");
