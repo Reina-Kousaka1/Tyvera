@@ -1991,6 +1991,8 @@ inline int poll_descriptor(int descriptor, short events,
     }
 }
 
+#endif
+
 inline Task<StringResult<std::shared_ptr<ListData<SocketAddress>>>> resolve_host(
     std::string host, std::int64_t port, const std::string& file, int line, int column) {
     using Output = StringResult<std::shared_ptr<ListData<SocketAddress>>>;
