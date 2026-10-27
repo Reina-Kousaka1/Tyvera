@@ -1729,6 +1729,15 @@ inline NativeScheduler& native_scheduler() {
     static NativeScheduler value;
     return value;
 }
+inline void notify_task_scheduler() noexcept {
+    try {
+        auto& scheduler = native_scheduler();
+        // Synchronize with runTasks' predicate evaluation. The predicate observes
+        // actor readiness and reply-wait flags while holding this same mutex.
+        std::lock_guard<std::mutex> lock(scheduler.mutex);
+        scheduler.changed.notify_all();
+    } catch (...) {}
+}
 inline thread_local TaskControl* active_task_control = nullptr;
 class NativeTaskExecution {
     std::unique_lock<std::mutex> lock_;
@@ -2674,7 +2683,7 @@ template <typename T> struct ReplyCell final : ReplyCellBase {
                 waiter->lifecycle_changed.notify_all();
             } catch (...) {}
         }
-        native_scheduler().changed.notify_all();
+        notify_task_scheduler();
     }
     void refresh_locked() {
         if (state != ReplyState::pending || !timeout_milliseconds) return;
@@ -2792,7 +2801,7 @@ template <typename T> inline std::optional<T> await_reply(
             waiter->actor_reply_wait_has_deadline.store(false, std::memory_order_release);
         }
         registered = false;
-        native_scheduler().changed.notify_all();
+        notify_task_scheduler();
     };
     try {
         waiter->check_interruption();
@@ -2807,7 +2816,7 @@ template <typename T> inline std::optional<T> await_reply(
                 registered = true;
             }
         }
-        native_scheduler().changed.notify_all();
+        notify_task_scheduler();
 
         for (;;) {
             waiter->check_interruption();
@@ -3834,13 +3843,16 @@ inline void actor_started(const std::shared_ptr<ActorBase>& actor) {
 inline void actor_initialization_failed(const std::shared_ptr<ActorBase>& actor) noexcept {
     if (!actor) return;
     auto& state = actor_runtime_state();
-    std::lock_guard<std::mutex> lock(state.mutex);
-    actor->status = "crashed";
-    actor->mailbox.clear();
-    actor->queued = false;
-    remove_ready_actor_locked(state, actor.get());
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        actor->status = "crashed";
+        actor->mailbox.clear();
+        actor->queued = false;
+        remove_ready_actor_locked(state, actor.get());
+    }
     fail_actor_replies(actor, "actor initialization failed before replying");
     actor->tyv_clear_state();
+    notify_task_scheduler();
 }
 inline void enqueue_actor(
     const std::shared_ptr<ActorBase>& actor, const std::string& actor_name,
@@ -3869,7 +3881,7 @@ inline void enqueue_actor(
             throw Failure(file, line, column, "cannot enqueue actor message");
         }
     }
-    native_scheduler().changed.notify_all();
+    notify_task_scheduler();
     actor_runtime_state().changed.notify_all();
 }
 template <typename T, typename MakeMessage> inline ReplyReceiver<T> actor_request(
@@ -3922,7 +3934,7 @@ template <typename T, typename MakeMessage> inline ReplyReceiver<T> actor_reques
         }
     }
     state.changed.notify_all();
-    native_scheduler().changed.notify_all();
+    notify_task_scheduler();
     return ReplyReceiver<T>{std::move(cell)};
 }
 inline bool actor_is_alive(const std::shared_ptr<ActorBase>& actor) noexcept {
