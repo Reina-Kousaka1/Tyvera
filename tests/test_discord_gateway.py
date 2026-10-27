@@ -1256,11 +1256,13 @@ async fn run() {
             }
             let first = rest.requestBotCoordinated(coordinator, "channels/:channel_id/messages", "channel:12", token, "GET", "channels/12/messages", bytesFromString(""), seconds(3))
             let second = rest.requestBotCoordinated(coordinator, "channels/:channel_id/messages", "channel:12", token, "GET", "channels/12/messages", bytesFromString(""), seconds(3))
-            match await first {
+            let firstResult = await first
+            match firstResult {
                 Err(_) => println("first queued request failed")
                 Ok(response) => println(response.status)
             }
-            match await second {
+            let secondResult = await second
+            match secondResult {
                 Err(_) => println("second queued request failed")
                 Ok(response) => println(response.status)
             }
