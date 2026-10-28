@@ -3684,6 +3684,7 @@ inline ActorRuntimeState& actor_runtime_state() {
     static ActorRuntimeState state;
     return state;
 }
+inline constexpr std::size_t MAX_ACTOR_MONITORS = 4096;
 inline void notify_actor_monitors(
     const std::shared_ptr<ActorBase>& actor, const std::string& reason) noexcept {
     if (!actor) return;
@@ -3744,7 +3745,6 @@ struct ActorHandlerScope {
     }
 };
 inline constexpr std::size_t MAX_ACTOR_OWNED_TASKS = 4096;
-inline constexpr std::size_t MAX_ACTOR_MONITORS = 4096;
 inline void attach_task_to_current_actor(
     const std::shared_ptr<TaskControl>& task, const std::string& file, int line, int column) {
     if (!actor_handler_active()) return;
