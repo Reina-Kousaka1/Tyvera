@@ -121,6 +121,7 @@ _TYPE_MAP = {
     "HttpRequest": IRType.HTTP_REQUEST,
     "HttpResponse": IRType.HTTP_RESPONSE,
     "Supervisor": IRType.SUPERVISOR,
+    "TaskGroup": IRType.TASK_GROUP,
     "RestartPolicy": IRType.RESTART_POLICY,
     "SupervisorBackoff": IRType.SUPERVISOR_BACKOFF,
     "Void": IRType.VOID,
@@ -380,16 +381,22 @@ class _FunctionLowerer:
             )
         if isinstance(statement, AwaitStatement):
             task = self._expression(statement.value)
-            if not isinstance(task.type, IRAppliedType) or task.type.name not in {"Task", "ReplyReceiver"}:
+            if task.type == IRType.TASK_GROUP:
+                awaited_type = IRType.VOID
+            elif isinstance(task.type, IRAppliedType) and task.type.name in {"Task", "ReplyReceiver"}:
+                awaited_type = task.type.arguments[0]
+            else:
                 raise Diagnostic(
                     statement.location, "backend",
-                    "native backend currently supports await for Task<T> and ReplyReceiver<T>",
+                    "native backend currently supports await for Task<T>, TaskGroup, and ReplyReceiver<T>",
                 )
             result = None
             if statement.binding_name is not None:
+                if awaited_type == IRType.VOID:
+                    raise Diagnostic(statement.location, "backend", "native await cannot bind a Void result")
                 result = self._new_variable(
                     statement.binding_name,
-                    ir_type_name(task.type.arguments[0]),
+                    ir_type_name(awaited_type),
                     mutable=statement.mutable,
                     location=statement.location,
                 )
@@ -742,6 +749,7 @@ class _FunctionLowerer:
                 or isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Secret"
                 or isinstance(receiver.type, IRAppliedType) and receiver.type.name in {"ReplySender", "ReplyReceiver"}
                 or isinstance(receiver.type, IRActorRefType)
+                or receiver.type == IRType.TASK_GROUP
                 or receiver.type in {
                 IRType.JSON, IRType.BYTE, IRType.DURATION, IRType.BYTES, IRType.BYTE_BUFFER,
                     IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
@@ -803,7 +811,7 @@ class _FunctionLowerer:
                 "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool", "jsonNull", "jsonArray", "jsonObject",
                 "readBytes", "writeBytes", "pathJoin", "pathExists", "openText",
                 "openTextReader", "openTextWriter", "hostOS", "hostArchitecture", "environment", "runActors",
-                "monotonicMilliseconds", "runTasks", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen",
+                "monotonicMilliseconds", "runTasks", "taskGroup", "resolveHost", "tcpConnect", "tlsConnect", "tcpListen",
                 "webSocketUrl", "webSocketConnect", "httpMethod", "httpUrl", "httpHeaders",
                 "httpRequest", "httpSend", "httpGet", "httpPost", "httpPut", "httpDelete",
                 "oneForOne", "oneForAll", "restForOne", "permanentChildPolicy",
