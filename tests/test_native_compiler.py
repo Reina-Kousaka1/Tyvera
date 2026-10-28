@@ -1848,7 +1848,7 @@ async fn observe(monitor: ReplyReceiver<String>) {
 fn main() {
     let broken = spawn(Broken())
     let monitor = broken.monitor()
-    let waiter = spawn(observe(monitor))
+    let waiter = observe(monitor)
     broken.fail()
     runActors()
     runTasks()
