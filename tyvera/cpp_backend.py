@@ -1151,6 +1151,7 @@ class _CppGenerator:
                 "isCancelled": "is_cancelled",
                 "isTimedOut": "is_timed_out",
                 "cancel": "cancel",
+                "demonitor": "cancel",
                 "tryReceive": "try_receive",
             }
             return f"({receiver}).{functions[method]}()"
@@ -1163,6 +1164,8 @@ class _CppGenerator:
             }
             return f"tyvera_runtime::{functions[method]}({', '.join([receiver, *arguments])})"
         if isinstance(expression.receiver.type, IRActorRefType):
+            if method == "monitor":
+                return f"tyvera_runtime::actor_monitor({receiver}, {_location_args(expression.location)})"
             if method == "isAlive":
                 return f"tyvera_runtime::actor_is_alive({receiver})"
             if method == "stop":
@@ -3630,6 +3633,8 @@ struct ActorBase : std::enable_shared_from_this<ActorBase> {
     std::string status = "starting";
     std::deque<std::function<void()>> mailbox;
     std::vector<std::weak_ptr<ReplyCellBase>> pending_replies;
+    std::vector<std::weak_ptr<ReplyCell<std::string>>> pending_monitors;
+    std::string last_exit_reason;
     bool queued = false;
     std::function<void()> tyv_restart;
     std::weak_ptr<Supervisor> supervisor;
@@ -3679,6 +3684,45 @@ inline ActorRuntimeState& actor_runtime_state() {
     static ActorRuntimeState state;
     return state;
 }
+inline void notify_actor_monitors(
+    const std::shared_ptr<ActorBase>& actor, const std::string& reason) noexcept {
+    if (!actor) return;
+    try {
+        auto& state = actor_runtime_state();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        actor->last_exit_reason = reason;
+        for (const auto& pending : actor->pending_monitors)
+            if (const auto cell = pending.lock()) cell->send(reason);
+        actor->pending_monitors.clear();
+    } catch (...) {}
+}
+inline ReplyReceiver<std::string> actor_monitor(
+    const std::shared_ptr<ActorBase>& actor, const std::string& file, int line, int column) {
+    auto cell = std::make_shared<ReplyCell<std::string>>(std::nullopt);
+    if (!actor) {
+        cell->send("actor reference unavailable");
+        return ReplyReceiver<std::string>{std::move(cell)};
+    }
+    std::string terminal_reason;
+    {
+        auto& state = actor_runtime_state();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (actor->status == "alive" || actor->status == "starting" || actor->status == "restarting") {
+            auto& monitors = actor->pending_monitors;
+            monitors.erase(std::remove_if(monitors.begin(), monitors.end(), [](const auto& pending) {
+                const auto current = pending.lock();
+                return !current || !current->is_pending();
+            }), monitors.end());
+            if (monitors.size() >= MAX_ACTOR_MONITORS)
+                fail(file, line, column, "actor monitor capacity (maximum 4096) exceeded");
+            monitors.emplace_back(cell);
+        } else {
+            terminal_reason = actor->last_exit_reason.empty() ? actor->status : actor->last_exit_reason;
+        }
+    }
+    if (!terminal_reason.empty()) cell->send(std::move(terminal_reason));
+    return ReplyReceiver<std::string>{std::move(cell)};
+}
 inline bool& actor_handler_active() {
     static thread_local bool active = false;
     return active;
@@ -3700,6 +3744,7 @@ struct ActorHandlerScope {
     }
 };
 inline constexpr std::size_t MAX_ACTOR_OWNED_TASKS = 4096;
+inline constexpr std::size_t MAX_ACTOR_MONITORS = 4096;
 inline void attach_task_to_current_actor(
     const std::shared_ptr<TaskControl>& task, const std::string& file, int line, int column) {
     if (!actor_handler_active()) return;
@@ -3863,6 +3908,7 @@ inline void stop_actor_for_supervisor(const std::shared_ptr<ActorBase>& actor) n
     }
     cancel_actor_tasks(actor);
     fail_actor_replies(actor, "actor stopped before replying");
+    notify_actor_monitors(actor, "normal stop");
     actor->tyv_clear_state();
     actor_runtime_state().changed.notify_all();
 }
@@ -3903,6 +3949,7 @@ inline std::string restart_actor_for_supervisor(
     }
     cancel_actor_tasks(actor);
     fail_actor_replies(actor, "actor restarted before replying");
+    notify_actor_monitors(actor, "actor restarted");
     actor->tyv_clear_state();
     try {
         check_shutdown(file, line, column);
@@ -3910,6 +3957,7 @@ inline std::string restart_actor_for_supervisor(
         auto& state = actor_runtime_state();
         std::lock_guard<std::mutex> lock(state.mutex);
         actor->status = "alive";
+        actor->last_exit_reason.clear();
         return {};
     } catch (const SignalShutdown&) {
         throw;
@@ -4304,6 +4352,7 @@ inline bool actor_stop(
     }
     cancel_actor_tasks(actor);
     fail_actor_replies(actor, "actor stopped before replying");
+    notify_actor_monitors(actor, "normal stop");
     actor_runtime_state().changed.notify_all();
     actor->tyv_clear_state();
     const auto failure = supervisor_actor_stopped(actor, file, line, column);
@@ -4327,6 +4376,7 @@ inline void mark_actor_crashed(const std::shared_ptr<ActorBase>& actor, const st
     }
     cancel_actor_tasks(actor);
     fail_actor_replies(actor, failure);
+    notify_actor_monitors(actor, failure);
     actor->tyv_clear_state();
 }
 inline std::string apply_actor_failure(
@@ -4476,6 +4526,7 @@ inline void shutdown_actors() noexcept {
     for (auto actor = actors.rbegin(); actor != actors.rend(); ++actor) {
         cancel_actor_tasks(*actor);
         fail_actor_replies(*actor, "actor stopped before replying");
+        notify_actor_monitors(*actor, "runtime shutdown");
         (*actor)->tyv_restart = {};
         (*actor)->tyv_clear_state();
     }

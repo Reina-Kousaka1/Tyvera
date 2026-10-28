@@ -95,6 +95,7 @@ from .type_names import split_type
 _MISSING = object()
 _MOVED = object()
 _MAX_ACTOR_MAILBOX = 100_000
+_MAX_ACTOR_MONITORS = 4_096
 _MAX_ACTOR_DELIVERIES = 100_000
 _MAX_SUPERVISOR_RESTARTS = 1_000
 _MAX_TASK_STEPS = 100_000
@@ -137,6 +138,7 @@ class _TyveraReplyCell:
     started_at: float | None = None
     timeout_milliseconds: int | None = None
     clock: Callable[[], float] | None = None
+    monitor_actor: _TyveraActor | None = None
     identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
     def __repr__(self) -> str:
@@ -379,6 +381,8 @@ class _TyveraActor:
     declaration: ActorDeclaration | None = None
     constructor_arguments: list[object] = dataclass_field(default_factory=list)
     pending_replies: set[_TyveraReplyCell] = dataclass_field(default_factory=set)
+    pending_monitors: set[_TyveraReplyCell] = dataclass_field(default_factory=set)
+    exit_reason: str | None = None
     identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
 
@@ -1761,6 +1765,23 @@ class Interpreter:
                 if expression.method == "stop":
                     self._stop_supervised_supervisor(receiver, expression.location, depth + 1)
                     return None
+            if isinstance(receiver, _TyveraActorRef) and expression.method == "monitor":
+                cell = _TyveraReplyCell()
+                actor = receiver.actor
+                if actor.status in {"alive", "starting", "restarting"}:
+                    actor.pending_monitors = {
+                        current for current in actor.pending_monitors if current.state == "pending"
+                    }
+                    if len(actor.pending_monitors) >= _MAX_ACTOR_MONITORS:
+                        raise Diagnostic(
+                            expression.location, "runtime",
+                            f"actor monitor capacity ({_MAX_ACTOR_MONITORS}) exceeded",
+                        )
+                    cell.monitor_actor = actor
+                    actor.pending_monitors.add(cell)
+                else:
+                    self._send_reply(cell, actor.exit_reason or actor.status)
+                return _TyveraReplyReceiver(cell)
             if isinstance(receiver, _TyveraActorRef) and expression.method in {"request", "requestWithin", "sendAfter"}:
                 actor = receiver.actor
                 scheduled = expression.method == "sendAfter"
@@ -1840,10 +1861,13 @@ class Interpreter:
                     return cell.state == "cancelled"
                 if expression.method == "isTimedOut":
                     return cell.state == "timed_out"
-                if expression.method == "cancel":
+                if expression.method in {"cancel", "demonitor"}:
                     if cell.state != "pending":
                         return False
                     cell.state = "cancelled"
+                    if expression.method == "demonitor" and cell.monitor_actor is not None:
+                        cell.monitor_actor.pending_monitors.discard(cell)
+                        cell.monitor_actor = None
                     return True
                 if expression.method == "tryReceive":
                     if cell.state == "sent":
@@ -2504,6 +2528,7 @@ class Interpreter:
         finally:
             self._current_actor = previous_actor
         actor.status = "alive"
+        actor.exit_reason = None
         self._emit_runtime_event(RuntimeEvent(
             RuntimeEventKind.ACTOR_STARTED, f"{declaration.name}#{actor.identity}",
             None if actor.supervisor is None else actor.supervisor.strategy,
@@ -2535,6 +2560,13 @@ class Interpreter:
             f"{error.location.line}:{error.location.column}: {error.message}"
         )
 
+    def _notify_actor_monitors(self, actor: _TyveraActor, reason: str) -> None:
+        actor.exit_reason = reason
+        for cell in actor.pending_monitors:
+            self._send_reply(cell, reason)
+            cell.monitor_actor = None
+        actor.pending_monitors.clear()
+
     def _fail_pending_replies(self, actor: _TyveraActor, error: str) -> None:
         self._cancel_actor_tasks(actor)
         self._cancel_actor_timers(actor)
@@ -2551,6 +2583,10 @@ class Interpreter:
         self._cancel_actor_tasks(actor)
         if actor.status in {"alive", "starting", "restarting"}:
             actor.status = "stopped"
+        if was_live:
+            self._notify_actor_monitors(
+                actor, "normal stop" if reply_error == "actor stopped before replying" else reply_error,
+            )
         for cell in actor.pending_replies:
             self._refresh_reply(cell)
             if cell.state == "pending":
@@ -4983,6 +5019,7 @@ class Interpreter:
     def _restart_supervised_actor(
         self, actor: _TyveraActor, failure: str, call_location: Location, depth: int,
     ) -> str | None:
+        self._notify_actor_monitors(actor, failure)
         self._fail_pending_replies(actor, failure)
         actor.mailbox.clear()
         supervisor = actor.supervisor

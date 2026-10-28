@@ -138,7 +138,15 @@ supervisor start, stop, crash, restart, escalation, dead letter, and runtime
 shutdown. Crash reasons have a typed kind and optional source location; event
 sink exceptions are ignored. Dead-letter diagnostics are retained in a bounded
 ring of 1,024 entries. A send to an inactive actor also returns a controlled
-runtime diagnostic. There is no Tyvera-level link/monitor API yet.
+runtime diagnostic. Actor monitoring is available through `ActorRef<T>.monitor()`, which returns
+a one-shot `ReplyReceiver<String>`. It becomes ready when that actor instance
+stops, crashes, restarts, or the runtime shuts down; monitoring an already
+terminated actor completes immediately with its stored terminal reason.
+`demonitor()` cancels a pending observation and returns whether it did so.
+Monitor receivers share the existing reply-channel await and consumption
+semantics. At most 4,096 pending monitor registrations are retained per actor;
+demonitoring releases a pending registration immediately. Actor links and
+crash propagation are not implemented yet.
 
 ## Host signal and process shutdown
 

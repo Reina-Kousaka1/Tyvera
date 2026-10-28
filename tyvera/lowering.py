@@ -724,7 +724,7 @@ class _FunctionLowerer:
                     self._expression(expression.receiver), actor_name, handler_symbol,
                     request_arguments, timeout, self._expression_type(expression), expression.location,
                 )
-            if actor_name is not None and expression.method not in {"stop", "isAlive"}:
+            if actor_name is not None and expression.method not in {"stop", "isAlive", "monitor"}:
                 handler_symbol = self.actor_symbols.get(actor_name, {}).get(expression.method)
                 if handler_symbol is None:
                     raise Diagnostic(expression.location, "backend", f"native backend cannot resolve actor handler '{actor_name}.{expression.method}'")

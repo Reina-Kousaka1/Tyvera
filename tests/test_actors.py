@@ -116,6 +116,48 @@ fn main() {
             Interpreter(program, output).run()
         self.assertEqual(output.getvalue(), "false\n")
 
+    def test_actor_monitor_observes_stop_and_demonitor_cancels_observation(self) -> None:
+        output, _ = self.run_source("""actor Worker { on work() {} }
+fn main() {
+    let worker = spawn(Worker())
+    let monitor = worker.monitor()
+    worker.stop()
+    println(monitor.isReady())
+    match monitor.tryReceive() {
+        Ok(Some(reason)) => println(reason)
+        Ok(None) => println("pending")
+        Err(error) => println(error)
+    }
+    println(monitor.demonitor())
+    let stopped = worker.monitor()
+    println(stopped.isReady())
+    let cancellable = spawn(Worker()).monitor()
+    println(cancellable.demonitor())
+    println(cancellable.isCancelled())
+}
+""")
+        self.assertEqual(output, "true\nnormal stop\nfalse\ntrue\ntrue\ntrue\n")
+
+    def test_actor_monitor_is_awaitable_and_reports_crash_reason(self) -> None:
+        output, _ = self.run_source("""actor Broken {
+    on fail() { let failure: Float = 1 / 0 }
+}
+async fn observe(monitor: ReplyReceiver<String>) {
+    await monitor as reason
+    println(reason)
+}
+fn main() {
+    let broken = spawn(Broken())
+    let monitor = broken.monitor()
+    let waiter = spawn(observe(monitor))
+    broken.fail()
+    runActors()
+    runTasks()
+}
+""")
+        self.assertIn("actor 'Broken' crashed at actors.tyv:2:", output)
+        self.assertTrue(output.endswith("division by zero\n"))
+
     def test_one_for_one_restarts_only_crashed_child_and_resets_its_state(self) -> None:
         output, _ = self.run_source('''actor Counter {
     var value: Int

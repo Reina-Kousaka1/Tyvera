@@ -376,7 +376,7 @@ class TypeChecker:
                 fields[member.name] = member
             handlers: dict[str, Signature] = {}
             for method in declaration.handlers:
-                if method.name in {"stop", "isAlive", "request", "requestWithin", "sendAfter"}:
+                if method.name in {"stop", "isAlive", "monitor", "request", "requestWithin", "sendAfter"}:
                     raise Diagnostic(method.location, "type", f"actor handler name '{method.name}' is reserved by ActorRef methods")
                 if method.name in handlers:
                     raise Diagnostic(method.location, "type", f"actor handler '{method.name}' is already declared")
@@ -1554,6 +1554,7 @@ class TypeChecker:
                     "isCancelled": ((), "Bool"),
                     "isTimedOut": ((), "Bool"),
                     "cancel": ((), "Bool"),
+                    "demonitor": ((), "Bool"),
                     "tryReceive": ((), make_type("Result", [make_type("Option", [receiver_arguments[0]]), "String"])),
                 }
                 method_signature = methods.get(expression.method)
@@ -1735,6 +1736,10 @@ class TypeChecker:
                 if len(receiver_arguments) != 1 or receiver_arguments[0] not in self.actors:
                     raise Diagnostic(expression.location, "type", "invalid actor reference type")
                 actor = self.actors[receiver_arguments[0]]
+                if expression.method == "monitor":
+                    self._check_arguments(expression.arguments, argument_types, (), expression.location,
+                                          "ActorRef.monitor")
+                    return make_type("ReplyReceiver", ["String"])
                 if expression.method == "isAlive":
                     self._check_arguments(expression.arguments, argument_types, (), expression.location,
                                           "ActorRef.isAlive")

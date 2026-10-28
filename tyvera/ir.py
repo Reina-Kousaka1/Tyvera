@@ -558,11 +558,16 @@ def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef
             "isCancelled": ((), IRType.BOOL),
             "isTimedOut": ((), IRType.BOOL),
             "cancel": ((), IRType.BOOL),
+            "demonitor": ((), IRType.BOOL),
             "tryReceive": ((), _applied("Result", _applied("Option", item), IRType.STRING)),
         }
         return signatures.get(method)
     if isinstance(receiver, IRActorRefType):
-        return {"isAlive": ((), IRType.BOOL), "stop": ((), IRType.VOID)}.get(method)
+        return {
+            "isAlive": ((), IRType.BOOL),
+            "monitor": ((), _applied("ReplyReceiver", IRType.STRING)),
+            "stop": ((), IRType.VOID),
+        }.get(method)
     if receiver == IRType.SUPERVISOR:
         return {"isAlive": ((), IRType.BOOL), "stop": ((), IRType.VOID)}.get(method)
     if receiver == IRType.TASK_GROUP:
