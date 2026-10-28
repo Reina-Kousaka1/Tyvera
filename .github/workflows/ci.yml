@@ -18,7 +18,7 @@ jobs:
   test:
     name: test (Python ${{ matrix.python-version }}${{ matrix.arch-suffix }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       CXX: g++
       TYVERA_CI_ARCH: ${{ matrix.architecture }}

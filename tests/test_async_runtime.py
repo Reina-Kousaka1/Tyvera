@@ -288,6 +288,33 @@ fn main() {
         self.assertEqual(output, "child failure propagated\nowner failed\n")
         self.assertGreaterEqual(now[0], 0.001)
 
+    def test_actor_timer_deadline_promotes_message_while_only_monitor_waits(self) -> None:
+        now = [0.0]
+        sleeps = []
+
+        def advance(delay: float) -> None:
+            sleeps.append(delay)
+            if len(sleeps) > 2:
+                raise AssertionError("timer deadline was not promoted after waking")
+            now[0] += delay
+
+        output = self.run_source('''actor Worker {
+    on stopLater(target: ActorRef<Worker>) { target.stop() }
+}
+async fn observe() {
+    let worker = spawn(Worker())
+    let monitor = worker.monitor()
+    let timer = worker.sendAfter(milliseconds(100), stopLater, worker)
+    let reason: String = await monitor
+    println(reason)
+}
+fn main() {
+    let task = observe()
+    runTasks()
+}''', clock=lambda: now[0], sleeper=advance)
+        self.assertEqual(output, "normal stop\n")
+        self.assertEqual(sleeps, [0.1])
+
     def test_task_sleep_does_not_consume_unrelated_actor_timer(self) -> None:
         now = [2.0]
 

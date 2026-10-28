@@ -4631,6 +4631,8 @@ class Interpreter:
                 self._settle_timed_tasks()
                 self._wake_waiting_tasks()
                 self._settle_joining_tasks()
+                if self._has_waiting_actor_reply():
+                    self._promote_due_timers()
                 if self._ready_tasks:
                     if scheduler_steps >= _MAX_TASK_STEPS:
                         failure = (

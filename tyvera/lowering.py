@@ -103,6 +103,7 @@ _TYPE_MAP = {
     "Json": IRType.JSON,
     "Byte": IRType.BYTE,
     "Duration": IRType.DURATION,
+    "Timer": IRType.TIMER,
     "Bytes": IRType.BYTES,
     "ByteBuffer": IRType.BYTE_BUFFER,
     "TextFile": IRType.TEXT_FILE,
@@ -604,10 +605,6 @@ class _FunctionLowerer:
                 return IRActorSelfRef(IRActorRefType(self.actor_name), expression.location)
             variable = self._lookup(expression.identifier, expression.location)
             return IRLocalRef(variable.identifier, variable.type, expression.location)
-        if isinstance(expression, MemberCall) and expression.method == "sendAfter":
-            receiver_type = self.checked.expression_types.get(expression.receiver.location, "")
-            if split_type(receiver_type)[0] == "ActorRef":
-                raise Diagnostic(expression.location, "backend", "native actor timers are not yet supported")
         expression_type = self._expression_type(expression)
         if isinstance(expression, Literal):
             return IRLiteral(expression.value, expression_type, expression.location)
@@ -706,7 +703,18 @@ class _FunctionLowerer:
                 receiver_arguments[0] if receiver_base == "ActorRef" and len(receiver_arguments) == 1 else None
             )
             if actor_name is not None and expression.method == "sendAfter":
-                raise Diagnostic(expression.location, "backend", "native actor timers are not yet supported")
+                selector = expression.arguments[1]
+                if not isinstance(selector, Name):
+                    raise Diagnostic(expression.location, "backend", "native actor timer handler must be named directly")
+                handler_symbol = self.actor_symbols.get(actor_name, {}).get(selector.identifier)
+                if handler_symbol is None:
+                    raise Diagnostic(selector.location, "backend", "native backend cannot resolve actor timer handler")
+                return IRActorSend(
+                    self._expression(expression.receiver), actor_name, handler_symbol,
+                    tuple(self._expression(argument) for argument in expression.arguments[2:]),
+                    self._expression_type(expression), expression.location,
+                    self._expression(expression.arguments[0]),
+                )
             if actor_name is not None and expression.method in {"request", "requestWithin"}:
                 timed = expression.method == "requestWithin"
                 selector_index = 1 if timed else 0
@@ -751,7 +759,7 @@ class _FunctionLowerer:
                 or isinstance(receiver.type, IRActorRefType)
                 or receiver.type == IRType.TASK_GROUP
                 or receiver.type in {
-                IRType.JSON, IRType.BYTE, IRType.DURATION, IRType.BYTES, IRType.BYTE_BUFFER,
+                IRType.JSON, IRType.BYTE, IRType.DURATION, IRType.TIMER, IRType.BYTES, IRType.BYTE_BUFFER,
                     IRType.TEXT_FILE, IRType.TEXT_READER, IRType.TEXT_WRITER,
                     IRType.SOCKET_ADDRESS, IRType.TCP_CONNECTION, IRType.TLS_CONNECTION, IRType.TCP_LISTENER,
                     IRType.WEBSOCKET, IRType.WEBSOCKET_URL, IRType.WEBSOCKET_MESSAGE,
@@ -807,7 +815,7 @@ class _FunctionLowerer:
                     IRUserType(record.name), expression.location,
                 )
             if expression.callee in {
-                "milliseconds", "seconds", "durationFromSeconds", "sleepFor", "byteFromInt", "bytesFromString", "byteBuffer", "readText", "writeText",
+                "milliseconds", "seconds", "durationFromSeconds", "sleepFor", "timerAfter", "byteFromInt", "bytesFromString", "byteBuffer", "readText", "writeText",
                 "parseJson", "jsonStringify", "jsonString", "jsonInt", "jsonFloat", "jsonBool", "jsonNull", "jsonArray", "jsonObject",
                 "readBytes", "writeBytes", "pathJoin", "pathExists", "openText",
                 "openTextReader", "openTextWriter", "hostOS", "hostArchitecture", "environment", "runActors",

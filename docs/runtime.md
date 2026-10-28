@@ -300,7 +300,27 @@ responsible for every child. Groups cannot cross actor boundaries or be created
 and used in actor handlers.
 `Task.tryResult()` is a non-starting poll with the reference Result/Option shape. Ordinary results may be observed repeatedly. A resource-containing task is consumed: a completed result transfers once, while a pending task is cancelled and its operation retains cleanup ownership until it drains. The 64-unfinished-task and 4,096-registered-value limits still apply.
 
-`ActorRef.monitor()`/`demonitor()` and symmetric `link()`/`unlink()` are supported by the native runtime. `sendAfter` timers and supervised actors owning move-only Resources remain unsupported natively.
+`ActorRef.monitor()`/`demonitor()` and symmetric `link()`/`unlink()` are supported by the native runtime. Supervised actors owning move-only Resources remain unsupported natively.
+
+Native `timerAfter(Duration)` and `ActorRef.sendAfter(Duration, handler, ...)`
+use monotonic Timer identity handles with the reference readiness, remaining-time
+and cancellation rules. Zero/negative delays are immediately ready; cancellation
+of a ready timer returns false. Readiness does not itself deliver a message.
+Delivery appends due messages to the existing FIFO mailbox at actor scheduler
+turns; `runActors()` never waits for a future timer. When a Task awaits an actor
+reply or monitor, `runTasks()` includes pending actor timers in its next deadline
+and promotes them on wakeup. Unrelated Task sleeps do not consume actor timers.
+
+A scheduled timer belongs to its target actor, not to the scheduling Task.
+Stop, crash, initialization failure, supervised restart and runtime shutdown
+cancel undelivered timers and release their captured arguments. Stop versus
+promotion is serialized under the actor-state mutex: an already promoted message
+is subject to normal mailbox cleanup, while an undelivered timer cannot target
+a restarted actor instance. Timer handles may outlive cancellation; they then
+report cancelled, not ready, and zero remaining time. The native registry permits
+4,096 pending actor timers; exceeding this backend safety limit produces a
+source-based diagnostic. Ordinary unscheduled timers do not occupy the registry.
+This is an experimental native capacity limit, not a new language-wide limit.
 Native HTTP workers encode mutable, potentially aliased request headers under
 the same execution guard used by Tyvera task bodies. Network waits happen after
 releasing that guard; cancellation also interrupts workers queued to acquire it.

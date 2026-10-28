@@ -24,6 +24,7 @@ class IRType(str, Enum):
     JSON = "Json"
     BYTE = "Byte"
     DURATION = "Duration"
+    TIMER = "Timer"
     BYTES = "Bytes"
     BYTE_BUFFER = "ByteBuffer"
     TEXT_FILE = "TextFile"
@@ -253,6 +254,7 @@ class IRActorSend(IRExpression):
     arguments: tuple[IRExpression, ...]
     type: IRTypeRef
     location: Location
+    delay: IRExpression | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -570,6 +572,9 @@ def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef
         }.get(method)
     if receiver == IRType.SUPERVISOR:
         return {"isAlive": ((), IRType.BOOL), "stop": ((), IRType.VOID)}.get(method)
+    if receiver == IRType.TIMER:
+        return {"isReady": ((), IRType.BOOL), "isCancelled": ((), IRType.BOOL),
+                "cancel": ((), IRType.BOOL), "remaining": ((), IRType.DURATION)}.get(method)
     if receiver == IRType.TASK_GROUP:
         return {"isDone": ((), IRType.BOOL), "cancel": ((), IRType.INT)}.get(method)
     if isinstance(receiver, IRAppliedType) and receiver.name == "Task":
@@ -1071,13 +1076,19 @@ def _validate_expression(
         return expression.type
     if isinstance(expression, IRActorSend):
         receiver_type = _validate_expression(expression.receiver, functions, scopes)
-        if receiver_type != IRActorRefType(expression.actor_name) or expression.type != IRType.VOID:
+        result_type = IRType.TIMER if expression.delay is not None else IRType.VOID
+        if expression.delay is not None and _validate_expression(expression.delay, functions, scopes) != IRType.DURATION:
+            raise _invalid(expression.delay.location, "IR actor timer delay must have Duration type")
+        if receiver_type != IRActorRefType(expression.actor_name) or expression.type != result_type:
             raise _invalid(expression.location, "IR actor message receiver or result type is invalid")
         handler = functions.get(expression.handler_symbol)
         if (handler is None or handler.actor_name != expression.actor_name or handler.actor_initializer
                 or not handler.name.startswith(expression.actor_name + ".")):
             raise _invalid(expression.location, "IR actor message has no matching handler")
         expected = tuple(parameter.type for parameter in handler.parameters)
+        if (expression.delay is not None and expected and isinstance(expected[-1], IRAppliedType)
+                and expected[-1].name == "ReplySender"):
+            raise _invalid(expression.location, "IR actor timer cannot schedule a request handler")
         actual = tuple(_validate_expression(argument, functions, scopes) for argument in expression.arguments)
         if actual != expected:
             raise _invalid(expression.location, "IR actor message arguments do not match its handler")
@@ -1206,6 +1217,7 @@ def _validate_expression(
             "seconds": ((IRType.INT,), IRType.DURATION),
             "durationFromSeconds": ((IRType.FLOAT,), _applied("Result", IRType.DURATION, IRType.STRING)),
             "sleepFor": ((IRType.DURATION,), _applied("Task", IRType.VOID)),
+            "timerAfter": ((IRType.DURATION,), IRType.TIMER),
             "byteFromInt": ((IRType.INT,), _applied("Result", IRType.BYTE, IRType.STRING)),
             "bytesFromString": ((IRType.STRING,), IRType.BYTES),
             "byteBuffer": ((IRType.INT,), _applied("Result", IRType.BYTE_BUFFER, IRType.STRING)),

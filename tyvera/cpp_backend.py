@@ -443,6 +443,7 @@ class _CppGenerator:
             IRType.SUPERVISOR: "std::shared_ptr<tyvera_runtime::Supervisor>",
             IRType.TLS_CONNECTION: "std::shared_ptr<tyvera_runtime::TlsConnection>",
             IRType.DURATION: "tyvera_runtime::Duration",
+            IRType.TIMER: "std::shared_ptr<tyvera_runtime::Timer>",
             IRType.BYTES: "std::vector<std::uint8_t>",
             IRType.BYTE_BUFFER: "std::shared_ptr<tyvera_runtime::ByteBuffer>",
             IRType.TEXT_FILE: "std::shared_ptr<tyvera_runtime::TextFile>",
@@ -869,6 +870,7 @@ class _CppGenerator:
                 "seconds": "duration_seconds",
                 "durationFromSeconds": "duration_from_seconds",
                 "sleepFor": "sleep_for",
+                "timerAfter": "timer_after",
                 "byteFromInt": "byte_from_int",
                 "parseJson": "parse_json",
                 "jsonStringify": "json_stringify",
@@ -921,7 +923,7 @@ class _CppGenerator:
             values = list(temporaries)
             if expression.builtin in {
                 "byteFromInt", "byteBuffer", "seconds", "sleepFor", "oneForOne", "oneForAll",
-                "restForOne", "exponentialBackoff", "taskGroup",
+                "restForOne", "exponentialBackoff", "taskGroup", "timerAfter",
             }:
                 values.append(_location_args(expression.location))
             elif expression.builtin == "openText":
@@ -982,8 +984,12 @@ class _CppGenerator:
             weak_target = self._new_temporary()
             arguments = [self._new_temporary() for _ in expression.arguments]
             actor_type = _cpp_actor_identifier(expression.actor_name)
-            lines = ["([&]() -> void {"]
+            lines = [f"([&]() -> {self._cpp_type(expression.type)} {{"]
             lines.append(f"    const auto {target} = {self._expression(expression.receiver)};")
+            delay = None
+            if expression.delay is not None:
+                delay = self._new_temporary()
+                lines.append(f"    const auto {delay} = {self._expression(expression.delay)};")
             for name, argument in zip(arguments, expression.arguments):
                 lines.append(f"    const auto {name} = {self._expression(argument)};")
             lines.append(f"    auto {typed_target} = std::dynamic_pointer_cast<{actor_type}>({target});")
@@ -994,8 +1000,11 @@ class _CppGenerator:
             lines.append(f"    const std::weak_ptr<{actor_type}> {weak_target} = {typed_target};")
             captures = ", ".join([weak_target, *arguments])
             args = ", ".join(arguments)
+            call = (f"return tyvera_runtime::actor_send_after({target}, {_cpp_string_literal(expression.actor_name)}, {delay}, "
+                    if delay is not None else
+                    f"tyvera_runtime::enqueue_actor({target}, {_cpp_string_literal(expression.actor_name)}, ")
             lines.append(
-                f"    tyvera_runtime::enqueue_actor({target}, {_cpp_string_literal(expression.actor_name)}, "
+                f"    {call}"
                 f"[{captures}]() {{ if (auto target = {weak_target}.lock()) target->{expression.handler_symbol}({args}); }}, "
                 f"{_location_args(expression.location)});"
             )
@@ -1155,6 +1164,10 @@ class _CppGenerator:
                 "tryReceive": "try_receive",
             }
             return f"({receiver}).{functions[method]}()"
+        if expression.receiver.type == IRType.TIMER:
+            functions = {"isReady": "timer_is_ready", "isCancelled": "timer_is_cancelled",
+                         "cancel": "timer_cancel", "remaining": "timer_remaining"}
+            return f"tyvera_runtime::{functions[method]}({receiver})"
         if expression.receiver.type == IRType.JSON:
             functions = {
                 "kind": "json_kind", "isNull": "json_is_null", "asString": "json_as_string",
@@ -1537,14 +1550,30 @@ struct Duration {
     friend constexpr bool operator>(Duration left, Duration right) noexcept { return right < left; }
     friend constexpr bool operator>=(Duration left, Duration right) noexcept { return !(left < right); }
 };
-inline std::chrono::steady_clock::time_point duration_deadline(Duration duration) noexcept {
-    const auto now = std::chrono::steady_clock::now();
+inline std::chrono::steady_clock::time_point duration_deadline(
+    Duration duration, std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) noexcept {
     if (duration.milliseconds <= 0) return now;
     const auto available = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::time_point::max() - now).count();
     if (duration.milliseconds > available) return std::chrono::steady_clock::time_point::max();
     return now + std::chrono::milliseconds(duration.milliseconds);
 }
+struct ActorBase;
+struct Timer {
+    const std::chrono::steady_clock::time_point started_at = std::chrono::steady_clock::now();
+    const std::int64_t duration_milliseconds;
+    const std::chrono::steady_clock::time_point due;
+    std::atomic<bool> cancelled{false};
+    bool delivered = false; // ActorRuntimeState::mutex guards delivery and captures.
+    std::weak_ptr<ActorBase> target;
+    std::function<void()> message;
+    std::string actor_name;
+    std::string file;
+    int line = 1;
+    int column = 1;
+    explicit Timer(Duration duration)
+        : duration_milliseconds(duration.milliseconds), due(duration_deadline(duration, started_at)) {}
+};
 inline std::string host_os() {
 #if defined(__linux__)
     return "linux";
@@ -3806,6 +3835,69 @@ inline ActorRuntimeState& actor_runtime_state() {
     static ActorRuntimeState state;
     return state;
 }
+inline constexpr std::size_t MAX_NATIVE_PENDING_ACTOR_TIMERS = 4096;
+inline std::vector<std::shared_ptr<Timer>>& scheduled_actor_timers() {
+    // All registry access uses ActorRuntimeState::mutex, including stop/fire races.
+    static std::vector<std::shared_ptr<Timer>> timers;
+    return timers;
+}
+inline bool timer_is_ready(const std::shared_ptr<Timer>& timer) {
+    if (!timer || timer->cancelled.load(std::memory_order_acquire)) return false;
+    const auto elapsed = std::chrono::duration<long double, std::milli>(
+        std::chrono::steady_clock::now() - timer->started_at).count();
+    return elapsed >= static_cast<long double>(timer->duration_milliseconds);
+}
+inline bool timer_is_cancelled(const std::shared_ptr<Timer>& timer) {
+    return timer && timer->cancelled.load(std::memory_order_acquire);
+}
+inline Duration timer_remaining(const std::shared_ptr<Timer>& timer) {
+    if (!timer || timer_is_cancelled(timer)) return Duration{0};
+    const auto elapsed = std::chrono::duration<long double, std::milli>(
+        std::chrono::steady_clock::now() - timer->started_at).count();
+    const auto left = std::ceil(static_cast<long double>(timer->duration_milliseconds) - elapsed);
+    if (left <= 0) return Duration{0};
+    const auto maximum = std::numeric_limits<std::int64_t>::max();
+    return Duration{left >= static_cast<long double>(maximum) ? maximum : static_cast<std::int64_t>(left)};
+}
+inline void prune_actor_timers_locked() {
+    auto& timers = scheduled_actor_timers();
+    timers.erase(std::remove_if(timers.begin(), timers.end(), [](const auto& timer) {
+        return timer->cancelled.load(std::memory_order_acquire) || timer->delivered;
+    }), timers.end());
+}
+inline void cancel_actor_timers_locked(const ActorBase* actor) {
+    for (const auto& timer : scheduled_actor_timers()) {
+        const auto target = timer->target.lock();
+        if (target.get() == actor && !timer->delivered) {
+            timer->cancelled.store(true, std::memory_order_release);
+            timer->message = nullptr;
+        }
+    }
+    prune_actor_timers_locked();
+}
+inline std::shared_ptr<Timer> timer_after(Duration duration, const std::string& file, int line, int column) {
+    try { return std::make_shared<Timer>(duration); }
+    catch (const std::bad_alloc&) { throw Failure(file, line, column, "cannot allocate timer"); }
+}
+inline bool timer_cancel(const std::shared_ptr<Timer>& timer) {
+    if (!timer) return false;
+    {
+        std::lock_guard<std::mutex> lock(actor_runtime_state().mutex);
+        if (timer_is_cancelled(timer) || timer_is_ready(timer)) return false;
+        timer->cancelled.store(true, std::memory_order_release);
+        timer->message = nullptr;
+        prune_actor_timers_locked();
+    }
+    notify_task_scheduler();
+    return true;
+}
+inline std::optional<std::chrono::steady_clock::time_point> next_actor_timer_deadline() {
+    std::lock_guard<std::mutex> lock(actor_runtime_state().mutex);
+    std::optional<std::chrono::steady_clock::time_point> next;
+    for (const auto& timer : scheduled_actor_timers())
+        if (!timer_is_cancelled(timer) && !timer->delivered && (!next || timer->due < *next)) next = timer->due;
+    return next;
+}
 inline constexpr std::size_t MAX_ACTOR_MONITORS = 4096;
 inline constexpr std::size_t MAX_ACTOR_LINKS = 4096;
 inline std::vector<std::shared_ptr<ActorBase>> detach_actor_links_locked(
@@ -4118,6 +4210,7 @@ inline void stop_actor_for_supervisor(const std::shared_ptr<ActorBase>& actor) n
         was_live = actor->status == "alive" || actor->status == "starting" || actor->status == "restarting";
         if (was_live) actor->last_exit_reason = "normal stop";
         actor->status = "stopped";
+        cancel_actor_timers_locked(actor.get());
         actor->mailbox.clear();
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
@@ -4160,6 +4253,7 @@ inline std::string restart_actor_for_supervisor(
         auto& state = actor_runtime_state();
         std::lock_guard<std::mutex> lock(state.mutex);
         actor->status = "restarting";
+        cancel_actor_timers_locked(actor.get());
         actor->mailbox.clear();
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
@@ -4389,6 +4483,14 @@ inline std::optional<std::chrono::steady_clock::time_point> next_supervisor_rest
         [](const auto& left, const auto& right) { return left.due < right.due; });
     return next->due;
 }
+inline std::optional<std::chrono::steady_clock::time_point> next_actor_work_deadline(bool include_timers) {
+    auto next = next_supervisor_restart_deadline();
+    if (include_timers) {
+        const auto timer = next_actor_timer_deadline();
+        if (timer && (!next || *timer < *next)) next = timer;
+    }
+    return next;
+}
 inline std::shared_ptr<ActorBase> supervisor_start_actor(
     const std::shared_ptr<Supervisor>& supervisor, const std::shared_ptr<ActorBase>& actor,
     RestartPolicy policy, const std::string& file, int line, int column) {
@@ -4476,6 +4578,7 @@ inline void actor_initialization_failed(const std::shared_ptr<ActorBase>& actor)
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         actor->status = "crashed";
+        cancel_actor_timers_locked(actor.get());
         actor->mailbox.clear();
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
@@ -4485,36 +4588,105 @@ inline void actor_initialization_failed(const std::shared_ptr<ActorBase>& actor)
     actor->tyv_clear_state();
     notify_task_scheduler();
 }
+inline void enqueue_actor_locked(
+    ActorRuntimeState& state, const std::shared_ptr<ActorBase>& actor, const std::string& actor_name,
+    std::function<void()> message, const std::string& file, int line, int column) {
+    if (!actor || actor->actor_name != actor_name)
+        throw Failure(file, line, column, "actor reference type mismatch");
+    if (actor->status != "alive")
+        throw Failure(file, line, column, "cannot send a message to a " + actor->status + " actor");
+    if (actor->mailbox.size() >= MAX_ACTOR_MAILBOX)
+        throw Failure(file, line, column, "actor mailbox capacity (100000) exceeded");
+    try {
+        actor->mailbox.push_back(std::move(message));
+        if (!actor->queued) {
+            try {
+                state.ready.push_back(actor);
+                actor->queued = true;
+            } catch (...) {
+                actor->mailbox.pop_back();
+                throw;
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        throw Failure(file, line, column, "cannot enqueue actor message");
+    }
+}
 inline void enqueue_actor(
     const std::shared_ptr<ActorBase>& actor, const std::string& actor_name,
     std::function<void()> message, const std::string& file, int line, int column) {
     auto& state = actor_runtime_state();
     {
         std::lock_guard<std::mutex> lock(state.mutex);
-        if (!actor || actor->actor_name != actor_name)
-            throw Failure(file, line, column, "actor reference type mismatch");
-        if (actor->status != "alive")
-            throw Failure(file, line, column, "cannot send a message to a " + actor->status + " actor");
-        if (actor->mailbox.size() >= MAX_ACTOR_MAILBOX)
-            throw Failure(file, line, column, "actor mailbox capacity (100000) exceeded");
-        try {
-            actor->mailbox.push_back(std::move(message));
-            if (!actor->queued) {
-                try {
-                    state.ready.push_back(actor);
-                    actor->queued = true;
-                } catch (...) {
-                    actor->mailbox.pop_back();
-                    throw;
-                }
-            }
-        } catch (const std::bad_alloc&) {
-            throw Failure(file, line, column, "cannot enqueue actor message");
-        }
+        enqueue_actor_locked(state, actor, actor_name, std::move(message), file, line, column);
     }
     notify_task_scheduler();
-    actor_runtime_state().changed.notify_all();
+    state.changed.notify_all();
 }
+inline std::shared_ptr<Timer> actor_send_after(
+    const std::shared_ptr<ActorBase>& actor, const std::string& actor_name, Duration delay,
+    std::function<void()> message, const std::string& file, int line, int column) {
+    auto timer = timer_after(delay, file, line, column);
+    try {
+        auto& state = actor_runtime_state();
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (!actor || actor->actor_name != actor_name)
+                throw Failure(file, line, column, "actor reference type mismatch");
+            if (actor->status != "alive")
+                throw Failure(file, line, column, "cannot schedule a message for a " + actor->status + " actor");
+            auto& timers = scheduled_actor_timers();
+            if (timers.size() >= MAX_NATIVE_PENDING_ACTOR_TIMERS) {
+                prune_actor_timers_locked();
+                if (timers.size() >= MAX_NATIVE_PENDING_ACTOR_TIMERS)
+                    throw Failure(file, line, column, "native actor timer capacity exceeded (maximum 4096 pending timers)");
+            }
+            timer->target = actor;
+            timer->actor_name = actor_name;
+            timer->message = std::move(message);
+            timer->file = file;
+            timer->line = line;
+            timer->column = column;
+            timers.push_back(timer);
+        }
+        notify_task_scheduler();
+        state.changed.notify_all();
+        return timer;
+    } catch (const std::bad_alloc&) {
+        throw Failure(file, line, column, "cannot allocate actor timer");
+    }
+}
+inline void promote_due_actor_timers() {
+    auto& state = actor_runtime_state();
+    bool promoted = false;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        try {
+            for (const auto& timer : scheduled_actor_timers()) {
+                if (timer_is_cancelled(timer) || timer->delivered || !timer_is_ready(timer)) continue;
+                const auto actor = timer->target.lock();
+                if (!actor || actor->status != "alive") {
+                    timer->cancelled.store(true, std::memory_order_release);
+                    timer->message = nullptr;
+                    continue;
+                }
+                timer->delivered = true;
+                enqueue_actor_locked(state, actor, timer->actor_name, std::move(timer->message),
+                                     timer->file, timer->line, timer->column);
+                promoted = true;
+            }
+        } catch (...) {
+            prune_actor_timers_locked();
+            throw;
+        }
+        prune_actor_timers_locked();
+    }
+    if (promoted) {
+        notify_task_scheduler();
+        state.changed.notify_all();
+    }
+}
+
 template <typename T, typename MakeMessage> inline ReplyReceiver<T> actor_request(
     const std::shared_ptr<ActorBase>& actor, const std::string& actor_name,
     std::optional<std::int64_t> timeout_milliseconds, MakeMessage&& make_message,
@@ -4583,6 +4755,7 @@ inline bool actor_stop(
         if (actor->status != "alive") return false;
         actor->status = "stopped";
         actor->last_exit_reason = "normal stop";
+        cancel_actor_timers_locked(actor.get());
         actor->mailbox.clear();
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
@@ -4612,6 +4785,7 @@ inline std::vector<std::shared_ptr<ActorBase>> mark_actor_crashed(
         if (actor->status != "alive") return {};
         actor->status = "crashed";
         actor->last_exit_reason = failure;
+        cancel_actor_timers_locked(actor.get());
         actor->mailbox.clear();
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
@@ -4695,6 +4869,7 @@ inline StringResult<std::int64_t> run_actors(
     std::string first_crash;
     while (processed < delivery_limit) {
         check_shutdown(file, line, column);
+        promote_due_actor_timers();
         const auto settled = settle_due_supervisor_restarts();
         if (settled && !settled->empty() && first_crash.empty()) first_crash = *settled;
         std::shared_ptr<ActorBase> actor;
@@ -4782,12 +4957,14 @@ inline StringResult<std::int64_t> run_actors(
                     actor->queued = true;
                 } catch (const std::bad_alloc&) {
                     actor->status = "crashed";
+                    cancel_actor_timers_locked(actor.get());
                     actor->mailbox.clear();
                     if (first_crash.empty())
                         first_crash = "actor '" + actor->actor_name + "' crashed: native runtime failure";
                 }
             }
         }
+        promote_due_actor_timers();
     }
     {
         auto& state = actor_runtime_state();
@@ -4818,11 +4995,13 @@ inline void shutdown_actors() noexcept {
         for (auto actor = actors.rbegin(); actor != actors.rend(); ++actor) {
             (*actor)->status = "stopped";
             (*actor)->last_exit_reason = "runtime shutdown";
+            cancel_actor_timers_locked(actor->get());
             (*actor)->mailbox.clear();
             (*actor)->queued = false;
         }
         state.ready.clear();
         state.pending_restarts.clear();
+        scheduled_actor_timers().clear();
         state.supervisors.clear();
     }
     for (auto actor = actors.rbegin(); actor != actors.rend(); ++actor) {
@@ -6636,7 +6815,14 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
         }
 
         const auto work_revision = scheduler.work_revision.load(std::memory_order_acquire);
-        const auto restart_deadline = next_supervisor_restart_deadline();
+        bool include_timers = false;
+        {
+            std::lock_guard<std::mutex> task_lock(scheduler.mutex);
+            include_timers = std::any_of(scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
+                return task->waiting_for_actor_reply.load(std::memory_order_acquire);
+            });
+        }
+        const auto restart_deadline = next_actor_work_deadline(include_timers);
         std::unique_lock<std::mutex> lock(scheduler.mutex);
         auto work_ready = [&scheduler, work_revision, restart_deadline]() {
             const bool unstarted = std::any_of(scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
@@ -6704,7 +6890,7 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
                             && !task->actor_reply_wait_has_deadline.load(std::memory_order_acquire)
                             && !task->is_cancelled());
                 });
-            if (unresolved && !native_actor_message_ready() && !next_supervisor_restart_deadline()) {
+            if (unresolved && !native_actor_message_ready() && !next_actor_work_deadline(true)) {
                 if (scheduler_failure.empty())
                     scheduler_failure = "task scheduler has an unresolved actor reply with no runnable work or deadline";
                 for (const auto& task : current_tasks)
@@ -6715,6 +6901,7 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
             std::unique_lock<NativeExecutionMutex> restart_lock(scheduler.execution_mutex);
             ActiveExecutionLockScope restart_scope(restart_lock);
             const auto settled = settle_due_supervisor_restarts();
+            promote_due_actor_timers();
             if (settled && !settled->empty() && scheduler_failure.empty()) scheduler_failure = *settled;
         }
         if (pump_actor) {

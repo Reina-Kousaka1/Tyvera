@@ -724,7 +724,7 @@ backoff. Native TaskGroups support owner-bound direct-child registration,
 duplicate rejection, `isDone`, cancellation, and `await` joins. Groups do not
 transfer task ownership and cannot cross actor boundaries. Native
 `monitor()`/`demonitor()` and symmetric `link()`/`unlink()` are supported.
-`sendAfter` and actor state owning move-only Resources remain unsupported. The reference interpreter
+Native `timerAfter` and `sendAfter` are supported; pending actor timers are capped at 4,096. Actor state owning move-only Resources remains unsupported. The reference interpreter
 remains the complete runtime for language features outside the native subset.
 
 ## JSON values
@@ -1056,7 +1056,7 @@ experimental Linux path additionally supports async functions, `Task<T>`,
 DNS, TCP, a verified TLS client, cooperative task cancellation, and monotonic
 deadlines, TaskGroups, result polling, actor request/reply, monitoring/links,
 Supervisor V2, and bounded HTTP/WebSocket clients. Classes, generic
-functions/types, actor message timers, HTTP/WebSocket servers, native task
+functions/types, HTTP/WebSocket servers, native task
 detachment, and native FFI remain unsupported. Native actor state cannot own
 Resources or Task handles; Tasks created by a handler belong to that actor
 instance and drain on stop/crash/restart. `await` remains statement-only;

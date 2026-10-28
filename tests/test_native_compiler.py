@@ -666,20 +666,15 @@ fn main() {
         with tempfile.TemporaryDirectory(prefix="tyvera-cli-build-") as temporary:
             root = Path(temporary)
             source = root / "unsupported.tyv"
-            source.write_text('''actor Worker {
-    on ping() {}
-}
-fn main() {
-    let worker = spawn(Worker())
-    let timer = worker.sendAfter(milliseconds(1), ping)
-}''', encoding="utf-8")
+            source.write_text('''class Worker { fn init() {} }
+fn main() { let worker = Worker() }''', encoding="utf-8")
             output = root / "unsupported"
             stdout = io.StringIO()
             stderr = io.StringIO()
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 result = cli_main(["build", str(source), "--output", str(output)])
             self.assertEqual(result, 1)
-            self.assertIn("native actor timers are not yet supported", stderr.getvalue())
+            self.assertIn("native backend does not yet support classes", stderr.getvalue())
             self.assertFalse(output.exists())
 
     def test_build_cli_typechecks_before_creating_any_artifact(self) -> None:
