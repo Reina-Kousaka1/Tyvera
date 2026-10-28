@@ -402,6 +402,8 @@ class _CppGenerator:
             return f"tyvera_generated::{_cpp_user_type_identifier(type_name.name)}"
         if type_name == IRType.SUPERVISOR:
             return "std::shared_ptr<tyvera_runtime::Supervisor>"
+        if type_name == IRType.TASK_GROUP:
+            return "tyvera_runtime::TaskGroup"
         if isinstance(type_name, IRAppliedType):
             arguments = [_CppGenerator._cpp_type(argument) for argument in type_name.arguments]
             if type_name.name == "Option":
@@ -558,9 +560,11 @@ class _CppGenerator:
             task = self._new_temporary()
             self._line(f"auto {task} = {self._expression(statement.task)};")
             task_type = statement.task.type
-            if not isinstance(task_type, IRAppliedType):
+            if task_type == IRType.TASK_GROUP:
+                self._line(f"({task}).await({_location_args(statement.location)});")
+            elif not isinstance(task_type, IRAppliedType):
                 raise ValueError("validated IR await has a non-applied operand")
-            if task_type.name == "ReplyReceiver":
+            elif task_type.name == "ReplyReceiver":
                 consume = "true" if statement.result is not None else "false"
                 awaited = (
                     f"tyvera_runtime::await_reply({task}, {consume}, "
@@ -887,6 +891,7 @@ class _CppGenerator:
                 "openTextReader": "open_text_reader",
                 "openTextWriter": "open_text_writer",
                 "runTasks": "run_tasks",
+                "taskGroup": "task_group",
                 "runActors": "run_actors",
                 "resolveHost": "resolve_host",
                 "tcpConnect": "tcp_connect",
@@ -916,7 +921,7 @@ class _CppGenerator:
             values = list(temporaries)
             if expression.builtin in {
                 "byteFromInt", "byteBuffer", "seconds", "sleepFor", "oneForOne", "oneForAll",
-                "restForOne", "exponentialBackoff",
+                "restForOne", "exponentialBackoff", "taskGroup",
             }:
                 values.append(_location_args(expression.location))
             elif expression.builtin == "openText":
@@ -1162,6 +1167,11 @@ class _CppGenerator:
                 return f"tyvera_runtime::actor_is_alive({receiver})"
             if method == "stop":
                 return f"tyvera_runtime::actor_stop({receiver}, {_location_args(expression.location)})"
+        if expression.receiver.type == IRType.TASK_GROUP:
+            if method == "add":
+                return f"({receiver}).add({arguments[0]}, {_location_args(expression.location)})"
+            functions = {"isDone": "is_done", "cancel": "cancel"}
+            return f"({receiver}).{functions[method]}({_location_args(expression.location)})"
         if expression.receiver.type == IRType.SUPERVISOR:
             if method == "isAlive":
                 return f"tyvera_runtime::supervisor_is_alive({receiver})"
@@ -1598,7 +1608,10 @@ inline void reacquire_execution_lock(std::unique_lock<NativeExecutionMutex>& loc
 inline thread_local std::unique_lock<NativeExecutionMutex>* active_execution_lock = nullptr;
 constexpr std::size_t MAX_NATIVE_TASK_VALUES_PER_RUN = 4096;
 constexpr std::size_t MAX_NATIVE_UNFINISHED_TASKS_PER_RUN = 64;
+inline std::atomic<std::uint64_t> next_native_task_identity{1};
 struct TaskControl {
+    const std::uint64_t identity = next_native_task_identity.fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t owner_identity = 0;
     std::atomic<bool> started{false};
     std::atomic<bool> done{false};
     std::atomic<bool> cancellation_requested{false};
@@ -1674,6 +1687,7 @@ struct TaskControl {
     }
     void add_child(const std::shared_ptr<TaskControl>& child) {
         child->owner = this;
+        child->owner_identity = identity;
         bool cancel_now = false;
         {
             std::lock_guard<std::mutex> lock(children_mutex);
@@ -2189,6 +2203,96 @@ template <> struct Task<void> {
         }
     }
 };
+struct TaskGroupState {
+    const std::uint64_t owner_identity;
+    mutable std::mutex mutex;
+    std::vector<std::weak_ptr<TaskControl>> members;
+    explicit TaskGroupState(std::uint64_t owner) : owner_identity(owner) {}
+};
+inline bool& actor_handler_active();
+struct TaskGroup {
+    std::shared_ptr<TaskGroupState> state;
+    void require_owner(const std::string& file, int line, int column) const {
+        if (!state) throw Failure(file, line, column, "cannot use an empty TaskGroup");
+        const auto current_owner = active_task_control ? active_task_control->identity : 0;
+        if (actor_handler_active() || current_owner != state->owner_identity)
+            throw Failure(file, line, column, "TaskGroup may only be used by its creating task");
+    }
+    template <typename T> bool add(const Task<T>& task, const std::string& file, int line, int column) const {
+        require_owner(file, line, column);
+        if (!task.state || task.state->owner_identity != state->owner_identity)
+            throw Failure(file, line, column, "TaskGroup.add accepts only a task created by the group's owner");
+        std::lock_guard<std::mutex> lock(state->mutex);
+        for (const auto& existing : state->members) {
+            if (auto member = existing.lock(); member && member == task.state) return false;
+        }
+        state->members.push_back(task.state);
+        return true;
+    }
+    bool is_done(const std::string& file, int line, int column) const {
+        require_owner(file, line, column);
+        std::vector<std::weak_ptr<TaskControl>> members;
+        { std::lock_guard<std::mutex> lock(state->mutex); members = state->members; }
+        for (const auto& weak : members) {
+            if (auto member = weak.lock(); member && !member->done.load(std::memory_order_acquire)) return false;
+        }
+        return true;
+    }
+    std::int64_t cancel(const std::string& file, int line, int column) const {
+        require_owner(file, line, column);
+        std::vector<std::weak_ptr<TaskControl>> members;
+        { std::lock_guard<std::mutex> lock(state->mutex); members = state->members; }
+        std::int64_t count = 0;
+        for (const auto& weak : members) {
+            if (auto member = weak.lock(); member && !member->done.load(std::memory_order_acquire)
+                && !member->is_cancelled()) {
+                member->request_cancel();
+                ++count;
+            }
+        }
+        return count;
+    }
+    void await(const std::string& file, int line, int column) const {
+        require_owner(file, line, column);
+        std::vector<std::shared_ptr<TaskControl>> members;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            for (const auto& weak : state->members) if (auto member = weak.lock()) members.push_back(std::move(member));
+        }
+        auto* execution_lock = active_execution_lock;
+        const bool resume_serialized = execution_lock && execution_lock->owns_lock();
+        if (resume_serialized) execution_lock->unlock();
+        try {
+            for (const auto& member : members) {
+                if (!member->started.load(std::memory_order_acquire)) member->start();
+                while (!member->done.load(std::memory_order_acquire)) {
+                    std::unique_lock<std::mutex> lock(member->lifecycle_mutex);
+                    member->lifecycle_changed.wait_for(lock, std::chrono::milliseconds(50), [&member]() {
+                        return member->done.load(std::memory_order_acquire);
+                    });
+                    lock.unlock();
+                    if (active_task_control) active_task_control->check_interruption();
+                }
+                if (active_task_control) active_task_control->check_interruption();
+                const auto failure = member->failure_message();
+                if (!failure.empty()) throw Failure(file, line, column, failure);
+            }
+            if (active_task_control) active_task_control->check_interruption();
+            if (resume_serialized) reacquire_execution_lock(*execution_lock, active_task_control);
+        } catch (...) {
+            if (resume_serialized) reacquire_execution_lock(*execution_lock, active_task_control);
+            throw;
+        }
+    }
+    bool operator==(const TaskGroup& other) const noexcept { return state == other.state; }
+    bool operator!=(const TaskGroup& other) const noexcept { return !(*this == other); }
+};
+inline TaskGroup task_group(const std::string& file, int line, int column) {
+    if (actor_handler_active()) throw Failure(file, line, column, "task groups cannot be created inside actor message handlers");
+    const auto owner = active_task_control ? active_task_control->identity : 0;
+    return TaskGroup{std::make_shared<TaskGroupState>(owner)};
+}
+
 template <typename T> inline Task<T> make_task_with_mode(std::function<T()> operation, bool serialized,
                                                          const std::string& file, int line, int column) {
     auto state = std::make_shared<TaskState<T>>(std::move(operation), serialized, file, line, column);
