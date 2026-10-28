@@ -720,8 +720,11 @@ messages and request/reply through `ReplySender<T>`, `ReplyReceiver<T>`,
 Tasks are cancelled and drained on lifecycle changes. The experimental native
 supervisor subset supports nested `oneForOne`, `oneForAll`, and `restForOne`
 trees, restart policies and intensity windows, and monotonic exponential
-backoff. Native TaskGroups, `sendAfter`, monitoring/links, and supervised
-actors owning move-only Resources remain unsupported. The reference interpreter
+backoff. Native TaskGroups support owner-bound direct-child registration,
+duplicate rejection, `isDone`, cancellation, and `await` joins. Groups do not
+transfer task ownership and cannot cross actor boundaries. `sendAfter`,
+monitoring/links, and supervised actors owning move-only Resources remain
+unsupported. The reference interpreter
 remains the complete runtime for language features outside the native subset.
 
 ## JSON values
