@@ -1427,7 +1427,9 @@ fn main() {
                 group = arrivals[offset:offset + 5]
                 self.assertGreaterEqual(group[1] - group[0], 0.20)
                 self.assertGreaterEqual(min(group[3], group[4]) - group[2], 0.20)
-                self.assertEqual(
+                # Concurrent tasks are ordered by reservation arrival, not source creation.
+                # The ticket-level test above verifies the coordinator's FIFO contract.
+                self.assertCountEqual(
                     request_paths[offset + 3:offset + 5],
                     ["/api/v10/channels/12/messages/first", "/api/v10/channels/12/messages/second"],
                 )
