@@ -1594,23 +1594,36 @@ struct NativeExecutionMutex {
     std::mutex state_mutex;
     std::condition_variable changed;
     bool locked = false;
+    std::deque<const void*> queue;
 
     void lock() {
         std::unique_lock<std::mutex> lock(state_mutex);
-        changed.wait(lock, [this]() { return !locked; });
+        const int ticket = 0;
+        queue.push_back(&ticket);
+        changed.wait(lock, [this, &ticket]() { return !locked && queue.front() == &ticket; });
+        queue.pop_front();
         locked = true;
     }
     bool try_lock() {
         std::lock_guard<std::mutex> lock(state_mutex);
-        if (locked) return false;
+        if (locked || !queue.empty()) return false;
         locked = true;
         return true;
     }
     template <typename Cancelled>
     bool lock_or_cancel(Cancelled&& cancelled) {
         std::unique_lock<std::mutex> lock(state_mutex);
-        changed.wait(lock, [this, &cancelled]() { return !locked || cancelled(); });
-        if (cancelled()) return false;
+        const int ticket = 0;
+        queue.push_back(&ticket);
+        changed.wait(lock, [this, &ticket, &cancelled]() {
+            return (!locked && queue.front() == &ticket) || cancelled();
+        });
+        if (cancelled()) {
+            queue.erase(std::find(queue.begin(), queue.end(), &ticket));
+            changed.notify_all();
+            return false;
+        }
+        queue.pop_front();
         locked = true;
         return true;
     }
@@ -6139,6 +6152,9 @@ inline bool websocket_await_timed(
     try {
         output.emplace(operation.await_move(file, line, column));
         return true;
+    } catch (const TaskFailure&) {
+        if (target->deadline_cancellation.load(std::memory_order_acquire)) return false;
+        throw;
     } catch (const Failure&) {
         if (target->deadline_cancellation.load(std::memory_order_acquire)) return false;
         throw;
