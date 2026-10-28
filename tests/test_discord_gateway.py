@@ -1305,11 +1305,11 @@ async fn run() {
     println(secondEarly > 0)
     let firstPermit = await coordinator.request(acquire, "channels/:channel_id/messages", "channel:10", firstTicket, 60000)
     println(firstPermit)
-    let firstComplete = coordinator.request(complete, "channels/:channel_id/messages", "channel:10", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
+    let firstComplete = coordinator.request(complete, firstTicket, "channels/:channel_id/messages", "channel:10", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
     let firstCompleteValue = await firstComplete
     let secondPermit = await coordinator.request(acquire, "channels/:channel_id/messages", "channel:10", secondTicket, 60000)
     println(secondPermit)
-    let secondComplete = coordinator.request(complete, "channels/:channel_id/messages", "channel:10", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
+    let secondComplete = coordinator.request(complete, secondTicket, "channels/:channel_id/messages", "channel:10", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
     let secondCompleteValue = await secondComplete
 
     let olderTicket = await coordinator.request(reserveWaiter, "channel:20", 60000)
@@ -1319,15 +1319,15 @@ async fn run() {
     println(laterEarly > 0)
     let independentPermit = await coordinator.request(acquire, "channels/:channel_id/messages", "channel:21", independentTicket, 60000)
     println(independentPermit)
-    let independentComplete = coordinator.request(complete, "channels/:channel_id/messages", "channel:21", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
+    let independentComplete = coordinator.request(complete, independentTicket, "channels/:channel_id/messages", "channel:21", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
     let independentCompleteValue = await independentComplete
     let olderPermit = await coordinator.request(acquire, "channels/:channel_id/messages", "channel:20", olderTicket, 60000)
     println(olderPermit)
-    let olderComplete = coordinator.request(complete, "channels/:channel_id/messages", "channel:20", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
+    let olderComplete = coordinator.request(complete, olderTicket, "channels/:channel_id/messages", "channel:20", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
     let olderCompleteValue = await olderComplete
     let laterPermit = await coordinator.request(acquire, "channels/:channel_id/messages", "channel:20", laterTicket, 60000)
     println(laterPermit)
-    let laterComplete = coordinator.request(complete, "channels/:channel_id/messages", "channel:20", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
+    let laterComplete = coordinator.request(complete, laterTicket, "channels/:channel_id/messages", "channel:20", None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
     let laterCompleteValue = await laterComplete
 
     let cancelledTicket = await coordinator.request(reserveWaiter, "channel:30", 60000)
@@ -1373,6 +1373,79 @@ fn main() {
             expected = "true\n0\n0\ntrue\n0\n0\n0\ntrue\n-2\n"
             self.assertEqual(reference, (0, expected, ""))
             self.assertEqual(native_result, reference)
+
+    def test_rate_limit_tickets_and_completions_cannot_replay_new_reservations(self) -> None:
+        source = r'''import "../src/rest.tyv" as rest
+async fn verify() {
+    let c = rest.newRestRateLimitCoordinator()
+    let route = "channels/:channel_id/messages"
+    let scope = "channel:10"
+    let first = await c.request(reserveWaiter, scope, 60000)
+    let firstPermit = await c.request(acquire, route, scope, first, 60000)
+    println(firstPermit == 0)
+    let firstDone = await c.request(complete, first, route, scope, None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
+    println(firstDone == 1)
+    let second = await c.request(reserveWaiter, scope, 60000)
+    println(second > first)
+    let staleAcquire = await c.request(acquire, route, scope, first, 60000)
+    println(staleAcquire == -2)
+    let secondPermit = await c.request(acquire, route, scope, second, 60000)
+    println(secondPermit == 0)
+    let staleDone = await c.request(complete, first, route, scope, None<String>(), Some(100), None<Int>(), 200, false, None<Int>())
+    println(staleDone == 0)
+    let third = await c.request(reserveWaiter, scope, 60000)
+    let thirdWait = await c.request(acquire, route, scope, third, 60000)
+    println(thirdWait > 0)
+    let secondDone = await c.request(complete, second, route, scope, None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
+    println(secondDone == 1)
+    let thirdPermit = await c.request(acquire, route, scope, third, 60000)
+    println(thirdPermit == 0)
+    let thirdDone = await c.request(complete, third, route, scope, None<String>(), None<Int>(), None<Int>(), 200, false, None<Int>())
+    println(thirdDone == 1)
+    let cancelled = await c.request(reserveWaiter, scope, 60000)
+    let removed = await c.request(cancelWaiter, cancelled)
+    println(removed)
+    let replacement = await c.request(reserveWaiter, scope, 60000)
+    println(replacement > cancelled)
+    let replayed = await c.request(acquire, route, scope, cancelled, 60000)
+    println(replayed == -2)
+    let replacementPermit = await c.request(acquire, route, scope, replacement, 60000)
+    println(replacementPermit == 0)
+}
+fn main() {
+    let task = verify()
+    match runTasks() {
+        Ok(_) => {}
+        Err(error) => eprintln(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix=".tyvera-discord-ticket-ownership-", dir=DISCORD_ROOT) as temporary:
+            directory = Path(temporary)
+            entry = directory / "ownership.tyv"
+            entry.write_text(source, encoding="utf-8")
+            checked = compile_checked_project(entry, DISCORD_ROOT)
+            output, errors = io.StringIO(), io.StringIO()
+            ReferenceInterpreterBackend().execute(
+                checked, output=output, error_output=errors, project_root=DISCORD_ROOT,
+            )
+            reference = (0, output.getvalue(), errors.getvalue())
+            self.assertEqual(reference, (0, "true\n" * 14, ""))
+            if _native_cpp_available():
+                executable = directory / "ownership-native"
+                CppNativeBackend().build(
+                    lower_checked_program(checked), executable, project_root=DISCORD_ROOT,
+                )
+                environment = os.environ.copy()
+                for name in ("PYTHONPATH", "PYTHONHOME", "DISCORD_TOKEN"):
+                    environment.pop(name, None)
+                if os.name != "nt":
+                    environment["PATH"] = ""
+                native = subprocess.run(
+                    [str(executable)], cwd=DISCORD_ROOT, capture_output=True, text=True,
+                    encoding="utf-8", env=environment, check=False, timeout=30,
+                )
+                self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
 
     def test_coordinated_rest_waits_for_global_and_bucket_limits_with_native_parity(self) -> None:
         native_available = _native_cpp_available()
