@@ -1447,6 +1447,56 @@ fn main() {
                 )
                 self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
 
+    def test_concurrent_global_rate_limits_keep_the_longest_deadline(self) -> None:
+        source = r'''import "../src/rest.tyv" as rest
+async fn verify() {
+    let c = rest.newRestRateLimitCoordinator()
+    let route = "channels/:channel_id/messages"
+    let first = await c.request(reserveWaiter, "channel:1", 120000)
+    let second = await c.request(reserveWaiter, "channel:2", 120000)
+    let firstPermit = await c.request(acquire, route, "channel:1", first, 60000)
+    let secondPermit = await c.request(acquire, route, "channel:2", second, 60000)
+    println(firstPermit == 0 && secondPermit == 0)
+    let longer = await c.request(complete, first, route, "channel:1", None<String>(), None<Int>(), None<Int>(), 429, true, Some(60000))
+    let shorter = await c.request(complete, second, route, "channel:2", None<String>(), None<Int>(), None<Int>(), 429, true, Some(1000))
+    println(longer == 1 && shorter == 1)
+    let waiting = await c.request(reserveWaiter, "channel:3", 120000)
+    let wait = await c.request(acquire, route, "channel:3", waiting, 60000)
+    println(wait > 50000)
+    let removed = await c.request(cancelWaiter, waiting)
+    println(removed)
+}
+fn main() {
+    let task = verify()
+    match runTasks() {
+        Ok(_) => {}
+        Err(error) => eprintln(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix=".tyvera-discord-global-deadline-", dir=DISCORD_ROOT) as temporary:
+            directory = Path(temporary)
+            entry = directory / "global.tyv"
+            entry.write_text(source, encoding="utf-8")
+            checked = compile_checked_project(entry, DISCORD_ROOT)
+            output, errors = io.StringIO(), io.StringIO()
+            ReferenceInterpreterBackend().execute(
+                checked, output=output, error_output=errors, project_root=DISCORD_ROOT,
+            )
+            reference = (0, output.getvalue(), errors.getvalue())
+            self.assertEqual(reference, (0, "true\n" * 4, ""))
+            if _native_cpp_available():
+                executable = directory / "global-native"
+                CppNativeBackend().build(
+                    lower_checked_program(checked), executable, project_root=DISCORD_ROOT,
+                )
+                native = subprocess.run(
+                    [str(executable)], cwd=DISCORD_ROOT, capture_output=True, text=True,
+                    encoding="utf-8", check=False, timeout=30,
+                )
+                self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+
+
     def test_coordinated_rest_waits_for_global_and_bucket_limits_with_native_parity(self) -> None:
         native_available = _native_cpp_available()
         openssl = shutil.which("openssl")

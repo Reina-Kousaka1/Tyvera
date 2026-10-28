@@ -406,7 +406,10 @@ pub actor DiscordRestRateLimitCoordinator {
             self.blockedUntilByMajor.put(majorScope, now + delayMilliseconds)
             self.stateExpirations.put(majorScope, now + 600000)
             if globalLimit {
-                self.globalBlockedUntil = now + delayMilliseconds
+                let candidate = now + delayMilliseconds
+                if candidate > self.globalBlockedUntil {
+                    self.globalBlockedUntil = candidate
+                }
             }
         } else {
             match remaining {

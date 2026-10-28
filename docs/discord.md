@@ -92,6 +92,9 @@ return 0 and are ignored. This prevents a late request from releasing a newer
 request's lease after timeout/recovery. These actor messages are an experimental
 internal coordination protocol; the public `requestBotCoordinated` and
 `requestBotWithRetriesCoordinated` function signatures are unchanged.
+Concurrent global 429 responses retain the latest outstanding monotonic
+deadline. A later response with a shorter retry delay cannot shorten an
+already active global block.
 
 The coordinator caps retained route mappings and major-scope states at 512 each and expires idle entries after ten minutes. It allows at most 512 active major scopes, serializes requests within one major scope, and conservatively applies the latest remaining/reset state to that whole scope; independent Discord buckets under one major scope can therefore be over-throttled. The queue is capped at 512 outstanding tickets. Waiting tasks recheck at most every 50 ms; reservation order is the order in which the coordinator accepts reservation messages, and it is retained per major scope while unrelated scopes remain independent. A request timeout removes its ticket. If a task is externally cancelled before that path runs, its ticket remains inert only until its bounded deadline and is pruned lazily on the next reservation or acquisition. Cancellation during transport leaves a bounded lease until its request timeout plus five seconds. Coordinated requests accept timeouts from 1 ms through 10 minutes. Malformed 429 delays use a one-second local block; no request is automatically replayed except by the explicit retry API, and transport failures are never retried. Legacy `requestBot` and `requestBotWithRetries` calls do not participate in coordinator state.
 The package now has an experimental native lowering path for linked source
