@@ -269,8 +269,12 @@ Native actor-owned Tasks are bound to the actor instance that creates them.
 Stop, crash, supervised restart, and runtime shutdown request cancellation and
 wait for those Tasks to finish cleanup before the lifecycle transition completes.
 A Task that stops its own actor unwinds at its next interruption point.
-`sendAfter` timers, monitoring/links, task groups, and
-supervised actors owning move-only Resources remain unsupported natively.
+Native TaskGroups support owner-bound registration of direct child Tasks,
+duplicate rejection, `isDone`, cancellation, and `await` joins. A group is a
+join/cancellation view, not an ownership transfer; the creator remains
+responsible for every child. Groups cannot cross actor boundaries or be created
+and used in actor handlers.
+`sendAfter` timers, monitoring/links, and supervised actors owning move-only Resources remain unsupported natively.
 Generated actor references use shared runtime handles; queued callbacks hold
 weak target references, and runtime shutdown clears mailboxes, supervisors,
 and actor state to break reference cycles. The native runtime retains spawned
