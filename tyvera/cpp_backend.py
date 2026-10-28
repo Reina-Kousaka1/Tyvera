@@ -1565,6 +1565,10 @@ struct Failure final : std::exception {
         : file(std::move(source_file)), line(source_line), column(source_column), message(std::move(text)) {}
     const char* what() const noexcept override { return message.c_str(); }
 };
+inline std::string render_task_failure(const Failure& failure) {
+    return failure.file + ":" + std::to_string(failure.line) + ":" + std::to_string(failure.column)
+        + ": runtime error: " + failure.message;
+}
 struct TaskCancelled final : std::exception {
     const char* what() const noexcept override { return "task was cancelled"; }
 };
@@ -1637,6 +1641,8 @@ struct TaskControl {
     virtual void start() = 0;
     virtual void join() = 0;
     virtual std::string failure_message() const = 0;
+    virtual std::string failure_message_for_owner() const = 0;
+    virtual std::string failure_message_for_run() const = 0;
     virtual bool wait_until(std::chrono::steady_clock::time_point deadline, const TaskControl* waiter) = 0;
     virtual void notify_waiters() noexcept {}
     bool prepare_start() {
@@ -1682,6 +1688,10 @@ struct TaskControl {
     bool is_cancelled() const noexcept { return cancellation_requested.load(std::memory_order_acquire); }
     bool is_done() const {
         if (done.load(std::memory_order_acquire) || is_cancelled()) return true;
+        std::lock_guard<std::mutex> lock(child_failure_mutex);
+        return !child_failure.empty();
+    }
+    bool has_child_failure() const {
         std::lock_guard<std::mutex> lock(child_failure_mutex);
         return !child_failure.empty();
     }
@@ -1751,7 +1761,7 @@ struct TaskControl {
                 }
                 if (!check_owner) continue;
                 check_interruption();
-                const auto message = child->failure_message();
+                const auto message = child->failure_message_for_owner();
                 if (!message.empty()) {
                     record_child_failure(message);
                     check_interruption();
@@ -1767,7 +1777,7 @@ struct TaskControl {
     }
     void notify_owner_failure() {
         if (!owner) return;
-        const auto message = failure_message();
+        const auto message = failure_message_for_owner();
         if (!message.empty()) owner->record_child_failure(message);
     }
 };
@@ -1935,6 +1945,7 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
                     }
                     self->done.store(true, std::memory_order_release);
                 }
+                self->notify_owner_failure();
                 self->lifecycle_changed.notify_all();
                 auto& scheduler = native_scheduler();
                 {
@@ -1943,7 +1954,6 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
                 }
                 self->ready.notify_all();
                 scheduler.changed.notify_all();
-                self->notify_owner_failure();
             });
         } catch (...) {
             const auto failure = std::current_exception();
@@ -1957,6 +1967,7 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
                 cleanup_failure = std::move(cleanup);
                 done.store(true, std::memory_order_release);
             }
+            notify_owner_failure();
             lifecycle_changed.notify_all();
             auto& scheduler = native_scheduler();
             {
@@ -1965,7 +1976,6 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
             }
             ready.notify_all();
             scheduler.changed.notify_all();
-            notify_owner_failure();
         }
     }
     T await(const std::string& file, int line, int column) {
@@ -1978,6 +1988,9 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
             if (active_task_control) active_task_control->check_interruption();
             lock.lock();
         }
+        lock.unlock();
+        if (active_task_control) active_task_control->check_interruption();
+        lock.lock();
         if (error) {
             try { std::rethrow_exception(error); }
             catch (const TaskCancelled&) { throw Failure(file, line, column, "task was cancelled"); }
@@ -1995,6 +2008,9 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
             if (active_task_control) active_task_control->check_interruption();
             lock.lock();
         }
+        lock.unlock();
+        if (active_task_control) active_task_control->check_interruption();
+        lock.lock();
         if (error) {
             try { std::rethrow_exception(error); }
             catch (const TaskCancelled&) { throw Failure(file, line, column, "task was cancelled"); }
@@ -2021,6 +2037,34 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
         if (error) {
             try { std::rethrow_exception(error); }
             catch (const Failure& failure) { message = failure.what(); }
+            catch (const TaskCancelled&) {}
+            catch (...) { message = "native task failed"; }
+        }
+        return message + cleanup_failure;
+    }
+    std::string failure_message_for_owner() const override {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::string message;
+        if (error) {
+            try { std::rethrow_exception(error); }
+            catch (const Failure& failure) {
+                message = has_child_failure() ? failure.what() : render_task_failure(failure);
+            }
+            catch (const TaskCancelled&) {}
+            catch (...) { message = "native task failed"; }
+        }
+        return message + cleanup_failure;
+    }
+    std::string failure_message_for_run() const override {
+        const auto reply_failure = actor_reply_failure_message();
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!reply_failure.empty()) return reply_failure + cleanup_failure;
+        std::string message;
+        if (error) {
+            try { std::rethrow_exception(error); }
+            catch (const Failure& failure) {
+                message = has_child_failure() ? failure.what() : render_task_failure(failure);
+            }
             catch (const TaskCancelled&) {}
             catch (...) { message = "native task failed"; }
         }
@@ -2078,12 +2122,12 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
                     self->cleanup_failure = std::move(cleanup);
                     self->done.store(true, std::memory_order_release);
                 }
+                self->notify_owner_failure();
                 self->lifecycle_changed.notify_all();
                 auto& scheduler = native_scheduler();
                 { std::lock_guard<std::mutex> lock(scheduler.mutex); ++scheduler.completed; }
                 self->ready.notify_all();
                 scheduler.changed.notify_all();
-                self->notify_owner_failure();
             });
         } catch (...) {
             const auto failure = std::current_exception();
@@ -2097,12 +2141,12 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
                 cleanup_failure = std::move(cleanup);
                 done.store(true, std::memory_order_release);
             }
+            notify_owner_failure();
             lifecycle_changed.notify_all();
             auto& scheduler = native_scheduler();
             { std::lock_guard<std::mutex> lock(scheduler.mutex); ++scheduler.completed; }
             ready.notify_all();
             scheduler.changed.notify_all();
-            notify_owner_failure();
         }
     }
     void await(const std::string& file, int line, int column) {
@@ -2115,6 +2159,9 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
             if (active_task_control) active_task_control->check_interruption();
             lock.lock();
         }
+        lock.unlock();
+        if (active_task_control) active_task_control->check_interruption();
+        lock.lock();
         if (error) {
             try { std::rethrow_exception(error); }
             catch (const TaskCancelled&) { throw Failure(file, line, column, "task was cancelled"); }
@@ -2137,6 +2184,34 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
         if (error) {
             try { std::rethrow_exception(error); }
             catch (const Failure& failure) { message = failure.what(); }
+            catch (const TaskCancelled&) {}
+            catch (...) { message = "native task failed"; }
+        }
+        return message + cleanup_failure;
+    }
+    std::string failure_message_for_owner() const override {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::string message;
+        if (error) {
+            try { std::rethrow_exception(error); }
+            catch (const Failure& failure) {
+                message = has_child_failure() ? failure.what() : render_task_failure(failure);
+            }
+            catch (const TaskCancelled&) {}
+            catch (...) { message = "native task failed"; }
+        }
+        return message + cleanup_failure;
+    }
+    std::string failure_message_for_run() const override {
+        const auto reply_failure = actor_reply_failure_message();
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!reply_failure.empty()) return reply_failure + cleanup_failure;
+        std::string message;
+        if (error) {
+            try { std::rethrow_exception(error); }
+            catch (const Failure& failure) {
+                message = has_child_failure() ? failure.what() : render_task_failure(failure);
+            }
             catch (const TaskCancelled&) {}
             catch (...) { message = "native task failed"; }
         }
@@ -2274,7 +2349,7 @@ struct TaskGroup {
                     if (active_task_control) active_task_control->check_interruption();
                 }
                 if (active_task_control) active_task_control->check_interruption();
-                const auto failure = member->failure_message();
+                const auto failure = member->failure_message_for_owner();
                 if (!failure.empty()) throw Failure(file, line, column, failure);
             }
             if (active_task_control) active_task_control->check_interruption();
@@ -6255,12 +6330,12 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
     if (!scheduler_failure.empty()) return result_error<std::int64_t>(std::move(scheduler_failure));
     for (const auto& task : completed_tasks) {
         if (task->owner) continue;
-        const auto failure = task->failure_message();
+        const auto failure = task->failure_message_for_run();
         if (!failure.empty()) {
             const auto reply_failure = task->actor_reply_failure_message();
             if (!reply_failure.empty() && failure == reply_failure)
                 return result_error<std::int64_t>(reply_failure);
-            return result_error<std::int64_t>("async task failed: " + failure);
+            return result_error<std::int64_t>(failure);
         }
     }
     return result_ok<std::int64_t>(static_cast<std::int64_t>(completed_count));
