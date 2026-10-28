@@ -4138,7 +4138,14 @@ fn main() {{
         Err(error) => println(error)
         Ok(_) => {{}}
     }}
-    let posted = await httpPost(url, headers, bytesFromString("upload"), milliseconds(2000))
+    let pendingPost = httpPost(url, headers, bytesFromString("upload"), milliseconds(2000))
+    let alias = headers
+    var mutation: Int = 0
+    while mutation < 256 {{
+        let changed = alias.set("X-Upload", "yes")
+        mutation = mutation + 1
+    }}
+    let posted = await pendingPost
     match posted {{
         Err(error) => println(error)
         Ok(response) => {{

@@ -301,6 +301,9 @@ and used in actor handlers.
 `Task.tryResult()` is a non-starting poll with the reference Result/Option shape. Ordinary results may be observed repeatedly. A resource-containing task is consumed: a completed result transfers once, while a pending task is cancelled and its operation retains cleanup ownership until it drains. The 64-unfinished-task and 4,096-registered-value limits still apply.
 
 `ActorRef.monitor()`/`demonitor()` and symmetric `link()`/`unlink()` are supported by the native runtime. `sendAfter` timers and supervised actors owning move-only Resources remain unsupported natively.
+Native HTTP workers encode mutable, potentially aliased request headers under
+the same execution guard used by Tyvera task bodies. Network waits happen after
+releasing that guard; cancellation also interrupts workers queued to acquire it.
 Generated actor references use shared runtime handles; queued callbacks hold
 weak target references, and runtime shutdown clears mailboxes, supervisors,
 and actor state to break reference cycles. The native runtime retains spawned

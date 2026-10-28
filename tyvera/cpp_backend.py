@@ -7772,7 +7772,14 @@ inline Task<StringResult<std::shared_ptr<HttpResponse>>> http_send(
     return make_io_task<Output>(
         [url = std::move(url), request = std::move(request), timeout, file, line, column]() mutable -> Output {
             if (!request) return result_error<std::shared_ptr<HttpResponse>>("invalid HTTP request values");
+            // HttpHeaders aliases are mutable Tyvera values. Encode under the
+            // same execution guard as their callers, then release it before I/O.
+            // Cancellation must also wake a worker queued behind an actor stop.
+            std::unique_lock<NativeExecutionMutex> request_lock(
+                native_scheduler().execution_mutex, std::defer_lock);
+            reacquire_execution_lock(request_lock, active_task_control);
             auto encoded = http_encode_request(*request, url);
+            request_lock.unlock();
             if (std::holds_alternative<std::string>(encoded))
                 return result_error<std::shared_ptr<HttpResponse>>("HTTP request encoding failed: " + std::get<1>(std::move(encoded)));
             auto transport = std::make_shared<NativeHttpTransport>();
