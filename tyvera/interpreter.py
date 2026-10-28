@@ -723,6 +723,7 @@ class Interpreter:
         self.secret_provider = SecretProvider(self.project_root)
         self._clock = monotonic_seconds if clock is None else clock
         self._sleep = monotonic_sleep if sleeper is None else sleeper
+        self._interruptible_idle_wait = clock is None and sleeper is None
         self._io_backend: IOBackend | None = None
         self._shutdown_controller = shutdown_controller
         self._runtime_event_sink = runtime_event_sink
@@ -2805,7 +2806,7 @@ class Interpreter:
             if pending.due_at > now:
                 if not wait:
                     break
-                self._sleep(pending.due_at - now)
+                self._wait_idle(pending.due_at - now, pending.location)
                 continue
             self._pending_supervisor_restarts.pop(0)
             supervisor = pending.supervisor
@@ -3031,6 +3032,16 @@ class Interpreter:
         if self._io_backend is None:
             self._io_backend = IOBackend()
         return self._io_backend
+
+    def _wait_idle(self, delay: float, location: Location) -> None:
+        # Use the existing selector wakeup for real-time signal-aware waits.
+        # Injected clocks/sleepers remain deterministic for scheduler tests.
+        if self._shutdown_controller is not None and self._interruptible_idle_wait:
+            backend = self._get_io_backend()
+            self._check_shutdown(location)
+            backend.wait(delay)
+        else:
+            self._sleep(delay)
 
     @staticmethod
     def _task_is_active(task: _TyveraTask) -> bool:
@@ -4722,7 +4733,7 @@ class Interpreter:
                 if deadline is not None:
                     delay = max(0.0, deadline - self._clock())
                     if delay > 0:
-                        self._sleep(delay)
+                        self._wait_idle(delay, location)
                     continue
 
                 waiting_on_reply = self._has_waiting_actor_reply(active)

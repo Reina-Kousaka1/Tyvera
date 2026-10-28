@@ -745,7 +745,7 @@ class _FunctionLowerer:
             if expression.type_arguments:
                 raise Diagnostic(expression.location, "backend", "native backend does not yet support generic method calls")
             if isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Task" and expression.method not in {
-                "cancel", "isCancelled", "isDone", "withTimeout", "tryResult",
+                "cancel", "isCancelled", "isDone", "withTimeout", "tryResult", "detach",
             }:
                 raise Diagnostic(
                     expression.location, "backend",

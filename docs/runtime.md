@@ -258,6 +258,16 @@ they never fall back to the reference interpreter. See
 
 ## Native runtime boundaries
 
+Native runtime exit first rejects new Task registration, cancels registered Tasks
+in reverse registration order, starts only the cleanup path of cancelled cold
+Tasks, and joins all workers before stopping the remaining actors. Moved
+arguments remain owned by their Task until cleanup completes. Cleanup failures
+are reported without replacing an original runtime error or signal exit code.
+Linux SIGINT/SIGTERM wakes idle scheduler waits through a non-blocking self-pipe;
+the signal handler never takes runtime locks or performs cleanup. The reference
+interpreter uses its existing selector wakeup for real-time idle deadlines too;
+injected test clocks and sleepers retain deterministic scheduling.
+
 The reference scheduler remains cooperative and single-threaded. The native
 Linux subset uses OS worker threads for tasks and pending network I/O, but
 serializes Tyvera task bodies so shared mutable values are not accessed in
@@ -296,7 +306,15 @@ A Task that stops its own actor unwinds at its next interruption point.
 Native TaskGroups support owner-bound registration of direct child Tasks,
 duplicate rejection, `isDone`, cancellation, and `await` joins. A group is a
 join/cancellation view, not an ownership transfer; the creator remains
-responsible for every child. Groups cannot cross actor boundaries or be created
+responsible for every non-detached child. Native `Task.detach()` returns `true`
+only for an active direct child of the calling Task; root, terminal, repeated,
+and non-owner detach attempts return `false`. It removes the Task-parent edge
+and memberships in that owner's groups. The detached Task keeps its resources,
+remains in the scheduler registry, and can outlive its parent. Failure stays
+visible in `runTasks()`, and cancellation of the former parent no longer reaches
+it. An independent actor ownership edge is retained. Detachment does not bypass
+the 64 unfinished / 4,096 registered Task limits or final runtime shutdown.
+Groups cannot cross actor boundaries or be created
 and used in actor handlers.
 `Task.tryResult()` is a non-starting poll with the reference Result/Option shape. Ordinary results may be observed repeatedly. A resource-containing task is consumed: a completed result transfers once, while a pending task is cancelled and its operation retains cleanup ownership until it drains. The 64-unfinished-task and 4,096-registered-value limits still apply.
 

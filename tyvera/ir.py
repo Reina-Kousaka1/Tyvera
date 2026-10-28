@@ -582,6 +582,7 @@ def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef
             "isDone": ((), IRType.BOOL),
             "isCancelled": ((), IRType.BOOL),
             "cancel": ((), IRType.BOOL),
+            "detach": ((), IRType.BOOL),
             "withTimeout": ((IRType.DURATION,), _applied("Task", receiver.arguments[0])),
             "tryResult": ((), _applied(
                 "Result", IRType.BOOL if receiver.arguments[0] == IRType.VOID

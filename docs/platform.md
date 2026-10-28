@@ -62,6 +62,13 @@ stops supervisor trees from the root downward, and drains the bounded I/O
 worker pool before exit. Cleanup failure is appended without replacing the
 signal or its conventional exit code.
 
+Native Linux executables use a non-blocking, close-on-exec self-pipe and one
+bounded runtime wakeup worker. The signal handler only records the first signal
+and writes a wakeup byte; the worker notifies scheduler condition variables.
+A sleeping detached Task is cancelled and joined before runtime exit, including
+resource cleanup. This path is tested on Linux x86-64 and ARM64; it is not a
+claim of equivalent native signal support on every host platform.
+
 This is cooperative shutdown, not preemption. A currently executing
 synchronous Tyvera call must return before the next safe point. No configurable
 grace period or forced termination of arbitrary child-process trees exists.

@@ -662,8 +662,9 @@ scheduler-root work, and its failure remains visible as an error from
 TaskGroup values cannot be sent between actors. A detached task can outlive its
 former parent task; runtime shutdown remains the final cancellation boundary.
 A task started directly by an actor constructor or message handler belongs to
-that actor and is cancelled on actor stop, crash, or supervised restart. Actor
-handlers cannot detach their direct tasks because they run synchronously.
+that actor and is cancelled on actor stop, crash, or supervised restart.
+Detachment removes only a Task-parent edge; it does not remove an independent
+actor ownership edge. Calls outside a parent Task return `false`.
 The task scheduler is single-threaded; it provides cooperative concurrency,
 not parallel execution. When tasks await actor replies, the scheduler delivers
 at most one queued actor message between task turns, so a continuously runnable
@@ -1056,8 +1057,7 @@ experimental Linux path additionally supports async functions, `Task<T>`,
 DNS, TCP, a verified TLS client, cooperative task cancellation, and monotonic
 deadlines, TaskGroups, result polling, actor request/reply, monitoring/links,
 Supervisor V2, and bounded HTTP/WebSocket clients. Classes, generic
-functions/types, HTTP/WebSocket servers, native task
-detachment, and native FFI remain unsupported. Native actor state cannot own
+functions/types, HTTP/WebSocket servers, and native FFI remain unsupported. Native actor state cannot own
 Resources or Task handles; Tasks created by a handler belong to that actor
 instance and drain on stop/crash/restart. `await` remains statement-only;
 synchronous calls are atomic. `runActors()` drains queued messages and pending

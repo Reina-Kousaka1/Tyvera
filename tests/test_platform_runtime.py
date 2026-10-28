@@ -142,6 +142,33 @@ fn main() {
             self.assertEqual((root / "shutdown.txt").read_text(encoding="utf-8"), "closed on shutdown")
             self.assertEqual(interpreter._runtime_state, "closed")
 
+    def test_shutdown_wakes_a_task_deadline_without_sleep_polling(self) -> None:
+        program, _ = compile_source('''async fn wait() { await sleepFor(seconds(60)) }
+fn main() { let task = wait(); runTasks() }''', "sleep-shutdown.tyv")
+        controller = ShutdownController()
+        with patch("tyvera.interpreter.IOBackend") as adapter:
+            backend = adapter.return_value
+            backend.has_pending = False
+            backend.wait.side_effect = lambda _timeout: controller.request(signal.SIGTERM)
+            interpreter = Interpreter(program, io.StringIO(), shutdown_controller=controller)
+            with self.assertRaises(ShutdownDiagnostic):
+                interpreter.run()
+            backend.wait.assert_called_once()
+            self.assertGreater(backend.wait.call_args.args[0], 0)
+            backend.wake.assert_called_once()
+            backend.shutdown.assert_called_once()
+            self.assertEqual(interpreter._runtime_state, "closed")
+
+    def test_shutdown_before_idle_adapter_creation_cannot_lose_wakeup(self) -> None:
+        program, _ = compile_source("fn main() {}", "early-shutdown.tyv")
+        controller = ShutdownController()
+        interpreter = Interpreter(program, io.StringIO(), shutdown_controller=controller)
+        controller.request(signal.SIGINT)
+        with patch("tyvera.interpreter.IOBackend") as adapter:
+            with self.assertRaises(ShutdownDiagnostic):
+                interpreter._wait_idle(60, program.functions[0].location)
+            adapter.return_value.wait.assert_not_called()
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux process signals")
     def test_cli_signal_exit_codes_and_cleanup_for_sigint_and_sigterm(self) -> None:
         source = '''fn main() {

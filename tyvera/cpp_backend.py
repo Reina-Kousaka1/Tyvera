@@ -237,26 +237,37 @@ class _CppGenerator:
         self._line("return static_cast<int>(tyvera_runtime::ExitCode::initialization_failure);")
         self.indent -= 1
         self._line("}")
+        self._line("tyvera_runtime::ShutdownSignalWakeup signal_wakeup;")
+        self._line("if (!signal_wakeup.ready()) {")
+        self.indent += 1
+        self._line('std::cerr << "<native>:1:1: runtime initialization failed: could not create shutdown wakeup\\n";')
+        self._line("return static_cast<int>(tyvera_runtime::ExitCode::initialization_failure);")
+        self.indent -= 1
+        self._line("}")
         self._line("tyvera_runtime::ActorRuntimeScope actor_runtime_scope;")
         self._line("try {")
         self.indent += 1
         self._line(f"tyvera_generated::{self.module.entry_symbol}();")
+        self._line("actor_runtime_scope.shutdown();")
         self._line('tyvera_runtime::check_shutdown("<native>", 1, 1);')
         self._line("if (tyvera_runtime::report_cleanup_failures()) return 1;")
         self._line("return static_cast<int>(tyvera_runtime::ExitCode::success);")
         self.indent -= 1
         self._line("} catch (const tyvera_runtime::SignalShutdown& signal) {")
         self.indent += 1
-        self._line("""std::cerr << signal.file << ':' << signal.line << ':' << signal.column << ": runtime shutdown: " << signal.what() << tyvera_runtime::cleanup_failure_suffix() << '\\n';""")
+        self._line("actor_runtime_scope.shutdown();")
+        self._line("""std::cerr << signal.file << ':' << signal.line << ':' << signal.column << ": runtime error: " << signal.what() << tyvera_runtime::cleanup_failure_suffix() << '\\n';""")
         self._line("return signal.exit_code;")
         self.indent -= 1
         self._line("} catch (const tyvera_runtime::Failure& error) {")
         self.indent += 1
+        self._line("actor_runtime_scope.shutdown();")
         self._line("""std::cerr << error.file << ':' << error.line << ':' << error.column << ": runtime error: " << error.message << tyvera_runtime::cleanup_failure_suffix() << '\\n';""")
         self._line("return static_cast<int>(tyvera_runtime::ExitCode::runtime_failure);")
         self.indent -= 1
         self._line("} catch (const std::exception&) {")
         self.indent += 1
+        self._line("actor_runtime_scope.shutdown();")
         self._line("""std::cerr << "<native>:1:1: runtime error: native runtime failure" << tyvera_runtime::cleanup_failure_suffix() << '\\n';""")
         self._line("return static_cast<int>(tyvera_runtime::ExitCode::runtime_failure);")
         self.indent -= 1
@@ -1218,7 +1229,7 @@ class _CppGenerator:
                     return f"({receiver}).try_result()"
                 move_result = "true" if _ir_contains_resource(expression.receiver.type.arguments[0]) else "false"
                 return f"({receiver}).try_result<{move_result}>()"
-            functions = {"cancel": "cancel", "isCancelled": "is_cancelled", "isDone": "is_done"}
+            functions = {"cancel": "cancel", "isCancelled": "is_cancelled", "isDone": "is_done", "detach": "detach"}
             return f"({receiver}).{functions[method]}()"
         if expression.receiver.type == IRType.DURATION and method == "inMilliseconds":
             return f"({receiver}).milliseconds"
@@ -1494,11 +1505,26 @@ enum class ExitCode : int {
     platform_failure = 72,
 };
 
-inline volatile std::sig_atomic_t requested_shutdown_signal = 0;
+static_assert(std::atomic<std::sig_atomic_t>::is_always_lock_free,
+              "native shutdown requires lock-free signal atomics");
+inline std::atomic<std::sig_atomic_t> requested_shutdown_signal{0};
+#if defined(__linux__)
+inline std::atomic<std::sig_atomic_t> shutdown_wakeup_write_fd{-1};
+#endif
 inline void shutdown_signal_handler(int number) noexcept {
     // Signal context may only record a small scalar. The first signal owns the
     // shutdown request; repeats do not bypass deterministic RAII cleanup.
-    if (requested_shutdown_signal == 0) requested_shutdown_signal = number;
+    std::sig_atomic_t first = 0;
+    requested_shutdown_signal.compare_exchange_strong(first, number, std::memory_order_relaxed);
+#if defined(__linux__)
+    const int saved_errno = errno;
+    const int descriptor = static_cast<int>(shutdown_wakeup_write_fd.load(std::memory_order_relaxed));
+    if (descriptor >= 0) {
+        const unsigned char byte = 1;
+        (void)::write(descriptor, &byte, 1); // Async-signal-safe; never block a handler.
+    }
+    errno = saved_errno;
+#endif
 }
 inline bool install_shutdown_handlers() noexcept {
     if (std::signal(SIGINT, shutdown_signal_handler) == SIG_ERR) return false;
@@ -1690,7 +1716,7 @@ constexpr std::size_t MAX_NATIVE_UNFINISHED_TASKS_PER_RUN = 64;
 inline std::atomic<std::uint64_t> next_native_task_identity{1};
 struct TaskControl {
     const std::uint64_t identity = next_native_task_identity.fetch_add(1, std::memory_order_relaxed);
-    std::uint64_t owner_identity = 0;
+    std::atomic<std::uint64_t> owner_identity{0};
     std::atomic<bool> started{false};
     bool execution_registered = false;
     std::atomic<bool> done{false};
@@ -1719,6 +1745,7 @@ struct TaskControl {
     virtual std::string failure_message() const = 0;
     virtual std::string failure_message_for_owner() const = 0;
     virtual std::string failure_message_for_run() const = 0;
+    virtual std::string shutdown_cleanup_failure() const = 0;
     virtual bool wait_until(std::chrono::steady_clock::time_point deadline, const TaskControl* waiter) = 0;
     virtual void notify_waiters() noexcept {}
     void register_execution() {
@@ -1863,10 +1890,30 @@ struct TaskControl {
         if (resume_serialized && !execution_lock->owns_lock() && !is_cancelled())
             reacquire_execution_lock(*execution_lock, this);
     }
+    bool detach_from(TaskControl* caller) {
+        if (!caller || caller == this) return false;
+        // Completion publishes done under lifecycle_mutex before notifying its
+        // owner. Detach either removes a live edge first, or observes completion.
+        std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex);
+        if (owner != caller || is_done() || caller->is_done()) return false;
+        std::lock_guard<std::mutex> children_lock(caller->children_mutex);
+        const auto found = std::find_if(caller->children.begin(), caller->children.end(),
+            [this](const auto& child) { return child.get() == this; });
+        if (found == caller->children.end()) return false;
+        caller->children.erase(found);
+        owner = nullptr;
+        owner_identity.store(0, std::memory_order_release);
+        return true;
+    }
     void notify_owner_failure() {
-        if (!owner) return;
+        TaskControl* recipient = nullptr;
+        {
+            std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex);
+            recipient = owner;
+        }
+        if (!recipient) return;
         const auto message = failure_message_for_owner();
-        if (!message.empty()) owner->record_child_failure(message);
+        if (!message.empty()) recipient->record_child_failure(message);
     }
 };
 inline std::string cleanup_failure_suffix();
@@ -1876,6 +1923,7 @@ struct NativeScheduler {
     std::condition_variable changed;
     std::vector<std::shared_ptr<TaskControl>> tasks;
     bool running = false;
+    bool shutting_down = false;
     std::size_t completed = 0;
     std::atomic<std::uint64_t> work_revision{0};
 };
@@ -1959,6 +2007,7 @@ inline void register_native_task(const std::shared_ptr<TaskControl>& task,
     bool start_now = false;
     {
         std::lock_guard<std::mutex> lock(scheduler.mutex);
+        if (scheduler.shutting_down) throw TaskCancelled{};
         if (scheduler.tasks.size() >= MAX_NATIVE_TASK_VALUES_PER_RUN)
             throw Failure(file, line, column, "native task capacity exceeded (maximum 4096 Task values per run)");
         const auto unfinished_tasks = std::count_if(
@@ -2127,6 +2176,10 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
         ready.notify_all();
     }
     void join() override { if (worker.joinable()) worker.join(); }
+    std::string shutdown_cleanup_failure() const override {
+        std::lock_guard<std::mutex> lock(mutex);
+        return cleanup_failure;
+    }
     std::string failure_message() const override {
         std::lock_guard<std::mutex> lock(mutex);
         std::string message;
@@ -2281,6 +2334,10 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
         ready.notify_all();
     }
     void join() override { if (worker.joinable()) worker.join(); }
+    std::string shutdown_cleanup_failure() const override {
+        std::lock_guard<std::mutex> lock(mutex);
+        return cleanup_failure;
+    }
     std::string failure_message() const override {
         std::lock_guard<std::mutex> lock(mutex);
         std::string message;
@@ -2341,6 +2398,7 @@ inline std::string task_poll_failure(const std::shared_ptr<TaskControl>& state) 
 template <typename T> struct Task {
     std::shared_ptr<TaskState<T>> state;
     bool cancel() const { return state && state->request_cancel(); }
+    bool detach() const { return state && state->detach_from(active_task_control); }
     bool is_cancelled() const { return state && state->is_cancelled(); }
     bool is_done() const { return !state || state->is_done(); }
     template <bool MoveResult = false> StringResult<std::optional<T>> try_result() const {
@@ -2404,6 +2462,7 @@ template <typename T> struct Task {
 template <> struct Task<void> {
     std::shared_ptr<TaskState<void>> state;
     bool cancel() const { return state && state->request_cancel(); }
+    bool detach() const { return state && state->detach_from(active_task_control); }
     bool is_cancelled() const { return state && state->is_cancelled(); }
     bool is_done() const { return !state || state->is_done(); }
     StringResult<bool> try_result() const {
@@ -2463,7 +2522,8 @@ struct TaskGroup {
         std::vector<std::weak_ptr<TaskControl>> members;
         { std::lock_guard<std::mutex> lock(state->mutex); members = state->members; }
         for (const auto& weak : members) {
-            if (auto member = weak.lock(); member && !member->done.load(std::memory_order_acquire)) return false;
+            if (auto member = weak.lock(); member && member->owner_identity.load(std::memory_order_acquire) == state->owner_identity
+                && !member->done.load(std::memory_order_acquire)) return false;
         }
         return true;
     }
@@ -2473,8 +2533,8 @@ struct TaskGroup {
         { std::lock_guard<std::mutex> lock(state->mutex); members = state->members; }
         std::int64_t count = 0;
         for (const auto& weak : members) {
-            if (auto member = weak.lock(); member && !member->done.load(std::memory_order_acquire)
-                && !member->is_cancelled()) {
+            if (auto member = weak.lock(); member && member->owner_identity.load(std::memory_order_acquire) == state->owner_identity
+                && !member->done.load(std::memory_order_acquire) && !member->is_cancelled()) {
                 member->request_cancel();
                 ++count;
             }
@@ -2486,7 +2546,9 @@ struct TaskGroup {
         std::vector<std::shared_ptr<TaskControl>> members;
         {
             std::lock_guard<std::mutex> lock(state->mutex);
-            for (const auto& weak : state->members) if (auto member = weak.lock()) members.push_back(std::move(member));
+            for (const auto& weak : state->members)
+                if (auto member = weak.lock(); member && member->owner_identity.load(std::memory_order_acquire) == state->owner_identity)
+                    members.push_back(std::move(member));
         }
         auto* execution_lock = active_execution_lock;
         const bool resume_serialized = execution_lock && execution_lock->owns_lock();
@@ -2650,6 +2712,36 @@ inline bool report_cleanup_failures() {
     }
     errors.clear();
     return true;
+}
+
+inline void shutdown_native_tasks() noexcept {
+    auto& scheduler = native_scheduler();
+    std::vector<std::shared_ptr<TaskControl>> tasks;
+    {
+        std::lock_guard<std::mutex> lock(scheduler.mutex);
+        scheduler.shutting_down = true;
+        scheduler.running = false;
+        tasks.swap(scheduler.tasks);
+    }
+    for (auto task = tasks.rbegin(); task != tasks.rend(); ++task) {
+        try { (*task)->request_cancel(); } catch (...) {}
+    }
+    // Starting a cancelled cold task runs only its cancellation/cleanup path.
+    // This releases moved arguments even when main never pumped the scheduler.
+    for (const auto& task : tasks) {
+        try { if (!task->started.load(std::memory_order_acquire)) task->start(); }
+        catch (...) {}
+    }
+    for (const auto& task : tasks) {
+        try { task->join(); } catch (...) {}
+        try {
+            auto cleanup = task->shutdown_cleanup_failure();
+            const std::string prefix = "; resource cleanup also failed: ";
+            if (cleanup.rfind(prefix, 0) == 0) cleanup.erase(0, prefix.size());
+            if (!cleanup.empty())
+                record_cleanup_failure(task->source_file, task->source_line, task->source_column, cleanup);
+        } catch (...) {}
+    }
 }
 
 [[noreturn]] inline void fail(const std::string& file, int line, int column, const char* message) {
@@ -5014,8 +5106,73 @@ inline void shutdown_actors() noexcept {
     state.changed.notify_all();
 }
 struct ActorRuntimeScope {
-    ~ActorRuntimeScope() { shutdown_actors(); }
+    bool closed = false;
+    void shutdown() noexcept {
+        if (closed) return;
+        closed = true;
+        shutdown_native_tasks();
+        shutdown_actors();
+    }
+    ~ActorRuntimeScope() { shutdown(); }
 };
+class ShutdownSignalWakeup {
+#if defined(__linux__)
+    int read_fd_ = -1;
+    int write_fd_ = -1;
+    std::atomic<bool> stopping_{false};
+    std::thread worker_;
+public:
+    ShutdownSignalWakeup() noexcept {
+        int descriptors[2];
+        if (::pipe2(descriptors, O_NONBLOCK | O_CLOEXEC) != 0) return;
+        read_fd_ = descriptors[0];
+        write_fd_ = descriptors[1];
+        try {
+            worker_ = std::thread([this]() {
+                while (!stopping_.load(std::memory_order_acquire)) {
+                    pollfd item{read_fd_, POLLIN, 0};
+                    const int status = ::poll(&item, 1, -1);
+                    if (status < 0 && errno == EINTR) continue;
+                    if (status <= 0 || (item.revents & (POLLERR | POLLNVAL))) break;
+                    unsigned char buffer[64];
+                    while (::read(read_fd_, buffer, sizeof(buffer)) > 0) {}
+                    if (stopping_.load(std::memory_order_acquire)) break;
+                    notify_task_scheduler();
+                    auto& actors = actor_runtime_state();
+                    std::lock_guard<std::mutex> lock(actors.mutex);
+                    actors.changed.notify_all();
+                }
+            });
+            shutdown_wakeup_write_fd.store(write_fd_, std::memory_order_release);
+            if (requested_shutdown_signal.load(std::memory_order_acquire) != 0) wake();
+        } catch (...) {
+            ::close(read_fd_);
+            ::close(write_fd_);
+            read_fd_ = write_fd_ = -1;
+        }
+    }
+    void wake() noexcept {
+        const unsigned char byte = 1;
+        if (write_fd_ >= 0) (void)::write(write_fd_, &byte, 1);
+    }
+    bool ready() const noexcept { return read_fd_ >= 0 && worker_.joinable(); }
+    ~ShutdownSignalWakeup() noexcept {
+        shutdown_wakeup_write_fd.store(-1, std::memory_order_release);
+        stopping_.store(true, std::memory_order_release);
+        wake();
+        if (worker_.joinable()) worker_.join();
+        if (read_fd_ >= 0) ::close(read_fd_);
+        if (write_fd_ >= 0) ::close(write_fd_);
+    }
+#else
+public:
+    ShutdownSignalWakeup() noexcept = default;
+    bool ready() const noexcept { return true; }
+#endif
+    ShutdownSignalWakeup(const ShutdownSignalWakeup&) = delete;
+    ShutdownSignalWakeup& operator=(const ShutdownSignalWakeup&) = delete;
+};
+
 inline StringResult<Duration> duration_from_seconds(double seconds) {
     if (!std::isfinite(seconds) || seconds < 0.0)
         return result_error<Duration>("Duration seconds must be finite and non-negative");
@@ -6788,6 +6945,7 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
     std::size_t completed_count = 0;
     std::string scheduler_failure;
     for (;;) {
+        check_shutdown(file, line, column);
         std::vector<std::shared_ptr<TaskControl>> to_start;
         bool all_done = false;
         {
@@ -6845,7 +7003,8 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
                             && !task->is_cancelled());
                 });
             const bool actor_ready = native_actor_message_ready();
-            return unstarted || all_finished || (waiting_reply && actor_ready)
+            return requested_shutdown_signal.load(std::memory_order_acquire) != 0
+                || unstarted || all_finished || (waiting_reply && actor_ready)
                 || scheduler.work_revision.load(std::memory_order_acquire) != work_revision
                 || (restart_deadline && std::chrono::steady_clock::now() >= *restart_deadline)
                 || (all_waiting_without_deadline && !actor_ready && !restart_deadline);
