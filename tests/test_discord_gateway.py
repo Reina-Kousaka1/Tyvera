@@ -131,8 +131,10 @@ def server_frame(payload: bytes) -> bytes:
     return header + payload
 
 
-def server_close_frame(code: int = 1000) -> bytes:
-    payload = code.to_bytes(2, "big")
+def server_close_frame(code: int = 1000, reason: str = "") -> bytes:
+    payload = code.to_bytes(2, "big") + reason.encode("utf-8")
+    if len(payload) > 125:
+        raise AssertionError("test close payload exceeds the WebSocket control-frame limit")
     return bytes((0x88, len(payload))) + payload
 
 
@@ -421,6 +423,150 @@ fn main() {{
                 self.assertEqual((native_result.returncode, native_result.stdout, native_result.stderr),
                                  (0, output.getvalue(), errors.getvalue()))
                 self.assertNotIn("fake-gateway-token", native_result.stdout + native_result.stderr)
+
+    def test_gateway_summary_exposes_peer_close_reason_with_native_parity(self) -> None:
+        native_available = _native_cpp_available()
+        openssl = shutil.which("openssl")
+        if openssl is None:
+            self.skipTest("OpenSSL is required to create a temporary fake Gateway certificate")
+
+        with tempfile.TemporaryDirectory(prefix=".tyvera-discord-close-reason-", dir=DISCORD_ROOT) as temporary:
+            directory = Path(temporary)
+            certificate = directory / "gateway.crt"
+            private_key = directory / "gateway.key"
+            subprocess.run(
+                [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(private_key),
+                 "-out", str(certificate), "-days", "2", "-subj", "/CN=gateway.discord.gg",
+                 "-addext", "subjectAltName=DNS:gateway.discord.gg"],
+                check=True, capture_output=True, text=True,
+            )
+            server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_context.load_cert_chain(str(certificate), str(private_key))
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0))
+            connection_count = 2 if native_available else 1
+            listener.listen(connection_count)
+            listener.settimeout(60)
+            port = listener.getsockname()[1]
+            failures: list[BaseException] = []
+
+            def serve() -> None:
+                try:
+                    for _ in range(connection_count):
+                        raw, _ = listener.accept()
+                        raw.settimeout(10)
+                        secure = server_context.wrap_socket(raw, server_side=True)
+                        secure.settimeout(10)
+                        request = bytearray()
+                        while b"\r\n\r\n" not in request:
+                            chunk = secure.recv(4096)
+                            if not chunk:
+                                raise RuntimeError("client closed before the WebSocket handshake")
+                            request.extend(chunk)
+                        headers: dict[str, str] = {}
+                        for line in bytes(request).split(b"\r\n")[1:]:
+                            if not line:
+                                break
+                            name, _, value = line.partition(b":")
+                            headers[name.decode("ascii").lower()] = value.strip().decode("ascii")
+                        key = headers["sec-websocket-key"]
+                        secure.sendall(
+                            ("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
+                             "Upgrade: websocket\r\n"
+                             f"Sec-WebSocket-Accept: {make_accept_value(key)}\r\n\r\n").encode("ascii")
+                        )
+                        secure.sendall(server_close_frame(1000, "maintenance complete"))
+                        secure.close()
+                except BaseException as error:
+                    failures.append(RuntimeError(
+                        f"fake close-reason peer failed: {type(error).__name__}: {error}"
+                    ))
+                finally:
+                    listener.close()
+
+            thread = threading.Thread(target=serve, daemon=True)
+            thread.start()
+            entry = directory / "close-reason.tyv"
+            entry.write_text(r'''import "../src/client.tyv" as discord
+async fn run() {
+    match environment("TYVERA_FAKE_DISCORD_TOKEN") {
+        None => println("missing fake token")
+        Some(token) => {
+            let result = await discord.runGatewayReliable(token, discord.defaultIntents(), 1, seconds(3), 0, 0, 0)
+            match result {
+                Err(_) => println("gateway failed")
+                Ok(summary) => {
+                    println(summary.ready)
+                    println(summary.closeCode == Some(1000))
+                    match summary.closeReason {
+                        Some(reason) => println(reason)
+                        None => println("missing close reason")
+                    }
+                }
+            }
+        }
+    }
+}
+fn main() {
+    let task = run()
+    match runTasks() {
+        Ok(_) => {}
+        Err(error) => eprintln("runTasks failed: " + error)
+    }
+}
+''', encoding="utf-8")
+            checked = compile_checked_project(entry, DISCORD_ROOT)
+            output = io.StringIO()
+            errors = io.StringIO()
+            original_connect = Interpreter._websocket_connect_task
+            original_getaddrinfo = socket.getaddrinfo
+            default_context = ssl.create_default_context
+
+            def route_gateway(self, address, timeout, location):
+                prefix = "wss://gateway.discord.gg/"
+                if address.startswith(prefix):
+                    address = address.replace(prefix, f"wss://gateway.discord.gg:{port}/", 1)
+                return original_connect(self, address, timeout, location)
+
+            def local_dns(host, selected_port, *args, **kwargs):
+                if host == "gateway.discord.gg":
+                    return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", selected_port))]
+                return original_getaddrinfo(host, selected_port, *args, **kwargs)
+
+            def trusted_context(*args, **kwargs):
+                context = default_context(*args, **kwargs)
+                context.load_verify_locations(cafile=str(certificate))
+                return context
+
+            try:
+                with patch.object(Interpreter, "_websocket_connect_task", route_gateway), \
+                        patch("tyvera.interpreter.socket.getaddrinfo", side_effect=local_dns), \
+                        patch("tyvera.interpreter.ssl.create_default_context", side_effect=trusted_context), \
+                        patch.dict(os.environ, {"TYVERA_FAKE_DISCORD_TOKEN": "fake-close-reason-token"}):
+                    ReferenceInterpreterBackend().execute(
+                        checked, output=output, error_output=errors, project_root=DISCORD_ROOT,
+                    )
+                reference_result = (0, output.getvalue(), errors.getvalue())
+                native_result = None
+                if native_available:
+                    native_result = _native_discord_run(
+                        checked, directory / "gateway-close-reason", directory, port, certificate,
+                        {"TYVERA_FAKE_DISCORD_TOKEN": "fake-close-reason-token"},
+                    )
+            finally:
+                listener.close()
+                thread.join(30)
+
+            self.assertFalse(thread.is_alive(), "fake close-reason Gateway server did not stop")
+            self.assertEqual(failures, [])
+            expected = "false\ntrue\nmaintenance complete\n"
+            self.assertEqual((0, output.getvalue(), errors.getvalue()), (0, expected, ""))
+            if native_result is not None:
+                self.assertEqual(
+                    (native_result.returncode, native_result.stdout, native_result.stderr),
+                    reference_result,
+                )
 
     def test_local_gateway_reconnect_resumes_then_reidentifies_invalid_session(self) -> None:
         native_available = _native_cpp_available()

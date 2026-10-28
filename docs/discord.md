@@ -44,7 +44,8 @@ Invalid Session and close codes 4007/4009 start a new Identify session.
 `GatewayRecoveryAction` centralizes close-code handling: 1000 stops, 1001 and
 4000/4001/4002/4003/4005/4008 reconnect, 4004 and 4010–4014 are fatal, and
 unrecognized codes fail closed. Reconnects are capped at 32, dispatches at 10,000, and the
-backoff arguments at 120 seconds. Heartbeats use monotonic fixed deadlines;
+backoff arguments at 120 seconds.
+The returned `GatewayRunSummary` exposes the final attempt's peer close code and UTF-8 close reason when present. Heartbeats use monotonic fixed deadlines;
 the first heartbeat is currently sent after one full interval, without
 Discord's recommended random initial jitter. There is no reconnect jitter;
 callers should use a small reconnect budget appropriate to their application.

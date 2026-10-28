@@ -35,6 +35,7 @@ pub record GatewayRunSummary {
     recoveryAction: gateway.GatewayRecoveryAction
     recoveryReason: Option<String>
     closeCode: Option<Int>
+    closeReason: Option<String>
     events: List<gateway.GatewayDispatch>
 }
 
@@ -284,13 +285,14 @@ async fn runGatewaySession(token: Secret<String>, intents: List<GatewayIntent>, 
                 Ok(value) => match value {
                     None => {
                         let earlyCloseCode = connection.closeCode()
+                        let earlyCloseReason = connection.closeReason()
                         let earlyAction = recoveryForClose(earlyCloseCode, sessionId, resumeUrl, sequence)
                         let earlyReason: Option<String> = Some("Discord Gateway closed before Hello")
                         connection.close()
                         if earlyAction == gateway.GatewayRecoveryAction.Fatal {
                             return Err<GatewayRunSummary, String>("Discord Gateway closed before Hello with a fatal status")
                         }
-                        return Ok<GatewayRunSummary, String>(GatewayRunSummary(ready, sessionId, resumeUrl, sequence, dispatches, messages, heartbeats, earlyAction, earlyReason, earlyCloseCode, events))
+                        return Ok<GatewayRunSummary, String>(GatewayRunSummary(ready, sessionId, resumeUrl, sequence, dispatches, messages, heartbeats, earlyAction, earlyReason, earlyCloseCode, earlyCloseReason, events))
                     }
                     Some(message) => match helloInterval(message) {
                         Err(error) => {
@@ -329,6 +331,7 @@ async fn runGatewaySession(token: Secret<String>, intents: List<GatewayIntent>, 
                                     var recoveryAction: gateway.GatewayRecoveryAction = gateway.GatewayRecoveryAction.Stop
                                     var recoveryReason: Option<String> = None<String>()
                                     var closeCode: Option<Int> = None<Int>()
+                                    var closeReason: Option<String> = None<String>()
                                     var active: Bool = true
                                     var nextHeartbeatAt: Int = monotonicMilliseconds() + heartbeatInterval
                                     while active && dispatches < maxDispatches {
@@ -377,6 +380,7 @@ async fn runGatewaySession(token: Secret<String>, intents: List<GatewayIntent>, 
                                             Ok(value) => match value {
                                                 None => {
                                                     closeCode = connection.closeCode()
+                                                    closeReason = connection.closeReason()
                                                     recoveryAction = recoveryForClose(closeCode, sessionId, resumeUrl, sequence)
                                                     recoveryReason = Some("Discord Gateway disconnected")
                                                     active = false
@@ -478,7 +482,7 @@ async fn runGatewaySession(token: Secret<String>, intents: List<GatewayIntent>, 
                                             if retryableGatewaySessionTransportError(error) {
                                                 recoveryAction = recoveryForClose(None<Int>(), sessionId, resumeUrl, sequence)
                                                 recoveryReason = Some(error)
-                                                return Ok<GatewayRunSummary, String>(GatewayRunSummary(ready, sessionId, resumeUrl, sequence, dispatches, messages, heartbeats, recoveryAction, recoveryReason, closeCode, events))
+                                                return Ok<GatewayRunSummary, String>(GatewayRunSummary(ready, sessionId, resumeUrl, sequence, dispatches, messages, heartbeats, recoveryAction, recoveryReason, closeCode, closeReason, events))
                                             }
                                             return Err<GatewayRunSummary, String>(error)
                                         }
@@ -487,11 +491,11 @@ async fn runGatewaySession(token: Secret<String>, intents: List<GatewayIntent>, 
                                                 let closed = await connection.closeGracefully()
                                                 match closed {
                                                     Err(error) => return Err<GatewayRunSummary, String>(error)
-                                                    Ok(_) => return Ok<GatewayRunSummary, String>(GatewayRunSummary(ready, sessionId, resumeUrl, sequence, dispatches, messages, heartbeats, recoveryAction, recoveryReason, closeCode, events))
+                                                    Ok(_) => return Ok<GatewayRunSummary, String>(GatewayRunSummary(ready, sessionId, resumeUrl, sequence, dispatches, messages, heartbeats, recoveryAction, recoveryReason, closeCode, closeReason, events))
                                                 }
                                             }
                                             connection.close()
-                                            return Ok<GatewayRunSummary, String>(GatewayRunSummary(ready, sessionId, resumeUrl, sequence, dispatches, messages, heartbeats, recoveryAction, recoveryReason, closeCode, events))
+                                            return Ok<GatewayRunSummary, String>(GatewayRunSummary(ready, sessionId, resumeUrl, sequence, dispatches, messages, heartbeats, recoveryAction, recoveryReason, closeCode, closeReason, events))
                                         }
                                     }
                                 }
