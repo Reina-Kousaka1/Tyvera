@@ -1610,11 +1610,12 @@ struct NativeExecutionMutex {
         locked = true;
         return true;
     }
-    template <typename Cancelled>
-    bool lock_or_cancel(Cancelled&& cancelled) {
+    template <typename Cancelled, typename Queued>
+    bool lock_or_cancel(Cancelled&& cancelled, Queued&& queued) {
         std::unique_lock<std::mutex> lock(state_mutex);
         const int ticket = 0;
         queue.push_back(&ticket);
+        queued();
         changed.wait(lock, [this, &ticket, &cancelled]() {
             return (!locked && queue.front() == &ticket) || cancelled();
         });
@@ -1627,6 +1628,10 @@ struct NativeExecutionMutex {
         locked = true;
         return true;
     }
+    template <typename Cancelled>
+    bool lock_or_cancel(Cancelled&& cancelled) {
+        return lock_or_cancel(std::forward<Cancelled>(cancelled), []() {});
+    }
     void unlock() noexcept {
         {
             std::lock_guard<std::mutex> lock(state_mutex);
@@ -1634,7 +1639,10 @@ struct NativeExecutionMutex {
         }
         changed.notify_all();
     }
-    void notify_waiters() noexcept { changed.notify_all(); }
+    void notify_waiters() noexcept {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        changed.notify_all();
+    }
 };
 void notify_execution_waiters() noexcept;
 template <typename T> using StringResult = std::variant<T, std::string>;
@@ -1655,6 +1663,7 @@ struct TaskControl {
     const std::uint64_t identity = next_native_task_identity.fetch_add(1, std::memory_order_relaxed);
     std::uint64_t owner_identity = 0;
     std::atomic<bool> started{false};
+    bool execution_registered = false;
     std::atomic<bool> done{false};
     std::atomic<bool> cancellation_requested{false};
     std::atomic<bool> deadline_cancellation{false};
@@ -1683,6 +1692,17 @@ struct TaskControl {
     virtual std::string failure_message_for_run() const = 0;
     virtual bool wait_until(std::chrono::steady_clock::time_point deadline, const TaskControl* waiter) = 0;
     virtual void notify_waiters() noexcept {}
+    void register_execution() {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        execution_registered = true;
+        lifecycle_changed.notify_all();
+    }
+    void wait_for_execution_registration() {
+        std::unique_lock<std::mutex> lock(lifecycle_mutex);
+        lifecycle_changed.wait(lock, [this]() {
+            return execution_registered || done.load(std::memory_order_acquire);
+        });
+    }
     bool prepare_start() {
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         bool expected = false;
@@ -1771,6 +1791,7 @@ struct TaskControl {
         }
         cancel_children();
         lifecycle_changed.notify_all();
+        notify_execution_waiters();
     }
     void check_interruption() const {
         std::string failure;
@@ -1852,7 +1873,7 @@ inline void reacquire_execution_lock(std::unique_lock<NativeExecutionMutex>& loc
     auto* execution = lock.mutex();
     if (!execution) return;
     if (cancellation_owner) {
-        if (execution->lock_or_cancel([cancellation_owner]() { return cancellation_owner->is_cancelled(); })) {
+        if (execution->lock_or_cancel([cancellation_owner]() { return cancellation_owner->is_done(); })) {
             lock = std::unique_lock<NativeExecutionMutex>(*execution, std::adopt_lock);
             return;
         }
@@ -1871,13 +1892,15 @@ public:
         active_task_control = &task;
         if (task.serialized) {
             auto& execution = native_scheduler().execution_mutex;
-            if (execution.lock_or_cancel([&task]() { return task.is_cancelled(); })) {
+            if (execution.lock_or_cancel([&task]() { return task.is_done(); },
+                                         [&task]() { task.register_execution(); })) {
                 lock_ = std::unique_lock<NativeExecutionMutex>(execution, std::adopt_lock);
                 active_execution_lock = &lock_;
             } else {
                 active_execution_lock = nullptr;
             }
         } else {
+            task.register_execution();
             active_execution_lock = nullptr;
         }
     }
@@ -1995,6 +2018,7 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
                 self->ready.notify_all();
                 scheduler.changed.notify_all();
             });
+            wait_for_execution_registration();
         } catch (...) {
             const auto failure = std::current_exception();
             work = nullptr;
@@ -2069,7 +2093,10 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
         });
         return done.load(std::memory_order_acquire);
     }
-    void notify_waiters() noexcept override { ready.notify_all(); }
+    void notify_waiters() noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        ready.notify_all();
+    }
     void join() override { if (worker.joinable()) worker.join(); }
     std::string failure_message() const override {
         std::lock_guard<std::mutex> lock(mutex);
@@ -2172,6 +2199,7 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
                 self->ready.notify_all();
                 scheduler.changed.notify_all();
             });
+            wait_for_execution_registration();
         } catch (...) {
             const auto failure = std::current_exception();
             work = nullptr;
@@ -2219,7 +2247,10 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
         });
         return done.load(std::memory_order_acquire);
     }
-    void notify_waiters() noexcept override { ready.notify_all(); }
+    void notify_waiters() noexcept override {
+        std::lock_guard<std::mutex> lock(mutex);
+        ready.notify_all();
+    }
     void join() override { if (worker.joinable()) worker.join(); }
     std::string failure_message() const override {
         std::lock_guard<std::mutex> lock(mutex);
@@ -5348,6 +5379,8 @@ inline Task<StringResult<std::shared_ptr<TlsConnection>>> tls_connect(
             return result_ok<std::shared_ptr<TlsConnection>>(std::move(result));
         } catch (const TaskCancelled&) {
             throw;
+        } catch (const TaskFailure&) {
+            throw;
         } catch (const Failure&) {
             throw;
         } catch (...) {
@@ -5682,6 +5715,8 @@ inline Task<StringResult<std::optional<std::vector<std::uint8_t>>>> tls_read(
                 return result_error<std::optional<std::vector<std::uint8_t>>>("TLS operation failed");
             }
         } catch (const TaskCancelled&) {
+            throw;
+        } catch (const TaskFailure&) {
             throw;
         } catch (const Failure&) {
             throw;
@@ -6186,18 +6221,28 @@ inline Task<StringResult<std::shared_ptr<WebSocket>>> websocket_connect(
         return make_io_task<Output>([]() -> Output {
             return result_error<std::shared_ptr<WebSocket>>("WebSocket timeout must be greater than zero");
         }, file, line, column);
-    auto work = make_io_task<Output>([url = std::move(url), timeout, file, line, column]() mutable -> Output {
+    return make_io_task<Output>([url = std::move(url), timeout, file, line, column]() mutable -> Output {
         try {
             const bool secure = url.scheme == "wss";
             std::shared_ptr<WebSocket> socket = std::make_shared<WebSocket>();
             socket->operation_timeout_milliseconds = timeout.milliseconds;
             if (secure) {
-                auto opened = tls_connect(url.host, url.port, file, line, column).await_move(file, line, column);
+                auto operation = tls_connect(url.host, url.port, file, line, column);
+                std::optional<StringResult<std::shared_ptr<TlsConnection>>> completion;
+                if (!websocket_await_timed(std::move(operation), timeout.milliseconds,
+                                           file, line, column, completion))
+                    return result_error<std::shared_ptr<WebSocket>>("WebSocket connect failed: timed out");
+                auto opened = std::move(*completion);
                 if (std::holds_alternative<std::string>(opened))
                     return result_error<std::shared_ptr<WebSocket>>("WebSocket connect failed: " + std::get<1>(std::move(opened)));
                 socket->tls = std::get<0>(std::move(opened));
             } else {
-                auto opened = tcp_connect(url.host, url.port, file, line, column).await_move(file, line, column);
+                auto operation = tcp_connect(url.host, url.port, file, line, column);
+                std::optional<StringResult<std::shared_ptr<TcpConnection>>> completion;
+                if (!websocket_await_timed(std::move(operation), timeout.milliseconds,
+                                           file, line, column, completion))
+                    return result_error<std::shared_ptr<WebSocket>>("WebSocket connect failed: timed out");
+                auto opened = std::move(*completion);
                 if (std::holds_alternative<std::string>(opened))
                     return result_error<std::shared_ptr<WebSocket>>("WebSocket connect failed: " + std::get<1>(std::move(opened)));
                 socket->tcp = std::get<0>(std::move(opened));
@@ -6268,20 +6313,12 @@ inline Task<StringResult<std::shared_ptr<WebSocket>>> websocket_connect(
             }
         } catch (const TaskCancelled&) {
             throw;
+        } catch (const TaskFailure&) {
+            throw;
         } catch (const Failure&) {
             throw;
         } catch (...) {
             return result_error<std::shared_ptr<WebSocket>>("WebSocket connection failed");
-        }
-    }, file, line, column);
-    auto bounded = task_with_timeout(std::move(work), timeout, true, file, line, column);
-    return make_io_task<Output>([bounded = std::move(bounded), file, line, column]() mutable -> Output {
-        try {
-            return bounded.await_move(file, line, column);
-        } catch (const Failure& failure) {
-            if (std::string(failure.what()) == "task timed out")
-                return result_error<std::shared_ptr<WebSocket>>("WebSocket connection timed out");
-            throw;
         }
     }, file, line, column);
 }
@@ -6590,7 +6627,13 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
             }
         }
         if (all_done) break;
-        for (const auto& task : to_start) task->start();
+        if (!to_start.empty()) {
+            // Queue the initial serialized workers before any task body runs.
+            // Otherwise a short task can monopolize every checkpoint before
+            // later-created worker threads have even reached the execution queue.
+            std::unique_lock<NativeExecutionMutex> startup_lock(scheduler.execution_mutex);
+            for (const auto& task : to_start) task->start();
+        }
 
         const auto work_revision = scheduler.work_revision.load(std::memory_order_acquire);
         const auto restart_deadline = next_supervisor_restart_deadline();

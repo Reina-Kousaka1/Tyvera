@@ -1291,6 +1291,49 @@ fn main() {
                 [line for line in native_lines if line in {"handled", "reply delivered", "complete"}],
             )
 
+    def test_native_actor_reply_delegated_to_child_task_drains_on_stop(self) -> None:
+        source = '''async fn deliver(reply: ReplySender<Int>) {
+    await sleepFor(milliseconds(2))
+    reply.send(42)
+}
+actor Worker {
+    on query(reply: ReplySender<Int>) {
+        let task = deliver(reply)
+    }
+}
+async fn query() {
+    var index: Int = 0
+    while index < 16 {
+        let worker = spawn(Worker())
+        let answer: Int = await worker.request(query)
+        println(answer)
+        worker.stop()
+        index = index + 1
+    }
+}
+fn main() {
+    let task = query()
+    match runTasks() {
+        Ok(_) => println("finished")
+        Err(error) => eprintln(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-delegated-reply-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "delegated-reply", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "42\n" * 16 + "finished\n")
+            # Reuse the executable to exercise registration/wakeup order without
+            # hiding a race behind repeated compiler invocations.
+            for _ in range(4):
+                repeated = subprocess.run(
+                    [str(root / "delegated-reply")], cwd=root,
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+                self.assertEqual((repeated.returncode, repeated.stdout, repeated.stderr), reference)
+
     def test_native_bare_await_reply_preserves_try_receive_value(self) -> None:
         source = '''actor Worker {
     on get(reply: ReplySender<Int>) { reply.send(27) }
@@ -4270,6 +4313,75 @@ fn main() {{
     @unittest.skipUnless(
         sys.platform.startswith("linux"), "native WSS tests require Linux and OpenSSL",
     )
+    def test_native_websocket_handshake_timeout_is_a_result_and_drains_transport(self) -> None:
+        failures: list[str] = []
+        completed: list[bool] = []
+        lock = threading.Lock()
+        drained = threading.Event()
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                try:
+                    self.request.settimeout(5)
+                    request = bytearray()
+                    while b"\r\n\r\n" not in request:
+                        chunk = self.request.recv(1024)
+                        if not chunk:
+                            raise AssertionError("client closed before its Upgrade request")
+                        request.extend(chunk)
+                        if len(request) > 32768:
+                            raise AssertionError("oversized Upgrade request")
+                    # Deliberately withhold Upgrade; EOF proves the timed-out
+                    # operation released its transport instead of leaking it.
+                    if self.request.recv(1) != b"":
+                        raise AssertionError("unexpected post-Upgrade payload")
+                except Exception as error:
+                    with lock:
+                        failures.append(str(error))
+                finally:
+                    with lock:
+                        completed.append(True)
+                        if len(completed) == 2:
+                            drained.set()
+
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-websocket-timeout-") as temporary:
+            root = Path(temporary)
+            server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            source = f'''async fn client() {{
+    let opened = await webSocketConnect("ws://127.0.0.1:{port}/", seconds(1))
+    using connection = move opened {{
+        println("unexpected connection")
+    }} else error {{
+        println(error)
+    }}
+}}
+fn main() {{
+    let task = client()
+    match runTasks() {{
+        Ok(_) => println("drained")
+        Err(error) => eprintln(error)
+    }}
+}}'''
+            try:
+                reference = self._reference_result(source, root)
+                native = self._native_source_result(source, root, root / "websocket-timeout", root)
+                self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+                self.assertEqual(reference, (0, "WebSocket handshake-read failed: timed out\ndrained\n", ""))
+                self.assertTrue(drained.wait(timeout=5), "timed-out transports did not close")
+                self.assertEqual(failures, [])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=1)
+
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "native WSS tests require Linux and OpenSSL",
+    )
+
     def test_native_wss_echo_uses_verified_tls_and_matches_reference(self) -> None:
         openssl = shutil.which("openssl")
         if openssl is None:

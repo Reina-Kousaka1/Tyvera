@@ -261,7 +261,11 @@ they never fall back to the reference interpreter. See
 The reference scheduler remains cooperative and single-threaded. The native
 Linux subset uses OS worker threads for tasks and pending network I/O, but
 serializes Tyvera task bodies so shared mutable values are not accessed in
-parallel. Among simultaneously runnable tasks, exact native turn interleaving
+parallel. Execution-lock waiters are admitted in FIFO order; cancelled waiters
+leave that queue without blocking later work. At the start of a Task drain,
+initial serialized workers register before any of their bodies execute.
+Registration and cancellation notifications use guarded wait predicates rather
+than relying on host thread yields. Among simultaneously runnable tasks, exact native turn interleaving
 is not a cross-backend guarantee; native parity covers values and lifecycle,
 while fairness checks ensure a task awaiting an actor reply is not starved. Native task cancellation is cooperative at statement/loop and socket
 poll checkpoints; owned children are cancelled on owner cancellation/failure
