@@ -578,6 +578,10 @@ def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef
             "isCancelled": ((), IRType.BOOL),
             "cancel": ((), IRType.BOOL),
             "withTimeout": ((IRType.DURATION,), _applied("Task", receiver.arguments[0])),
+            "tryResult": ((), _applied(
+                "Result", IRType.BOOL if receiver.arguments[0] == IRType.VOID
+                else _applied("Option", receiver.arguments[0]), IRType.STRING,
+            )),
         }
         return signatures.get(method)
     if isinstance(receiver, IRAppliedType) and receiver.name == "Secret":

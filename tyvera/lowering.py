@@ -737,7 +737,7 @@ class _FunctionLowerer:
             if expression.type_arguments:
                 raise Diagnostic(expression.location, "backend", "native backend does not yet support generic method calls")
             if isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Task" and expression.method not in {
-                "cancel", "isCancelled", "isDone", "withTimeout",
+                "cancel", "isCancelled", "isDone", "withTimeout", "tryResult",
             }:
                 raise Diagnostic(
                     expression.location, "backend",
@@ -762,11 +762,11 @@ class _FunctionLowerer:
                 raise Diagnostic(expression.location, "backend", f"native backend does not yet support methods on {ir_type_name(receiver.type)}")
             if (
                 isinstance(receiver.type, IRAppliedType) and receiver.type.name == "Task"
-                and expression.method == "withTimeout"
+                and expression.method in {"withTimeout", "tryResult"}
                 and self.checked.move_sites.get(expression.location) is not None
             ):
                 if not isinstance(expression.receiver, Name):
-                    raise Diagnostic(expression.location, "backend", "native Task.withTimeout requires a local Task binding")
+                    raise Diagnostic(expression.location, "backend", f"native Task.{expression.method} requires a local Task binding")
                 source = self._lookup(expression.receiver.identifier, expression.receiver.location)
                 receiver = IRMove(
                     IRLocalRef(source.identifier, source.type, expression.receiver.location),

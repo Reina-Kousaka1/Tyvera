@@ -256,7 +256,7 @@ private and exposes no public ABI. Native builds reject unsupported calls;
 they never fall back to the reference interpreter. See
 [Backend Architecture](backend-architecture.md).
 
-## Not implemented
+## Native runtime boundaries
 
 The reference scheduler remains cooperative and single-threaded. The native
 Linux subset uses OS worker threads for tasks and pending network I/O, but
@@ -266,7 +266,7 @@ is not a cross-backend guarantee; native parity covers values and lifecycle,
 while fairness checks ensure a task awaiting an actor reply is not starved. Native task cancellation is cooperative at statement/loop and socket
 poll checkpoints; owned children are cancelled on owner cancellation/failure
 and joined before owner completion. A blocking native DNS lookup cannot be
-interrupted mid-call. Native task groups remain unsupported. The experimental
+interrupted mid-call. The experimental
 native C++17 actor subset supports typed fire-and-forget and request/reply
 messages, FIFO delivery per actor,
 round-robin actor turns, `stop`, `isAlive`, bounded mailboxes, and
@@ -275,7 +275,10 @@ round-robin actor turns, `stop`, `isAlive`, bounded mailboxes, and
 monotonic exponential backoff. Restarts stop affected children in reverse
 start order and reconstruct them in start order. Backoff deadlines and general
 actor turns are serviced by `runActors()`;
-while a native task waits for a reply, `runTasks()` pumps one actor turn. It does not independently settle delayed supervisor restarts. Native `request`
+while a native task waits for a reply, `runTasks()` pumps one actor turn.
+Supervisor backoff deadlines also wake the Task scheduler while other work is
+waiting, without requiring an unrelated actor message. It does not wait for a
+future restart after all Tasks are already terminal. Native `request`
 and `requestWithin` produce typed ReplyReceivers. Readiness,
 cancellation, timeout observation, and `tryReceive()` work directly. A native
 async task may await a ReplyReceiver; `runTasks()` pumps one queued actor turn
@@ -291,13 +294,15 @@ duplicate rejection, `isDone`, cancellation, and `await` joins. A group is a
 join/cancellation view, not an ownership transfer; the creator remains
 responsible for every child. Groups cannot cross actor boundaries or be created
 and used in actor handlers.
+`Task.tryResult()` is a non-starting poll with the reference Result/Option shape. Ordinary results may be observed repeatedly. A resource-containing task is consumed: a completed result transfers once, while a pending task is cancelled and its operation retains cleanup ownership until it drains. The 64-unfinished-task and 4,096-registered-value limits still apply.
+
 `ActorRef.monitor()`/`demonitor()` and symmetric `link()`/`unlink()` are supported by the native runtime. `sendAfter` timers and supervised actors owning move-only Resources remain unsupported natively.
 Generated actor references use shared runtime handles; queued callbacks hold
 weak target references, and runtime shutdown clears mailboxes, supervisors,
 and actor state to break reference cycles. The native runtime retains spawned
 actors until process shutdown even when user `ActorRef` values leave scope. Calling `runActors()` or `runTasks()`
 from a native actor handler raises the same controlled runtime failure as the
-reference runtime. The Linux native backend also has experimental HTTP and
+reference runtime. Structured RuntimeEvents and the bounded dead-letter ring remain reference-embedding facilities; no public native diagnostic sink is provided yet. The Linux native backend also has experimental HTTP and
 WebSocket client subsets; native HTTP server, router/general codec, and
 WebSocket server remain unsupported. Native Linux TLS client operations use
 the same task cancellation and monotonic-deadline behavior as the supported

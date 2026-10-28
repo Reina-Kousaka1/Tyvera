@@ -1200,6 +1200,11 @@ class _CppGenerator:
                     f"tyvera_runtime::task_with_timeout(std::move({receiver}), {arguments[0]}, "
                     f"{move_result}, {_location_args(expression.location)})"
                 )
+            if method == "tryResult":
+                if expression.receiver.type.arguments[0] == IRType.VOID:
+                    return f"({receiver}).try_result()"
+                move_result = "true" if _ir_contains_resource(expression.receiver.type.arguments[0]) else "false"
+                return f"({receiver}).try_result<{move_result}>()"
             functions = {"cancel": "cancel", "isCancelled": "is_cancelled", "isDone": "is_done"}
             return f"({receiver}).{functions[method]}()"
         if expression.receiver.type == IRType.DURATION and method == "inMilliseconds":
@@ -1579,6 +1584,11 @@ inline std::string render_task_failure(const Failure& failure) {
 struct TaskCancelled final : std::exception {
     const char* what() const noexcept override { return "task was cancelled"; }
 };
+struct TaskFailure final : std::exception {
+    std::string message;
+    explicit TaskFailure(std::string value) : message(std::move(value)) {}
+    const char* what() const noexcept override { return message.c_str(); }
+};
 
 struct NativeExecutionMutex {
     std::mutex state_mutex;
@@ -1614,6 +1624,14 @@ struct NativeExecutionMutex {
     void notify_waiters() noexcept { changed.notify_all(); }
 };
 void notify_execution_waiters() noexcept;
+template <typename T> using StringResult = std::variant<T, std::string>;
+template <typename T> inline StringResult<T> result_ok(T value) {
+    return StringResult<T>{std::in_place_index<0>, std::move(value)};
+}
+template <typename T> inline StringResult<T> result_error(std::string message) {
+    return StringResult<T>{std::in_place_index<1>, std::move(message)};
+}
+
 struct TaskControl;
 inline void reacquire_execution_lock(std::unique_lock<NativeExecutionMutex>& lock, TaskControl* cancellation_owner);
 inline thread_local std::unique_lock<NativeExecutionMutex>* active_execution_lock = nullptr;
@@ -1796,6 +1814,7 @@ struct NativeScheduler {
     std::vector<std::shared_ptr<TaskControl>> tasks;
     bool running = false;
     std::size_t completed = 0;
+    std::atomic<std::uint64_t> work_revision{0};
 };
 inline NativeScheduler& native_scheduler() {
     static NativeScheduler value;
@@ -1810,6 +1829,7 @@ inline void notify_task_scheduler() noexcept {
         // Synchronize with runTasks' predicate evaluation. The predicate observes
         // actor readiness and reply-wait flags while holding this same mutex.
         std::lock_guard<std::mutex> lock(scheduler.mutex);
+        scheduler.work_revision.fetch_add(1, std::memory_order_release);
         scheduler.changed.notify_all();
     } catch (...) {}
 }
@@ -2000,7 +2020,7 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
         lock.lock();
         if (error) {
             try { std::rethrow_exception(error); }
-            catch (const TaskCancelled&) { throw Failure(file, line, column, "task was cancelled"); }
+            catch (const TaskCancelled&) { throw TaskFailure("awaited task was cancelled"); }
         }
         if (!result) throw Failure(file, line, column, "native task completed without a result");
         return *result;
@@ -2020,7 +2040,7 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
         lock.lock();
         if (error) {
             try { std::rethrow_exception(error); }
-            catch (const TaskCancelled&) { throw Failure(file, line, column, "task was cancelled"); }
+            catch (const TaskCancelled&) { throw TaskFailure("awaited task was cancelled"); }
         }
         if (!result) throw Failure(file, line, column, "native task result was already consumed");
         T value = std::move(*result);
@@ -2044,6 +2064,7 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
         if (error) {
             try { std::rethrow_exception(error); }
             catch (const Failure& failure) { message = failure.what(); }
+            catch (const TaskFailure& failure) { message = failure.what(); }
             catch (const TaskCancelled&) {}
             catch (...) { message = "native task failed"; }
         }
@@ -2057,6 +2078,7 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
             catch (const Failure& failure) {
                 message = has_child_failure() ? failure.what() : render_task_failure(failure);
             }
+            catch (const TaskFailure& failure) { message = failure.what(); }
             catch (const TaskCancelled&) {}
             catch (...) { message = "native task failed"; }
         }
@@ -2072,6 +2094,7 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
             catch (const Failure& failure) {
                 message = has_child_failure() ? failure.what() : render_task_failure(failure);
             }
+            catch (const TaskFailure& failure) { message = failure.what(); }
             catch (const TaskCancelled&) {}
             catch (...) { message = "native task failed"; }
         }
@@ -2171,7 +2194,7 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
         lock.lock();
         if (error) {
             try { std::rethrow_exception(error); }
-            catch (const TaskCancelled&) { throw Failure(file, line, column, "task was cancelled"); }
+            catch (const TaskCancelled&) { throw TaskFailure("awaited task was cancelled"); }
         }
     }
     bool wait_until(std::chrono::steady_clock::time_point deadline, const TaskControl* waiter) override {
@@ -2191,6 +2214,7 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
         if (error) {
             try { std::rethrow_exception(error); }
             catch (const Failure& failure) { message = failure.what(); }
+            catch (const TaskFailure& failure) { message = failure.what(); }
             catch (const TaskCancelled&) {}
             catch (...) { message = "native task failed"; }
         }
@@ -2204,6 +2228,7 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
             catch (const Failure& failure) {
                 message = has_child_failure() ? failure.what() : render_task_failure(failure);
             }
+            catch (const TaskFailure& failure) { message = failure.what(); }
             catch (const TaskCancelled&) {}
             catch (...) { message = "native task failed"; }
         }
@@ -2219,6 +2244,7 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
             catch (const Failure& failure) {
                 message = has_child_failure() ? failure.what() : render_task_failure(failure);
             }
+            catch (const TaskFailure& failure) { message = failure.what(); }
             catch (const TaskCancelled&) {}
             catch (...) { message = "native task failed"; }
         }
@@ -2226,11 +2252,49 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
     }
 };
 
+inline std::string task_poll_failure(const std::shared_ptr<TaskControl>& state) {
+    if (!state) return "task is unavailable";
+    if (state->done.load(std::memory_order_acquire)) {
+        const auto failure = state->failure_message_for_run();
+        if (!failure.empty()) return failure;
+    }
+    {
+        std::lock_guard<std::mutex> lock(state->child_failure_mutex);
+        if (!state->child_failure.empty()) return "owned child task failed: " + state->child_failure;
+    }
+    return state->is_cancelled() ? "task was cancelled" : "";
+}
+
 template <typename T> struct Task {
     std::shared_ptr<TaskState<T>> state;
     bool cancel() const { return state && state->request_cancel(); }
     bool is_cancelled() const { return state && state->is_cancelled(); }
     bool is_done() const { return !state || state->is_done(); }
+    template <bool MoveResult = false> StringResult<std::optional<T>> try_result() const {
+        const auto failure = task_poll_failure(state);
+        if (!failure.empty()) return result_error<std::optional<T>>(failure);
+        if (!state->done.load(std::memory_order_acquire)) {
+            if constexpr (MoveResult) {
+                // Consuming a pending resource task must not orphan its operation.
+                // A concurrent completion wins if cancellation is no longer possible.
+                if (!state->request_cancel()) return try_result<MoveResult>();
+            }
+            return result_ok<std::optional<T>>(std::nullopt);
+        }
+        // Completion can race the first snapshot above. Recheck its outcome before
+        // touching the result; the result mutex then serializes move-only transfer.
+        const auto completed_failure = task_poll_failure(state);
+        if (!completed_failure.empty()) return result_error<std::optional<T>>(completed_failure);
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!state->result) return result_error<std::optional<T>>("task result was already consumed");
+        if constexpr (MoveResult) {
+            std::optional<T> value(std::move(*state->result));
+            state->result.reset();
+            return result_ok<std::optional<T>>(std::move(value));
+        } else {
+            return result_ok<std::optional<T>>(state->result);
+        }
+    }
     T await(const std::string& file, int line, int column) const {
         if (!state) throw Failure(file, line, column, "cannot await an empty Task");
         auto* execution_lock = active_execution_lock;
@@ -2269,6 +2333,16 @@ template <> struct Task<void> {
     bool cancel() const { return state && state->request_cancel(); }
     bool is_cancelled() const { return state && state->is_cancelled(); }
     bool is_done() const { return !state || state->is_done(); }
+    StringResult<bool> try_result() const {
+        const auto failure = task_poll_failure(state);
+        if (!failure.empty()) return result_error<bool>(failure);
+        const bool completed = state->done.load(std::memory_order_acquire);
+        if (completed) {
+            const auto completed_failure = task_poll_failure(state);
+            if (!completed_failure.empty()) return result_error<bool>(completed_failure);
+        }
+        return result_ok<bool>(completed);
+    }
     void await(const std::string& file, int line, int column) const {
         if (!state) throw Failure(file, line, column, "cannot await an empty Task");
         auto* execution_lock = active_execution_lock;
@@ -2440,11 +2514,11 @@ template <typename T> inline Task<T> task_with_timeout(
             } else {
                 return source.await(file, line, column);
             }
-        } catch (const Failure&) {
+        } catch (...) {
             if (target->deadline_cancellation.load(std::memory_order_acquire))
-                throw Failure(file, line, column, "task timed out");
+                throw TaskFailure("task timed out");
             if (target->is_cancelled())
-                throw Failure(file, line, column, "timed task was cancelled");
+                throw TaskFailure("timed task was cancelled");
             throw;
         }
     };
@@ -2905,13 +2979,6 @@ inline std::variant<std::vector<std::uint8_t>, std::string> bytes_slice(
 }
 
 constexpr std::uint64_t MAX_BYTE_BUFFER_LENGTH = 67108864;
-template <typename T> using StringResult = std::variant<T, std::string>;
-template <typename T> inline StringResult<T> result_ok(T value) {
-    return StringResult<T>{std::in_place_index<0>, std::move(value)};
-}
-template <typename T> inline StringResult<T> result_error(std::string message) {
-    return StringResult<T>{std::in_place_index<1>, std::move(message)};
-}
 
 struct ReplyCellBase {
     virtual ~ReplyCellBase() = default;
@@ -2922,6 +2989,7 @@ enum class ReplyState { pending, sent, failed, cancelled, timed_out, consumed };
 template <typename T> struct ReplyCell final : ReplyCellBase {
     mutable std::mutex mutex;
     ReplyState state = ReplyState::pending;
+    std::atomic<bool> registration_pending{true};
     std::optional<T> value;
     std::string error;
     std::chrono::steady_clock::time_point started_at = std::chrono::steady_clock::now();
@@ -2930,6 +2998,7 @@ template <typename T> struct ReplyCell final : ReplyCellBase {
 
     explicit ReplyCell(std::optional<std::int64_t> timeout) : timeout_milliseconds(timeout) {}
     void notify_waiters_locked() noexcept {
+        if (state != ReplyState::pending) registration_pending.store(false, std::memory_order_release);
         for (auto* waiter : waiters) {
             if (!waiter) continue;
             try {
@@ -2972,9 +3041,13 @@ template <typename T> struct ReplyCell final : ReplyCellBase {
         }
     }
     bool is_pending() override {
-        std::lock_guard<std::mutex> lock(mutex);
-        refresh_locked();
-        return state == ReplyState::pending;
+        // Pruning holds actor state, so it must not take the reply mutex: reply
+        // publication takes that mutex before notifying the Task scheduler.
+        if (!registration_pending.load(std::memory_order_acquire)) return false;
+        if (!timeout_milliseconds) return true;
+        const auto elapsed = std::chrono::duration<long double, std::milli>(
+            std::chrono::steady_clock::now() - started_at).count();
+        return elapsed < static_cast<long double>(*timeout_milliseconds);
     }
     bool send(T next) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -3775,12 +3848,17 @@ inline void notify_actor_monitors(
     const std::shared_ptr<ActorBase>& actor, const std::string& reason) noexcept {
     if (!actor) return;
     try {
-        auto& state = actor_runtime_state();
-        std::lock_guard<std::mutex> lock(state.mutex);
-        actor->last_exit_reason = reason;
-        for (const auto& pending : actor->pending_monitors)
+        std::vector<std::weak_ptr<ReplyCell<std::string>>> monitors;
+        {
+            auto& state = actor_runtime_state();
+            std::lock_guard<std::mutex> lock(state.mutex);
+            actor->last_exit_reason = reason;
+            monitors.swap(actor->pending_monitors);
+        }
+        // Sending wakes the Task scheduler. Do this after releasing actor state
+        // so scheduler readiness checks cannot invert the two locks.
+        for (const auto& pending : monitors)
             if (const auto cell = pending.lock()) cell->send(reason);
-        actor->pending_monitors.clear();
     } catch (...) {}
 }
 inline ReplyReceiver<std::string> actor_monitor(
@@ -3909,9 +3987,14 @@ inline constexpr std::size_t MAX_ACTOR_MAILBOX = 100000;
 inline constexpr std::int64_t MAX_ACTOR_DELIVERIES = 100000;
 inline void fail_actor_replies(const std::shared_ptr<ActorBase>& actor, const std::string& message) noexcept {
     if (!actor) return;
-    for (const auto& pending : actor->pending_replies)
+    std::vector<std::weak_ptr<ReplyCellBase>> replies;
+    {
+        auto& state = actor_runtime_state();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        replies.swap(actor->pending_replies);
+    }
+    for (const auto& pending : replies)
         if (const auto cell = pending.lock()) cell->fail(message);
-    actor->pending_replies.clear();
 }
 inline void remove_ready_actor_locked(ActorRuntimeState& state, const ActorBase* actor) {
     state.ready.erase(std::remove_if(state.ready.begin(), state.ready.end(), [actor](const auto& candidate) {
@@ -3984,9 +4067,12 @@ inline bool supervisor_is_alive(const std::shared_ptr<Supervisor>& supervisor) n
 }
 inline void stop_actor_for_supervisor(const std::shared_ptr<ActorBase>& actor) noexcept {
     if (!actor) return;
+    bool was_live = false;
     {
         auto& state = actor_runtime_state();
         std::lock_guard<std::mutex> lock(state.mutex);
+        was_live = actor->status == "alive" || actor->status == "starting" || actor->status == "restarting";
+        if (was_live) actor->last_exit_reason = "normal stop";
         actor->status = "stopped";
         actor->mailbox.clear();
         actor->queued = false;
@@ -3995,7 +4081,7 @@ inline void stop_actor_for_supervisor(const std::shared_ptr<ActorBase>& actor) n
     }
     cancel_actor_tasks(actor);
     fail_actor_replies(actor, "actor stopped before replying");
-    notify_actor_monitors(actor, "normal stop");
+    if (was_live) notify_actor_monitors(actor, "normal stop");
     actor->tyv_clear_state();
     actor_runtime_state().changed.notify_all();
 }
@@ -4170,6 +4256,7 @@ inline std::string supervisor_handle_failure(
                 now + std::chrono::milliseconds(delay),
             });
             state.changed.notify_all();
+            notify_task_scheduler();
             return {};
         }
     }
@@ -4451,6 +4538,7 @@ inline bool actor_stop(
         std::lock_guard<std::mutex> lock(state.mutex);
         if (actor->status != "alive") return false;
         actor->status = "stopped";
+        actor->last_exit_reason = "normal stop";
         actor->mailbox.clear();
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
@@ -4479,6 +4567,7 @@ inline std::vector<std::shared_ptr<ActorBase>> mark_actor_crashed(
         std::lock_guard<std::mutex> lock(state.mutex);
         if (actor->status != "alive") return {};
         actor->status = "crashed";
+        actor->last_exit_reason = failure;
         actor->mailbox.clear();
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
@@ -4684,6 +4773,7 @@ inline void shutdown_actors() noexcept {
         actors.swap(state.actors);
         for (auto actor = actors.rbegin(); actor != actors.rend(); ++actor) {
             (*actor)->status = "stopped";
+            (*actor)->last_exit_reason = "runtime shutdown";
             (*actor)->mailbox.clear();
             (*actor)->queued = false;
         }
@@ -6486,8 +6576,10 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
         if (all_done) break;
         for (const auto& task : to_start) task->start();
 
+        const auto work_revision = scheduler.work_revision.load(std::memory_order_acquire);
+        const auto restart_deadline = next_supervisor_restart_deadline();
         std::unique_lock<std::mutex> lock(scheduler.mutex);
-        scheduler.changed.wait(lock, [&scheduler]() {
+        auto work_ready = [&scheduler, work_revision, restart_deadline]() {
             const bool unstarted = std::any_of(scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
                 return !task->started.load(std::memory_order_acquire);
             });
@@ -6509,8 +6601,12 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
                 });
             const bool actor_ready = native_actor_message_ready();
             return unstarted || all_finished || (waiting_reply && actor_ready)
-                || (all_waiting_without_deadline && !actor_ready);
-        });
+                || scheduler.work_revision.load(std::memory_order_acquire) != work_revision
+                || (restart_deadline && std::chrono::steady_clock::now() >= *restart_deadline)
+                || (all_waiting_without_deadline && !actor_ready && !restart_deadline);
+        };
+        if (restart_deadline) scheduler.changed.wait_until(lock, *restart_deadline, work_ready);
+        else scheduler.changed.wait(lock, work_ready);
         const bool actor_ready = native_actor_message_ready();
         const bool waiting_reply = std::any_of(
             scheduler.tasks.begin(), scheduler.tasks.end(), [](const auto& task) {
@@ -6525,16 +6621,42 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
                         && !task->actor_reply_wait_has_deadline.load(std::memory_order_acquire)
                         && !task->is_cancelled());
             });
-        const bool deadlocked = all_waiting_without_deadline && !actor_ready;
+        const bool deadlocked = all_waiting_without_deadline && !actor_ready && !restart_deadline;
+        const bool restart_due = restart_deadline && std::chrono::steady_clock::now() >= *restart_deadline;
         const bool pump_actor = waiting_reply && actor_ready;
-        const auto active_tasks = scheduler.tasks;
         lock.unlock();
         if (deadlocked) {
-            if (scheduler_failure.empty())
-                scheduler_failure = "task scheduler has an unresolved actor reply with no runnable work or deadline";
-            for (const auto& task : active_tasks) {
-                if (!task->done.load(std::memory_order_acquire)) task->request_cancel();
+            std::unique_lock<NativeExecutionMutex> execution_lock(scheduler.execution_mutex);
+            ActiveExecutionLockScope execution_scope(execution_lock);
+            // A sender may have published a reply immediately after the wait
+            // snapshot. Recheck while Tyvera execution is paused before cancelling.
+            std::vector<std::shared_ptr<TaskControl>> current_tasks;
+            {
+                std::lock_guard<std::mutex> task_lock(scheduler.mutex);
+                current_tasks = scheduler.tasks;
             }
+            const bool unresolved = !current_tasks.empty()
+                && std::any_of(current_tasks.begin(), current_tasks.end(), [](const auto& task) {
+                    return !task->done.load(std::memory_order_acquire);
+                })
+                && std::all_of(current_tasks.begin(), current_tasks.end(), [](const auto& task) {
+                    return task->done.load(std::memory_order_acquire)
+                        || (task->waiting_for_actor_reply.load(std::memory_order_acquire)
+                            && !task->actor_reply_wait_has_deadline.load(std::memory_order_acquire)
+                            && !task->is_cancelled());
+                });
+            if (unresolved && !native_actor_message_ready() && !next_supervisor_restart_deadline()) {
+                if (scheduler_failure.empty())
+                    scheduler_failure = "task scheduler has an unresolved actor reply with no runnable work or deadline";
+                for (const auto& task : current_tasks)
+                    if (!task->done.load(std::memory_order_acquire)) task->request_cancel();
+            }
+        }
+        if (restart_due && !pump_actor) {
+            std::unique_lock<NativeExecutionMutex> restart_lock(scheduler.execution_mutex);
+            ActiveExecutionLockScope restart_scope(restart_lock);
+            const auto settled = settle_due_supervisor_restarts();
+            if (settled && !settled->empty() && scheduler_failure.empty()) scheduler_failure = *settled;
         }
         if (pump_actor) {
             std::unique_lock<NativeExecutionMutex> actor_turn_lock(scheduler.execution_mutex);

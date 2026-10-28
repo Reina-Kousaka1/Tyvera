@@ -109,7 +109,7 @@ and during bounded socket polling; an in-progress system DNS lookup cannot be
 interrupted until the resolver returns. Native `Task.withTimeout(Duration)` uses a
 steady monotonic deadline, cancels its source operation, and waits for source
 cleanup before reporting timeout; completion published at the deadline wins.
-`tryResult()` and task groups remain unsupported natively. Actor-created tasks are tied to their actor instance. Lifecycle changes cancel and drain other owned tasks before clearing or rebuilding actor state; a task that stops its own actor unwinds cooperatively at its next interruption point. Native `runTasks()` currently
+`tryResult()` polls without starting work: non-`Void` tasks return `Result<Option<T>,String>`, while `Task<Void>` returns `Result<Bool,String>`. Ordinary results remain available for repeated observation. Polling a resource task consumes its handle, transfers a completed result once, or cancels a pending acquisition; cancellation cleanup remains cooperative. Native TaskGroups provide owner-bound direct-child membership, cancellation, and joining. Actor-created tasks are tied to their actor instance. Lifecycle changes cancel and drain other owned tasks before clearing or rebuilding actor state; a task that stops its own actor unwinds cooperatively at its next interruption point. Native `runTasks()` currently
 reports completed native tasks, while the reference runtime reports
 continuation steps; that progress count is not portable yet. The native C++17
 subset also implements synchronous file/path/ByteBuffer APIs. Neither backend
@@ -120,8 +120,8 @@ architecture detection, monotonic time, secret-wrapped environment lookup,
 cooperative signal shutdown, and argv-based child-process management. Ubuntu
 x86-64 is the explicit Linux CI reference and continues to run the native C++17
 tests. The platform adapter does not make Linux-specific details part of the
-language, and it is not linked into generated native programs. Linux AArch64
-is recognized by the bootstrap but is not independently CI-tested. See
+language, and it is not linked into generated native programs. CI also runs
+the complete Python 3.13/native suite on an Ubuntu 24.04 AArch64 host. See
 [Host platform foundation](platform.md).
 
 The networking layer has no user-defined general Stream interface. TCP
@@ -202,16 +202,21 @@ experimental native actor/supervisor subset supports stateful actor
 declarations, `spawn`, typed fire-and-forget messages, `stop`, `isAlive`,
 `runActors()`, nested supervisors, all three restart strategies and child
 policies, restart-intensity windows, and monotonic exponential backoff.
-Supervised actors that own Resources or Tasks are rejected because their
-reconstruction contract is not yet defined. Non-generic immutable records and
+Actor fields cannot own Resources or Task handles; handler-created Tasks are
+owned by their actor instance and drained on lifecycle transitions. Non-generic immutable records and
 user-defined enums now lower as nominal native values, including construction,
 field access, equality, enum matching, and imported package declarations.
-Generic user-defined types, tuples, classes, actor timers, monitoring/links,
+Generic user-defined types, tuples, classes, actor timers,
 HTTP servers/routers/decoders, and WebSocket servers remain interpreter-only.
+Native monitor/demonitor and symmetric link/unlink share the reference
+lifecycle rules, including transitive crash propagation and grouped supervisor
+restarts.
 Native actor turns and delayed restarts are driven by `runActors()`; pending
 request replies can also drive one actor turn from `runTasks()`. Actor-owned
-Tasks are cancelled on stop, crash, restart, and runtime shutdown; task groups
-and full actor/task scheduling parity remain unsupported. There is no
+Tasks are cancelled on stop, crash, restart, and runtime shutdown. TaskGroups
+preserve owner binding. The Task scheduler also services monotonic supervisor
+restart deadlines while other tasks wait; exact task-body interleaving remains
+backend-dependent. There is no
 `unsafe` or FFI declaration syntax. Any later FFI must define ownership,
 lifetimes, mutability, and error conversion explicitly; a native crash cannot
 become a recoverable Tyvera `Result`. See the [Memory Model](memory-model.md)
@@ -279,15 +284,16 @@ does not make C++ part of Tyvera's language.
 | Text resources | `TextFile`, `TextReader`, `TextWriter`, `using`, move transfer, `Result`/function transfer, synchronous methods, modes, close/isOpen, and deterministic LIFO cleanup are implemented. |
 | Non-generic records and user-defined enums | Experimental native nominal values: immutable records, tagged enum payloads, constructors, field access, equality, and checked nested matching. Linked package declarations are lowered together. Generic nominal types and recursive layouts are rejected with a backend diagnostic. |
 | Tuples, classes, interfaces, generic functions | Interpreter-only. |
-| `Task<T>`, async functions, `await`, `sleepFor`, `runTasks()` | Experimental native subset; ordinary task bodies are serialized, while timer and I/O waits use worker tasks. Cooperative task/child cancellation and monotonic `withTimeout(Duration)`/`sleepFor(Duration)` deadlines are supported. Actor-created tasks are cancelled on actor stop, crash, supervised restart, and runtime shutdown. Other owned tasks drain before actor state is cleared or rebuilt; a task stopping its own actor unwinds cooperatively at its next interruption point. `tryResult()` and task groups remain unsupported. |
+| `Task<T>`, async functions, `await`, `sleepFor`, `runTasks()` | Experimental native subset; ordinary task bodies are serialized, while timer and I/O waits use worker tasks. Cooperative task/child cancellation and monotonic `withTimeout(Duration)`/`sleepFor(Duration)` deadlines are supported. Actor-created tasks are cancelled on actor stop, crash, supervised restart, and runtime shutdown. Other owned tasks drain before actor state is cleared or rebuilt; a task stopping its own actor unwinds cooperatively at its next interruption point. `tryResult()` and owner-bound TaskGroups are supported; `detach()` remains interpreter-only. |
 | DNS, TCP, and TLS client | Experimental on native Linux: `resolveHost`, `tcpConnect`, `tcpListen`, `accept`, connection read/write, and verified `tlsConnect` with hostname/IP checks, all as typed `Task<Result<...,String>>` operations. RAII handles close sockets and TLS sessions. |
 | HTTP/WebSocket client | Experimental native Linux subset: typed HTTP values and GET/POST/PUT/DELETE/custom request client; bounded HTTP/1.1 responses; bounded `ws`/verified `wss` client. Native HTTP server/router/general codec and WebSocket server remain interpreter-only. |
-| Linked source packages | Experimental; supported declarations from relative multi-file imports, including non-generic records/enums, lower with the program. Selected repository-local Discord decoder, Gateway, and REST paths compile and run natively against fake local TLS services without Discord-specific backend lowering. A supervised `GatewayRunner` with an actor-owned Gateway task is covered by a local fake-Gateway integration test; reusable event callbacks, a REST actor, and shared REST rate-limit coordination remain unsupported. |
+| Linked source packages | Experimental; supported declarations from relative multi-file imports, including non-generic records/enums, lower with the program. Selected repository-local Discord decoder, Gateway, and REST paths compile and run natively against fake local TLS services without Discord-specific backend lowering. A supervised `GatewayRunner` with an actor-owned Gateway task is covered by a local fake-Gateway integration test; shared REST rate-limit coordination has bounded per-major-scope FIFO tickets and global/bucket waiting. Reusable event callbacks and a general REST service actor remain unimplemented. |
 | Actors and `ActorRef<T>` | Experimental native C++17 subset: actor declarations/state, `spawn`, typed fire-and-forget and request/reply (`request`, `requestWithin`, `ReplySender.send`, and `ReplyReceiver` readiness/cancel/`tryReceive`), `stop`, `isAlive`, and bounded `runActors()`. Per-actor FIFO mailboxes use round-robin turns; unresolved replies fail on stop, crash, or shutdown. Actor constructors and handlers can start Tasks bound to that actor instance; other owned tasks drain before actor state is cleared or rebuilt; a task stopping its own actor unwinds cooperatively at its next interruption point. Native async tasks can await a reply, which lets `runTasks()` pump a queued actor turn. |
 | Supervisors | Experimental native support for nested trees, `oneForOne`/`oneForAll`/`restForOne`, permanent/transient/temporary policies, monotonic restart windows, deterministic exponential backoff, reverse stop order, and start-order restart. Backoff deadlines progress in `runActors()`. While a task awaits a typed reply, `runTasks()` pumps one queued actor turn and releases serialized task execution until the reply settles; an unresolved unbounded reply with no queued actor work produces a controlled deadlock error. Actor fields cannot contain Resources or Tasks; handler-created Tasks are actor-owned and cancelled on stop, crash, supervised restart, and runtime shutdown. Other owned tasks drain before state is cleared or rebuilt; the current self-stopping task unwinds at its next interruption point. |
-| Awaiting a `ReplyReceiver<T>` | Experimental native support inside async functions. `runTasks()` pumps queued actor turns for pending replies; timeout, cancellation, stop/crash failure, and no-work deadlock are controlled. `sendAfter` and monitor/link remain interpreter-only. |
+| Awaiting a `ReplyReceiver<T>` | Experimental native support inside async functions. `runTasks()` pumps queued actor turns for pending replies; timeout, cancellation, stop/crash failure, and no-work deadlock are controlled. Native monitor/demonitor and link/unlink are supported; `sendAfter` remains interpreter-only. |
 | `hostOS()`, `hostArchitecture()`, `monotonicMilliseconds()`, `environment(String)` | Native C++17 runtime and reference implementations; environment results remain `Option<Secret<String>>`, and monotonic time is used for elapsed-time decisions. Project-local `.tyvera.secrets` is still read only by the reference secret provider. |
 | Native SIGINT/SIGTERM shutdown | Generated C++17 records the first signal and unwinds at statement/loop safe points; scope resources use RAII cleanup. |
+| Structured runtime events | The reference embedding API emits bounded typed events and dead letters. No equivalent public native event sink or stable embedding ABI is exposed yet. |
 | Native FFI, stable public ABI, cross-compilation | Planned; no syntax or runtime contract is exposed. |
 
 Unsupported features never fall back to the interpreter. The full source is

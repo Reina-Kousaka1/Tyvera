@@ -321,6 +321,57 @@ fn main() {
         self.assertIn(".cancel()", generated)
         self.assertIn(".is_cancelled()", generated)
 
+    def test_task_result_polling_has_typed_ir_and_resource_moves(self) -> None:
+        module = self.lower('''async fn answer() -> Int { return 42 }
+async fn empty() {}
+fn main() {
+    let number = answer()
+    let polled = number.tryResult()
+    let task = empty()
+    let done = task.tryResult()
+}
+''')
+        body = module.functions[-1].body
+        self.assertIsInstance(body[1].value, IRMethodCall)
+        self.assertEqual(body[1].value.type, IRAppliedType(
+            "Result", (IRAppliedType("Option", (IRType.INT,)), IRType.STRING)))
+        self.assertEqual(body[3].value.type, IRAppliedType("Result", (IRType.BOOL, IRType.STRING)))
+        generated = emit_cpp(module)
+        self.assertIn(".try_result<false>()", generated)
+        self.assertIn(".try_result()", generated)
+
+        owned = self.lower('''fn main() {
+    let task = tcpListen("127.0.0.1", 0, 8)
+    let result = task.tryResult()
+}
+''')
+        self.assertIsInstance(owned.functions[-1].body[1].value.receiver, IRMove)
+        self.assertIn(".try_result<true>()", emit_cpp(owned))
+        with self.assertRaisesRegex(Diagnostic, "moved"):
+            compile_checked_source('''fn main() {
+    let task = tcpListen("127.0.0.1", 0, 8)
+    let result = task.tryResult()
+    println(task.isDone())
+}
+''', "consumed_task.tyv")
+
+    def test_ir_validator_rejects_wrong_task_poll_result_type(self) -> None:
+        from dataclasses import replace
+
+        module = self.lower('''async fn answer() -> Int { return 42 }
+fn main() {
+    let task = answer()
+    let result = task.tryResult()
+}
+''')
+        main = module.functions[-1]
+        statement = main.body[1]
+        invalid = replace(statement, value=replace(statement.value, type=IRType.BOOL))
+        broken_main = replace(main, body=(main.body[0], invalid))
+        broken = replace(module, functions=(*module.functions[:-1], broken_main))
+        with self.assertRaisesRegex(Diagnostic, "result has the wrong type"):
+            validate_ir(broken)
+
     def test_native_duration_and_task_timeout_lower_to_typed_ir(self) -> None:
         module = self.lower('''async fn value() -> Int { return 7 }
 fn main() {
@@ -741,6 +792,211 @@ class NativeExecutionTests(unittest.TestCase):
     def _tyvera_string(value: str) -> str:
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
+
+    def test_native_task_result_polling_preserves_values_and_actor_replies(self) -> None:
+        source = '''actor Counter {
+    on read(reply: ReplySender<Int>) { reply.send(42) }
+}
+async fn answer(counter: ActorRef<Counter>) -> Int {
+    let value: Int = await counter.request(read)
+    return value
+}
+async fn empty() {}
+fn main() {
+    let counter = spawn(Counter())
+    let task = answer(counter)
+    let voidTask = empty()
+    match task.tryResult() {
+        Ok(None) => println("pending")
+        _ => println("unexpected early result")
+    }
+    match voidTask.tryResult() {
+        Ok(done) => println(done)
+        Err(error) => println(error)
+    }
+    runTasks()
+    match task.tryResult() {
+        Ok(Some(value)) => println(value)
+        _ => println("missing result")
+    }
+    match task.tryResult() {
+        Ok(Some(value)) => println(value)
+        _ => println("missing repeated result")
+    }
+    match voidTask.tryResult() {
+        Ok(done) => println(done)
+        Err(error) => println(error)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-task-poll-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "poll", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "pending\nfalse\n42\n42\ntrue\n")
+
+    def test_native_task_polling_reports_failure_cancellation_and_timeout(self) -> None:
+        source = '''async fn answer() -> Int { return 42 }
+async fn broken() -> Int {
+    let invalid: Float = 1 / 0
+    return 0
+}
+async fn slow() { await sleepFor(seconds(30)) }
+async fn parent() { let child = broken() }
+fn main() {
+    let cancelled = answer()
+    cancelled.cancel()
+    match cancelled.tryResult() {
+        Err(error) => println(error)
+        _ => println("unexpected cancelled result")
+    }
+    runTasks()
+    let failed = broken()
+    runTasks()
+    match failed.tryResult() {
+        Err(error) => println(error)
+        _ => println("unexpected failed result")
+    }
+    let owner = parent()
+    runTasks()
+    match owner.tryResult() {
+        Err(error) => println(error)
+        _ => println("unexpected owner result")
+    }
+    let timed = slow().withTimeout(milliseconds(0))
+    runTasks()
+    match timed.tryResult() {
+        Err(error) => println(error)
+        _ => println("unexpected timeout result")
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-task-poll-errors-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "poll-errors", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertTrue(native.stdout.startswith("task was cancelled\n"))
+            self.assertIn("owned child task failed:", native.stdout)
+            self.assertTrue(native.stdout.endswith("task timed out\n"))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "native socket resource polling requires Linux")
+    def test_native_task_polling_transfers_resources_and_cancels_pending_acquisition(self) -> None:
+        source = '''fn closeListener(opened: Result<TcpListener,String>) -> Int {
+    using listener = move opened {
+        println(listener.isOpen())
+        match listener.localAddress() {
+            Ok(address) => return address.port()
+            Err(error) => println(error)
+        }
+    } else error { println(error) }
+    return 0
+}
+fn main() {
+    let task = tcpListen("127.0.0.1", 0, 8)
+    runTasks()
+    let polled = task.tryResult()
+    var port: Int = 0
+    match move polled {
+        Ok(maybe) => match move maybe {
+            Some(opened) => port = closeListener(move opened)
+            None => println("missing listener")
+        }
+        Err(error) => println(error)
+    }
+    // The original listener must already be closed before binding its port again.
+    let rebound = tcpListen("127.0.0.1", port, 8)
+    runTasks()
+    let second = rebound.tryResult()
+    match move second {
+        Ok(maybe) => match move maybe {
+            Some(opened) => { let ignored = closeListener(move opened) }
+            None => println("missing rebound listener")
+        }
+        Err(error) => println(error)
+    }
+    let pending = tcpListen("127.0.0.1", 0, 8)
+    let early = pending.tryResult()
+    match move early {
+        Ok(maybe) => match move maybe {
+            None => println("pending cancelled")
+            Some(opened) => { let unexpected = closeListener(move opened) }
+        }
+        Err(error) => println(error)
+    }
+    runTasks()
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-task-poll-resource-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "poll-resource", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "true\ntrue\npending cancelled\n")
+
+    def test_native_task_scheduler_services_idle_supervisor_backoff(self) -> None:
+        source = '''actor Worker {
+    init() { println("started") }
+    on fail(reply: ReplySender<Int>) {
+        reply.send(1)
+        let failure: Float = 1 / 0
+    }
+}
+async fn observe(worker: ActorRef<Worker>) {
+    let acknowledged: Int = await worker.request(fail)
+    println(acknowledged)
+    await sleepFor(milliseconds(250))
+    println(worker.isAlive())
+}
+fn main() {
+    let supervisor = oneForOne(2, 5000, exponentialBackoff(10, 10))
+    let worker = supervisor.start(Worker())
+    let task = observe(worker)
+    match runTasks() {
+        Ok(_) => println("drained")
+        Err(error) => println(error)
+    }
+    println(worker.isAlive())
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-shared-deadlines-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "deadlines", root)
+            self.assertEqual((native.returncode, native.stderr), (reference[0], reference[2]))
+            reference_lines = reference[1].splitlines()
+            native_lines = native.stdout.splitlines()
+            self.assertEqual(sorted(native_lines), sorted(reference_lines))
+            self.assertEqual(native_lines.count("started"), 2)
+            self.assertEqual(native_lines.count("true"), 2)
+            self.assertEqual(native_lines[-2:], ["drained", "true"])
+
+    def test_native_monitor_stop_wakeups_do_not_invert_scheduler_locks(self) -> None:
+        source = '''actor Worker { on work() {} }
+async fn observe(monitor: ReplyReceiver<String>) {
+    let reason: String = await monitor
+    println(reason)
+}
+async fn stop(worker: ActorRef<Worker>) { worker.stop() }
+fn main() {
+    var index: Int = 0
+    while index < 32 {
+        let worker = spawn(Worker())
+        let observer = observe(worker.monitor())
+        let stopper = stop(worker)
+        runTasks()
+        println(worker.isAlive())
+        index = index + 1
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-monitor-wakeup-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "monitor-wakeup", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "normal stop\nfalse\n" * 32)
 
     def test_native_sleep_for_matches_reference_task_scheduling(self) -> None:
         source = '''async fn pause() {

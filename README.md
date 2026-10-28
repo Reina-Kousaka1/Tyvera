@@ -232,9 +232,12 @@ bounded server, and static router. The experimental native compiler supports the
 selected value and collection features, synchronous file/binary/path I/O,
 owned file resources, and an experimental Linux async TCP/DNS/TLS client subset
 documented in
-[Backend Architecture](docs/backend-architecture.md). Actors, Supervisors,
-native HTTP/WebSockets, and broader runtime support remain interpreter-only or
-planned. True parallel execution, separate standard-library modules, and
+[Backend Architecture](docs/backend-architecture.md). Experimental native
+Actors, request/reply, monitoring/links, Supervisor V2, owned Tasks/TaskGroups,
+typed JSON, and HTTP/WebSocket clients also run against local integration
+fixtures. Native HTTP/WebSocket servers, actor timers, general classes/generics,
+and broader runtime support remain interpreter-only or planned. Parallel
+Tyvera task-body execution, separate standard-library modules, and
 external secret stores remain planned. See
 the [roadmap](docs/roadmap.md) for sequence and scope, and
 [release/versioning notes](docs/release-process.md) for the

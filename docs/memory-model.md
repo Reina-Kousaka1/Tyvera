@@ -76,9 +76,9 @@ implements the supported subset noted below.
 | `ByteBuffer` | Shared mutable reference to zero-initialized, runtime-managed bytes; access is bounds checked and snapshots are immutable. | Reference runtime and native allocation/access/snapshot are implemented with a 64 MiB cap. Raw pointers, unchecked access, custom allocators, and manual deallocation are not exposed. |
 | `Json` | Immutable tagged value; arrays are ordered and object equality is structural independent of insertion order. Parse/encode are bounded at 16 MiB and 128 nested containers. | Reference and experimental native C++17 parser, constructors, accessors, comparison, and compact encoding share these limits; user-defined record/ADT codecs are not implemented. |
 | `Option<T>`, `Result<T,E>` | Immutable tagged values with structural equality; nested references retain their own identity/value behavior. | Implemented in the bootstrap and native backend for types in the native support subset. |
-| Enums, newtypes, tuples, records | Typed value types; records are immutable nominal values and fields compare structurally. | Implemented in the bootstrap; native backend remains interpreter-only. |
+| Enums, newtypes, tuples, records | Typed value types; records are immutable nominal values and fields compare structurally. | Implemented in the bootstrap; non-generic immutable records and enums also have experimental native lowering. Newtypes, tuples, and generic nominal layouts remain interpreter-only. |
 | Class instances, lists, maps | Classes use stable identity; lists and maps compare by contents. Assignment copies references; collection contents remain shared. | Lists and maps are implemented natively for supported element types; classes remain interpreter-only. |
-| Actor references, tasks, reply handles, timers, supervisors | Opaque identity handles. Copying a handle does not copy the actor, task, or operation it names. | Interpreter implements the full experimental lifecycle. Native C++17 supports an experimental typed ActorRef/send/stop/alive subset; supervisors, reply handles, timers, monitor/link, and actor-owned tasks remain interpreter-only. No public runtime ABI exists. |
+| Actor references, tasks, reply handles, timers, supervisors | Opaque identity handles. Copying a handle does not copy the actor, task, or operation it names. | Interpreter implements the full experimental lifecycle. Native C++17 supports experimental actors, request/reply, monitoring/links, Supervisor V2, owned Tasks, and owner-bound TaskGroups. Actor message timers and task detachment remain interpreter-only. No public runtime ABI exists. |
 | Resource handles | One live owner, explicit transfer, deterministic release. | Implemented for text files, TCP connections/listeners, and HTTP servers. Native file resources use checked moves and synchronous LIFO cleanup. Experimental native Linux TCP uses checked move-only connection/listener handles with a private RAII descriptor; in-flight operations use duplicated descriptors and closing the owner shuts down the shared socket. Native task cancellation cascades through owned children and socket waits; DNS cancellation is observed after the system lookup returns. Native `Task.withTimeout(Duration)` uses monotonic deadlines and waits for source cleanup. |
 
 For mutable ordinary references, `==` compares identity. Value equality
@@ -169,7 +169,7 @@ and file operations. Native Backend V1 implements synchronous text and binary
 file/path operations, plus an experimental Linux async-task/DNS/TCP subset.
 Native socket readiness uses non-blocking descriptors and worker operations;
 native cooperative cancellation follows owned-task trees and socket waits.
-Deadlines, task groups, and async file operations remain interpreter-only.
+Monotonic deadlines and owner-bound TaskGroups are supported natively; async file operations remain interpreter-only.
 Native operations must continue to match the same
 observable Tyvera behavior with the platform's readiness facilities.
 
@@ -191,9 +191,14 @@ runtime preserves checked numeric behavior, controlled I/O results, and
 source-located runtime errors. Executables do not invoke or embed Python.
 The native backend has an experimental Linux slice for `Task<T>`, `await`,
 `runTasks`, DNS, TCP, and cooperative task cancellation. Native monotonic task deadlines are implemented for the supported task subset.
-Task groups, Actors, Supervisors, user-defined types, generic functions, HTTP
+Native actors, Supervisor V2, monitoring/links, and TaskGroups retain the
+reference ownership boundaries. Non-generic records/enums are native values.
+Generic functions/nominal types, classes, tuples, actor timers, HTTP
 servers/routers/general decoders, WebSocket servers, and FFI remain
-interpreter-only or planned. No public native ABI is implemented.
+interpreter-only or planned. Native `Task.tryResult()` copies ordinary completed
+values, but consumes a resource task: a completed handle is moved out exactly
+once, while pending acquisition is cancelled and cleaned up by its owning
+operation. No public native ABI is implemented.
 
 `Bytes` is an immutable Tyvera value. Native values are represented internally
 by vectors and passed by value, preserving observable value semantics.

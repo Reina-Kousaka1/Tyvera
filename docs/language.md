@@ -711,7 +711,7 @@ verified TLS client operations form an experimental Linux-only subset; native
 HTTP and WebSocket clients also have bounded Linux subsets. Native TLS uses
 OpenSSL trust paths and verifies DNS hostnames and IP addresses by default.
 The native backend also accepts async functions, `Task<T>`, `await`,
-`runTasks()`, cooperative `Task.cancel()`, `isCancelled()`, `isDone()`, and
+`runTasks()`, cooperative `Task.cancel()`, `isCancelled()`, `isDone()`, `tryResult()`, and
 `withTimeout(Duration)`. Cancellation cascades through owned child tasks and is
 checked at task statement/loop and socket-poll boundaries. A system DNS lookup
 cannot be interrupted mid-call. Native Actors support typed fire-and-forget
@@ -722,9 +722,9 @@ supervisor subset supports nested `oneForOne`, `oneForAll`, and `restForOne`
 trees, restart policies and intensity windows, and monotonic exponential
 backoff. Native TaskGroups support owner-bound direct-child registration,
 duplicate rejection, `isDone`, cancellation, and `await` joins. Groups do not
-transfer task ownership and cannot cross actor boundaries. `sendAfter`,
-monitoring/links, and supervised actors owning move-only Resources remain
-unsupported. The reference interpreter
+transfer task ownership and cannot cross actor boundaries. Native
+`monitor()`/`demonitor()` and symmetric `link()`/`unlink()` are supported.
+`sendAfter` and actor state owning move-only Resources remain unsupported. The reference interpreter
 remains the complete runtime for language features outside the native subset.
 
 ## JSON values
@@ -882,8 +882,9 @@ The experimental C++17 backend implements this synchronous slice directly:
 buffer/binary limit, project-root-relative file paths, checked `Result`
 errors, secret-path protection, move-only resource transfers, and LIFO cleanup.
 The generated executable uses private C++ runtime storage and does not invoke
-Python. Async file operations, HTTP, native FFI, and actor supervision or
-request/reply remain interpreter-only or planned. The experimental native
+Python. Async file operations, HTTP/WebSocket servers, and native FFI remain
+interpreter-only or planned. Native Supervisor V2 and typed actor request/reply
+are supported experimentally. The experimental native
 Linux actor subset supports typed fire-and-forget messages, FIFO mailboxes,
 round-robin dispatch, stop/alive checks, and isolated handler failure. The
 experimental native Linux subset also supports
@@ -1053,13 +1054,15 @@ Linked package modules lower together for supported declarations. The
 experimental Linux path additionally supports async functions, `Task<T>`,
 `await`, `sleepFor(Duration)`, `runTasks()`, secret-wrapped `environment`,
 DNS, TCP, a verified TLS client, cooperative task cancellation, and monotonic
-deadlines. Classes, generic functions/types, task groups, WebSockets, HTTP
-servers, and native FFI remain unsupported by the native backend. Native actors
-and Supervisors remain experimental; supervised actor state cannot own
-Resources or Tasks, and request/reply, timers, monitoring/links, and actor-owned
-tasks remain unsupported. `await` remains statement-only;
-synchronous calls are atomic.
-`runActors()` remains non-blocking; `runTasks()` waits for task deadlines.
+deadlines, TaskGroups, result polling, actor request/reply, monitoring/links,
+Supervisor V2, and bounded HTTP/WebSocket clients. Classes, generic
+functions/types, actor message timers, HTTP/WebSocket servers, native task
+detachment, and native FFI remain unsupported. Native actor state cannot own
+Resources or Task handles; Tasks created by a handler belong to that actor
+instance and drain on stop/crash/restart. `await` remains statement-only;
+synchronous calls are atomic. `runActors()` drains queued messages and pending
+supervisor backoff; `runTasks()` services task and supervisor deadlines while
+Tasks remain active.
 Actor request timeouts do not interrupt work. No performance claim is made. No
 termination checking or loop execution budget is provided;
 users can write infinite loops. Parsing and execution use
