@@ -16,9 +16,9 @@ The experimental shared REST coordinator is explicit: create one with
 `newRestRateLimitCoordinator()` and pass it to
 `requestBotCoordinated` or `requestBotWithRetriesCoordinated`. It records
 server bucket metadata, applies monotonic global and major-scope limits, and
-serializes calls sharing a major scope. State and active scopes are bounded;
-there is no FIFO/fairness guarantee, and independent buckets under one major
-scope may be conservatively over-throttled. The legacy request functions stay
+serializes calls sharing a major scope. State and active scopes are bounded. Reservation tickets accepted for one
+major scope are served in FIFO order; unrelated major scopes remain independent.
+Independent buckets under one major scope may be conservatively over-throttled. The legacy request functions stay
 uncoordinated. See [the detailed limits](../../docs/discord.md).
 
 The Gateway client uses typed intents and implements TLS verification,
@@ -35,8 +35,9 @@ modules. Linux CI exercises REST and Gateway flows through both the reference
 runtime and native executables against local fake TLS services. The checked-in
 bot example composes the Gateway Task under a transiently supervised
 `GatewayRunner` actor. Native lifecycle changes cancel and drain other
-actor-owned Tasks before state is cleared or rebuilt. The package does not yet provide a reusable Actor/Supervisor client API, a FIFO
-REST request queue, a typed event callback, cache, or shard coordinator. The package manager is not implemented and this
+actor-owned Tasks before state is cleared or rebuilt. The package does not yet provide a reusable Actor/Supervisor client API, a
+typed event callback, cache, or shard coordinator. The bounded REST coordinator
+preserves FIFO order within each major scope. The package manager is not implemented and this
 package is not published. See [the full support
 status](../../docs/discord.md). This software is experimental and not
 production-ready.
