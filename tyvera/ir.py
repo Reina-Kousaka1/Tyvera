@@ -43,6 +43,7 @@ class IRType(str, Enum):
     HTTP_RESPONSE = "HttpResponse"
     ACTOR_REF = "ActorRef"
     SUPERVISOR = "Supervisor"
+    TASK_GROUP = "TaskGroup"
     RESTART_POLICY = "RestartPolicy"
     SUPERVISOR_BACKOFF = "SupervisorBackoff"
     VOID = "Void"
@@ -540,6 +541,8 @@ def _contains_resource(type_ref: IRTypeRef) -> bool:
 
 
 def _contains_task(type_ref: IRTypeRef) -> bool:
+    if type_ref == IRType.TASK_GROUP:
+        return True
     if isinstance(type_ref, IRAppliedType):
         return type_ref.name == "Task" or any(_contains_task(item) for item in type_ref.arguments)
     return False
@@ -562,6 +565,8 @@ def _method_signature(receiver: IRTypeRef, method: str) -> tuple[tuple[IRTypeRef
         return {"isAlive": ((), IRType.BOOL), "stop": ((), IRType.VOID)}.get(method)
     if receiver == IRType.SUPERVISOR:
         return {"isAlive": ((), IRType.BOOL), "stop": ((), IRType.VOID)}.get(method)
+    if receiver == IRType.TASK_GROUP:
+        return {"isDone": ((), IRType.BOOL), "cancel": ((), IRType.INT)}.get(method)
     if isinstance(receiver, IRAppliedType) and receiver.name == "Task":
         signatures = {
             "isDone": ((), IRType.BOOL),
@@ -1214,6 +1219,7 @@ def _validate_expression(
             "openTextReader": ((IRType.STRING,), _applied("Result", IRType.TEXT_READER, IRType.STRING)),
             "openTextWriter": ((IRType.STRING, IRType.STRING), _applied("Result", IRType.TEXT_WRITER, IRType.STRING)),
             "runTasks": ((), _applied("Result", IRType.INT, IRType.STRING)),
+            "taskGroup": ((), IRType.TASK_GROUP),
             "runActors": ((), _applied("Result", IRType.INT, IRType.STRING)),
             "oneForOne": ((IRType.INT, IRType.INT), IRType.SUPERVISOR),
             "oneForAll": ((IRType.INT, IRType.INT), IRType.SUPERVISOR),
@@ -1272,6 +1278,15 @@ def _validate_expression(
         return expression.type
     if isinstance(expression, IRMethodCall):
         receiver_type = _validate_expression(expression.receiver, functions, scopes)
+        if receiver_type == IRType.TASK_GROUP and expression.method == "add":
+            if len(expression.arguments) != 1:
+                raise _invalid(expression.location, "IR TaskGroup.add has the wrong number of arguments")
+            task_type = _validate_expression(expression.arguments[0], functions, scopes)
+            if not isinstance(task_type, IRAppliedType) or task_type.name != "Task" or len(task_type.arguments) != 1:
+                raise _invalid(expression.arguments[0].location, "IR TaskGroup.add requires Task<T>")
+            if expression.type != IRType.BOOL:
+                raise _invalid(expression.location, "IR TaskGroup.add must return Bool")
+            return expression.type
         if receiver_type == IRType.SUPERVISOR and expression.method == "start":
             if len(expression.arguments) not in {1, 2}:
                 raise _invalid(expression.location, "IR Supervisor.start has the wrong number of arguments")
@@ -1408,11 +1423,16 @@ def _validate_statements(
             if not is_async:
                 raise _invalid(statement.location, "IR await is only valid inside an async function")
             awaitable_type = _validate_expression(statement.task, functions, scopes)
-            if (not isinstance(awaitable_type, IRAppliedType)
-                    or awaitable_type.name not in {"Task", "ReplyReceiver"}
-                    or len(awaitable_type.arguments) != 1):
-                raise _invalid(statement.location, "IR await operand must be Task<T> or ReplyReceiver<T>")
-            result_type = awaitable_type.arguments[0]
+            if awaitable_type == IRType.TASK_GROUP:
+                if statement.result is not None:
+                    raise _invalid(statement.location, "IR await of TaskGroup cannot bind a result")
+                result_type = IRType.VOID
+            else:
+                if (not isinstance(awaitable_type, IRAppliedType)
+                        or awaitable_type.name not in {"Task", "ReplyReceiver"}
+                        or len(awaitable_type.arguments) != 1):
+                    raise _invalid(statement.location, "IR await operand must be Task<T>, TaskGroup, or ReplyReceiver<T>")
+                result_type = awaitable_type.arguments[0]
             if statement.result is None and _contains_resource(result_type):
                 raise _invalid(statement.location, "IR await of a Resource result requires a result binding")
             if statement.result is not None:
