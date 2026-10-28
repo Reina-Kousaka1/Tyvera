@@ -64,6 +64,7 @@ from .ir import (
     ir_type_name,
     validate_ir,
 )
+from .native_effects import independent_scalar_functions
 from .source import Diagnostic, Location
 
 
@@ -189,10 +190,12 @@ class _CppGenerator:
         self.module = module
         self.project_root = Path(project_root or Path.cwd()).expanduser().resolve()
         self.function_symbols = {function.symbol: function for function in module.functions}
+        self.independent_functions = independent_scalar_functions(module)
         self.lines: list[str] = []
         self.indent = 0
         self.temporary = 0
         self.async_context = False
+        self.scalar_sync_context = False
         self.actor_context: IRActor | None = None
 
     def generate(self) -> str:
@@ -507,8 +510,10 @@ class _CppGenerator:
     def _function(self, function: IRFunction) -> None:
         self.temporary = 0
         previous_async_context = self.async_context
+        previous_scalar_sync_context = self.scalar_sync_context
         previous_actor_context = self.actor_context
         self.async_context = function.is_async
+        self.scalar_sync_context = not function.is_async and function.symbol in self.independent_functions
         self.actor_context = next(
             (actor for actor in self.module.actors if actor.name == function.actor_name), None,
         )
@@ -520,7 +525,7 @@ class _CppGenerator:
                 for parameter in function.parameters
             )
             self._line(
-                f"return tyvera_runtime::make_task<{self._cpp_type(function.return_type)}>("
+                f"return tyvera_runtime::make_task_with_mode<{self._cpp_type(function.return_type)}>("
                 f"[{captures}]() mutable -> {self._cpp_type(function.return_type)} {{"
             )
             self.indent += 1
@@ -537,10 +542,12 @@ class _CppGenerator:
             if function.return_type == IRType.VOID:
                 self._line("return;")
             self.indent -= 1
-            self._line(f"}}, {_location_args(function.location)});")
+            serialized = "false" if function.symbol in self.independent_functions else "true"
+            self._line(f"}}, {serialized}, {_location_args(function.location)});")
         self.indent -= 1
         self._line("}")
         self.async_context = previous_async_context
+        self.scalar_sync_context = previous_scalar_sync_context
         self.actor_context = previous_actor_context
 
     def _local_name(self, identifier: int) -> str:
@@ -551,6 +558,8 @@ class _CppGenerator:
     def _statement(self, statement) -> None:
         if self.async_context:
             self._line("tyvera_runtime::task_checkpoint();")
+        elif self.scalar_sync_context:
+            self._line("tyvera_runtime::task_cancellation_checkpoint();")
         self._line(f"tyvera_runtime::check_shutdown({_location_args(statement.location)});")
         if isinstance(statement, IRLet):
             self._line(
@@ -626,6 +635,8 @@ class _CppGenerator:
             self.indent += 1
             if self.async_context:
                 self._line("tyvera_runtime::task_checkpoint();")
+            elif self.scalar_sync_context:
+                self._line("tyvera_runtime::task_cancellation_checkpoint();")
             self._line(f"tyvera_runtime::check_shutdown({_location_args(statement.location)});")
             self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(statement.location)});")
             for nested in statement.body:
@@ -644,6 +655,8 @@ class _CppGenerator:
             self.indent += 1
             if self.async_context:
                 self._line("tyvera_runtime::task_checkpoint();")
+            elif self.scalar_sync_context:
+                self._line("tyvera_runtime::task_cancellation_checkpoint();")
             self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(statement.location)});")
             self._line(f"const auto tyv_local_{statement.variable.identifier} = {snapshot}_item;")
             for nested in statement.body:
@@ -1989,6 +2002,9 @@ struct ActiveExecutionLockScope {
         : previous(active_execution_lock) { active_execution_lock = &lock; }
     ~ActiveExecutionLockScope() { active_execution_lock = previous; }
 };
+inline void task_cancellation_checkpoint() {
+    if (active_task_control) active_task_control->check_interruption();
+}
 inline void task_checkpoint() {
     if (active_task_control) active_task_control->check_interruption();
     auto* execution_lock = active_execution_lock;

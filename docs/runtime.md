@@ -269,9 +269,17 @@ interpreter uses its existing selector wakeup for real-time idle deadlines too;
 injected test clocks and sleepers retain deterministic scheduling.
 
 The reference scheduler remains cooperative and single-threaded. The native
-Linux subset uses OS worker threads for tasks and pending network I/O, but
-serializes Tyvera task bodies so shared mutable values are not accessed in
-parallel. Execution-lock waiters are admitted in FIFO order; cancelled waiters
+Linux subset uses OS worker threads for tasks and pending network I/O.
+Task bodies retain serialized execution whenever they can access shared mutable
+values or runtime effects. A conservative proof over validated typed IR permits
+independent scalar-only async functions to run without the execution lock.
+The allowlist contains Int, Float, Bool, String, Byte, Duration and Void, local
+bindings/assignment, arithmetic/comparison, branches, blocks, loops, returns,
+and already-proven synchronous callees. Actor methods, aggregates, handles,
+builtins, output, waits, recursion and unknown constructs are excluded. This
+is a private backend optimization, not a public parallelism or ordering promise.
+Cancellation checkpoints and checked arithmetic remain active. No claim of
+concurrent mutation support or improved performance follows from this proof. Execution-lock waiters are admitted in FIFO order; cancelled waiters
 leave that queue without blocking later work. At the start of a Task drain,
 initial serialized workers register before any of their bodies execute.
 Registration and cancellation notifications use guarded wait predicates rather
@@ -358,3 +366,28 @@ text-file operations, and experimental HTTP/1.1. See the
 [memory model](memory-model.md) and
 [backend architecture](backend-architecture.md).
 
+
+## Native event sink: open design boundary
+
+The reference embedding constructor accepts a synchronous `runtime_event_sink`
+callback receiving typed `RuntimeEvent` / `CrashReason` values. Callback failures
+are isolated from application behavior; the runtime retains at most 1,024 dead
+letters. This is a host embedding hook, not a Tyvera language callback API.
+
+Native executables currently have no equivalent public event sink. The native
+backend builds executables; `ExecutionBackend.execute` is an interpreter-side
+host protocol, and there is no stable native embedding ABI to extend. Neither
+stdout nor stderr is silently repurposed for structured events.
+
+Two possible future contracts need an explicit design decision:
+
+- A versioned native embedding callback ABI needs value ownership, callback
+  lifetime, reentrancy, thread affinity, failure isolation and teardown rules.
+- An opt-in bounded event stream needs a versioned schema, transport, overflow
+  and backpressure policy, redaction, and failure/exit behavior.
+
+Neither alternative is implemented. General concurrent mutation, a public native
+event sink, and higher-level Discord callback/cache/shard services remain open;
+Whale 2.2 is not declared complete by the timer, detachment or scalar-worker
+increments. Existing Discord Gateway and REST APIs continue to use the general
+Actor/Task/networking runtime rather than backend-specific library hooks.

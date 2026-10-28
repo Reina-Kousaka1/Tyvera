@@ -65,7 +65,7 @@ branches, loops and match arms. Move-only text and TCP resources support
 `Option`/`Result` carriers, task transfer, control-flow checking, and
 deterministic cleanup. Async text-file operations, DNS, selector-backed TCP,
 backpressure, and cancellation are implemented in the reference runtime.
-True parallelism, HTTP streaming, native HTTP/WebSocket services, non-network
+General parallelism, HTTP streaming, native HTTP/WebSocket services, non-network
 resource families, standard-library modules, and a native runtime for the full
 language remain planned. The reference runtime's verified TLS client and bounded
 WebSocket client are implemented experimentally; the native backend's
