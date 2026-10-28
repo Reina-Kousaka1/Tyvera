@@ -16,15 +16,28 @@ concurrency:
 
 jobs:
   test:
-    name: test (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: test (Python ${{ matrix.python-version }}${{ matrix.arch-suffix }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     env:
       CXX: g++
+      TYVERA_CI_ARCH: ${{ matrix.architecture }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.13"]
+        include:
+          - python-version: "3.10"
+            runner: ubuntu-latest
+            architecture: x86_64
+            arch-suffix: ""
+          - python-version: "3.13"
+            runner: ubuntu-latest
+            architecture: x86_64
+            arch-suffix: ""
+          - python-version: "3.13"
+            runner: ubuntu-24.04-arm
+            architecture: aarch64
+            arch-suffix: " / ARM64"
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -48,11 +61,12 @@ jobs:
       - name: Verify Ubuntu platform foundation
         run: |
           python - <<'PY'
+          import os
           from tyvera.platform_runtime import Architecture, OperatingSystem, detect_host_platform
 
           host = detect_host_platform()
           assert host.operating_system is OperatingSystem.LINUX, host
-          assert host.architecture is Architecture.X86_64, host
+          assert host.architecture is Architecture(os.environ["TYVERA_CI_ARCH"]), host
           assert host.linux_architecture_supported, host
           PY
           tyvera check examples/platform_runtime.tyv
@@ -61,7 +75,9 @@ jobs:
           env -u DISCORD_TOKEN tyvera run libraries/discord
 
       - name: Run complete test suite
-        run: python -m unittest discover -v
+        run: |
+          python -m compileall -q tyvera tests
+          python -m unittest discover -v
 
       - name: Check secret-file protection
         shell: bash
