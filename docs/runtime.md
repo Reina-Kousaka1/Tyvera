@@ -278,8 +278,11 @@ bindings/assignment, arithmetic/comparison, branches, blocks, loops, returns,
 and already-proven synchronous callees. Actor methods, aggregates, handles,
 builtins, output, waits, recursion and unknown constructs are excluded. This
 is a private backend optimization, not a public parallelism or ordering promise.
-Cancellation checkpoints and checked arithmetic remain active. No claim of
-concurrent mutation support or improved performance follows from this proof. Execution-lock waiters are admitted in FIFO order; cancelled waiters
+Cancellation checkpoints and checked arithmetic remain active. Synchronous
+functions called by tasks also check cancellation at statements and loops without
+releasing the execution lock. These checks do not interrupt actor handlers on
+behalf of a caller's task. Synchronous blocking operations cannot be interrupted
+until they return. No claim of concurrent mutation support or improved performance follows from this proof. Execution-lock waiters are admitted in FIFO order; cancelled waiters
 leave that queue without blocking later work. At the start of a Task drain,
 initial serialized workers register before any of their bodies execute.
 Registration and cancellation notifications use guarded wait predicates rather

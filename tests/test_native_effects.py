@@ -178,6 +178,71 @@ fn main() { let task = controller(); match runTasks() { Ok(_) => println("unexpe
             self.assertNotIn("unexpected", result.stdout)
             self.assertIn("timed out", result.stdout.lower())
 
+    @unittest.skipUnless(native.HAS_CPP_COMPILER, "native end-to-end checks require a C++17 compiler")
+    def test_effectful_sync_callee_observes_task_cancellation(self) -> None:
+        source = """fn spin() { let values = List<Int>(); while true {} }
+async fn worker() { spin() }
+async fn controller() {
+    let child = worker()
+    let timed = child.withTimeout(milliseconds(100))
+    await timed
+}
+fn main() { let task = controller(); match runTasks() { Ok(_) => println("unexpected")
+    Err(error) => println(error) } }"""
+        self.assertNotIn("worker", self.names(self.module(source)))
+        with tempfile.TemporaryDirectory(prefix="tyvera-effectful-sync-cancel-") as temporary:
+            root = pathlib.Path(temporary)
+            result = native.NativeExecutionTests._native_source_result(
+                self, source, root, root / "effectful-sync-cancel", root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("timed out", result.stdout.lower())
+
+    @unittest.skipUnless(native.HAS_CPP_COMPILER, "native end-to-end checks require a C++17 compiler")
+    def test_cancellation_in_sync_callee_cleans_up_resource(self) -> None:
+        source = """fn spin() {
+    using file = openText("cancelled.txt", "write") {
+        file.write("closed during cancellation")
+        while true {}
+    } else error { println(error) }
+}
+async fn worker() { spin() }
+async fn controller() {
+    let child = worker()
+    let timed = child.withTimeout(milliseconds(500))
+    await timed
+}
+fn main() { let task = controller(); match runTasks() { Ok(_) => println("unexpected")
+    Err(error) => println(error) } }"""
+        with tempfile.TemporaryDirectory(prefix="tyvera-sync-cancel-cleanup-") as temporary:
+            root = pathlib.Path(temporary)
+            result = native.NativeExecutionTests._native_source_result(
+                self, source, root, root / "sync-cancel-cleanup", root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("timed out", result.stdout.lower())
+            self.assertEqual((root / "cancelled.txt").read_text(encoding="utf-8"),
+                             "closed during cancellation")
+
+    @unittest.skipUnless(native.HAS_CPP_COMPILER, "native end-to-end checks require a C++17 compiler")
+    def test_owned_timeout_failure_is_stable_across_completion_races(self) -> None:
+        source = """async fn spin() { while true {} }
+async fn controller() {
+    let child = spin()
+    let timed = child.withTimeout(milliseconds(100))
+    await timed
+}
+fn main() { let task = controller(); match runTasks() { Ok(_) => println("unexpected")
+    Err(error) => println(error) } }"""
+        with tempfile.TemporaryDirectory(prefix="tyvera-timeout-owner-race-") as temporary:
+            root = pathlib.Path(temporary)
+            expected = native.NativeExecutionTests._reference_result(source, root)
+            executable = root / "timeout-race"
+            result = native.NativeExecutionTests._native_source_result(self, source, root, executable, root)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), expected)
+            for _ in range(30):
+                result = subprocess.run([str(executable)], cwd=root, capture_output=True,
+                                        text=True, timeout=10, check=False)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), expected)
+
     def test_independent_loop_still_observes_task_timeout_and_cancellation(self) -> None:
         source = '''async fn spin() { while true {} }
 async fn controller() {

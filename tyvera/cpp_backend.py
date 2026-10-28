@@ -195,7 +195,7 @@ class _CppGenerator:
         self.indent = 0
         self.temporary = 0
         self.async_context = False
-        self.scalar_sync_context = False
+        self.sync_context = False
         self.actor_context: IRActor | None = None
 
     def generate(self) -> str:
@@ -510,10 +510,10 @@ class _CppGenerator:
     def _function(self, function: IRFunction) -> None:
         self.temporary = 0
         previous_async_context = self.async_context
-        previous_scalar_sync_context = self.scalar_sync_context
+        previous_sync_context = self.sync_context
         previous_actor_context = self.actor_context
         self.async_context = function.is_async
-        self.scalar_sync_context = not function.is_async and function.symbol in self.independent_functions
+        self.sync_context = not function.is_async and function.actor_name is None
         self.actor_context = next(
             (actor for actor in self.module.actors if actor.name == function.actor_name), None,
         )
@@ -547,7 +547,7 @@ class _CppGenerator:
         self.indent -= 1
         self._line("}")
         self.async_context = previous_async_context
-        self.scalar_sync_context = previous_scalar_sync_context
+        self.sync_context = previous_sync_context
         self.actor_context = previous_actor_context
 
     def _local_name(self, identifier: int) -> str:
@@ -558,7 +558,7 @@ class _CppGenerator:
     def _statement(self, statement) -> None:
         if self.async_context:
             self._line("tyvera_runtime::task_checkpoint();")
-        elif self.scalar_sync_context:
+        elif self.sync_context:
             self._line("tyvera_runtime::task_cancellation_checkpoint();")
         self._line(f"tyvera_runtime::check_shutdown({_location_args(statement.location)});")
         if isinstance(statement, IRLet):
@@ -635,7 +635,7 @@ class _CppGenerator:
             self.indent += 1
             if self.async_context:
                 self._line("tyvera_runtime::task_checkpoint();")
-            elif self.scalar_sync_context:
+            elif self.sync_context:
                 self._line("tyvera_runtime::task_cancellation_checkpoint();")
             self._line(f"tyvera_runtime::check_shutdown({_location_args(statement.location)});")
             self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(statement.location)});")
@@ -655,7 +655,7 @@ class _CppGenerator:
             self.indent += 1
             if self.async_context:
                 self._line("tyvera_runtime::task_checkpoint();")
-            elif self.scalar_sync_context:
+            elif self.sync_context:
                 self._line("tyvera_runtime::task_cancellation_checkpoint();")
             self._line(f"tyvera_runtime::CleanupScope tyv_cleanup_scope_{self._new_temporary()}({_location_args(statement.location)});")
             self._line(f"const auto tyv_local_{statement.variable.identifier} = {snapshot}_item;")
@@ -1918,6 +1918,12 @@ struct TaskControl {
         owner_identity.store(0, std::memory_order_release);
         return true;
     }
+    void propagate_completed_failure_to_waiter(TaskControl* waiter) {
+        if (!waiter || waiter == this || owner_identity.load(std::memory_order_acquire) != waiter->identity)
+            return;
+        const auto message = failure_message_for_owner();
+        if (!message.empty()) waiter->record_child_failure(message);
+    }
     void notify_owner_failure() {
         TaskControl* recipient = nullptr;
         {
@@ -2002,8 +2008,9 @@ struct ActiveExecutionLockScope {
         : previous(active_execution_lock) { active_execution_lock = &lock; }
     ~ActiveExecutionLockScope() { active_execution_lock = previous; }
 };
+inline bool& actor_handler_active();
 inline void task_cancellation_checkpoint() {
-    if (active_task_control) active_task_control->check_interruption();
+    if (active_task_control && !actor_handler_active()) active_task_control->check_interruption();
 }
 inline void task_checkpoint() {
     if (active_task_control) active_task_control->check_interruption();
@@ -2147,6 +2154,7 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
             lock.lock();
         }
         lock.unlock();
+        propagate_completed_failure_to_waiter(active_task_control);
         if (active_task_control) active_task_control->check_interruption();
         lock.lock();
         if (error) {
@@ -2167,6 +2175,7 @@ template <typename T> struct TaskState final : TaskControl, std::enable_shared_f
             lock.lock();
         }
         lock.unlock();
+        propagate_completed_failure_to_waiter(active_task_control);
         if (active_task_control) active_task_control->check_interruption();
         lock.lock();
         if (error) {
@@ -2329,6 +2338,7 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
             lock.lock();
         }
         lock.unlock();
+        propagate_completed_failure_to_waiter(active_task_control);
         if (active_task_control) active_task_control->check_interruption();
         lock.lock();
         if (error) {
