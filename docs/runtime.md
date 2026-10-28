@@ -145,8 +145,17 @@ terminated actor completes immediately with its stored terminal reason.
 `demonitor()` cancels a pending observation and returns whether it did so.
 Monitor receivers share the existing reply-channel await and consumption
 semantics. At most 4,096 pending monitor registrations are retained per actor;
-demonitoring releases a pending registration immediately. Actor links and
-crash propagation are not implemented yet.
+demonitoring releases a pending registration immediately. `ActorRef<T>.link(other)`
+creates a symmetric link between two distinct live actors and returns `true`;
+repeating an existing link is idempotent. `unlink(other)` removes the symmetric
+link and returns whether one existed. Self-links and links to stopped actors return
+`false`, and each actor is limited to 4,096 links. Normal stop and runtime shutdown
+remove links without propagating failure. An abnormal actor crash propagates across
+the connected live-link component, cancels owned work, completes monitors/replies,
+and submits supervised actors as one grouped failure per Supervisor so restart
+strategy and intensity are applied once. Link relationships are discarded on stop
+or crash and are not inherited by restarted actor instances. Actor links are
+experimental.
 
 ## Host signal and process shutdown
 
@@ -282,7 +291,7 @@ duplicate rejection, `isDone`, cancellation, and `await` joins. A group is a
 join/cancellation view, not an ownership transfer; the creator remains
 responsible for every child. Groups cannot cross actor boundaries or be created
 and used in actor handlers.
-`sendAfter` timers, monitoring/links, and supervised actors owning move-only Resources remain unsupported natively.
+`ActorRef.monitor()`/`demonitor()` and symmetric `link()`/`unlink()` are supported by the native runtime. `sendAfter` timers and supervised actors owning move-only Resources remain unsupported natively.
 Generated actor references use shared runtime handles; queued callbacks hold
 weak target references, and runtime shutdown clears mailboxes, supervisors,
 and actor state to break reference cycles. The native runtime retains spawned

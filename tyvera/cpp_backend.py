@@ -1164,6 +1164,10 @@ class _CppGenerator:
             }
             return f"tyvera_runtime::{functions[method]}({', '.join([receiver, *arguments])})"
         if isinstance(expression.receiver.type, IRActorRefType):
+            if method == "link":
+                return f"tyvera_runtime::actor_link({receiver}, {arguments[0]})"
+            if method == "unlink":
+                return f"tyvera_runtime::actor_unlink({receiver}, {arguments[0]})"
             if method == "monitor":
                 return f"tyvera_runtime::actor_monitor({receiver}, {_location_args(expression.location)})"
             if method == "isAlive":
@@ -3634,6 +3638,7 @@ struct ActorBase : std::enable_shared_from_this<ActorBase> {
     std::deque<std::function<void()>> mailbox;
     std::vector<std::weak_ptr<ReplyCellBase>> pending_replies;
     std::vector<std::weak_ptr<ReplyCell<std::string>>> pending_monitors;
+    std::vector<std::weak_ptr<ActorBase>> links;
     std::string last_exit_reason;
     bool queued = false;
     std::function<void()> tyv_restart;
@@ -3685,6 +3690,87 @@ inline ActorRuntimeState& actor_runtime_state() {
     return state;
 }
 inline constexpr std::size_t MAX_ACTOR_MONITORS = 4096;
+inline constexpr std::size_t MAX_ACTOR_LINKS = 4096;
+inline std::vector<std::shared_ptr<ActorBase>> detach_actor_links_locked(
+    const std::shared_ptr<ActorBase>& actor) {
+    std::vector<std::shared_ptr<ActorBase>> peers;
+    if (!actor) return peers;
+    for (const auto& weak_peer : actor->links) {
+        const auto peer = weak_peer.lock();
+        if (!peer || peer == actor) continue;
+        peers.push_back(peer);
+        auto& reciprocal = peer->links;
+        reciprocal.erase(std::remove_if(reciprocal.begin(), reciprocal.end(),
+            [&actor](const auto& candidate) {
+                const auto linked = candidate.lock();
+                return !linked || linked == actor;
+            }), reciprocal.end());
+    }
+    actor->links.clear();
+    return peers;
+}
+inline void unlink_actor_links_locked(const std::shared_ptr<ActorBase>& actor) noexcept {
+    if (!actor) return;
+    for (const auto& weak_peer : actor->links) {
+        const auto peer = weak_peer.lock();
+        if (!peer || peer == actor) continue;
+        auto& reciprocal = peer->links;
+        reciprocal.erase(std::remove_if(reciprocal.begin(), reciprocal.end(),
+            [&actor](const auto& candidate) {
+                const auto linked = candidate.lock();
+                return !linked || linked == actor;
+            }), reciprocal.end());
+    }
+    actor->links.clear();
+}
+inline bool actor_link(
+    const std::shared_ptr<ActorBase>& actor, const std::shared_ptr<ActorBase>& peer) {
+    if (!actor || !peer || actor == peer) return false;
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (actor->status != "alive" || peer->status != "alive") return false;
+    auto has_link = [](const auto& source, const auto& target) {
+        return std::any_of(source->links.begin(), source->links.end(),
+            [&target](const auto& weak) { return weak.lock() == target; });
+    };
+    const bool already_linked = has_link(actor, peer) || has_link(peer, actor);
+    if (already_linked) {
+        try {
+            if (!has_link(actor, peer)) actor->links.emplace_back(peer);
+            if (!has_link(peer, actor)) peer->links.emplace_back(actor);
+        } catch (...) {
+            return false;
+        }
+        return true;
+    }
+    if (actor->links.size() >= MAX_ACTOR_LINKS || peer->links.size() >= MAX_ACTOR_LINKS) return false;
+    try {
+        actor->links.emplace_back(peer);
+        peer->links.emplace_back(actor);
+    } catch (...) {
+        actor->links.erase(std::remove_if(actor->links.begin(), actor->links.end(),
+            [&peer](const auto& weak) { return weak.lock() == peer; }), actor->links.end());
+        peer->links.erase(std::remove_if(peer->links.begin(), peer->links.end(),
+            [&actor](const auto& weak) { return weak.lock() == actor; }), peer->links.end());
+        return false;
+    }
+    return true;
+}
+inline bool actor_unlink(
+    const std::shared_ptr<ActorBase>& actor, const std::shared_ptr<ActorBase>& peer) {
+    if (!actor || !peer || actor == peer) return false;
+    auto& state = actor_runtime_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    const bool existed = std::any_of(actor->links.begin(), actor->links.end(),
+        [&peer](const auto& weak) { return weak.lock() == peer; })
+        || std::any_of(peer->links.begin(), peer->links.end(),
+            [&actor](const auto& weak) { return weak.lock() == actor; });
+    actor->links.erase(std::remove_if(actor->links.begin(), actor->links.end(),
+        [&peer](const auto& weak) { const auto linked = weak.lock(); return !linked || linked == peer; }), actor->links.end());
+    peer->links.erase(std::remove_if(peer->links.begin(), peer->links.end(),
+        [&actor](const auto& weak) { const auto linked = weak.lock(); return !linked || linked == actor; }), peer->links.end());
+    return existed;
+}
 inline void notify_actor_monitors(
     const std::shared_ptr<ActorBase>& actor, const std::string& reason) noexcept {
     if (!actor) return;
@@ -3905,6 +3991,7 @@ inline void stop_actor_for_supervisor(const std::shared_ptr<ActorBase>& actor) n
         actor->mailbox.clear();
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
+        unlink_actor_links_locked(actor);
     }
     cancel_actor_tasks(actor);
     fail_actor_replies(actor, "actor stopped before replying");
@@ -3994,7 +4081,8 @@ inline std::string restart_supervisor_tree(
 inline std::string supervisor_handle_failure(
     const std::shared_ptr<Supervisor>& supervisor, const std::shared_ptr<ActorBase>& actor,
     const std::shared_ptr<Supervisor>& nested, const std::string& failure, bool normal_stop,
-    const std::string& file, int line, int column) {
+    const std::string& file, int line, int column,
+    const std::vector<std::shared_ptr<ActorBase>>& linked_triggers = {}) {
     auto& state = actor_runtime_state();
     std::lock_guard<std::recursive_mutex> lock(state.supervision_mutex);
     if (!supervisor || supervisor->status != "alive") return failure;
@@ -4006,16 +4094,32 @@ inline std::string supervisor_handle_failure(
     const auto policy = found->policy;
     if (normal_stop && policy != RestartPolicy::permanent) return {};
     if (!normal_stop && policy == RestartPolicy::temporary) return failure;
-    const auto index = static_cast<std::size_t>(std::distance(supervisor->children.begin(), found));
-    std::size_t begin = index;
-    std::size_t end = index + 1;
-    if (supervisor->strategy == RestartStrategy::one_for_all) {
-        begin = 0;
-        end = supervisor->children.size();
-    } else if (supervisor->strategy == RestartStrategy::rest_for_one) {
-        end = supervisor->children.size();
+    std::vector<std::size_t> trigger_indexes{
+        static_cast<std::size_t>(std::distance(supervisor->children.begin(), found)),
+    };
+    for (const auto& linked : linked_triggers) {
+        if (!linked || linked == actor || linked->supervisor.lock() != supervisor) continue;
+        const auto linked_child = std::find_if(supervisor->children.begin(), supervisor->children.end(),
+            [&linked](const SupervisorChild& child) { return child.actor == linked; });
+        if (linked_child == supervisor->children.end()) continue;
+        const auto linked_policy = linked_child->policy;
+        if (normal_stop && linked_policy != RestartPolicy::permanent) continue;
+        if (!normal_stop && linked_policy == RestartPolicy::temporary) continue;
+        const auto linked_index = static_cast<std::size_t>(std::distance(supervisor->children.begin(), linked_child));
+        if (std::find(trigger_indexes.begin(), trigger_indexes.end(), linked_index) == trigger_indexes.end())
+            trigger_indexes.push_back(linked_index);
     }
-    for (std::size_t current = end; current > begin; --current) {
+    std::vector<bool> affected_flags(supervisor->children.size(), false);
+    if (supervisor->strategy == RestartStrategy::one_for_all) {
+        std::fill(affected_flags.begin(), affected_flags.end(), true);
+    } else if (supervisor->strategy == RestartStrategy::rest_for_one) {
+        const auto begin = *std::min_element(trigger_indexes.begin(), trigger_indexes.end());
+        std::fill(affected_flags.begin() + static_cast<std::ptrdiff_t>(begin), affected_flags.end(), true);
+    } else {
+        for (const auto index : trigger_indexes) affected_flags[index] = true;
+    }
+    for (std::size_t current = supervisor->children.size(); current > 0; --current) {
+        if (!affected_flags[current - 1]) continue;
         const auto& child = supervisor->children[current - 1];
         if (child.actor) stop_actor_for_supervisor(child.actor);
         else stop_supervisor_tree(child.supervisor);
@@ -4050,9 +4154,9 @@ inline std::string supervisor_handle_failure(
         }
         delay = std::min(delay, supervisor->backoff->maximum_milliseconds);
         if (delay > 0) {
-            std::vector<SupervisorChild> affected(
-                supervisor->children.begin() + static_cast<std::ptrdiff_t>(begin),
-                supervisor->children.begin() + static_cast<std::ptrdiff_t>(end));
+            std::vector<SupervisorChild> affected;
+            for (std::size_t current = 0; current < supervisor->children.size(); ++current)
+                if (affected_flags[current]) affected.push_back(supervisor->children[current]);
             for (const auto& child : affected) {
                 if (child.supervisor) child.supervisor->status = "restarting";
             }
@@ -4069,7 +4173,8 @@ inline std::string supervisor_handle_failure(
             return {};
         }
     }
-    for (std::size_t current = begin; current < end; ++current) {
+    for (std::size_t current = 0; current < supervisor->children.size(); ++current) {
+        if (!affected_flags[current]) continue;
         const auto& child = supervisor->children[current];
         if (child.policy == RestartPolicy::temporary) continue;
         std::string restart_failure;
@@ -4349,6 +4454,7 @@ inline bool actor_stop(
         actor->mailbox.clear();
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
+        (void)detach_actor_links_locked(actor);
     }
     cancel_actor_tasks(actor);
     fail_actor_replies(actor, "actor stopped before replying");
@@ -4363,29 +4469,90 @@ inline std::string actor_crash_message(const ActorBase& actor, const Failure& er
     return "actor '" + actor.actor_name + "' crashed at " + error.file + ":" +
         std::to_string(error.line) + ":" + std::to_string(error.column) + ": " + error.message;
 }
-inline void mark_actor_crashed(const std::shared_ptr<ActorBase>& actor, const std::string& failure) noexcept {
-    if (!actor) return;
+inline std::vector<std::shared_ptr<ActorBase>> mark_actor_crashed(
+    const std::shared_ptr<ActorBase>& actor, const std::string& failure, bool* transitioned = nullptr) {
+    if (transitioned) *transitioned = false;
+    if (!actor) return {};
+    std::vector<std::shared_ptr<ActorBase>> linked;
     {
         auto& state = actor_runtime_state();
         std::lock_guard<std::mutex> lock(state.mutex);
-        if (actor->status != "alive") return;
+        if (actor->status != "alive") return {};
         actor->status = "crashed";
         actor->mailbox.clear();
         actor->queued = false;
         remove_ready_actor_locked(state, actor.get());
+        linked = detach_actor_links_locked(actor);
     }
     cancel_actor_tasks(actor);
     fail_actor_replies(actor, failure);
     notify_actor_monitors(actor, failure);
     actor->tyv_clear_state();
+    if (transitioned) *transitioned = true;
+    return linked;
+}
+inline std::vector<std::shared_ptr<ActorBase>> propagate_linked_actor_crashes(
+    const std::vector<std::shared_ptr<ActorBase>>& initially_linked,
+    const std::shared_ptr<ActorBase>& source, const std::string& failure) {
+    std::vector<std::pair<std::shared_ptr<ActorBase>, std::shared_ptr<ActorBase>>> pending;
+    for (const auto& peer : initially_linked) pending.emplace_back(peer, source);
+    std::vector<ActorBase*> seen;
+    if (source) seen.push_back(source.get());
+    std::vector<std::shared_ptr<ActorBase>> crashed;
+    while (!pending.empty()) {
+        auto edge = std::move(pending.back());
+        pending.pop_back();
+        const auto& peer = edge.first;
+        const auto& from = edge.second;
+        if (!peer || std::find(seen.begin(), seen.end(), peer.get()) != seen.end()) continue;
+        seen.push_back(peer.get());
+        const std::string from_name = from ? from->actor_name : "linked actor";
+        const std::string peer_failure = "actor '" + peer->actor_name +
+            "' crashed because linked actor '" + from_name + "' failed: " + failure;
+        bool transitioned = false;
+        const auto neighbors = mark_actor_crashed(peer, peer_failure, &transitioned);
+        if (!transitioned) continue;
+        crashed.push_back(peer);
+        for (const auto& neighbor : neighbors) pending.emplace_back(neighbor, peer);
+    }
+    return crashed;
 }
 inline std::string apply_actor_failure(
     const std::shared_ptr<ActorBase>& actor, const std::string& failure,
-    const std::string& file, int line, int column) {
+    const std::string& file, int line, int column,
+    const std::vector<std::shared_ptr<ActorBase>>& linked_actors = {}) {
     if (!actor) return failure;
-    const auto supervisor = actor->supervisor.lock();
-    if (!supervisor) return failure;
-    return supervisor_handle_failure(supervisor, actor, {}, failure, false, file, line, column);
+    std::vector<std::pair<std::shared_ptr<Supervisor>, std::vector<std::shared_ptr<ActorBase>>>> groups;
+    std::string first_failure;
+    auto add_trigger = [&](const std::shared_ptr<ActorBase>& trigger) {
+        if (!trigger) return;
+        const auto supervisor = trigger->supervisor.lock();
+        if (!supervisor) {
+            if (first_failure.empty()) first_failure = failure;
+            return;
+        }
+        if (trigger->restart_policy == RestartPolicy::temporary) {
+            if (first_failure.empty()) first_failure = failure;
+            return;
+        }
+        auto found = std::find_if(groups.begin(), groups.end(),
+            [&supervisor](const auto& group) { return group.first == supervisor; });
+        if (found == groups.end()) {
+            groups.emplace_back(supervisor, std::vector<std::shared_ptr<ActorBase>>{});
+            found = groups.end() - 1;
+        }
+        found->second.push_back(trigger);
+    };
+    add_trigger(actor);
+    for (const auto& linked : linked_actors) add_trigger(linked);
+    for (const auto& group : groups) {
+        if (group.second.empty()) continue;
+        std::vector<std::shared_ptr<ActorBase>> extra(group.second.begin() + 1, group.second.end());
+        const auto failure_result = supervisor_handle_failure(
+            group.first, group.second.front(), {}, failure, false, file, line, column, extra);
+        if (!failure_result.empty() && first_failure.empty()) first_failure = failure_result;
+    }
+    return first_failure;
 }
 inline StringResult<std::int64_t> run_actors(
     const std::string& file, int line, int column, bool wait_for_pending = true,
@@ -4440,9 +4607,10 @@ inline StringResult<std::int64_t> run_actors(
             }
             if (was_alive) {
                 const auto crash = actor_crash_message(*actor, error);
-                mark_actor_crashed(actor, crash);
+                const auto linked = mark_actor_crashed(actor, crash);
+                const auto propagated = propagate_linked_actor_crashes(linked, actor, crash);
                 const auto failure = apply_actor_failure(
-                    actor, crash, error.file, error.line, error.column);
+                    actor, crash, error.file, error.line, error.column, propagated);
                 if (first_crash.empty() && !failure.empty()) first_crash = failure;
             }
         } catch (const std::exception&) {
@@ -4454,8 +4622,9 @@ inline StringResult<std::int64_t> run_actors(
             }
             if (was_alive) {
                 const std::string crash = "actor '" + actor->actor_name + "' crashed: native runtime failure";
-                mark_actor_crashed(actor, crash);
-                const auto failure = apply_actor_failure(actor, crash, "<native>", 1, 1);
+                const auto linked = mark_actor_crashed(actor, crash);
+                const auto propagated = propagate_linked_actor_crashes(linked, actor, crash);
+                const auto failure = apply_actor_failure(actor, crash, "<native>", 1, 1, propagated);
                 if (first_crash.empty() && !failure.empty()) first_crash = failure;
             }
         } catch (...) {

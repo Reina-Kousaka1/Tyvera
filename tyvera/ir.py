@@ -1308,6 +1308,15 @@ def _validate_expression(
             if expression.type != expected_result:
                 raise _invalid(expression.location, "IR Supervisor.start result type does not match its child")
             return expression.type
+        if isinstance(receiver_type, IRActorRefType) and expression.method in {"link", "unlink"}:
+            if len(expression.arguments) != 1:
+                raise _invalid(expression.location, f"IR ActorRef.{expression.method} expects one ActorRef argument")
+            argument_type = _validate_expression(expression.arguments[0], functions, scopes)
+            if not isinstance(argument_type, IRActorRefType):
+                raise _invalid(expression.arguments[0].location, f"IR ActorRef.{expression.method} argument must be an ActorRef")
+            if expression.type != IRType.BOOL:
+                raise _invalid(expression.location, f"IR ActorRef.{expression.method} result must be Bool")
+            return expression.type
         expected = _method_signature(receiver_type, expression.method)
         if expected is None:
             raise _invalid(expression.location, f"unsupported IR method '{expression.method}' on {ir_type_name(receiver_type)}")

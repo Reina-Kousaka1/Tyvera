@@ -96,6 +96,7 @@ _MISSING = object()
 _MOVED = object()
 _MAX_ACTOR_MAILBOX = 100_000
 _MAX_ACTOR_MONITORS = 4_096
+_MAX_ACTOR_LINKS = 4_096
 _MAX_ACTOR_DELIVERIES = 100_000
 _MAX_SUPERVISOR_RESTARTS = 1_000
 _MAX_TASK_STEPS = 100_000
@@ -382,6 +383,7 @@ class _TyveraActor:
     constructor_arguments: list[object] = dataclass_field(default_factory=list)
     pending_replies: set[_TyveraReplyCell] = dataclass_field(default_factory=set)
     pending_monitors: set[_TyveraReplyCell] = dataclass_field(default_factory=set)
+    linked_actors: set[_TyveraActor] = dataclass_field(default_factory=set)
     exit_reason: str | None = None
     identity: int = dataclass_field(default_factory=lambda: next(_IDENTITY_SEQUENCE))
 
@@ -1765,6 +1767,13 @@ class Interpreter:
                 if expression.method == "stop":
                     self._stop_supervised_supervisor(receiver, expression.location, depth + 1)
                     return None
+            if isinstance(receiver, _TyveraActorRef) and expression.method in {"link", "unlink"}:
+                arguments = self._evaluate_arguments(expression.arguments, variables, depth)
+                if len(arguments) != 1 or not isinstance(arguments[0], _TyveraActorRef):
+                    raise AssertionError("checked ActorRef link expects one ActorRef")
+                return self._link_actors(
+                    receiver.actor, arguments[0].actor, unlink=expression.method == "unlink",
+                )
             if isinstance(receiver, _TyveraActorRef) and expression.method == "monitor":
                 cell = _TyveraReplyCell()
                 actor = receiver.actor
@@ -2577,7 +2586,68 @@ class Interpreter:
                 cell.error = error
         actor.pending_replies.clear()
 
+    @staticmethod
+    def _unlink_actor_links(actor: _TyveraActor) -> tuple[_TyveraActor, ...]:
+        linked = tuple(actor.linked_actors)
+        actor.linked_actors.clear()
+        for peer in linked:
+            peer.linked_actors.discard(actor)
+        return linked
+
+    @staticmethod
+    def _link_actors(actor: _TyveraActor, peer: _TyveraActor, *, unlink: bool = False) -> bool:
+        if actor is peer:
+            return False
+        if unlink:
+            linked = peer in actor.linked_actors
+            actor.linked_actors.discard(peer)
+            peer.linked_actors.discard(actor)
+            return linked
+        if actor.status != "alive" or peer.status != "alive":
+            return False
+        if peer in actor.linked_actors:
+            return True
+        if len(actor.linked_actors) >= _MAX_ACTOR_LINKS or len(peer.linked_actors) >= _MAX_ACTOR_LINKS:
+            return False
+        actor.linked_actors.add(peer)
+        peer.linked_actors.add(actor)
+        return True
+
+    def _propagate_linked_actor_crashes(
+        self, actor: _TyveraActor, failure: str, location: Location,
+    ) -> list[_TyveraActor]:
+        pending = list(self._unlink_actor_links(actor))
+        seen = {actor.identity}
+        crashed: list[_TyveraActor] = []
+        source_name = actor.declaration.name if actor.declaration is not None else actor.instance.class_name
+        while pending:
+            peer = pending.pop(0)
+            if peer.identity in seen:
+                continue
+            seen.add(peer.identity)
+            neighbors = self._unlink_actor_links(peer)
+            if peer.status not in {"alive", "starting", "restarting"}:
+                continue
+            peer.status = "crashed"
+            peer.mailbox.clear()
+            peer.queued = False
+            self._ready_actors = deque(current for current in self._ready_actors if current is not peer)
+            peer_name = peer.declaration.name if peer.declaration is not None else peer.instance.class_name
+            linked_failure = f"actor '{peer_name}' crashed because linked actor '{source_name}' failed: {failure}"
+            self._fail_pending_replies(peer, linked_failure)
+            self._notify_actor_monitors(peer, linked_failure)
+            self._emit_runtime_event(RuntimeEvent(
+                RuntimeEventKind.ACTOR_CRASHED, f"{peer_name}#{peer.identity}",
+                None if peer.supervisor is None else peer.supervisor.strategy,
+                reason=CrashReason(CrashKind.RUNTIME_ERROR, "linked actor failed",
+                                   location.filename, location.line, location.column),
+            ))
+            crashed.append(peer)
+            pending.extend(neighbors)
+        return crashed
+
     def _stop_actor(self, actor: _TyveraActor, reply_error: str = "actor stopped before replying") -> None:
+        self._unlink_actor_links(actor)
         was_live = actor.status in {"alive", "starting", "restarting"}
         self._cancel_actor_timers(actor)
         self._cancel_actor_tasks(actor)
@@ -2676,9 +2746,27 @@ class Interpreter:
         call_location: Location,
         depth: int,
     ) -> str | None:
+        return self._schedule_supervisor_restart_group(
+            supervisor, (trigger,), failure, call_location, depth,
+        )
+
+    def _schedule_supervisor_restart_group(
+        self,
+        supervisor: _TyveraSupervisor,
+        triggers: tuple[_TyveraActor | _TyveraSupervisor, ...],
+        failure: str,
+        call_location: Location,
+        depth: int,
+    ) -> str | None:
         if supervisor.status != "alive":
             return failure
-        affected = self._restart_targets(supervisor, trigger)
+        trigger = triggers[0]
+        affected_ids = {
+            id(child)
+            for item in triggers
+            for child in self._restart_targets(supervisor, item)
+        }
+        affected = tuple(child for child in supervisor.children if id(child) in affected_ids)
         for child in reversed(affected):
             self._stop_supervised_child(child, "supervisor restart strategy")
             if isinstance(child, _TyveraActor):
@@ -5019,19 +5107,36 @@ class Interpreter:
     def _restart_supervised_actor(
         self, actor: _TyveraActor, failure: str, call_location: Location, depth: int,
     ) -> str | None:
+        linked = self._propagate_linked_actor_crashes(actor, failure, call_location)
         self._notify_actor_monitors(actor, failure)
         self._fail_pending_replies(actor, failure)
         actor.mailbox.clear()
-        supervisor = actor.supervisor
-        if supervisor is None:
-            return failure
-        if supervisor.status != "alive":
-            actor.status = "stopped"
-            return failure
-        if actor.restart_policy is RestartPolicy.TEMPORARY:
-            actor.status = "stopped"
-            return failure
-        return self._schedule_supervisor_restart(supervisor, actor, failure, call_location, depth)
+        grouped: list[tuple[_TyveraSupervisor, list[_TyveraActor]]] = []
+        first_failure: str | None = None
+        for trigger in (actor, *linked):
+            supervisor = trigger.supervisor
+            if supervisor is None or supervisor.status != "alive":
+                if first_failure is None:
+                    first_failure = failure
+                trigger.status = "stopped" if supervisor is not None else trigger.status
+                continue
+            if trigger.restart_policy is RestartPolicy.TEMPORARY:
+                trigger.status = "stopped"
+                if first_failure is None:
+                    first_failure = failure
+                continue
+            group = next((actors for owner, actors in grouped if owner is supervisor), None)
+            if group is None:
+                group = []
+                grouped.append((supervisor, group))
+            group.append(trigger)
+        for supervisor, triggers in grouped:
+            restart_failure = self._schedule_supervisor_restart_group(
+                supervisor, tuple(triggers), failure, call_location, depth,
+            )
+            if restart_failure is not None and first_failure is None:
+                first_failure = restart_failure
+        return first_failure
 
     def _restart_supervised_supervisor(
         self, child: _TyveraSupervisor, failure: str, call_location: Location, depth: int,

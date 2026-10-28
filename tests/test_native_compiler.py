@@ -1735,6 +1735,36 @@ fn main() {
             native = self._native_source_result(source, root, root / "actors", root)
             self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
 
+    def test_native_actor_links_propagate_crashes_and_supervise_like_reference(self) -> None:
+        source = """actor Worker {
+    on fail() { let failure: Float = 1 / 0 }
+}
+fn main() {
+    let supervisor = oneForOne(5, 5000)
+    let first = supervisor.start(Worker())
+    let second = supervisor.start(Worker())
+    let monitor = second.monitor()
+    println(first.link(second))
+    first.fail()
+    runActors()
+    println(first.isAlive())
+    println(second.isAlive())
+    println(monitor.isReady())
+    match monitor.tryReceive() {
+        Ok(Some(reason)) => println("linked crash")
+        Ok(None) => println("pending")
+        Err(error) => println(error)
+    }
+    println(second.unlink(first))
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-actor-links-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actors", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            self.assertEqual(native.stdout, "true\ntrue\ntrue\ntrue\nlinked crash\nfalse\n")
+
     def test_native_actor_monitor_stop_and_demonitor_match_reference(self) -> None:
         source = """actor Worker { on work() {} }
 fn main() {

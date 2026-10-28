@@ -116,6 +116,73 @@ fn main() {
             Interpreter(program, output).run()
         self.assertEqual(output.getvalue(), "false\n")
 
+    def test_actor_links_are_symmetric_idempotent_and_type_checked(self) -> None:
+        output, _ = self.run_source("""actor Worker { on work() {} }
+fn main() {
+    let first = spawn(Worker())
+    let second = spawn(Worker())
+    println(first.link(second))
+    println(first.link(second))
+    println(second.unlink(first))
+    println(first.unlink(second))
+    println(first.link(first))
+    println(first.unlink(first))
+}
+""")
+        self.assertEqual(output, "true\ntrue\ntrue\nfalse\nfalse\nfalse\n")
+        self.reject("""actor Worker { on work() {} }
+fn main() {
+    let worker = spawn(Worker())
+    worker.link("not an actor")
+}
+""", "ActorRef.link expects an ActorRef")
+
+    def test_linked_actor_crash_propagates_and_supervisor_restarts_group(self) -> None:
+        output, _ = self.run_source("""actor Worker {
+    on fail() { let failure: Float = 1 / 0 }
+}
+fn main() {
+    let supervisor = oneForOne(5, 5000)
+    let first = supervisor.start(Worker())
+    let second = supervisor.start(Worker())
+    let monitor = second.monitor()
+    println(first.link(second))
+    first.fail()
+    runActors()
+    println(first.isAlive())
+    println(second.isAlive())
+    println(monitor.isReady())
+    match monitor.tryReceive() {
+        Ok(Some(reason)) => println("linked crash")
+        Ok(None) => println("pending")
+        Err(error) => println(error)
+    }
+    println(second.unlink(first))
+}
+""")
+        self.assertEqual(output, "true\ntrue\ntrue\ntrue\nlinked crash\nfalse\n")
+
+    def test_unlink_prevents_crash_propagation(self) -> None:
+        output, _ = self.run_source("""actor Worker {
+    on fail() { let failure: Float = 1 / 0 }
+    on work() {}
+}
+fn main() {
+    let supervisor = oneForOne(5, 5000)
+    let first = supervisor.start(Worker())
+    let second = supervisor.start(Worker())
+    println(first.link(second))
+    println(second.unlink(first))
+    let monitor = second.monitor()
+    first.fail()
+    runActors()
+    println(first.isAlive())
+    println(second.isAlive())
+    println(monitor.isReady())
+}
+""")
+        self.assertEqual(output, "true\ntrue\ntrue\ntrue\nfalse\n")
+
     def test_actor_monitor_observes_stop_and_demonitor_cancels_observation(self) -> None:
         output, _ = self.run_source("""actor Worker { on work() {} }
 fn main() {

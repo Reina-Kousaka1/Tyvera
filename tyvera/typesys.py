@@ -376,7 +376,7 @@ class TypeChecker:
                 fields[member.name] = member
             handlers: dict[str, Signature] = {}
             for method in declaration.handlers:
-                if method.name in {"stop", "isAlive", "monitor", "request", "requestWithin", "sendAfter"}:
+                if method.name in {"stop", "isAlive", "monitor", "link", "unlink", "request", "requestWithin", "sendAfter"}:
                     raise Diagnostic(method.location, "type", f"actor handler name '{method.name}' is reserved by ActorRef methods")
                 if method.name in handlers:
                     raise Diagnostic(method.location, "type", f"actor handler '{method.name}' is already declared")
@@ -1736,6 +1736,15 @@ class TypeChecker:
                 if len(receiver_arguments) != 1 or receiver_arguments[0] not in self.actors:
                     raise Diagnostic(expression.location, "type", "invalid actor reference type")
                 actor = self.actors[receiver_arguments[0]]
+                if expression.method in {"link", "unlink"}:
+                    if len(argument_types) != 1:
+                        raise Diagnostic(expression.location, "type", f"ActorRef.{expression.method} expects one ActorRef argument")
+                    argument_base, argument_arguments = split_type(self._canonical_type(argument_types[0]))
+                    if (argument_base != "ActorRef" or len(argument_arguments) != 1
+                            or argument_arguments[0] not in self.actors):
+                        raise Diagnostic(expression.arguments[0].location, "type",
+                                         f"ActorRef.{expression.method} expects an ActorRef<Actor>, found {argument_types[0]}")
+                    return "Bool"
                 if expression.method == "monitor":
                     self._check_arguments(expression.arguments, argument_types, (), expression.location,
                                           "ActorRef.monitor")
