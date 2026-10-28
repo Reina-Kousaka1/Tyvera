@@ -3115,7 +3115,7 @@ fn main() {
     }
 }
 fn main() {
-    report("{\"unicode\":\"\\ud83d\\ude03\",\"line\":\"a\nb\"}")
+    report("{\"unicode\":\"\\ud83d\\ude03\",\"line\":\"a\\nb\"}")
     report("[-0,-0.0,1.5,1e-4,1e-5,1e15,1e16,1e-9999]")
     report("{\"x\":1,\"x\":2}")
     report("9223372036854775808")
