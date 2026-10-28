@@ -669,6 +669,27 @@ fn main() {
             self.assertIn("was not found", caught.exception.message)
 
 
+    def test_native_task_group_lowering_preserves_await_and_owner_methods(self) -> None:
+        module = self.lower('''async fn child() {}
+async fn exercise() {
+    let group = taskGroup()
+    let pending = child()
+    group.add(pending)
+    await group
+    println(group.isDone())
+}
+fn main() {
+    let pending = exercise()
+    runTasks()
+}
+''')
+        generated = emit_cpp(module)
+        self.assertIn("tyvera_runtime::task_group(", generated)
+        self.assertIn(".add(", generated)
+        self.assertIn(".await(", generated)
+        self.assertIn(".is_done(", generated)
+
+
 @unittest.skipUnless(HAS_CPP_COMPILER, "native end-to-end checks require a C++17 compiler")
 class NativeExecutionTests(unittest.TestCase):
     def _build_and_run(
@@ -1935,6 +1956,81 @@ fn main() {{
                 server.server_close()
                 server_thread.join(timeout=1)
 
+    def test_native_task_group_registers_cancels_and_joins_children(self) -> None:
+        source = '''async fn waitLong() {
+    await sleepFor(seconds(60))
+}
+async fn exercise() {
+    let group = taskGroup()
+    let first = waitLong()
+    let second = waitLong()
+    println(group.add(first))
+    println(group.add(first))
+    println(group.add(second))
+    println(group.isDone())
+    println(group.cancel())
+    await group
+    println(group.isDone())
+}
+fn main() {
+    let pending = exercise()
+    match runTasks() {
+        Ok(_) => println("complete")
+        Err(error) => println(error)
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-task-group-") as temporary:
+            root = Path(temporary)
+            expected = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "task-group-app", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            self.assertEqual(native.stdout, "true\nfalse\ntrue\nfalse\n2\ntrue\ncomplete\n")
+
+    def test_native_task_group_enforces_creator_ownership_and_matches_reference(self) -> None:
+        source = '''async fn misuse(group: TaskGroup) {
+    println(group.isDone())
+}
+async fn owner() {
+    let group = taskGroup()
+    let pending = misuse(group)
+    await pending
+    println("unreachable")
+}
+fn main() {
+    let pending = owner()
+    match runTasks() {
+        Ok(_) => println("unexpected success")
+        Err(error) => println(error)
+    }
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-task-group-owner-") as temporary:
+            root = Path(temporary)
+            expected = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "task-group-owner-app", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            self.assertIn("TaskGroup may only be used by its creating task", native.stdout)
+
+    def test_native_root_task_group_tracks_root_task_completion(self) -> None:
+        source = '''async fn quick() {
+    await sleepFor(milliseconds(0))
+}
+fn main() {
+    let group = taskGroup()
+    let pending = quick()
+    println(group.add(pending))
+    match runTasks() {
+        Ok(_) => {}
+        Err(error) => println(error)
+    }
+    println(group.isDone())
+}'''
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-root-task-group-") as temporary:
+            root = Path(temporary)
+            expected = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "root-task-group-app", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), expected)
+            self.assertEqual(native.stdout, "true\ntrue\n")
+
     def test_native_task_registry_allows_more_than_64_sequential_tasks(self) -> None:
         source = '''async fn pulse() {
     await sleepFor(milliseconds(0))
@@ -3019,7 +3115,7 @@ fn main() {
     }
 }
 fn main() {
-    report("{\"unicode\":\"\\ud83d\\ude03\",\"line\":\"a\\nb\"}")
+    report("{\"unicode\":\"\\ud83d\\ude03\",\"line\":\"a\nb\"}")
     report("[-0,-0.0,1.5,1e-4,1e-5,1e15,1e16,1e-9999]")
     report("{\"x\":1,\"x\":2}")
     report("9223372036854775808")
