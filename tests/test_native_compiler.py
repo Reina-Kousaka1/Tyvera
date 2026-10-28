@@ -1765,6 +1765,51 @@ fn main() {
             self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
             self.assertEqual(native.stdout, "true\ntrue\ntrue\ntrue\nlinked crash\nfalse\n")
 
+    def test_native_transitive_actor_links_match_root_crash_across_supervisors(self) -> None:
+        source = """actor Origin {
+    on fail() { let failure: Float = 1 / 0 }
+}
+actor Middle { on work() {} }
+actor Leaf { on work() {} }
+fn main() {
+    let firstSupervisor = oneForOne(4, 5000)
+    let secondSupervisor = oneForOne(4, 5000)
+    let origin = firstSupervisor.start(Origin())
+    let middle = secondSupervisor.start(Middle())
+    let leaf = secondSupervisor.start(Leaf())
+    let middleMonitor = middle.monitor()
+    let leafMonitor = leaf.monitor()
+    println(origin.link(middle))
+    println(middle.link(leaf))
+    origin.fail()
+    match runActors() {
+        Ok(_) => println("drained")
+        Err(_) => println("failure observed")
+    }
+    println(origin.isAlive())
+    println(middle.isAlive())
+    println(leaf.isAlive())
+    match middleMonitor.tryReceive() {
+        Ok(Some(reason)) => println(reason)
+        Ok(None) => println("middle pending")
+        Err(error) => println(error)
+    }
+    match leafMonitor.tryReceive() {
+        Ok(Some(reason)) => println(reason)
+        Ok(None) => println("leaf pending")
+        Err(error) => println(error)
+    }
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="tyvera-native-transitive-links-") as temporary:
+            root = Path(temporary)
+            reference = self._reference_result(source, root)
+            native = self._native_source_result(source, root, root / "actors", root)
+            self.assertEqual((native.returncode, native.stdout, native.stderr), reference)
+            lines = native.stdout.splitlines()
+            self.assertEqual(sum("because linked actor 'Origin' failed:" in line for line in lines), 2)
+            self.assertEqual(lines[:6], ["true", "true", "drained", "true", "true", "true"])
+
     def test_native_actor_monitor_stop_and_demonitor_match_reference(self) -> None:
         source = """actor Worker { on work() {} }
 fn main() {
@@ -1797,7 +1842,7 @@ fn main() {
     on fail() { let failure: Float = 1 / 0 }
 }
 async fn observe(monitor: ReplyReceiver<String>) {
-    await monitor as reason
+    let reason: String = await monitor
     println(reason)
 }
 fn main() {

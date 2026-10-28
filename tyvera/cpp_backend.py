@@ -4503,10 +4503,9 @@ inline std::vector<std::shared_ptr<ActorBase>> propagate_linked_actor_crashes(
         auto edge = std::move(pending.back());
         pending.pop_back();
         const auto& peer = edge.first;
-        const auto& from = edge.second;
         if (!peer || std::find(seen.begin(), seen.end(), peer.get()) != seen.end()) continue;
         seen.push_back(peer.get());
-        const std::string from_name = from ? from->actor_name : "linked actor";
+        const std::string from_name = source ? source->actor_name : "linked actor";
         const std::string peer_failure = "actor '" + peer->actor_name +
             "' crashed because linked actor '" + from_name + "' failed: " + failure;
         bool transitioned = false;

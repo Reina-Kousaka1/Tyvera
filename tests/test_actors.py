@@ -210,7 +210,7 @@ fn main() {
     on fail() { let failure: Float = 1 / 0 }
 }
 async fn observe(monitor: ReplyReceiver<String>) {
-    await monitor as reason
+    let reason: String = await monitor
     println(reason)
 }
 fn main() {

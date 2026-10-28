@@ -152,7 +152,7 @@ link and returns whether one existed. Self-links and links to stopped actors ret
 `false`, and each actor is limited to 4,096 links. Normal stop and runtime shutdown
 remove links without propagating failure. An abnormal actor crash propagates across
 the connected live-link component, cancels owned work, completes monitors/replies,
-and submits supervised actors as one grouped failure per Supervisor so restart
+and uses the originating crash in each linked actor's diagnostic. It submits supervised actors as one grouped failure per Supervisor so restart
 strategy and intensity are applied once. Link relationships are discarded on stop
 or crash and are not inherited by restarted actor instances. Actor links are
 experimental.
