@@ -287,8 +287,12 @@ leave that queue without blocking later work. At the start of a Task drain,
 initial serialized workers register before any of their bodies execute.
 Registration and cancellation notifications use guarded wait predicates rather
 than relying on host thread yields. Among simultaneously runnable tasks, exact native turn interleaving
-is not a cross-backend guarantee; native parity covers values and lifecycle,
-while fairness checks ensure a task awaiting an actor reply is not starved. Native task cancellation is cooperative at statement/loop and socket
+is not a cross-backend guarantee; native parity covers values and lifecycle.
+When an actor request starts waiting while actor work is ready, the execution
+lock reserves its next turn for the actor pump. A sent reply then reserves the
+following turn for its waiter, which retains the lock through its first resumed
+source statement. This prevents a ready task from repeatedly reacquiring the
+lock ahead of actor delivery or the reply continuation. Native task cancellation is cooperative at statement/loop and socket
 poll checkpoints; owned children are cancelled on owner cancellation/failure
 and joined before owner completion. A blocking native DNS lookup cannot be
 interrupted mid-call. The experimental

@@ -1266,25 +1266,33 @@ fn main() {
         with tempfile.TemporaryDirectory(prefix="tyvera-native-actor-reply-fairness-") as temporary:
             root = Path(temporary)
             reference = self._reference_result(source, root)
-            native = self._native_source_result(source, root, root / "actor-reply-fairness", root)
-            self.assertEqual((native.returncode, native.stderr), (reference[0], reference[2]))
+            executable = root / "actor-reply-fairness"
+            native = self._native_source_result(source, root, executable, root)
             reference_lines = reference[1].splitlines()
-            native_lines = native.stdout.splitlines()
-            for lines in (reference_lines, native_lines):
+            native_runs = [native]
+            for _ in range(40):
+                native_runs.append(subprocess.run(
+                    [str(executable)], cwd=root, capture_output=True, text=True,
+                    timeout=10, check=False,
+                ))
+            for completed in native_runs:
+                self.assertEqual((completed.returncode, completed.stderr), (reference[0], reference[2]))
+                native_lines = completed.stdout.splitlines()
+                for lines in (reference_lines, native_lines):
+                    self.assertEqual(
+                        [line for line in lines if line.isdigit()],
+                        [str(index) for index in range(20)],
+                    )
+                    self.assertEqual(lines.count("handled"), 1)
+                    self.assertEqual(lines.count("reply delivered"), 1)
+                    self.assertEqual(lines.count("complete"), 1)
+                    self.assertLess(lines.index("handled"), lines.index("reply delivered"))
+                    self.assertLess(lines.index("reply delivered"), lines.index("19"))
+                    self.assertGreater(lines.index("complete"), lines.index("19"))
                 self.assertEqual(
-                    [line for line in lines if line.isdigit()],
-                    [str(index) for index in range(20)],
+                    [line for line in reference_lines if line in {"handled", "reply delivered", "complete"}],
+                    [line for line in native_lines if line in {"handled", "reply delivered", "complete"}],
                 )
-                self.assertEqual(lines.count("handled"), 1)
-                self.assertEqual(lines.count("reply delivered"), 1)
-                self.assertEqual(lines.count("complete"), 1)
-                self.assertLess(lines.index("handled"), lines.index("reply delivered"))
-                self.assertLess(lines.index("reply delivered"), lines.index("19"))
-                self.assertGreater(lines.index("complete"), lines.index("19"))
-            self.assertEqual(
-                [line for line in reference_lines if line in {"handled", "reply delivered", "complete"}],
-                [line for line in native_lines if line in {"handled", "reply delivered", "complete"}],
-            )
 
     def test_native_actor_reply_delegated_to_child_task_drains_on_stop(self) -> None:
         source = '''async fn deliver(reply: ReplySender<Int>) {

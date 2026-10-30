@@ -243,6 +243,76 @@ fn main() { let task = controller(); match runTasks() { Ok(_) => println("unexpe
                                         text=True, timeout=10, check=False)
                 self.assertEqual((result.returncode, result.stdout, result.stderr), expected)
 
+    @unittest.skipUnless(native.HAS_CPP_COMPILER, "native end-to-end checks require a C++17 compiler")
+    def test_polling_failed_owned_child_does_not_resume_parent(self) -> None:
+        source = """async fn fail() -> Int { return 9223372036854775807 + 1 }
+async fn controller() {
+    let child = fail()
+    while !child.isDone() { await sleepFor(milliseconds(1)) }
+    match child.tryResult() {
+        Ok(_) => println("unexpected result")
+        Err(_) => println("unexpectedly handled")
+    }
+}
+fn main() { let task = controller(); match runTasks() { Ok(_) => println("unexpected success")
+    Err(error) => println(error) } }"""
+        with tempfile.TemporaryDirectory(prefix="tyvera-poll-owner-race-") as temporary:
+            root = pathlib.Path(temporary)
+            expected = native.NativeExecutionTests._reference_result(source, root)
+            executable = root / "poll-race"
+            result = native.NativeExecutionTests._native_source_result(self, source, root, executable, root)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), expected)
+            for _ in range(30):
+                result = subprocess.run([str(executable)], cwd=root, capture_output=True,
+                                        text=True, timeout=10, check=False)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), expected)
+
+    @unittest.skipUnless(native.HAS_CPP_COMPILER, "native end-to-end checks require a C++17 compiler")
+    def test_group_join_propagates_owned_child_failure(self) -> None:
+        source = """async fn fail() -> Int { return 9223372036854775807 + 1 }
+async fn controller() {
+    let group = taskGroup()
+    let child = fail()
+    group.add(child)
+    await group
+    println("unexpected continuation")
+}
+fn main() { let task = controller(); match runTasks() { Ok(_) => println("unexpected success")
+    Err(error) => println(error) } }"""
+        with tempfile.TemporaryDirectory(prefix="tyvera-group-owner-race-") as temporary:
+            root = pathlib.Path(temporary)
+            expected = native.NativeExecutionTests._reference_result(source, root)
+            executable = root / "group-race"
+            result = native.NativeExecutionTests._native_source_result(self, source, root, executable, root)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), expected)
+            for _ in range(30):
+                result = subprocess.run([str(executable)], cwd=root, capture_output=True,
+                                        text=True, timeout=10, check=False)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), expected)
+
+    @unittest.skipUnless(native.HAS_CPP_COMPILER, "native end-to-end checks require a C++17 compiler")
+    def test_group_poll_propagates_owned_child_failure(self) -> None:
+        source = """async fn fail() -> Int { return 9223372036854775807 + 1 }
+async fn controller() {
+    let group = taskGroup()
+    let child = fail()
+    group.add(child)
+    while !group.isDone() { await sleepFor(milliseconds(1)) }
+    println("unexpected continuation")
+}
+fn main() { let task = controller(); match runTasks() { Ok(_) => println("unexpected success")
+    Err(error) => println(error) } }"""
+        with tempfile.TemporaryDirectory(prefix="tyvera-group-poll-race-") as temporary:
+            root = pathlib.Path(temporary)
+            expected = native.NativeExecutionTests._reference_result(source, root)
+            executable = root / "group-poll-race"
+            result = native.NativeExecutionTests._native_source_result(self, source, root, executable, root)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), expected)
+            for _ in range(30):
+                result = subprocess.run([str(executable)], cwd=root, capture_output=True,
+                                        text=True, timeout=10, check=False)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), expected)
+
     def test_independent_loop_still_observes_task_timeout_and_cancellation(self) -> None:
         source = '''async fn spin() { while true {} }
 async fn controller() {

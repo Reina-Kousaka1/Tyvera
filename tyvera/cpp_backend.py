@@ -538,6 +538,8 @@ class _CppGenerator:
             )
         for statement in function.body:
             self._statement(statement)
+            if function.is_async:
+                self._line("tyvera_runtime::task_complete_statement();")
         if function.is_async:
             if function.return_type == IRType.VOID:
                 self._line("return;")
@@ -1663,42 +1665,98 @@ struct NativeExecutionMutex {
     std::condition_variable changed;
     bool locked = false;
     std::deque<const void*> queue;
+    bool actor_pump_handoff = false;
+    const void* reply_handoff = nullptr;
+    const void* reply_handoff_turn = nullptr;
+
+    void begin_reply_handoff(const void* participant) {
+        if (!participant) return;
+        std::lock_guard<std::mutex> lock(state_mutex);
+        reply_handoff = participant;
+        changed.notify_all();
+    }
+    bool begin_reply_handoff_turn(const void* participant) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        if (reply_handoff == participant) {
+            reply_handoff = nullptr;
+            reply_handoff_turn = participant;
+            changed.notify_all();
+            return true;
+        }
+        return reply_handoff_turn == participant;
+    }
+    void complete_reply_handoff_turn(const void* participant) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        if (reply_handoff_turn != participant) return;
+        reply_handoff_turn = nullptr;
+        changed.notify_all();
+    }
+    void abandon_reply_handoff(const void* participant) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        if (reply_handoff == participant) reply_handoff = nullptr;
+        if (reply_handoff_turn == participant) reply_handoff_turn = nullptr;
+        changed.notify_all();
+    }
+    void begin_actor_pump_handoff() {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        actor_pump_handoff = true;
+        changed.notify_all();
+    }
 
     void lock() {
         std::unique_lock<std::mutex> lock(state_mutex);
         const int ticket = 0;
         queue.push_back(&ticket);
-        changed.wait(lock, [this, &ticket]() { return !locked && queue.front() == &ticket; });
+        changed.wait(lock, [this, &ticket]() {
+            return !locked && !actor_pump_handoff && reply_handoff == nullptr && queue.front() == &ticket;
+        });
         queue.pop_front();
         locked = true;
     }
     bool try_lock() {
         std::lock_guard<std::mutex> lock(state_mutex);
-        if (locked || !queue.empty()) return false;
+        if (locked || actor_pump_handoff || !queue.empty()) return false;
         locked = true;
         return true;
     }
     template <typename Cancelled, typename Queued>
-    bool lock_or_cancel(Cancelled&& cancelled, Queued&& queued) {
+    bool lock_or_cancel(Cancelled&& cancelled, Queued&& queued, const void* participant = nullptr) {
         std::unique_lock<std::mutex> lock(state_mutex);
         const int ticket = 0;
         queue.push_back(&ticket);
         queued();
-        changed.wait(lock, [this, &ticket, &cancelled]() {
-            return (!locked && queue.front() == &ticket) || cancelled();
+        changed.wait(lock, [this, &ticket, &cancelled, participant]() {
+            return (!locked && !actor_pump_handoff
+                && ((reply_handoff == participant && participant != nullptr)
+                    || (reply_handoff == nullptr && queue.front() == &ticket)))
+                || cancelled();
         });
         if (cancelled()) {
             queue.erase(std::find(queue.begin(), queue.end(), &ticket));
+            if (reply_handoff == participant) reply_handoff = nullptr;
             changed.notify_all();
             return false;
         }
-        queue.pop_front();
+        queue.erase(std::find(queue.begin(), queue.end(), &ticket));
         locked = true;
         return true;
     }
     template <typename Cancelled>
     bool lock_or_cancel(Cancelled&& cancelled) {
         return lock_or_cancel(std::forward<Cancelled>(cancelled), []() {});
+    }
+    void lock_for_actor_pump() {
+        std::unique_lock<std::mutex> lock(state_mutex);
+        const int ticket = 0;
+        queue.push_back(&ticket);
+        changed.wait(lock, [this, &ticket]() {
+            return !locked && reply_handoff == nullptr
+                && (actor_pump_handoff || queue.front() == &ticket);
+        });
+        queue.erase(std::find(queue.begin(), queue.end(), &ticket));
+        actor_pump_handoff = false;
+        locked = true;
+        changed.notify_all();
     }
     void unlock() noexcept {
         {
@@ -1969,7 +2027,8 @@ inline void reacquire_execution_lock(std::unique_lock<NativeExecutionMutex>& loc
     auto* execution = lock.mutex();
     if (!execution) return;
     if (cancellation_owner) {
-        if (execution->lock_or_cancel([cancellation_owner]() { return cancellation_owner->is_done(); })) {
+        if (execution->lock_or_cancel([cancellation_owner]() { return cancellation_owner->is_done(); },
+                                      []() {}, cancellation_owner)) {
             lock = std::unique_lock<NativeExecutionMutex>(*execution, std::adopt_lock);
             return;
         }
@@ -1989,7 +2048,7 @@ public:
         if (task.serialized) {
             auto& execution = native_scheduler().execution_mutex;
             if (execution.lock_or_cancel([&task]() { return task.is_done(); },
-                                         [&task]() { task.register_execution(); })) {
+                                         [&task]() { task.register_execution(); }, &task)) {
                 lock_ = std::unique_lock<NativeExecutionMutex>(execution, std::adopt_lock);
                 active_execution_lock = &lock_;
             } else {
@@ -2000,7 +2059,11 @@ public:
             active_execution_lock = nullptr;
         }
     }
-    ~NativeTaskExecution() { active_execution_lock = previous_; active_task_control = previous_task_; }
+    ~NativeTaskExecution() {
+        if (lock_.mutex()) lock_.mutex()->abandon_reply_handoff(active_task_control);
+        active_execution_lock = previous_;
+        active_task_control = previous_task_;
+    }
 };
 struct ActiveExecutionLockScope {
     std::unique_lock<NativeExecutionMutex>* previous;
@@ -2016,10 +2079,16 @@ inline void task_checkpoint() {
     if (active_task_control) active_task_control->check_interruption();
     auto* execution_lock = active_execution_lock;
     if (!execution_lock || !execution_lock->owns_lock()) return;
+    if (execution_lock->mutex()->begin_reply_handoff_turn(active_task_control)) return;
     execution_lock->unlock();
     std::this_thread::yield();
     reacquire_execution_lock(*execution_lock, active_task_control);
     if (active_task_control) active_task_control->check_interruption();
+}
+inline void task_complete_statement() {
+    auto* execution_lock = active_execution_lock;
+    if (execution_lock && execution_lock->owns_lock())
+        execution_lock->mutex()->complete_reply_handoff_turn(active_task_control);
 }
 inline void attach_task_to_current_actor(const std::shared_ptr<TaskControl>& task,
                                          const std::string& file, int line, int column);
@@ -2411,6 +2480,10 @@ template <> struct TaskState<void> final : TaskControl, std::enable_shared_from_
 inline std::string task_poll_failure(const std::shared_ptr<TaskControl>& state) {
     if (!state) return "task is unavailable";
     if (state->done.load(std::memory_order_acquire)) {
+        if (!actor_handler_active()) {
+            state->propagate_completed_failure_to_waiter(active_task_control);
+            if (active_task_control) active_task_control->check_interruption();
+        }
         const auto failure = state->failure_message_for_run();
         if (!failure.empty()) return failure;
     }
@@ -2426,7 +2499,14 @@ template <typename T> struct Task {
     bool cancel() const { return state && state->request_cancel(); }
     bool detach() const { return state && state->detach_from(active_task_control); }
     bool is_cancelled() const { return state && state->is_cancelled(); }
-    bool is_done() const { return !state || state->is_done(); }
+    bool is_done() const {
+        if (!state) return true;
+        if (state->done.load(std::memory_order_acquire) && !actor_handler_active()) {
+            state->propagate_completed_failure_to_waiter(active_task_control);
+            if (active_task_control) active_task_control->check_interruption();
+        }
+        return state->is_done();
+    }
     template <bool MoveResult = false> StringResult<std::optional<T>> try_result() const {
         const auto failure = task_poll_failure(state);
         if (!failure.empty()) return result_error<std::optional<T>>(failure);
@@ -2490,7 +2570,14 @@ template <> struct Task<void> {
     bool cancel() const { return state && state->request_cancel(); }
     bool detach() const { return state && state->detach_from(active_task_control); }
     bool is_cancelled() const { return state && state->is_cancelled(); }
-    bool is_done() const { return !state || state->is_done(); }
+    bool is_done() const {
+        if (!state) return true;
+        if (state->done.load(std::memory_order_acquire) && !actor_handler_active()) {
+            state->propagate_completed_failure_to_waiter(active_task_control);
+            if (active_task_control) active_task_control->check_interruption();
+        }
+        return state->is_done();
+    }
     StringResult<bool> try_result() const {
         const auto failure = task_poll_failure(state);
         if (!failure.empty()) return result_error<bool>(failure);
@@ -2547,11 +2634,18 @@ struct TaskGroup {
         require_owner(file, line, column);
         std::vector<std::weak_ptr<TaskControl>> members;
         { std::lock_guard<std::mutex> lock(state->mutex); members = state->members; }
+        bool all_done = true;
         for (const auto& weak : members) {
-            if (auto member = weak.lock(); member && member->owner_identity.load(std::memory_order_acquire) == state->owner_identity
-                && !member->done.load(std::memory_order_acquire)) return false;
+            if (auto member = weak.lock(); member && member->owner_identity.load(std::memory_order_acquire) == state->owner_identity) {
+                if (!member->done.load(std::memory_order_acquire)) {
+                    all_done = false;
+                } else {
+                    member->propagate_completed_failure_to_waiter(active_task_control);
+                    if (active_task_control) active_task_control->check_interruption();
+                }
+            }
         }
-        return true;
+        return all_done;
     }
     std::int64_t cancel(const std::string& file, int line, int column) const {
         require_owner(file, line, column);
@@ -2590,6 +2684,7 @@ struct TaskGroup {
                     lock.unlock();
                     if (active_task_control) active_task_control->check_interruption();
                 }
+                member->propagate_completed_failure_to_waiter(active_task_control);
                 if (active_task_control) active_task_control->check_interruption();
                 const auto failure = member->failure_message_for_owner();
                 if (!failure.empty()) throw Failure(file, line, column, failure);
@@ -3176,6 +3271,7 @@ struct ReplyCellBase {
     virtual void fail(const std::string& message) noexcept = 0;
     virtual bool is_pending() = 0;
 };
+inline bool native_actor_message_ready();
 enum class ReplyState { pending, sent, failed, cancelled, timed_out, consumed };
 template <typename T> struct ReplyCell final : ReplyCellBase {
     mutable std::mutex mutex;
@@ -3193,6 +3289,11 @@ template <typename T> struct ReplyCell final : ReplyCellBase {
         for (auto* waiter : waiters) {
             if (!waiter) continue;
             try {
+                // A reply wakes this task from outside the execution-lock queue.
+                // Reserve its next lock acquisition before notifying it so an
+                // already-runnable task cannot repeatedly retake the lock first.
+                if (state == ReplyState::sent)
+                    native_scheduler().execution_mutex.begin_reply_handoff(waiter);
                 // Reply state is protected by this cell mutex. Pair each notification
                 // with the waiter's lifecycle mutex so a reply cannot notify between
                 // the predicate check and the condition-variable sleep.
@@ -3342,6 +3443,8 @@ template <typename T> inline std::optional<T> await_reply(
                 registered = true;
             }
         }
+        if (registered && native_actor_message_ready())
+            native_scheduler().execution_mutex.begin_actor_pump_handoff();
         notify_task_scheduler();
 
         for (;;) {
@@ -7090,7 +7193,9 @@ inline StringResult<std::int64_t> run_tasks(const std::string& file, int line, i
             if (settled && !settled->empty() && scheduler_failure.empty()) scheduler_failure = *settled;
         }
         if (pump_actor) {
-            std::unique_lock<NativeExecutionMutex> actor_turn_lock(scheduler.execution_mutex);
+            scheduler.execution_mutex.lock_for_actor_pump();
+            std::unique_lock<NativeExecutionMutex> actor_turn_lock(
+                scheduler.execution_mutex, std::adopt_lock);
             ActiveExecutionLockScope actor_execution_scope(actor_turn_lock);
             const auto actor_result = run_actors(file, line, column, false, 1, false);
             if (std::holds_alternative<std::string>(actor_result) && scheduler_failure.empty())
