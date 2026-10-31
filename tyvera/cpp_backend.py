@@ -1742,6 +1742,32 @@ struct NativeExecutionMutex {
         return true;
     }
     template <typename Cancelled>
+    bool yield_or_cancel(Cancelled&& cancelled, const void* participant) {
+        std::unique_lock<std::mutex> lock(state_mutex);
+        const int ticket = 0;
+        // Queue this participant before releasing execution. Unlock followed by
+        // a host yield/re-lock leaves it absent from the FIFO, allowing a peer
+        // to finish all its statements before this thread is scheduled again.
+        queue.push_back(&ticket);
+        locked = false;
+        changed.notify_all();
+        changed.wait(lock, [this, &ticket, &cancelled, participant]() {
+            return (!locked && !actor_pump_handoff
+                && ((reply_handoff == participant && participant != nullptr)
+                    || (reply_handoff == nullptr && queue.front() == &ticket)))
+                || cancelled();
+        });
+        queue.erase(std::find(queue.begin(), queue.end(), &ticket));
+        if (cancelled()) {
+            if (reply_handoff == participant) reply_handoff = nullptr;
+            if (reply_handoff_turn == participant) reply_handoff_turn = nullptr;
+            changed.notify_all();
+            return false;
+        }
+        locked = true;
+        return true;
+    }
+    template <typename Cancelled>
     bool lock_or_cancel(Cancelled&& cancelled) {
         return lock_or_cancel(std::forward<Cancelled>(cancelled), []() {});
     }
@@ -2080,9 +2106,9 @@ inline void task_checkpoint() {
     auto* execution_lock = active_execution_lock;
     if (!execution_lock || !execution_lock->owns_lock()) return;
     if (execution_lock->mutex()->begin_reply_handoff_turn(active_task_control)) return;
-    execution_lock->unlock();
-    std::this_thread::yield();
-    reacquire_execution_lock(*execution_lock, active_task_control);
+    const bool resumed = execution_lock->mutex()->yield_or_cancel(
+        []() { return active_task_control && active_task_control->is_done(); }, active_task_control);
+    if (!resumed) execution_lock->release(); // The mutex was released, not reacquired.
     if (active_task_control) active_task_control->check_interruption();
 }
 inline void task_complete_statement() {
@@ -3413,7 +3439,6 @@ template <typename T> inline std::optional<T> await_reply(
 
     auto* execution_lock = active_execution_lock;
     const bool resume_serialized_execution = execution_lock && execution_lock->owns_lock();
-    if (resume_serialized_execution) execution_lock->unlock();
 
     bool registered = false;
     std::optional<T> received;
@@ -3445,6 +3470,10 @@ template <typename T> inline std::optional<T> await_reply(
         }
         if (registered && native_actor_message_ready())
             native_scheduler().execution_mutex.begin_actor_pump_handoff();
+        // Publish the suspended wait and actor handoff before releasing Tyvera
+        // execution. Otherwise a runnable peer can exhaust its checkpoints in
+        // the gap before the scheduler knows that a reply needs an actor turn.
+        if (resume_serialized_execution) execution_lock->unlock();
         notify_task_scheduler();
 
         for (;;) {

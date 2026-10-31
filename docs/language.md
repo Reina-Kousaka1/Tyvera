@@ -668,18 +668,46 @@ child and returns `true`; calling it on a root, terminal task or non-child
 returns `false`. Detaching also removes that task from groups owned by the
 parent, so group joins do not wait for it. The detached task continues as
 scheduler-root work, and its failure remains visible as an error from
-`runTasks()`. Cancellation does not interrupt a running statement. Task and
+`runTasks()`. Cancellation is cooperative, not host-level preemption. Task and
 TaskGroup values cannot be sent between actors. A detached task can outlive its
-former parent task; runtime shutdown remains the final cancellation boundary.
+former parent's success, failure or cancellation; runtime shutdown remains the
+final cancellation boundary. Its own children remain structured: it joins them
+on success and cancels them on failure/cancellation.
 A task started directly by an actor constructor or message handler belongs to
 that actor and is cancelled on actor stop, crash, or supervised restart.
 Detachment removes only a Task-parent edge; it does not remove an independent
 actor ownership edge. Calls outside a parent Task return `false`.
 The task scheduler is single-threaded; it provides cooperative concurrency,
-not parallel execution. When tasks await actor replies, the scheduler delivers
+not parallel execution. Cancellation is idempotent: `cancel()` returns `true`
+only for an active task, and `false` after cancellation, completion or failure.
+Terminal outcomes never change. It clears suspended waits/timers and cascades
+to unfinished children; it does not retrospectively cancel completed children.
+A cancelled task cannot publish a return value or resume an await. Synchronous
+helpers observe cancellation at statement/loop checkpoints without scheduling
+another task inside the call.
+
+Groups are views, not nestable Task values. Nested concurrency is expressed
+by a group member owning an inner group. Cancelling an outer member cancels its
+inner descendants. Cancelling only an inner group lets its owner continue after
+`await group`; cancelled members count as settled. A failed member instead
+fails the owner and cancels sibling work, including its other groups. A parent
+joins children even after an early `return`. Failure observation with
+`tryResult()` does not catch an ownership failure. `runTasks()` reports one
+representative new task failure per pump, not an aggregate, and does not report
+it again in the next pump; each failed task retains its own diagnostic.
+
+Timeout expiry uses source cancellation, not a second abort mechanism. A source
+already terminal at timeout settlement wins; otherwise expiry cancels it and
+fails the wrapper. Explicit cancellation settled first remains cancellation.
+Finishing only the source's sleep or function body is insufficient if it still
+has a continuation or owned children to join. Precise reference state and
+deadline ordering is documented in [Runtime semantics](runtime.md).
+
+When tasks await actor replies, the scheduler delivers
 at most one queued actor message between task turns, so a continuously runnable
 task cannot starve the reply. Synchronous calls, expressions, and actor
-handlers are atomic and can still delay other work. `runTasks()` waits against
+handlers do not yield to other tasks and can still delay other work.
+`runTasks()` waits against
 the injected monotonic clock for task, actor-reply, or I/O readiness; socket
 readiness and worker completion wake the scheduler without polling or blocking
 other runnable tasks. `runActors()` never sleeps for a future message. Both

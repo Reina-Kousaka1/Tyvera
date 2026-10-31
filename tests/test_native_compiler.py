@@ -4541,6 +4541,34 @@ fn main() {{
                 server.server_close()
                 thread.join(timeout=1)
 
+class NativeTaskLifecycleOrderingTests(unittest.TestCase):
+    def test_checkpoint_requeues_before_releasing_execution(self) -> None:
+        module = lower_checked_program(compile_checked_source("fn main() {}", "checkpoint-order.tyv"))
+        generated = emit_cpp(module)
+        start = generated.index("bool yield_or_cancel(")
+        end = generated.index("void lock_for_actor_pump()", start)
+        handoff = generated[start:end]
+        self.assertLess(handoff.index("queue.push_back(&ticket);"), handoff.index("locked = false;"))
+        start = generated.index("inline void task_checkpoint()")
+        end = generated.index("inline void task_complete_statement()", start)
+        checkpoint = generated[start:end]
+        self.assertIn("yield_or_cancel(", checkpoint)
+        self.assertNotIn("std::this_thread::yield()", checkpoint)
+        self.assertIn("execution_lock->release()", checkpoint)
+
+    def test_reply_wait_is_published_before_execution_is_released(self) -> None:
+        module = lower_checked_program(compile_checked_source("fn main() {}", "wait-order.tyv"))
+        generated = emit_cpp(module)
+        start = generated.index("template <typename T> inline std::optional<T> await_reply(")
+        end = generated.index("inline bool valid_utf8_string", start)
+        wait = generated[start:end]
+        release = wait.index("if (resume_serialized_execution) execution_lock->unlock();")
+        self.assertLess(wait.index("cell->waiters.push_back(waiter);"), release)
+        self.assertLess(wait.index("waiting_for_actor_reply.store(true"), release)
+        self.assertLess(wait.index("begin_actor_pump_handoff();"), release)
+        self.assertGreater(wait.index("notify_task_scheduler();", release), release)
+
+
 if __name__ == "__main__":
     unittest.main()
 

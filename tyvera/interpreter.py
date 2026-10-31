@@ -106,6 +106,10 @@ _IDENTITY_SEQUENCE = count(1)
 _HASH_MASK = (1 << 64) - 1
 
 
+class _TaskInterrupted(Exception):
+    """Internal cooperative unwind; the task already has its terminal outcome."""
+
+
 @dataclass(slots=True)
 class _ReturnSignal(Exception):
     value: object
@@ -747,6 +751,11 @@ class Interpreter:
     def _check_shutdown(self, location: Location) -> None:
         if self._shutdown_controller is not None:
             self._shutdown_controller.raise_if_requested(location)
+        self._check_task_interruption()
+
+    def _check_task_interruption(self) -> None:
+        if self._current_task is not None and not self._task_is_active(self._current_task):
+            raise _TaskInterrupted()
 
     def _emit_runtime_event(self, event: RuntimeEvent) -> None:
         if self._runtime_event_sink is not None:
@@ -2931,6 +2940,11 @@ class Interpreter:
     def _create_async_task(
         self, function: Function, arguments: list[object], location: Location, depth: int,
     ) -> _TyveraTask:
+        try:
+            self._check_task_interruption()
+        except _TaskInterrupted as interrupted:
+            self._cleanup_failed_argument_transfer(arguments, interrupted)
+            raise
         if not function.is_async:
             raise AssertionError("only async functions create Task values")
         if depth >= self.max_call_depth:
@@ -2949,6 +2963,7 @@ class Interpreter:
         return task
 
     def _create_sleep_task(self, duration: _TyveraDuration, location: Location) -> _TyveraTask:
+        self._check_task_interruption()
         now = self._clock()
         task = _TyveraTask(None, None, location, state="sleeping",
                            due_at=now + max(0, duration.milliseconds) / 1000.0,
@@ -2959,6 +2974,7 @@ class Interpreter:
         return task
 
     def _create_io_task(self, result_type: str, location: Location) -> _TyveraTask:
+        self._check_task_interruption()
         self._get_io_backend()
         task = _TyveraTask(None, None, location, state="io_wait", result_type=canonical_type(result_type),
                            parent=self._current_task, owner_actor=self._current_actor)
@@ -2972,6 +2988,7 @@ class Interpreter:
         state: dict[str, object], *, parent: _TyveraTask | None = None,
         resources: list[object] | None = None,
     ) -> _TyveraTask:
+        self._check_task_interruption()
         task = _TyveraTask(
             None, None, location, result_type=canonical_type(result_type),
             parent=self._current_task if parent is None else parent,
@@ -4608,6 +4625,7 @@ class Interpreter:
     def _create_timeout_task(
         self, target: _TyveraTask, duration: _TyveraDuration, location: Location,
     ) -> _TyveraTask:
+        self._check_task_interruption()
         task = _TyveraTask(
             None, None, location, state="timed_wait", result_type=target.result_type,
             due_at=self._clock() + duration.milliseconds / 1000.0,
@@ -4663,8 +4681,16 @@ class Interpreter:
                         else:
                             self._advance_async_task(task)
                     except _ReturnSignal as signal:
-                        task.result = signal.value
-                        self._complete_task(task)
+                        if self._task_is_active(task):
+                            task.result = signal.value
+                            self._complete_task(task)
+                        else:
+                            # A return expression may stop its own actor/task.
+                            # Do not publish a result or resurrect terminal work.
+                            for resource in self._resource_handles(signal.value):
+                                self._close_resource(resource)
+                    except _TaskInterrupted:
+                        pass
                     except ShutdownDiagnostic:
                         raise
                     except Diagnostic as error:
@@ -4766,8 +4792,16 @@ class Interpreter:
             for task in candidates
         )
 
+    def _evaluate_task_expression(self, expression: Expression, variables: ChainMap[str, object], depth: int) -> object:
+        value = self._evaluate(expression, variables, depth)
+        if self._current_task is not None and not self._task_is_active(self._current_task):
+            for resource in self._resource_handles(value):
+                self._close_resource(resource)
+            raise _TaskInterrupted()
+        return value
+
     def _advance_async_task(self, task: _TyveraTask) -> None:
-        if not task.frames:
+        if not self._task_is_active(task) or not task.frames:
             return
         frame = task.frames[-1]
         if isinstance(frame, _AsyncResourceFrame):
@@ -4779,7 +4813,7 @@ class Interpreter:
         if isinstance(frame, _AsyncLoopFrame):
             statement = frame.statement
             if isinstance(statement, WhileStatement):
-                if self._evaluate(statement.condition, frame.variables, task.depth):
+                if self._evaluate_task_expression(statement.condition, frame.variables, task.depth):
                     task.frames.append(_AsyncBlockFrame(statement.body, frame.variables.new_child()))
                 else:
                     task.frames.pop()
@@ -4805,7 +4839,7 @@ class Interpreter:
             return
         statement = frame.body[frame.index]
         if isinstance(statement, AwaitStatement):
-            target = self._evaluate(statement.value, frame.variables, task.depth)
+            target = self._evaluate_task_expression(statement.value, frame.variables, task.depth)
             if isinstance(target, _TyveraTaskGroup) and target.owner is not task:
                 raise Diagnostic(statement.location, "runtime", "TaskGroup may only be awaited by its creating task")
             state, error = self._await_state(target)
@@ -4825,7 +4859,7 @@ class Interpreter:
             task.frames.append(_AsyncBlockFrame(statement.body, frame.variables.new_child()))
             return
         if isinstance(statement, UsingStatement):
-            acquisition = self._evaluate(statement.resource, frame.variables, task.depth)
+            acquisition = self._evaluate_task_expression(statement.resource, frame.variables, task.depth)
             if not isinstance(acquisition, _TyveraVariant):
                 raise AssertionError("checked using acquisition did not return Result")
             frame.index += 1
@@ -4848,7 +4882,7 @@ class Interpreter:
                 raise AssertionError("checked using acquisition returned neither Ok nor Err")
             return
         if isinstance(statement, IfStatement):
-            body = statement.then_body if self._evaluate(statement.condition, frame.variables, task.depth) else statement.else_body
+            body = statement.then_body if self._evaluate_task_expression(statement.condition, frame.variables, task.depth) else statement.else_body
             frame.index += 1
             task.frames.append(_AsyncBlockFrame(body, frame.variables.new_child()))
             return
@@ -4857,7 +4891,7 @@ class Interpreter:
             task.frames.append(_AsyncLoopFrame(statement, frame.variables, task.depth))
             return
         if isinstance(statement, ForStatement):
-            iterable = self._evaluate(statement.iterable, frame.variables, task.depth)
+            iterable = self._evaluate_task_expression(statement.iterable, frame.variables, task.depth)
             if isinstance(iterable, _TyveraList):
                 items = tuple(iterable.values)
             elif isinstance(iterable, _TyveraMap):
@@ -4868,7 +4902,7 @@ class Interpreter:
             task.frames.append(_AsyncLoopFrame(statement, frame.variables, task.depth, items))
             return
         if isinstance(statement, MatchStatement):
-            value = self._evaluate(statement.value, frame.variables, task.depth)
+            value = self._evaluate_task_expression(statement.value, frame.variables, task.depth)
             frame.index += 1
             for arm in statement.arms:
                 matched, binding = self._matches(arm.pattern, value)
@@ -5019,7 +5053,12 @@ class Interpreter:
         variables[statement.binding_name] = value
 
     def _complete_task(self, task: _TyveraTask) -> None:
+        if not self._task_is_active(task):
+            return
         cleanup_errors = self._release_task_frames(task)
+        # Cleanup may itself cancel this task (e.g. through a resource Task).
+        if not self._task_is_active(task):
+            return
         if cleanup_errors:
             self._fail_task(task, "; ".join(cleanup_errors))
             return
@@ -5043,7 +5082,10 @@ class Interpreter:
         task.parent = None
 
     def _settle_joining_tasks(self) -> None:
-        for task in self._tasks:
+        # Children are registered after their owners. Settle bottom-up so a
+        # timer-only descendant can finish every joining ancestor in one pass,
+        # even when no runnable continuation remains to drive another turn.
+        for task in reversed(self._tasks):
             if task.state != "joining":
                 continue
             failed_child = next((child for child in task.children if child.state == "failed"), None)
@@ -5054,22 +5096,33 @@ class Interpreter:
                 task.state = "completed"
                 self._forget_http_connection_child(task)
 
-    def _cancel_task(self, task: _TyveraTask) -> None:
-        if task.state in {"completed", "failed", "cancelled"}:
-            return
-        task.state = "cancelled"
-        if task.io_cancel is not None:
-            cancel, task.io_cancel = task.io_cancel, None
-            cancel()
+    def _discard_task_wait(self, task: _TyveraTask) -> None:
+        # Publish the terminal state before calling this: I/O cancellation can
+        # synchronously deliver a late completion, which must not win the race.
         task.wait_target = None
         task.wait_frame = None
         task.wait_statement = None
+        task.due_at = None
+        task.native_wait_target = None
+        pending_result, task.native_wait_result = task.native_wait_result, _MISSING
+        task.native_wait_error = None
+        for resource in self._resource_handles(pending_result):
+            self._close_resource(resource)
+        if task.io_cancel is not None:
+            cancel, task.io_cancel = task.io_cancel, None
+            cancel()
+        if task.timeout_target is not None:
+            target, task.timeout_target = task.timeout_target, None
+            self._cancel_task(target)
+
+    def _cancel_task(self, task: _TyveraTask) -> None:
+        if not self._task_is_active(task):
+            return
+        task.state = "cancelled"
+        self._discard_task_wait(task)
         cleanup_errors = self._release_task_frames(task)
         if cleanup_errors:
             task.error = "; ".join(cleanup_errors)
-        if task.timeout_target is not None:
-            self._cancel_task(task.timeout_target)
-            task.timeout_target = None
         for child in task.children:
             self._cancel_task(child)
         self._cleanup_task_result(task)
@@ -5078,9 +5131,7 @@ class Interpreter:
         if task.state in {"completed", "failed", "cancelled"}:
             return
         task.state = "failed"
-        task.wait_target = None
-        task.wait_frame = None
-        task.wait_statement = None
+        self._discard_task_wait(task)
         cleanup_errors = self._release_task_frames(task)
         if cleanup_errors:
             error = f"{error}; resource cleanup also failed: {'; '.join(cleanup_errors)}"

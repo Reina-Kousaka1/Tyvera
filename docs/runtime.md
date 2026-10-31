@@ -26,9 +26,45 @@ At runtime shutdown:
 
 Shutdown cleanup does not replace the diagnostic that caused `main` to fail.
 Cancellation is cooperative: it clears suspended continuations and cancels
-descendants, but cannot interrupt a synchronous function, actor handler, or
-expression while it is executing. Discarding a continuation closes all owned
-resources in reverse acquisition order; cleanup itself does not suspend.
+descendants. It is checked at statement/loop boundaries in synchronous helpers
+as well as async continuations; it does not preempt an expression or host call.
+Discarding a continuation closes all owned resources in reverse acquisition
+order; cleanup itself does not suspend.
+
+## Reference task lifecycle
+
+The reference runtime keeps its existing internal states; no new public state
+API or second async system is introduced. Creation and registration are one
+operation, so there is no separately observable `created` or `scheduled` state.
+
+| State | Meaning and normal successor |
+| --- | --- |
+| `runnable` | Registered/queued continuation; only this state can be dispatched, to `running`. |
+| `running` | One continuation action; returns to `runnable`, suspends in `waiting`, or ends its body. |
+| `waiting` | Suspended on a Task, TaskGroup or actor reply; readiness queues it as `runnable`; a failed/cancelled awaited task fails the waiter. |
+| `sleeping` | Timer task; becomes `completed` when due. |
+| `timed_wait` | Timeout wrapper; follows its source terminal result, or cancels that source and fails on expiry. |
+| `io_wait` | Adapter-owned operation; completion publishes its result. |
+| `joining` | Body returned, but structured children remain; becomes `completed` after all children settle, or `failed` on child failure. |
+| `completed`, `failed`, `cancelled` | Terminal. No later cancel, fail, completion, stale queue entry or timer may change the lifecycle outcome. |
+
+Every active state can fail or be cancelled. A body return is not task completion
+while children remain. Joining chains settle from descendants to ancestors
+before deadlock detection, including when the last work was only a timer.
+Cancellation publishes `cancelled` before cancelling I/O or timeout sources,
+clears suspended waits/deadlines, closes owned resources,
+and cancels descendants. Repeated `cancel()` returns `false`; the first accepted
+request returns `true`. Cancelling an already completed/failed task returns
+`false` and preserves its result/error. Failure uses the same wait-disposal path.
+Late I/O completion cannot publish a second result and closes any returned
+resource instead.
+
+Cancellation is not a catchable error value inside the cancelled task. An
+internal unwind stops it at a statement/loop or continuation-expression
+checkpoint, including in synchronous helpers. No other task runs inside an
+expression or synchronous call, and native host operations are not preempted
+mid-call. A statement that cancels its own task cannot subsequently publish a
+return value or install a new await/branch continuation.
 
 ## Task ownership
 
@@ -36,13 +72,30 @@ resources in reverse acquisition order; cleanup itself does not suspend.
 | --- | --- | --- | --- |
 | Synchronous code in `main` | Runtime root | The scheduler runs it only when `runTasks()` is called. Runtime shutdown cancels unfinished work. | Runtime shutdown cancels it. A root failure is returned from `runTasks()`. |
 | An async task | Creating task | The parent joins every unfinished child before it completes. | Parent cancellation/failure cancels descendants. A child failure fails its owners and cancels sibling work. |
-| An actor constructor or message handler | Actor instance | It runs as a root task when `runTasks()` pumps it. | Actor stop, crash, supervisor restart, or runtime shutdown cancels and drains other unfinished actor tasks before clearing or rebuilding state. A task stopping its own actor unwinds cooperatively at its next checkpoint. |
+| An actor constructor or message handler | Actor instance, plus a creating Task if present | `runTasks()` pumps it; a constructor invoked from a Task can retain that Task parent too. | Actor stop, crash, supervisor restart, or runtime shutdown cancels and drains other unfinished actor tasks before clearing or rebuilding state. A task stopping its own actor unwinds cooperatively at its next checkpoint. |
 | Explicitly detached child | Runtime root | It no longer delays the former parent or appears in that parent's task groups. `runTasks()` still drives it. | It is no longer cancelled by its former owner; runtime shutdown still cancels it. Its failure remains visible in `runTasks()`. |
 
 `TaskGroup` is a view of registered direct children, not an ownership transfer.
 Each group has one owner. Nested groups join their own direct members; their
 owner task still joins all of its children. Cancelling a member cancels its
 descendants. Failing a member fails its owner.
+
+A group is not itself a Task and cannot contain another group. “Nested groups”
+means an outer group contains a child whose body owns an inner group. Cancelling
+the outer member reaches the inner members through task ownership. Cancelling
+only the inner group does not cancel its owner or outer group: cancelled
+members count as settled, and `await group` succeeds once all members settle
+unless a member failed. Already terminal members are preserved and not counted
+by `group.cancel()`. Membership in multiple groups does not duplicate ownership.
+A member failure immediately fails its owner and cancels the owner's other
+unfinished children, including children outside that particular group. An
+owner cannot finish with pending structured work. Detached members are removed
+from every group of their former owner and are the explicit exception.
+
+Detached roots keep their own children: they join on success and cancel those
+children on failure/cancellation. They survive former-parent success, failure,
+and cancellation, but not runtime shutdown. Detachment is not automatic error
+recovery, nor does it provide an independent event loop.
 
 Actor tasks are bound to the actor instance that created them. A supervised
 restart cancels tasks from the failed instance before the actor is rebuilt.
@@ -85,6 +138,35 @@ The interpreter accepts an injected monotonic clock and sleeper. Runtime and
 deadline tests use those hooks to advance time deterministically without
 waiting on wall-clock timers.
 
+## Task deadlines and boundary ordering
+
+`withTimeout(Duration)` creates a wrapper, not a second source-task lifecycle.
+The deadline starts at wrapper creation and uses the monotonic clock. On expiry
+it calls normal source cancellation and fails the wrapper with `task timed out`.
+Cancelling the wrapper explicitly also cancels its source; failing/discarding
+an active wrapper disposes its source wait too. An expired wrapper does not
+later complete when the cancelled source's old timer fires.
+
+In the reference pump, due sleep tasks are promoted before timeout wrappers
+are settled, then waiting and joining continuations are settled. Timeout
+settlement first checks whether the source is already terminal, then checks
+expiry. Thus a terminal source result wins even at the deadline; a source that
+still needs continuation/join steps is unfinished, even if its sleep child just
+completed. Deadlines do not preempt a running statement. At each boundary the
+first terminal outcome wins: explicit wrapper cancellation before settlement
+stays cancellation; expiry settled first stays failure. A manually cancelled
+source makes an active wrapper fail with `timed task was cancelled`. Parent
+cancellation cancels both owned sources and wrappers; no later timeout changes
+the parent's cancellation into failure.
+
+Native deadlines use the existing monotonic waits and lifecycle mutexes, not
+the reference clock hooks. A published completion wins there too; exact
+wall-clock interleavings and scheduler progress counts are not portable. Native
+reply await publishes its wait and actor handoff before releasing serialized
+execution. Native statement checkpoints atomically requeue before releasing
+execution rather than relying on host thread yield; cancellation removes the
+queued participant without publishing a second completion.
+
 ## Runtime errors
 
 Task failures retain their Tyvera diagnostic and propagate through task
@@ -93,6 +175,21 @@ returns `Err` when task work fails, including a detached task failure. An
 expected `Result::Err` value is not a task failure. Scheduler deadlock and
 safety-limit errors are returned as `Err` and do not interrupt the current
 Tyvera statement.
+
+`await task` forwards the task diagnostic; awaiting a cancelled task fails the
+waiter with `awaited task was cancelled` (it does not cancel the waiter).
+Child failure additionally travels up ownership and cancels siblings. A failure
+inside nested groups therefore reaches each enclosing owner. Propagation never
+replaces an owner's already terminal outcome. Serial cooperative execution
+makes competing child failures deterministic: the first delivered child failure
+wins and cancels still-active siblings. Independently failed roots retain their
+individual `tryResult()` diagnostics. `runTasks()` returns one representative
+unobserved new failure, selected in task registration order, not an aggregate;
+it does not re-report those failures on the next pump. `tryResult()` is a
+non-catching observation, not a recovery boundary. Detached failures are
+reported by the scheduler without failing a former owner. Expected I/O failures
+remain normalized `Result::Err` values; internal unwind signals are never
+user-visible Python exceptions.
 
 Actor message failures crash only that actor unless a supervisor restarts it.
 Stop, crash, restart, request cancellation, and request deadlines settle

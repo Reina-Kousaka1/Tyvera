@@ -163,7 +163,20 @@ runtime shutdown cancel that actor-owned work. Runtime shutdown closes actors,
 supervisors, timers, and all unfinished tasks. When a task awaits an actor
 reply, the scheduler interleaves a bounded actor turn with task steps to avoid
 starving that reply. Synchronous calls and individual expressions remain
-atomic. Full lifecycle rules are in the [Runtime documentation](runtime.md).
+atomic with respect to scheduling. Cancellation is checked at statement/loop
+boundaries in synchronous helpers and after async control/await expressions
+before changing continuation frames. An internal interruption signal unwinds
+only to the task pump; it is not a Tyvera error or a second async mechanism.
+Completion, failure and cancellation preserve terminal outcomes. Cancellation
+and failure share disposal of I/O waits, timeout sources, pending native wait
+results and timer metadata; late callbacks cannot complete terminal work.
+No threads or event loop were added for this lifecycle milestone. Existing
+native bounded workers and the I/O adapter retain their own architecture.
+Native reply await registers its wait and actor-pump handoff before releasing
+serialized execution. Statement checkpoints requeue atomically before release,
+so runnable peers cannot monopolize the gap left by a host-thread yield.
+Full lifecycle rules are in the [Runtime documentation](runtime.md), with the
+baseline investigation in [Task lifecycle audit](task-lifecycle-audit.md).
 
 ## Native backend V1
 
@@ -179,8 +192,10 @@ and owned text-file resources are part of the native subset. Linux also has
 experimental async DNS/TCP/TLS, HTTP/WebSocket clients, and actor/supervisor
 subsets. Non-generic records and user-defined enums have an experimental
 native path for checked constructors, fields, patterns, and linked package
-declarations. Classes, generic functions, task groups, and actor monitoring/
-links remain unsupported natively. Selected Discord package decoder, Gateway,
+declarations. Classes and generic functions remain unsupported natively.
+Owner-local task groups, explicit detach and actor monitoring/links have an
+experimental native implementation; see the backend boundary documentation.
+Selected Discord package decoder, Gateway,
 and REST flows compile and run against local fake services through the general
 native path; this is not full native support for the library. The full boundary
 and backend evaluation are in
