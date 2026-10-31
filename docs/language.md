@@ -62,19 +62,19 @@ for-loop    = "for" identifier "in" expression block ;
 function    = ["async"] "fn" identifier [function-type-parameters] "(" [parameters] ")" ["->" type] block ;
 function-type-parameters = "<" function-type-parameter {"," function-type-parameter} ">" ;
 function-type-parameter = identifier [":" type {"+" type}] ;
-class       = "class" identifier ["<" identifier {"," identifier} ">"] ["implements" type-list] "{" {field | method} "}" ;
-record      = "record" identifier ["<" identifier {"," identifier} ">"] "{" {identifier ":" type} "}" ;
-enum        = "enum" identifier ["<" identifier {"," identifier} ">"] "{" {identifier ["(" type {"," type} ")"]} "}" ;
-newtype     = "newtype" identifier ["<" identifier {"," identifier} ">"] "=" type ;
-type-alias  = "type" identifier ["<" identifier {"," identifier} ">"] "=" type ;
+class       = "class" identifier [function-type-parameters] ["implements" type-list] "{" {field | method} "}" ;
+record      = "record" identifier [function-type-parameters] "{" {identifier ":" type} "}" ;
+enum        = "enum" identifier [function-type-parameters] "{" {identifier ["(" type {"," type} ")"]} "}" ;
+newtype     = "newtype" identifier [function-type-parameters] "=" type ;
+type-alias  = "type" identifier [function-type-parameters] "=" type ;
 field       = ("let" | "var") identifier ":" type ;
-method      = "fn" identifier ["<" identifier {"," identifier} ">"] "(" [parameters] ")" ["->" type] block ;
-interface   = "interface" identifier "{" {method-signature} "}" ;
+method      = "fn" identifier [function-type-parameters] "(" [parameters] ")" ["->" type] block ;
+interface   = "interface" identifier [function-type-parameters] "{" {method-signature} "}" ;
 actor       = "actor" identifier "{" {actor-field | actor-init | actor-handler} "}" ;
 actor-field = ("let" | "var") identifier ":" type ;
 actor-init  = "init" "(" [parameters] ")" ["->" type] block ;
 actor-handler = "on" identifier "(" [parameters] ")" ["->" type] block ;
-method-signature = "fn" identifier "(" [parameters] ")" ["->" type] ;
+method-signature = "fn" identifier [function-type-parameters] "(" [parameters] ")" ["->" type] ;
 type-list   = identifier {"," identifier} ;
 parameters  = identifier ":" type {"," identifier ":" type} ;
 type        = identifier {"." identifier} ["<" type {"," type} ">"] | "(" type "," type {"," type} ")" ;
@@ -278,12 +278,12 @@ fn main() {
 as `Int`. `newtype UserId = Int` instead creates a distinct nominal value. Its
 constructor is `UserId(value)`, its wrapped value is read through `.value`, and
 `UserId(value)` patterns destructure it. Newtypes compare by nominal type and
-wrapped value. Records, tuples, enums and newtypes can be generic. Generic type
-declaration constraints are not implemented yet.
+wrapped value. Records, tuples, enums and newtypes can be generic.
 
 ## Generics
 
-Generic functions, classes, records, enums and newtypes use named type
+Generic functions, methods, classes, interfaces, records, enums, newtypes and
+aliases use named type
 parameters. Calls infer parameters from value arguments when possible;
 explicit type arguments are available when inference has no input:
 
@@ -304,21 +304,31 @@ fn main() {
 ```
 
 Type arguments are checked recursively and cannot be `Void`. Generic types are
-invariant. Generic methods, generic interfaces and type-parameter constraints
-on generic type declarations are not supported. Generic functions may constrain
-their parameters to one or more declared non-generic interfaces:
+invariant. Any generic declaration may constrain a parameter to one or more
+declared interfaces; an interface bound may itself be generic. The checker
+validates bounds whenever a concrete type application is formed, including
+constructors, annotations and interface implementations:
 
 ```tyv
 interface Named { fn name() -> String }
-fn display<T: Named>(value: T) -> String { return value.name() }
+interface Container<T> { fn get() -> T }
+
+class Box<T: Named> implements Container<T> {
+    let value: T
+    fn init(value: T) { self.value = value }
+    fn get() -> T { return self.value }
+    fn display<U: Named>(other: U) -> String { return other.name() }
+}
 ```
 
-The checker exposes only those interface methods inside the function and
-verifies the bound against each concrete or already-constrained type argument
-at a call. Generic functions cannot use a method that is absent from their
-bounds. The checker substitutes concrete types at each call; the bootstrap
-interpreter erases type arguments in runtime values, and no runtime cast or
-dynamic generic dispatch is exposed.
+The checker exposes only those interface methods inside the bounded declaration
+or method and verifies each bound against a concrete or already-constrained
+type argument. Generic methods have a scope independent from their enclosing
+class or interface parameters. Generic interface conformance substitutes the
+implemented interface arguments before comparing method signatures. The
+bootstrap interpreter erases type arguments in runtime values, and no runtime
+cast or dynamic generic dispatch is exposed. Native lowering of these generic
+forms remains planned.
 
 ## Core collections and iteration
 
@@ -1041,9 +1051,9 @@ scalar `println`/`eprintln`. The generated executable does not require Python.
 This build path is experimental and does not change Tyvera's language
 semantics.
 
-Current limits: classes, interfaces and the deterministic cooperative actor
-runtime with bounded `one_for_one` supervision are supported, but there is no
-inheritance, generic methods/interfaces, generic type-declaration constraints,
+Current limits: classes, generic interfaces and generic methods are supported
+by the reference implementation alongside the deterministic cooperative actor
+runtime with bounded `one_for_one` supervision, but there is no inheritance,
 `try`/`catch`, parallel process scheduling, importable standard-library
 modules, external secret-store provider, native interop, garbage collector
 implementation, and package manager. The native compiler supports the

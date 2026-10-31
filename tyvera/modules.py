@@ -222,6 +222,7 @@ class ModuleLoader:
                 newtype_decl.name = local[newtype_decl.name]
                 newtypes.append(newtype_decl)
             for alias_decl in module.program.type_aliases:
+                self._rewrite_constraints(alias_decl, module, local, imports, known)
                 alias_decl.target_type = self._resolve_type(alias_decl.target_type, module, local, imports,
                                                             known, alias_decl.location)
                 alias_decl.name = local[alias_decl.name]
@@ -265,17 +266,21 @@ class ModuleLoader:
                                 for argument in arguments])
 
     def _rewrite_function(self, function, module, local, imports, known) -> None:
-        function.type_constraints = {
-            parameter: [self._resolve_type(bound, module, local, imports, known, function.location)
-                        for bound in bounds]
-            for parameter, bounds in function.type_constraints.items()
-        }
+        self._rewrite_constraints(function, module, local, imports, known)
         for parameter in function.parameters:
             parameter.type_name = self._resolve_type(parameter.type_name, module, local, imports, known, parameter.location)
         function.return_type = self._resolve_type(function.return_type, module, local, imports, known, function.location)
         self._rewrite_block(function.body, module, local, imports, known)
 
+    def _rewrite_constraints(self, declaration, module, local, imports, known) -> None:
+        declaration.type_constraints = {
+            parameter: [self._resolve_type(bound, module, local, imports, known, declaration.location)
+                        for bound in bounds]
+            for parameter, bounds in getattr(declaration, "type_constraints", {}).items()
+        }
+
     def _rewrite_class(self, declaration, module, local, imports, known) -> None:
+        self._rewrite_constraints(declaration, module, local, imports, known)
         declaration.interfaces = [
             self._resolve_type(name, module, local, imports, known, declaration.location)
             for name in declaration.interfaces
@@ -283,13 +288,16 @@ class ModuleLoader:
         for field in declaration.fields:
             field.type_name = self._resolve_type(field.type_name, module, local, imports, known, field.location)
         for method in declaration.methods:
+            self._rewrite_constraints(method, module, local, imports, known)
             for parameter in method.parameters:
                 parameter.type_name = self._resolve_type(parameter.type_name, module, local, imports, known, parameter.location)
             method.return_type = self._resolve_type(method.return_type, module, local, imports, known, method.location)
             self._rewrite_block(method.body, module, local, imports, known)
 
     def _rewrite_interface(self, declaration, module, local, imports, known) -> None:
+        self._rewrite_constraints(declaration, module, local, imports, known)
         for method in declaration.methods:
+            self._rewrite_constraints(method, module, local, imports, known)
             for parameter in method.parameters:
                 parameter.type_name = self._resolve_type(parameter.type_name, module, local, imports, known, parameter.location)
             method.return_type = self._resolve_type(method.return_type, module, local, imports, known, method.location)
@@ -304,15 +312,18 @@ class ModuleLoader:
             self._rewrite_block(handler.body, module, local, imports, known)
 
     def _rewrite_record(self, declaration, module, local, imports, known) -> None:
+        self._rewrite_constraints(declaration, module, local, imports, known)
         for field in declaration.fields:
             field.type_name = self._resolve_type(field.type_name, module, local, imports, known, field.location)
 
     def _rewrite_enum(self, declaration, module, local, imports, known) -> None:
+        self._rewrite_constraints(declaration, module, local, imports, known)
         for variant in declaration.variants:
             variant.payload_types = [self._resolve_type(item, module, local, imports, known, variant.location)
                                      for item in variant.payload_types]
 
     def _rewrite_newtype(self, declaration, module, local, imports, known) -> None:
+        self._rewrite_constraints(declaration, module, local, imports, known)
         declaration.underlying_type = self._resolve_type(
             declaration.underlying_type, module, local, imports, known, declaration.location,
         )

@@ -41,6 +41,8 @@ class Method:
     return_type: str
     body: list[Statement]
     location: Location
+    type_parameters: list[str] = field(default_factory=list)
+    type_constraints: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -49,6 +51,8 @@ class MethodSignature:
     parameters: list[Parameter]
     return_type: str
     location: Location
+    type_parameters: list[str] = field(default_factory=list)
+    type_constraints: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -60,6 +64,7 @@ class ClassDeclaration:
     location: Location
     public: bool = False
     type_parameters: list[str] = field(default_factory=list)
+    type_constraints: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -69,6 +74,7 @@ class RecordDeclaration:
     location: Location
     public: bool = False
     type_parameters: list[str] = field(default_factory=list)
+    type_constraints: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -85,6 +91,7 @@ class EnumDeclaration:
     location: Location
     public: bool = False
     type_parameters: list[str] = field(default_factory=list)
+    type_constraints: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -94,6 +101,7 @@ class NewtypeDeclaration:
     location: Location
     public: bool = False
     type_parameters: list[str] = field(default_factory=list)
+    type_constraints: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -103,6 +111,7 @@ class TypeAliasDeclaration:
     location: Location
     public: bool = False
     type_parameters: list[str] = field(default_factory=list)
+    type_constraints: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -111,6 +120,8 @@ class InterfaceDeclaration:
     methods: list[MethodSignature]
     location: Location
     public: bool = False
+    type_parameters: list[str] = field(default_factory=list)
+    type_constraints: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

@@ -11,7 +11,7 @@ implemented.
 | Stage | Status | Scope and exit condition |
 | --- | --- | --- |
 | 1. Core language | Implemented | Primitive types, functions, checked returns, lexical scopes, mutable/immutable bindings, operators, conditionals, `while`, `break` and `continue`, covered by tests. |
-| 2. Object and value types | First slice implemented | Classes, fields, `self`, constructors, methods, interfaces and dispatch, plus generic immutable records, enums, tuples, newtypes, transparent aliases, interface-constrained generic functions, recursive exhaustiveness for finite sum/product patterns, portable value equality, and statically hashable Map keys. Generic methods/interfaces, bounds on generic type declarations, match guards and inheritance remain open. |
+| 2. Object and value types | Expanded generic slice implemented | Classes, fields, `self`, constructors, methods, interfaces and dispatch, plus generic immutable records, enums, tuples, newtypes and transparent aliases. Generic functions and methods support interface bounds; generic classes, interfaces, records, enums, newtypes and aliases support declaration bounds; generic interface conformance is checked after substitution. Recursive exhaustiveness for finite sum/product patterns, portable value equality and statically hashable Map keys are covered. Match guards and inheritance remain open. |
 | 3. Modules | First slice implemented | Relative `.tyv` imports, aliases, `pub` exports, module graph linking, visibility/missing/duplicate diagnostics, cycle detection and project-root containment. Local package dependencies are still planned. |
 | 4. Standard library | Core slice implemented | Generic collections, `for`, `Option<T>`, `Result<T,E>`, core matching, text I/O/path helpers, move-only `TextFile`/`TextReader`/`TextWriter` ownership with general move transfer and deterministic LIFO cleanup, local/environment secret providers, typed JSON, signed `Duration`, monotonic one-shot timers, timer-backed sleep tasks, cooperative parent-scoped lifecycle, owner-local `TaskGroup` joins/cancellation, explicit child detachment, actor-owned task cancellation, one-shot runtime shutdown and typed task deadlines. Separate stdlib modules remain planned. |
 | 5. Actor runtime | Reference semantics implemented; native subset experimental | Reference actors provide typed immutable messages, FIFO mailboxes, round-robin scheduling, request/reply, cancellation/deadlines, delayed messages, and crash reporting. Native C++17 supports state, typed send and request/reply, bounded FIFO mailboxes, round-robin `runActors()`, stop/alive, crash isolation, and actor-owned Tasks drained on stop/crash/restart/shutdown; timers and monitor/link remain interpreter-only. |
@@ -32,11 +32,12 @@ implemented.
    cancellation; retain the interpreter's actor/task lifecycle and keep host
    APIs private.
 3. Move or wrap collection, I/O, JSON, and secret operations behind normal
-   `tyvera.*` modules as the module model stabilizes; continue generic interface
-   and constraint work with conformance tests.
-4. Extend generic constraints to type declarations; keep adding conformance
-   cases for recursive patterns, structural types and backend-independent
-   equality.
+   `tyvera.*` modules as the module model stabilizes; keep extending generic
+   conformance coverage for recursive patterns, structural types and
+   backend-independent equality.
+4. Extend native lowering only with backend-independent generic conformance
+   tests; generic declarations and methods remain interpreter-only in the
+   experimental native backend.
 5. Keep native lowering independent from the Python reference interpreter and
    expand the supported subset only with differential conformance tests. Revisit
    LLVM or Cranelift if broader target/debug requirements justify the additional

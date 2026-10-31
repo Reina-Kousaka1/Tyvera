@@ -112,6 +112,7 @@ class ClassInfo:
 class InterfaceInfo:
     declaration: InterfaceDeclaration
     methods: dict[str, Signature]
+    type_parameters: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -266,6 +267,9 @@ class TypeChecker:
         for declaration in self.program.classes:
             self._validate_type_parameters(declaration.type_parameters, declaration.location)
             self.generic_arities[declaration.name] = len(declaration.type_parameters)
+        for declaration in self.program.interfaces:
+            self._validate_type_parameters(declaration.type_parameters, declaration.location)
+            self.generic_arities[declaration.name] = len(declaration.type_parameters)
         for declaration in self.program.records:
             self._validate_type_parameters(declaration.type_parameters, declaration.location)
             self.generic_arities[declaration.name] = len(declaration.type_parameters)
@@ -279,89 +283,135 @@ class TypeChecker:
             self._validate_type_parameters(declaration.type_parameters, declaration.location)
             self.generic_arities[declaration.name] = len(declaration.type_parameters)
             self.type_aliases[declaration.name] = declaration
-        for declaration in self.program.type_aliases:
-            self._validate_alias_cycle(declaration.target_type, {declaration.name})
-            self._require_known_type(declaration.target_type, declaration.location,
-                                     set(declaration.type_parameters))
-            if self._contains_resource(declaration.target_type):
-                raise Diagnostic(declaration.location, "type", "type aliases cannot hide a move-only Resource type")
-            if self._canonical_type(declaration.target_type) == "Void":
-                raise Diagnostic(declaration.location, "type", "type aliases cannot target Void")
         for declaration in self.program.interfaces:
-            methods: dict[str, Signature] = {}
-            for method in declaration.methods:
-                if method.name == "init":
-                    raise Diagnostic(method.location, "type", "interfaces cannot declare constructors")
-                if method.name in methods:
-                    raise Diagnostic(method.location, "type", f"interface method '{method.name}' is already declared")
-                methods[method.name] = self._method_signature(method)
-            self.interfaces[declaration.name] = InterfaceInfo(declaration, methods)
+            previous_constraints = self.active_type_constraints
+            self.active_type_constraints = dict(self._validate_type_constraints(
+                declaration.type_parameters, declaration.type_constraints, declaration.location,
+            ))
+            try:
+                methods: dict[str, Signature] = {}
+                interface_type_variables = set(declaration.type_parameters)
+                for method in declaration.methods:
+                    if method.name == "init":
+                        raise Diagnostic(method.location, "type", "interfaces cannot declare constructors")
+                    if method.name in methods:
+                        raise Diagnostic(method.location, "type", f"interface method '{method.name}' is already declared")
+                    methods[method.name] = self._method_signature(method, interface_type_variables)
+                self.interfaces[declaration.name] = InterfaceInfo(
+                    declaration, methods, tuple(declaration.type_parameters),
+                )
+            finally:
+                self.active_type_constraints = previous_constraints
+
+        # All nominal declarations share the same bound syntax as generic
+        # functions.  Validate it once the complete interface namespace is
+        # available, so bounds may refer to interfaces declared later in a file.
+        for declaration in [*self.program.classes, *self.program.interfaces,
+                            *self.program.records, *self.program.enums,
+                            *self.program.newtypes, *self.program.type_aliases]:
+            self._validate_type_constraints(
+                declaration.type_parameters, declaration.type_constraints, declaration.location,
+            )
+
+        for declaration in self.program.type_aliases:
+            previous_constraints = self.active_type_constraints
+            self.active_type_constraints = dict(self._declaration_constraints(declaration.name))
+            try:
+                self._validate_alias_cycle(declaration.target_type, {declaration.name})
+                self._require_known_type(declaration.target_type, declaration.location,
+                                         set(declaration.type_parameters))
+                if self._contains_resource(declaration.target_type):
+                    raise Diagnostic(declaration.location, "type", "type aliases cannot hide a move-only Resource type")
+                if self._canonical_type(declaration.target_type) == "Void":
+                    raise Diagnostic(declaration.location, "type", "type aliases cannot target Void")
+            finally:
+                self.active_type_constraints = previous_constraints
 
         for declaration in self.program.records:
             record_type_variables = set(declaration.type_parameters)
-            fields: dict[str, Field] = {}
-            for member in declaration.fields:
-                if member.name in fields:
-                    raise Diagnostic(member.location, "type", f"record field '{member.name}' is already declared")
-                self._require_known_type(member.type_name, member.location, record_type_variables)
-                if self._contains_resource(member.type_name):
-                    raise Diagnostic(member.location, "type", "records cannot contain move-only Resource values")
-                if self._canonical_type(member.type_name) == "Void":
-                    raise Diagnostic(member.location, "type", "record fields cannot have type Void")
-                if member.mutable:
-                    raise Diagnostic(member.location, "type", "record fields are immutable")
-                fields[member.name] = member
-            self.records[declaration.name] = RecordInfo(declaration, fields, tuple(declaration.type_parameters))
+            previous_constraints = self.active_type_constraints
+            self.active_type_constraints = dict(self._declaration_constraints(declaration.name))
+            try:
+                fields: dict[str, Field] = {}
+                for member in declaration.fields:
+                    if member.name in fields:
+                        raise Diagnostic(member.location, "type", f"record field '{member.name}' is already declared")
+                    self._require_known_type(member.type_name, member.location, record_type_variables)
+                    if self._contains_resource(member.type_name):
+                        raise Diagnostic(member.location, "type", "records cannot contain move-only Resource values")
+                    if self._canonical_type(member.type_name) == "Void":
+                        raise Diagnostic(member.location, "type", "record fields cannot have type Void")
+                    if member.mutable:
+                        raise Diagnostic(member.location, "type", "record fields are immutable")
+                    fields[member.name] = member
+                self.records[declaration.name] = RecordInfo(declaration, fields, tuple(declaration.type_parameters))
+            finally:
+                self.active_type_constraints = previous_constraints
 
         for declaration in self.program.enums:
             type_variables = set(declaration.type_parameters)
-            variants: dict[str, tuple[str, ...]] = {}
-            for variant in declaration.variants:
-                if variant.name in variants:
-                    raise Diagnostic(variant.location, "type", f"enum variant '{variant.name}' is already declared")
-                payload_types: list[str] = []
-                for payload_type in variant.payload_types:
-                    self._require_known_type(payload_type, variant.location, type_variables)
-                    if self._contains_resource(payload_type):
-                        raise Diagnostic(variant.location, "type", "enum payloads cannot contain move-only Resource values")
-                    if self._canonical_type(payload_type) == "Void":
-                        raise Diagnostic(variant.location, "type", "enum payloads cannot have type Void")
-                    payload_types.append(payload_type)
-                variants[variant.name] = tuple(payload_types)
-            self.enums[declaration.name] = EnumInfo(declaration, variants, tuple(declaration.type_parameters))
+            previous_constraints = self.active_type_constraints
+            self.active_type_constraints = dict(self._declaration_constraints(declaration.name))
+            try:
+                variants: dict[str, tuple[str, ...]] = {}
+                for variant in declaration.variants:
+                    if variant.name in variants:
+                        raise Diagnostic(variant.location, "type", f"enum variant '{variant.name}' is already declared")
+                    payload_types: list[str] = []
+                    for payload_type in variant.payload_types:
+                        self._require_known_type(payload_type, variant.location, type_variables)
+                        if self._contains_resource(payload_type):
+                            raise Diagnostic(variant.location, "type", "enum payloads cannot contain move-only Resource values")
+                        if self._canonical_type(payload_type) == "Void":
+                            raise Diagnostic(variant.location, "type", "enum payloads cannot have type Void")
+                        payload_types.append(payload_type)
+                    variants[variant.name] = tuple(payload_types)
+                self.enums[declaration.name] = EnumInfo(declaration, variants, tuple(declaration.type_parameters))
+            finally:
+                self.active_type_constraints = previous_constraints
 
         for declaration in self.program.newtypes:
             type_variables = set(declaration.type_parameters)
-            self._require_known_type(declaration.underlying_type, declaration.location, type_variables)
-            if self._contains_resource(declaration.underlying_type):
-                raise Diagnostic(declaration.location, "type", "newtypes cannot wrap move-only Resource values")
-            if self._canonical_type(declaration.underlying_type) == "Void":
-                raise Diagnostic(declaration.location, "type", "newtypes cannot wrap Void")
-            self.newtypes[declaration.name] = declaration
+            previous_constraints = self.active_type_constraints
+            self.active_type_constraints = dict(self._declaration_constraints(declaration.name))
+            try:
+                self._require_known_type(declaration.underlying_type, declaration.location, type_variables)
+                if self._contains_resource(declaration.underlying_type):
+                    raise Diagnostic(declaration.location, "type", "newtypes cannot wrap move-only Resource values")
+                if self._canonical_type(declaration.underlying_type) == "Void":
+                    raise Diagnostic(declaration.location, "type", "newtypes cannot wrap Void")
+                self.newtypes[declaration.name] = declaration
+            finally:
+                self.active_type_constraints = previous_constraints
 
         for declaration in self.program.classes:
             class_type_variables = set(declaration.type_parameters)
-            fields: dict[str, Field] = {}
-            for member in declaration.fields:
-                if member.name in fields:
-                    raise Diagnostic(member.location, "type", f"field '{member.name}' is already declared")
-                self._require_known_type(member.type_name, member.location, class_type_variables)
-                if self._contains_resource(member.type_name):
-                    raise Diagnostic(member.location, "type", "class fields cannot contain move-only Resource values")
-                if self._canonical_type(member.type_name) == "Void":
-                    raise Diagnostic(member.location, "type", "fields cannot have type Void")
-                fields[member.name] = member
-            methods: dict[str, Signature] = {}
-            for method in declaration.methods:
-                if method.name in methods:
-                    raise Diagnostic(method.location, "type", f"method '{method.name}' is already declared")
-                if method.name in fields:
-                    raise Diagnostic(method.location, "type", f"method '{method.name}' conflicts with a field")
-                methods[method.name] = self._method_signature(method, class_type_variables)
-            constructor = methods.get("init")
-            if declaration.fields and constructor is None:
-                raise Diagnostic(declaration.location, "type", f"class '{declaration.name}' declares fields and requires an 'init' constructor")
-            self.classes[declaration.name] = ClassInfo(declaration, fields, methods, tuple(declaration.type_parameters))
+            previous_constraints = self.active_type_constraints
+            self.active_type_constraints = dict(self._declaration_constraints(declaration.name))
+            try:
+                fields: dict[str, Field] = {}
+                for member in declaration.fields:
+                    if member.name in fields:
+                        raise Diagnostic(member.location, "type", f"field '{member.name}' is already declared")
+                    self._require_known_type(member.type_name, member.location, class_type_variables)
+                    if self._contains_resource(member.type_name):
+                        raise Diagnostic(member.location, "type", "class fields cannot contain move-only Resource values")
+                    if self._canonical_type(member.type_name) == "Void":
+                        raise Diagnostic(member.location, "type", "fields cannot have type Void")
+                    fields[member.name] = member
+                methods: dict[str, Signature] = {}
+                for method in declaration.methods:
+                    if method.name in methods:
+                        raise Diagnostic(method.location, "type", f"method '{method.name}' is already declared")
+                    if method.name in fields:
+                        raise Diagnostic(method.location, "type", f"method '{method.name}' conflicts with a field")
+                    methods[method.name] = self._method_signature(method, class_type_variables)
+                constructor = methods.get("init")
+                if declaration.fields and constructor is None:
+                    raise Diagnostic(declaration.location, "type", f"class '{declaration.name}' declares fields and requires an 'init' constructor")
+                self.classes[declaration.name] = ClassInfo(declaration, fields, methods, tuple(declaration.type_parameters))
+            finally:
+                self.active_type_constraints = previous_constraints
 
         for declaration in self.program.actors:
             fields: dict[str, Field] = {}
@@ -476,8 +526,8 @@ class TypeChecker:
     ) -> Signature:
         declared_parameters = list(getattr(function, "type_parameters", []))
         self._validate_type_parameters(declared_parameters, function.location)
-        declared_constraints = self._validate_function_constraints(
-            declared_parameters, getattr(function, "type_constraints", {}), function.location,
+        declared_constraints = self._validate_type_constraints(
+            declared_parameters, getattr(function, "type_constraints", {}), function.location, type_variables,
         )
         known_variables = set(type_variables or ()) | set(declared_parameters)
         parameter_names: set[str] = set()
@@ -504,8 +554,9 @@ class TypeChecker:
         return Signature(tuple(parameter_types), return_type, function.location,
                          tuple(declared_parameters), is_async, declared_constraints)
 
-    def _validate_function_constraints(
+    def _validate_type_constraints(
         self, parameters: list[str], constraints: dict[str, list[str]], location: Location,
+        outer_type_variables: set[str] | None = None,
     ) -> tuple[tuple[str, tuple[str, ...]], ...]:
         parameter_set = set(parameters)
         checked: list[tuple[str, tuple[str, ...]]] = []
@@ -515,10 +566,9 @@ class TypeChecker:
             seen: set[str] = set()
             for bound in bounds:
                 base, arguments = split_type(bound)
-                if arguments:
-                    raise Diagnostic(location, "type", "generic function constraints must name non-generic interfaces")
                 if base not in self.interfaces:
                     raise Diagnostic(location, "type", f"generic constraint '{bound}' is not a declared interface")
+                self._require_known_type(bound, location, parameter_set | set(outer_type_variables or ()))
                 if bound in seen:
                     raise Diagnostic(location, "type", f"generic constraint '{bound}' is repeated for '{parameter}'")
                 seen.add(bound)
@@ -561,6 +611,7 @@ class TypeChecker:
             actor_base, actor_arguments = split_type(arguments[0])
             if actor_arguments or actor_base not in self.actor_names:
                 raise Diagnostic(location, "type", "ActorRef requires one actor type, such as ActorRef<Counter>")
+        self._validate_type_application_constraints(base, arguments, location, known_variables)
         if base == "Map" and arguments and self._contains_resource(arguments[0]):
             raise Diagnostic(location, "type", f"{arguments[0]} is not hashable and cannot be used as a Map key")
         if self._contains_resource(type_name) and base not in {*self.resource_types, "Option", "Result", "Task"}:
@@ -568,6 +619,38 @@ class TypeChecker:
         if base == "Map" and arguments:
             if not self._is_hashable_key_type(arguments[0], known_variables):
                 raise Diagnostic(location, "type", f"Map key type '{arguments[0]}' is not a supported primitive or object-reference type")
+
+    def _declaration_constraints(self, base: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        declaration = (
+            next((item for item in self.program.classes if item.name == base), None)
+            or next((item for item in self.program.interfaces if item.name == base), None)
+            or next((item for item in self.program.records if item.name == base), None)
+            or next((item for item in self.program.enums if item.name == base), None)
+            or next((item for item in self.program.newtypes if item.name == base), None)
+            or next((item for item in self.program.type_aliases if item.name == base), None)
+        )
+        if declaration is None:
+            return ()
+        return self._validate_type_constraints(
+            declaration.type_parameters, declaration.type_constraints, declaration.location,
+        )
+
+    def _validate_type_application_constraints(
+        self, base: str, arguments: list[str], location: Location, type_variables: set[str],
+    ) -> None:
+        constraints = self._declaration_constraints(base)
+        if not constraints:
+            return
+        parameters = getattr(
+            next((item for item in [*self.program.classes, *self.program.interfaces, *self.program.records,
+                                    *self.program.enums, *self.program.newtypes, *self.program.type_aliases]
+                       if item.name == base), None),
+            "type_parameters", (),
+        )
+        if len(parameters) != len(arguments):
+            return
+        substitutions = dict(zip(parameters, (self._canonical_type(item) for item in arguments)))
+        self._check_generic_constraints(constraints, substitutions, location, f"type '{base}'")
 
     def _is_hashable_key_type(
         self,
@@ -626,22 +709,62 @@ class TypeChecker:
     def _check_interface_implementations(self) -> None:
         for class_info in self.classes.values():
             declaration = class_info.declaration
+            previous_constraints = self.active_type_constraints
+            self.active_type_constraints = dict(self._validate_type_constraints(
+                list(class_info.type_parameters), declaration.type_constraints, declaration.location,
+            ))
             seen: set[str] = set()
-            for interface_name in declaration.interfaces:
-                if interface_name in seen:
-                    raise Diagnostic(declaration.location, "type", f"interface '{interface_name}' is listed more than once")
-                seen.add(interface_name)
-                interface = self.interfaces.get(interface_name)
-                if interface is None:
-                    raise Diagnostic(declaration.location, "type", f"unknown interface '{interface_name}'")
-                for method_name, required in interface.methods.items():
-                    actual = class_info.methods.get(method_name)
-                    if actual is None:
-                        raise Diagnostic(declaration.location, "type", f"class '{declaration.name}' does not implement '{interface_name}.{method_name}'")
-                    if actual.parameter_types != required.parameter_types:
-                        raise Diagnostic(actual.location, "type", f"method '{method_name}' does not match '{interface_name}': parameter types differ")
-                    if actual.return_type != required.return_type:
-                        raise Diagnostic(actual.location, "type", f"method '{method_name}' does not match '{interface_name}': expected return type {required.return_type}, found {actual.return_type}")
+            try:
+                for interface_name in declaration.interfaces:
+                    if interface_name in seen:
+                        raise Diagnostic(declaration.location, "type", f"interface '{interface_name}' is listed more than once")
+                    seen.add(interface_name)
+                    base, arguments = split_type(interface_name)
+                    interface = self.interfaces.get(base)
+                    if interface is None:
+                        raise Diagnostic(declaration.location, "type", f"unknown interface '{base}'")
+                    self._require_known_type(interface_name, declaration.location, set(class_info.type_parameters))
+                    substitutions = dict(zip(interface.type_parameters, arguments))
+                    self._check_generic_constraints(
+                        self._declaration_constraints(base), substitutions, declaration.location,
+                        f"interface implementation '{interface_name}'",
+                    )
+                    for method_name, required in interface.methods.items():
+                        actual = class_info.methods.get(method_name)
+                        if actual is None:
+                            raise Diagnostic(declaration.location, "type", f"class '{declaration.name}' does not implement '{interface_name}.{method_name}'")
+                        if not self._interface_method_matches(required, actual, substitutions):
+                            if not arguments and not required.type_parameters and not actual.type_parameters:
+                                if actual.parameter_types != required.parameter_types:
+                                    raise Diagnostic(actual.location, "type", f"method '{method_name}' does not match '{interface_name}': parameter types differ")
+                                if actual.return_type != required.return_type:
+                                    raise Diagnostic(actual.location, "type", f"method '{method_name}' does not match '{interface_name}': expected return type {required.return_type}, found {actual.return_type}")
+                            raise Diagnostic(actual.location, "type", f"method '{method_name}' does not match '{interface_name}' after type substitution")
+            finally:
+                self.active_type_constraints = previous_constraints
+
+    @staticmethod
+    def _interface_method_matches(
+        required: Signature, actual: Signature, substitutions: dict[str, str],
+    ) -> bool:
+        if len(required.type_parameters) != len(actual.type_parameters):
+            return False
+        generic_names = dict(zip(required.type_parameters, actual.type_parameters))
+        expected_parameters = tuple(
+            substitute_type(substitute_type(item, substitutions), generic_names)
+            for item in required.parameter_types
+        )
+        expected_return = substitute_type(substitute_type(required.return_type, substitutions), generic_names)
+        if expected_parameters != actual.parameter_types or expected_return != actual.return_type:
+            return False
+        expected_constraints = {
+            generic_names[name]: tuple(
+                substitute_type(substitute_type(bound, substitutions), generic_names)
+                for bound in bounds
+            )
+            for name, bounds in required.type_constraints
+        }
+        return expected_constraints == dict(actual.type_constraints)
 
     def _check_function(self, function: Function, signature: Signature) -> None:
         previous = self.active_type_variables
@@ -668,8 +791,14 @@ class TypeChecker:
         if method.name == "init" and signature.return_type != "Void":
             raise Diagnostic(method.location, "type", "constructors must return Void")
         previous = self.active_type_variables
+        previous_constraints = self.active_type_constraints
         previous_flow = self._ownership_flow
-        self.active_type_variables = set(owner.type_parameters)
+        self.active_type_variables = set(owner.type_parameters) | set(signature.type_parameters)
+        owner_constraints = self._validate_type_constraints(
+            list(owner.type_parameters), getattr(owner.declaration, "type_constraints", {}), owner.declaration.location,
+        )
+        self.active_type_constraints = dict(owner_constraints)
+        self.active_type_constraints.update(dict(signature.type_constraints))
         self._ownership_flow = {}
         self._ownership_effects = []
         variables = ChainMap({p.name: self._new_binding(p.type_name, location=p.location)
@@ -681,6 +810,7 @@ class TypeChecker:
             self._require_return_paths(f"{owner.declaration.name}.{method.name}", signature.return_type, outcomes, method.location)
         finally:
             self.active_type_variables = previous
+            self.active_type_constraints = previous_constraints
             self._ownership_flow = previous_flow
 
     @staticmethod
@@ -1271,6 +1401,7 @@ class TypeChecker:
                 substitutions = self._resolve_type_arguments(
                     class_info.type_parameters, expression.type_arguments, expected, argument_types,
                     expression.arguments, expression.location, expression.callee,
+                    self._declaration_constraints(expression.callee),
                 )
                 return make_type(expression.callee, [substitutions[name] for name in class_info.type_parameters])
             record_info = self.records.get(expression.callee)
@@ -1279,6 +1410,7 @@ class TypeChecker:
                 substitutions = self._resolve_type_arguments(
                     record_info.type_parameters, expression.type_arguments, formal_types, argument_types,
                     expression.arguments, expression.location, expression.callee,
+                    self._declaration_constraints(expression.callee),
                 )
                 return make_type(expression.callee, [substitutions[name] for name in record_info.type_parameters])
             newtype = self.newtypes.get(expression.callee)
@@ -1287,6 +1419,7 @@ class TypeChecker:
                     tuple(newtype.type_parameters), expression.type_arguments,
                     (newtype.underlying_type,), argument_types, expression.arguments,
                     expression.location, expression.callee,
+                    self._declaration_constraints(expression.callee),
                 )
                 return make_type(expression.callee, [substitutions[name] for name in newtype.type_parameters])
             if expression.callee in self.actors:
@@ -1343,10 +1476,9 @@ class TypeChecker:
                 substitutions = self._resolve_type_arguments(
                     enum.type_parameters, expression.type_arguments, payload_types, argument_types,
                     expression.arguments, expression.location, f"{enum.declaration.name}.{expression.method}",
+                    self._declaration_constraints(enum.declaration.name),
                 )
                 return make_type(enum.declaration.name, [substitutions[name] for name in enum.type_parameters])
-            if expression.type_arguments:
-                raise Diagnostic(expression.location, "type", "generic methods are not supported yet")
             resource_binding = (variables.get(expression.receiver.identifier)
                                 if isinstance(expression.receiver, Name) else None)
             resource_receiver_base = (split_type(resource_binding.type_name)[0]
@@ -1801,20 +1933,26 @@ class TypeChecker:
                 signature = actor.methods.get(expression.method)
                 substitutions = {}
             elif receiver_base in self.interfaces:
-                signature = self.interfaces[receiver_base].methods.get(expression.method)
-                substitutions = {}
+                interface = self.interfaces[receiver_base]
+                signature = interface.methods.get(expression.method)
+                substitutions = dict(zip(interface.type_parameters, receiver_arguments))
             elif receiver_base in self.active_type_constraints:
-                candidates = [self.interfaces[interface_name].methods[expression.method]
-                              for interface_name in self.active_type_constraints[receiver_base]
-                              if expression.method in self.interfaces[interface_name].methods]
+                candidates = []
+                for interface_name in self.active_type_constraints[receiver_base]:
+                    interface_base, interface_arguments = split_type(interface_name)
+                    interface = self.interfaces[interface_base]
+                    candidate = interface.methods.get(expression.method)
+                    if candidate is not None:
+                        candidates.append((candidate, dict(zip(interface.type_parameters, interface_arguments))))
                 if candidates and any(
-                    candidate.parameter_types != candidates[0].parameter_types
-                    or candidate.return_type != candidates[0].return_type
-                    for candidate in candidates[1:]
+                    tuple(substitute_type(item, candidate_substitutions) for item in candidate.parameter_types)
+                    != tuple(substitute_type(item, candidates[0][1]) for item in candidates[0][0].parameter_types)
+                    or substitute_type(candidate.return_type, candidate_substitutions)
+                    != substitute_type(candidates[0][0].return_type, candidates[0][1])
+                    for candidate, candidate_substitutions in candidates[1:]
                 ):
                     raise Diagnostic(expression.location, "type", f"constraints on '{receiver_base}' require incompatible '{expression.method}' signatures")
-                signature = candidates[0] if candidates else None
-                substitutions = {}
+                signature, substitutions = candidates[0] if candidates else (None, {})
             else:
                 signature = None
                 substitutions = {}
@@ -1825,9 +1963,17 @@ class TypeChecker:
                     raise Diagnostic(expression.location, "type", f"type parameter '{receiver_base}' has no interface constraint providing method '{expression.method}'")
                 raise Diagnostic(expression.location, "type", f"type '{receiver_type}' has no method '{expression.method}'")
             parameter_types = tuple(substitute_type(item, substitutions) for item in signature.parameter_types)
-            self._check_arguments(expression.arguments, argument_types, parameter_types, expression.location,
-                                  f"{receiver_type}.{expression.method}")
-            return substitute_type(signature.return_type, substitutions)
+            constraints = tuple(
+                (name, tuple(substitute_type(bound, substitutions) for bound in bounds))
+                for name, bounds in signature.type_constraints
+            )
+            method_substitutions = self._resolve_type_arguments(
+                signature.type_parameters, expression.type_arguments, parameter_types, argument_types,
+                expression.arguments, expression.location, f"{receiver_type}.{expression.method}", constraints,
+            )
+            resolved = dict(substitutions)
+            resolved.update(method_substitutions)
+            return substitute_type(signature.return_type, resolved)
         if isinstance(expression, Unary):
             if (
                 expression.operator == "-"
@@ -1970,14 +2116,7 @@ class TypeChecker:
                     )
 
     def _satisfies_interface_constraint(self, type_name: str, interface_name: str) -> bool:
-        type_name = self._canonical_type(type_name)
-        base, _ = split_type(type_name)
-        if base == interface_name:
-            return True
-        class_info = self.classes.get(base)
-        if class_info is not None and interface_name in class_info.declaration.interfaces:
-            return True
-        return interface_name in self.active_type_constraints.get(base, ())
+        return self._is_assignable(interface_name, type_name)
 
     def _collection_method(
         self, collection: str, type_arguments: tuple[str, ...], method: str, location: Location,
@@ -2374,6 +2513,20 @@ class TypeChecker:
         if formal_arguments and formal_base == actual_base and len(formal_arguments) == len(actual_arguments):
             for formal_arg, actual_arg in zip(formal_arguments, actual_arguments):
                 self._infer_type_arguments(formal_arg, actual_arg, parameters, substitutions, location, callee)
+            return
+        # A generic parameter can be inferred through a nominal interface
+        # implementation, e.g. `read<T>(Container<T>)` called with `Box<String>`
+        # when `Box<U>` implements `Container<U>`.
+        class_info = self.classes.get(actual_base)
+        if class_info is not None:
+            class_substitutions = dict(zip(class_info.type_parameters, actual_arguments))
+            for declared_interface in class_info.declaration.interfaces:
+                implemented = self._canonical_type(substitute_type(declared_interface, class_substitutions))
+                implemented_base, implemented_arguments = split_type(implemented)
+                if (implemented_base == formal_base and len(implemented_arguments) == len(formal_arguments)):
+                    for formal_arg, actual_arg in zip(formal_arguments, implemented_arguments):
+                        self._infer_type_arguments(formal_arg, actual_arg, parameters, substitutions, location, callee)
+                    return
 
     def _check_arguments(
         self, arguments: list[Expression], actual_types: list[str], expected_types: tuple[str, ...],
@@ -2396,12 +2549,21 @@ class TypeChecker:
         actual = self._canonical_type(actual)
         if expected == actual:
             return True
-        actual_base, _ = split_type(actual)
+        actual_base, actual_arguments = split_type(actual)
         expected_base, expected_arguments = split_type(expected)
-        if expected_arguments:
-            return False
+        if actual_base in self.active_type_constraints:
+            for bound in self.active_type_constraints[actual_base]:
+                if self._canonical_type(bound) == expected:
+                    return True
         class_info = self.classes.get(actual_base)
-        return class_info is not None and expected_base in class_info.declaration.interfaces
+        if class_info is None:
+            return False
+        class_substitutions = dict(zip(class_info.type_parameters, actual_arguments))
+        for declared_interface in class_info.declaration.interfaces:
+            implemented = self._canonical_type(substitute_type(declared_interface, class_substitutions))
+            if implemented == expected:
+                return True
+        return False
 
     def _binary_type(self, expression: Binary, left: str, right: str) -> str:
         operator = expression.operator

@@ -64,14 +64,15 @@ manifest and creates starter projects. `cli.py` provides `new`, `run`, `check`,
   and required method names, parameter types and return types must match
   exactly. A conforming class is assignable to its interface. There is no
   class inheritance or structural duck typing.
-- Generic function, class, record, enum and newtype signatures retain type
-  parameters in the checked type representation. Calls infer parameters from
-  actual arguments or accept explicit type arguments; recursive substitution
-  validates nested applications before execution. Generic functions support
-  interface bounds with statically checked constrained method calls. Generic
-  methods/interfaces and bounds on generic type declarations are not supported.
-  The interpreter erases type arguments in runtime values; dispatch still uses
-  statically selected nominal methods.
+- Generic function, method, class, interface, record, enum, newtype and alias
+  signatures retain type parameters in the checked representation. Calls infer
+  parameters from actual arguments or accept explicit type arguments; recursive
+  substitution validates nested applications before execution. Interface bounds
+  are available on generic declarations and methods, including parameterized
+  interfaces; constrained member calls and generic-interface conformance are
+  checked after substitution. The interpreter erases type arguments in runtime
+  values; dispatch still uses statically selected nominal methods. These generic
+  forms remain interpreter-only for the experimental native backend.
 - `List<T>` and `Map<K,V>` expose Tyvera-specific typed APIs through private
   bootstrap value records. The checker owns their method signatures and
   iteration element types. A `for` evaluates its collection once and the

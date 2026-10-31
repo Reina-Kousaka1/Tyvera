@@ -248,7 +248,8 @@ class Parser:
     def _class_declaration(self, public: bool = False) -> ClassDeclaration:
         class_token = self._expect("CLASS", "expected 'class'")
         name = self._expect("IDENTIFIER", "expected a class name after 'class'")
-        type_parameters = self._type_parameters()
+        type_parameters = self._type_parameters(allow_constraints=True)
+        type_constraints = {name: list(bounds) for name, bounds in self._last_type_constraints.items()}
         interfaces: list[str] = []
         if self._match("IMPLEMENTS"):
             while True:
@@ -268,21 +269,27 @@ class Parser:
                 fields.append(Field(field_name.lexeme, field_type, declaration.kind == "VAR", declaration.location))
             elif self._check("FN"):
                 method_token = self._advance()
-                method_name, parameters, return_type = self._function_header()
+                method_name_token = self._expect("IDENTIFIER", "expected a function name after 'fn'")
+                method_type_parameters = self._type_parameters(allow_constraints=True)
+                method_constraints = {name: list(bounds) for name, bounds in self._last_type_constraints.items()}
+                method_name, parameters, return_type = self._function_header(method_name_token)
                 body = self._block()
-                methods.append(Method(method_name, parameters, return_type, body, method_token.location))
+                methods.append(Method(method_name, parameters, return_type, body, method_token.location,
+                                      method_type_parameters, method_constraints))
             else:
                 self._error(self._current(), "expected a field declaration or method in class body")
             if not self._check_any("NEWLINE", "SEMICOLON", "RBRACE", "EOF"):
                 self._error(self._current(), "expected a line break or ';' after class member")
             self._skip_separators()
         self._expect("RBRACE", "expected '}' to close class body")
-        return ClassDeclaration(name.lexeme, interfaces, fields, methods, class_token.location, public, type_parameters)
+        return ClassDeclaration(name.lexeme, interfaces, fields, methods, class_token.location, public,
+                                type_parameters, type_constraints)
 
     def _record_declaration(self, public: bool = False) -> RecordDeclaration:
         record_token = self._expect("RECORD", "expected 'record'")
         name = self._expect("IDENTIFIER", "expected a record name after 'record'")
-        type_parameters = self._type_parameters()
+        type_parameters = self._type_parameters(allow_constraints=True)
+        type_constraints = {name: list(bounds) for name, bounds in self._last_type_constraints.items()}
         self._expect("LBRACE", "expected '{' after record name")
         fields: list[Field] = []
         self._skip_separators()
@@ -297,12 +304,13 @@ class Parser:
                 self._error(self._current(), "expected a line break, ',', or ';' after record field")
             self._skip_separators()
         self._expect("RBRACE", "expected '}' to close record declaration")
-        return RecordDeclaration(name.lexeme, fields, record_token.location, public, type_parameters)
+        return RecordDeclaration(name.lexeme, fields, record_token.location, public, type_parameters, type_constraints)
 
     def _enum_declaration(self, public: bool = False) -> EnumDeclaration:
         enum_token = self._expect("ENUM", "expected 'enum'")
         name = self._expect("IDENTIFIER", "expected an enum name after 'enum'")
-        type_parameters = self._type_parameters()
+        type_parameters = self._type_parameters(allow_constraints=True)
+        type_constraints = {name: list(bounds) for name, bounds in self._last_type_constraints.items()}
         self._expect("LBRACE", "expected '{' after enum name")
         variants: list[EnumVariant] = []
         self._skip_separators()
@@ -324,41 +332,52 @@ class Parser:
         self._expect("RBRACE", "expected '}' to close enum declaration")
         if not variants:
             self._error(enum_token, "enum must declare at least one variant")
-        return EnumDeclaration(name.lexeme, variants, enum_token.location, public, type_parameters)
+        return EnumDeclaration(name.lexeme, variants, enum_token.location, public, type_parameters, type_constraints)
 
     def _newtype_declaration(self, public: bool = False) -> NewtypeDeclaration:
         newtype_token = self._expect("NEWTYPE", "expected 'newtype'")
         name = self._expect("IDENTIFIER", "expected a newtype name after 'newtype'")
-        type_parameters = self._type_parameters()
+        type_parameters = self._type_parameters(allow_constraints=True)
+        type_constraints = {name: list(bounds) for name, bounds in self._last_type_constraints.items()}
         self._expect("EQUAL", "expected '=' after newtype name")
         underlying_type = self._type_name("expected a representation type after '='")
-        return NewtypeDeclaration(name.lexeme, underlying_type, newtype_token.location, public, type_parameters)
+        return NewtypeDeclaration(name.lexeme, underlying_type, newtype_token.location, public, type_parameters,
+                                  type_constraints)
 
     def _type_alias_declaration(self, public: bool = False) -> TypeAliasDeclaration:
         alias_token = self._expect("TYPE", "expected 'type'")
         name = self._expect("IDENTIFIER", "expected a type alias name after 'type'")
-        type_parameters = self._type_parameters()
+        type_parameters = self._type_parameters(allow_constraints=True)
+        type_constraints = {name: list(bounds) for name, bounds in self._last_type_constraints.items()}
         self._expect("EQUAL", "expected '=' after type alias name")
         target_type = self._type_name("expected a target type after '='")
-        return TypeAliasDeclaration(name.lexeme, target_type, alias_token.location, public, type_parameters)
+        return TypeAliasDeclaration(name.lexeme, target_type, alias_token.location, public, type_parameters,
+                                    type_constraints)
 
     def _interface_declaration(self, public: bool = False) -> InterfaceDeclaration:
         interface_token = self._expect("INTERFACE", "expected 'interface'")
         name = self._expect("IDENTIFIER", "expected an interface name after 'interface'")
+        type_parameters = self._type_parameters(allow_constraints=True)
+        type_constraints = {name: list(bounds) for name, bounds in self._last_type_constraints.items()}
         self._expect("LBRACE", "expected '{' after interface name")
         methods: list[MethodSignature] = []
         self._skip_separators()
         while not self._check_any("RBRACE", "EOF"):
             method_token = self._expect("FN", "expected a method signature beginning with 'fn'")
-            method_name, parameters, return_type = self._function_header()
+            method_name_token = self._expect("IDENTIFIER", "expected a function name after 'fn'")
+            method_type_parameters = self._type_parameters(allow_constraints=True)
+            method_constraints = {name: list(bounds) for name, bounds in self._last_type_constraints.items()}
+            method_name, parameters, return_type = self._function_header(method_name_token)
             if self._check("LBRACE"):
                 self._error(self._current(), "interface methods declare signatures and cannot have bodies")
-            methods.append(MethodSignature(method_name, parameters, return_type, method_token.location))
+            methods.append(MethodSignature(method_name, parameters, return_type, method_token.location,
+                                           method_type_parameters, method_constraints))
             if not self._check_any("NEWLINE", "SEMICOLON", "RBRACE", "EOF"):
                 self._error(self._current(), "expected a line break or ';' after interface method")
             self._skip_separators()
         self._expect("RBRACE", "expected '}' to close interface body")
-        return InterfaceDeclaration(name.lexeme, methods, interface_token.location, public)
+        return InterfaceDeclaration(name.lexeme, methods, interface_token.location, public,
+                                    type_parameters, type_constraints)
 
     def _actor_declaration(self, public: bool = False) -> ActorDeclaration:
         actor_token = self._expect("ACTOR", "expected 'actor'")
