@@ -1,17 +1,47 @@
 version: 2
 updates:
+  # CI action updates are reviewable together. Major action revisions remain
+  # individual pull requests because they can alter the toolchain contract.
   - package-ecosystem: github-actions
     directory: /
-    target-branch: Dev
     schedule:
       interval: weekly
       day: tuesday
+      time: "03:30"
+      timezone: Europe/Berlin
     open-pull-requests-limit: 3
+    cooldown:
+      default-days: 3
+    groups:
+      ci-actions-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
 
+  # Tyvera currently has no runtime Python dependency set. Keep the bootstrap
+  # build tool separate from language/runtime semantics and group only its
+  # non-major routine updates.
   - package-ecosystem: pip
     directory: /
-    target-branch: Dev
     schedule:
       interval: weekly
       day: tuesday
+      time: "03:45"
+      timezone: Europe/Berlin
     open-pull-requests-limit: 3
+    cooldown:
+      default-days: 3
+      semver-major-days: 21
+      semver-minor-days: 7
+      semver-patch-days: 3
+    groups:
+      python-bootstrap-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - setuptools
+        update-types:
+          - minor
+          - patch
