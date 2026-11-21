@@ -24,8 +24,10 @@ Those languages are design references, not compatibility targets.
 - **Modules:** one module declaration per source file, explicit imports, and
   `pub` exports. The resolver loads transitive source files relative to their
   importers in dependency-first order, rejects cycles and duplicate module
-  names, and confines resolved paths to the entry directory tree. Cross-module
-  symbol lookup and type checking remain pending.
+  names, and confines resolved paths to the entry directory tree. Calls to
+  public functions with module-independent signatures are type-checked;
+  imported types, constants, re-exports, and code generation across modules
+  remain pending.
 - **Standard library:** small, layered packages for core values, collections,
   text, errors, I/O, and task/channel primitives. Platform services stay
   behind portable interfaces.
@@ -61,9 +63,10 @@ stores, minor/full collection, and survivor promotion. The native IR does not
 allocate these objects yet, and deterministic ownership for external resources
 has not been implemented.
 
-`src/resolver.rs` loads and parses a source import graph. It does not yet
-connect imported declarations to type checking or code generation; use
-`tyvera modules <entry.tyv>` to inspect the resolved dependency order.
+`src/resolver.rs` loads and parses a source import graph. The type checker
+resolves eligible public function calls across that graph. The native back end
+still compiles a single module at a time; use `tyvera modules <entry.tyv>` to
+inspect the resolved dependency order.
 
 Before native compilation is called complete, Tyvera must type-check programs,
 lower them to a documented typed IR, link the runtime, generate a native

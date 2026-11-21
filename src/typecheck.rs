@@ -1,9 +1,13 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use crate::ast::{
     BinaryOp, Block, ElseBranch, Expr, FunctionDecl, Item, Module, Statement, Type, UnaryOp,
 };
 use crate::diagnostic::{Diagnostic, Span};
+use crate::resolver::ModuleGraph;
+
+type ImportNamespaces = HashMap<String, HashMap<String, Option<ValueType>>>;
 
 /// A checked module and the inferred type of each source expression.
 #[derive(Clone, Debug)]
@@ -11,6 +15,20 @@ pub struct CheckedModule {
     pub module: Module,
     pub expression_types: HashMap<Span, ValueType>,
     pub function_types: HashMap<String, ValueType>,
+}
+
+/// A checked module in a dependency-first source program.
+#[derive(Clone, Debug)]
+pub struct CheckedSourceModule {
+    pub path: PathBuf,
+    pub checked: CheckedModule,
+}
+
+/// The result of checking all modules reachable from one entry file.
+#[derive(Clone, Debug)]
+pub struct CheckedProgram {
+    pub entry: PathBuf,
+    pub modules: Vec<CheckedSourceModule>,
 }
 
 /// Types after aliases have been expanded and user declarations resolved.
@@ -55,7 +73,124 @@ impl std::fmt::Display for ValueType {
 /// This pass validates local module declarations; import graph resolution and
 /// generic declaration parameters are deliberately handled by later passes.
 pub fn check(module: &Module) -> Result<CheckedModule, Vec<Diagnostic>> {
-    Checker::new(module.clone()).run()
+    Checker::new(module.clone(), HashMap::new()).run()
+}
+
+/// Type-check a resolved source graph, exposing only imported public functions.
+pub fn check_graph(graph: &ModuleGraph) -> Result<CheckedProgram, Vec<Diagnostic>> {
+    let mut modules_by_path = HashMap::<PathBuf, CheckedModule>::new();
+    let mut checked_modules = Vec::with_capacity(graph.modules().len());
+    let mut errors = Vec::new();
+
+    for source in graph.modules() {
+        let mut imports = ImportNamespaces::new();
+        for import in &source.imports {
+            let Some(dependency) = modules_by_path.get(&import.path) else {
+                errors.push(Diagnostic::new(
+                    format!(
+                        "{}: imported module was not successfully checked",
+                        import.path.display()
+                    ),
+                    Span::default(),
+                ));
+                continue;
+            };
+            let alias = import
+                .alias
+                .clone()
+                .or_else(|| {
+                    dependency
+                        .module
+                        .name
+                        .as_ref()
+                        .map(|name| name.text.clone())
+                })
+                .or_else(|| {
+                    import
+                        .path
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                })
+                .unwrap_or_default();
+            let mut exports = HashMap::new();
+            for item in &dependency.module.items {
+                let Item::Function(function) = item else {
+                    continue;
+                };
+                if function.is_public
+                    && let Some(signature) = dependency.function_types.get(&function.name.text)
+                {
+                    let importable = match signature {
+                        ValueType::Function(params, result) => {
+                            params.iter().all(is_importable_type) && is_importable_type(result)
+                        }
+                        _ => false,
+                    };
+                    exports.insert(
+                        function.name.text.clone(),
+                        importable.then(|| signature.clone()),
+                    );
+                }
+            }
+            if imports.insert(alias.clone(), exports).is_some() {
+                errors.push(Diagnostic::new(
+                    format!(
+                        "{}: import alias '{alias}' is declared more than once",
+                        source.path.display()
+                    ),
+                    Span::default(),
+                ));
+            }
+        }
+
+        match Checker::new(source.module.clone(), imports).run() {
+            Ok(checked) => {
+                modules_by_path.insert(source.path.clone(), checked.clone());
+                checked_modules.push(CheckedSourceModule {
+                    path: source.path.clone(),
+                    checked,
+                });
+            }
+            Err(diagnostics) => errors.extend(diagnostics.into_iter().map(|mut diagnostic| {
+                let position = diagnostic.position(&source.source);
+                diagnostic.message = format!(
+                    "{}:{}:{}: {}",
+                    source.path.display(),
+                    position.line,
+                    position.column,
+                    diagnostic.message
+                );
+                diagnostic
+            })),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(CheckedProgram {
+            entry: graph.entry().to_path_buf(),
+            modules: checked_modules,
+        })
+    } else {
+        Err(errors)
+    }
+}
+
+fn is_importable_type(ty: &ValueType) -> bool {
+    match ty {
+        ValueType::Unit
+        | ValueType::Int
+        | ValueType::Float
+        | ValueType::Bool
+        | ValueType::String => true,
+        ValueType::Array(inner)
+        | ValueType::Channel(inner)
+        | ValueType::Task(inner)
+        | ValueType::Optional(inner) => is_importable_type(inner),
+        ValueType::Function(params, result) => {
+            params.iter().all(is_importable_type) && is_importable_type(result)
+        }
+        ValueType::Named(_) => false,
+    }
 }
 
 #[derive(Clone)]
@@ -76,13 +211,14 @@ struct Checker {
     types: HashMap<String, UserType>,
     functions: HashMap<String, ValueType>,
     constants: HashMap<String, ValueType>,
+    imports: ImportNamespaces,
     scopes: Vec<HashMap<String, Local>>,
     expression_types: HashMap<Span, ValueType>,
     errors: Vec<Diagnostic>,
 }
 
 impl Checker {
-    fn new(module: Module) -> Self {
+    fn new(module: Module, imports: ImportNamespaces) -> Self {
         let functions = HashMap::from([(
             "print".to_owned(),
             ValueType::Function(vec![ValueType::String], Box::new(ValueType::Unit)),
@@ -92,6 +228,7 @@ impl Checker {
             types: HashMap::new(),
             functions,
             constants: HashMap::new(),
+            imports,
             scopes: Vec::new(),
             expression_types: HashMap::new(),
             errors: Vec::new(),
@@ -616,7 +753,36 @@ impl Checker {
                 span,
             } => self.infer_binary(left, *op, right, *span),
             Expr::Call { callee, args, span } => {
-                let callee_type = self.infer_expr(callee, None)?;
+                let callee_type = if let Expr::Field { object, field, .. } = callee.as_ref()
+                    && let Expr::Name(alias) = object.as_ref()
+                    && let Some(exports) = self.imports.get(&alias.text)
+                {
+                    match exports.get(&field.text) {
+                        Some(Some(signature)) => signature.clone(),
+                        Some(None) => {
+                            self.errors.push(Diagnostic::new(
+                                format!(
+                                    "imported function '{}.{}' uses module-local types, which are not supported across imports yet",
+                                    alias.text, field.text
+                                ),
+                                field.span,
+                            ));
+                            return None;
+                        }
+                        None => {
+                            self.errors.push(Diagnostic::new(
+                                format!(
+                                    "module '{}' has no exported function '{}'",
+                                    alias.text, field.text
+                                ),
+                                field.span,
+                            ));
+                            return None;
+                        }
+                    }
+                } else {
+                    self.infer_expr(callee, None)?
+                };
                 let ValueType::Function(params, result) = callee_type else {
                     self.errors.push(Diagnostic::new(
                         format!("value of type {callee_type} cannot be called"),

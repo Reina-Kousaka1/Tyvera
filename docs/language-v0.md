@@ -128,9 +128,10 @@ are deferred until those features are implemented.
 The current checker validates built-in and declared types, aliases, function
 signatures and calls, struct field access, enum constructors, local bindings,
 assignments, operators, arrays, and return paths in a single module. The
-`tyvera modules` command loads an import graph, but imported symbols are not
-yet resolved or type-checked across module boundaries. Generic declarations
-are also unsupported. The parser accepts generic type
+`tyvera modules` command loads an import graph. `tyvera check` supports calls
+to public imported functions when their signatures do not refer to
+module-local types; imported types, constants, and generic declarations remain
+unsupported. The parser accepts generic type
 application syntax, but `tyvera check` reports it as unsupported until generic
 declarations and their type rules exist.
 

@@ -14,7 +14,16 @@ const MAX_IMPORT_DEPTH: usize = 256;
 #[derive(Clone, Debug)]
 pub struct SourceModule {
     pub path: PathBuf,
+    pub source: String,
     pub module: Module,
+    pub imports: Vec<ResolvedImport>,
+}
+
+/// A module import after its path has been resolved to a canonical source file.
+#[derive(Clone, Debug)]
+pub struct ResolvedImport {
+    pub alias: Option<String>,
+    pub path: PathBuf,
 }
 
 /// All source modules reachable from an entry file.
@@ -173,17 +182,29 @@ impl Loader {
             }
         }
 
+        let mut imports = Vec::new();
         for import in module.items.iter().filter_map(|item| match item {
             crate::ast::Item::Import(import) => Some(import),
             _ => None,
         }) {
             if let Some(import_path) = self.resolve_import(&path, import) {
                 self.visit(&import_path, import.span, depth + 1);
+                if let Ok(import_path) = import_path.canonicalize() {
+                    imports.push(ResolvedImport {
+                        alias: import.alias.as_ref().map(|alias| alias.text.clone()),
+                        path: import_path,
+                    });
+                }
             }
         }
 
         self.states.insert(path.clone(), VisitState::Loaded);
-        self.modules.push(SourceModule { path, module });
+        self.modules.push(SourceModule {
+            path,
+            source,
+            module,
+            imports,
+        });
     }
 
     fn resolve_import(&mut self, importer: &Path, import: &ImportDecl) -> Option<PathBuf> {
@@ -261,6 +282,78 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, ["math", "geometry", "app"]);
         assert_eq!(graph.modules().len(), 3);
+    }
+
+    #[test]
+    fn typechecks_calls_to_public_imported_functions() {
+        let project = TempProject::new();
+        let entry = project.write(
+            "main.tyv",
+            "module app; import \"math\" as math; fn main() -> Int { return math.double(21); }",
+        );
+        project.write(
+            "math.tyv",
+            "module math; pub fn double(value: Int) -> Int { return value * 2; }",
+        );
+        let graph = load_module_graph(entry).unwrap();
+
+        let checked = crate::typecheck::check_graph(&graph).unwrap();
+
+        assert_eq!(checked.modules.len(), 2);
+        assert_eq!(
+            checked.modules[1]
+                .checked
+                .module
+                .name
+                .as_ref()
+                .unwrap()
+                .text,
+            "app"
+        );
+    }
+
+    #[test]
+    fn imported_private_functions_are_not_visible() {
+        let project = TempProject::new();
+        let entry = project.write(
+            "main.tyv",
+            "module app; import \"math\" as math; fn main() -> Int { return math.hidden(21); }",
+        );
+        project.write(
+            "math.tyv",
+            "module math; fn hidden(value: Int) -> Int { return value; }",
+        );
+        let graph = load_module_graph(entry).unwrap();
+
+        let errors = crate::typecheck::check_graph(&graph).unwrap_err();
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("no exported function 'hidden'"))
+        );
+    }
+
+    #[test]
+    fn imported_module_local_types_are_rejected_explicitly() {
+        let project = TempProject::new();
+        let entry = project.write(
+            "main.tyv",
+            "module app; import \"math\" as math; fn main() -> Int { math.take(nil); return 0; }",
+        );
+        project.write(
+            "math.tyv",
+            "module math; pub struct Point { x: Int, } pub fn take(value: Point) { return; }",
+        );
+        let graph = load_module_graph(entry).unwrap();
+
+        let errors = crate::typecheck::check_graph(&graph).unwrap_err();
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("module-local types"))
+        );
     }
 
     #[test]

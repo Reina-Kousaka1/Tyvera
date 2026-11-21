@@ -53,28 +53,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
             Err(diagnostic) => return Err(format_diagnostic(path, &source, &diagnostic)),
         },
         "check" => {
-            let module = parse(&source)
-                .map_err(|diagnostic| format_diagnostic(path, &source, &diagnostic))?;
-            match check(&module) {
-                Ok(checked) => println!(
-                    "type check ok: module {} ({} typed expressions)",
-                    checked
-                        .module
-                        .name
-                        .as_ref()
-                        .map(|name| name.text.as_str())
-                        .unwrap_or("<anonymous>"),
-                    checked.expression_types.len()
-                ),
-                Err(diagnostics) => {
-                    let rendered = diagnostics
-                        .iter()
-                        .map(|diagnostic| format_diagnostic(path, &source, diagnostic))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    return Err(rendered);
-                }
-            }
+            let graph = tyvera::resolver::load_module_graph(path)
+                .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+            let checked = tyvera::typecheck::check_graph(&graph)
+                .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+            let expression_count = checked
+                .modules
+                .iter()
+                .map(|module| module.checked.expression_types.len())
+                .sum::<usize>();
+            println!(
+                "type check ok: {} module(s), {expression_count} typed expressions",
+                checked.modules.len()
+            );
         }
         "run" => {
             let module = parse(&source)
@@ -188,6 +179,14 @@ fn format_diagnostic(path: &str, source: &str, diagnostic: &tyvera::Diagnostic) 
         "{path}:{}:{}: error: {}",
         position.line, position.column, diagnostic.message
     )
+}
+
+fn render_diagnostics(diagnostics: &[tyvera::Diagnostic]) -> String {
+    diagnostics
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn print_help() {

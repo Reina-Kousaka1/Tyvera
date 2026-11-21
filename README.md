@@ -15,10 +15,11 @@ Cranelift-backed JIT can execute the supported scalar subset through
 It accepts the grammar in
 [`docs/language-v0.md`](docs/language-v0.md).
 
-This is **not yet a complete compiler**. Name resolution and type checking
-across imported modules, generic type checking, integration of the runtime and
-heap with compiled programs, concurrency, and the standard library remain to
-be implemented.
+This is **not yet a complete compiler**. Cross-module checking currently
+supports calls to public functions whose signatures use built-in or otherwise
+module-independent types. Imported types, constants, re-exports, generic type
+checking, integration of the runtime and heap with compiled programs,
+concurrency, and the standard library remain to be implemented.
 `tyvera parse` checks syntax only. `tyvera check` validates the supported
 single-module type rules. `tyvera run` currently compiles only integer,
 floating-point, Boolean, local-variable, direct-call, and basic-control-flow
