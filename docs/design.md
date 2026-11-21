@@ -11,9 +11,10 @@ Those languages are design references, not compatibility targets.
   name/module resolution → static type checking → typed IR → native backend.
   Each stage owns its diagnostics and consumes explicit input from the prior
   stage.
-- **Native backend:** Cranelift is the code-generation backend. The first JIT
-  path compiles a typed scalar IR to host machine code in memory; emitting and
-  linking standalone executables remains a required later stage.
+- **Native backend:** Cranelift is the code-generation backend. The JIT runs a
+  typed scalar IR in memory, and the AOT path emits host-format relocatable
+  object files. A minimal Windows x64 linker path produces console
+  executables; other targets and runtime support remain future work.
 - **Runtime memory:** non-moving generational tracing for ordinary safe heap
   objects, deterministic scoped ownership for external/linear resources, and
   explicit unsafe boundaries for raw allocation, pinning, and FFI.
@@ -47,8 +48,10 @@ struct fields, enum constructors, function calls, local bindings, and core
 expression types. It does not resolve imported modules or generic declarations.
 A Cranelift JIT runs the supported scalar subset (integer, float and Boolean
 values, direct calls, local assignment, branches, and loops) with `fn main() ->
-Int` as the entry point. It does not yet emit standalone executables or provide
-a runtime library.
+Int` as the entry point. `tyvera object` emits relocatable objects for that
+subset. `tyvera build` links standalone Windows x64 console executables through
+the installed MSVC linker and Windows SDK. Other target/linker combinations and
+the language runtime are not implemented yet.
 
 Before native compilation is called complete, Tyvera must type-check programs,
 lower them to a documented typed IR, link the runtime, generate a native

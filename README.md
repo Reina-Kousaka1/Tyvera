@@ -21,7 +21,9 @@ management, concurrency, and the standard library remain to be implemented.
 single-module type rules. `tyvera run` currently compiles only integer,
 floating-point, Boolean, local-variable, direct-call, and basic-control-flow
 programs into host machine code in memory; it does not emit a standalone
-executable.
+executable. `tyvera object` emits a host-native relocatable object file for the
+same supported subset. `tyvera build` links a standalone Windows x64 console
+executable when Visual Studio Build Tools and the Windows SDK are installed.
 
 ## Build and use
 
@@ -32,6 +34,8 @@ cargo test
 cargo run -- parse examples/hello.tyv
 cargo run -- check examples/hello.tyv
 cargo run -- run examples/arithmetic.tyv
+cargo run -- object examples/arithmetic.tyv arithmetic.obj
+cargo run -- build examples/arithmetic.tyv arithmetic.exe
 cargo run -- lex examples/hello.tyv
 ```
 

@@ -155,4 +155,6 @@ execution requires a later memory-model revision.
 The memory and concurrency rules above are design commitments, not implemented
 guarantees in front-end draft 0.1. The current tool can parse and type-check a
 subset of one module and JIT-run the supported scalar subset through
-`fn main() -> Int`; it cannot emit a standalone executable.
+`fn main() -> Int`, emits host-native object files for that subset, and links a
+Windows x64 console executable with `tyvera build`. Other target linkers and
+the memory, task, channel, and standard-library runtime are not implemented.

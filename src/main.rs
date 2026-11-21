@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 use tyvera::{check, lex, native, parse};
 
@@ -22,10 +23,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
         print_help();
         return Ok(());
     }
-    if args.len() != 2 {
-        return Err("usage: tyvera <parse|check|run|lex> <source.tyv>".into());
-    }
     let command = &args[0];
+    let expected_args = if matches!(command.as_str(), "object" | "build") {
+        3
+    } else {
+        2
+    };
+    if args.len() != expected_args {
+        return Err(
+            "usage: tyvera <parse|check|run|lex> <source.tyv>\n       tyvera object <source.tyv> <output.obj>\n       tyvera build <source.tyv> <output.exe>"
+                .into(),
+        );
+    }
     let path = &args[1];
     let source = fs::read_to_string(path)
         .map_err(|error| format!("{path}: could not read source: {error}"))?;
@@ -86,6 +95,48 @@ fn run(args: Vec<String>) -> Result<(), String> {
             })?;
             println!("{result}");
         }
+        "object" => {
+            let module = parse(&source)
+                .map_err(|diagnostic| format_diagnostic(path, &source, &diagnostic))?;
+            let checked = check(&module).map_err(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| format_diagnostic(path, &source, diagnostic))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })?;
+            let object = native::emit_object(&checked).map_err(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| format_diagnostic(path, &source, diagnostic))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })?;
+            let output_path = &args[2];
+            fs::write(output_path, object)
+                .map_err(|error| format!("{output_path}: could not write object file: {error}"))?;
+            println!("wrote native object: {output_path}");
+        }
+        "build" => {
+            let module = parse(&source)
+                .map_err(|diagnostic| format_diagnostic(path, &source, &diagnostic))?;
+            let checked = check(&module).map_err(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| format_diagnostic(path, &source, diagnostic))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })?;
+            let output_path = &args[2];
+            native::build_executable(&checked, Path::new(output_path)).map_err(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| format_diagnostic(path, &source, diagnostic))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })?;
+            println!("built native executable: {output_path}");
+        }
         "lex" => match lex(&source) {
             Ok(tokens) => {
                 for token in tokens {
@@ -106,7 +157,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         },
         _ => {
             return Err(format!(
-                "unknown command '{command}'; expected 'parse', 'check', 'run', or 'lex'"
+                "unknown command '{command}'; expected 'parse', 'check', 'run', 'object', 'build', or 'lex'"
             ));
         }
     }
@@ -124,9 +175,11 @@ fn format_diagnostic(path: &str, source: &str, diagnostic: &tyvera::Diagnostic) 
 fn print_help() {
     println!("Tyvera 0.1.0 — native compiler prototype");
     println!("usage: tyvera <parse|check|run|lex> <source.tyv>");
+    println!("       tyvera object <source.tyv> <output.obj>");
+    println!("       tyvera build <source.tyv> <output.exe>");
     println!("       tyvera --version");
     println!();
     println!(
-        "'parse' checks syntax; 'check' checks the supported single-module type rules; 'run' JIT-compiles and executes fn main() -> Int."
+        "'parse' checks syntax; 'check' checks types; 'run' JIT-compiles fn main() -> Int; 'object' emits native object code; 'build' links a Windows x64 executable."
     );
 }

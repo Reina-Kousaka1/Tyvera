@@ -1,14 +1,26 @@
 use std::collections::HashMap;
 use std::mem;
+use std::path::Path;
+#[cfg(windows)]
+use std::{
+    env, fs,
+    path::PathBuf,
+    process::Command,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use cranelift::codegen::ir::UserFuncName;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
+use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::diagnostic::{Diagnostic, Span};
 use crate::ir::{self, Expr, Function, IrType, Program, Statement};
 use crate::typecheck::CheckedModule;
+
+#[cfg(windows)]
+static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct LocalBinding {
@@ -58,7 +70,7 @@ pub fn run(checked: &CheckedModule, entry: &str) -> Result<i64, Vec<Diagnostic>>
         .map_err(|error| vec![Diagnostic::new(error.to_string(), entry_function.span)])?;
     let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
 
-    let declarations = declare_functions(&mut module, &program)?;
+    let declarations = declare_functions(&mut module, &program, Linkage::Local)?;
     for function in &program.functions {
         compile_function(&mut module, function, &declarations)?;
     }
@@ -73,9 +85,211 @@ pub fn run(checked: &CheckedModule, entry: &str) -> Result<i64, Vec<Diagnostic>>
     Ok(entry_point())
 }
 
-fn declare_functions(
-    module: &mut JITModule,
+/// Compile a checked scalar module into a native relocatable object file.
+///
+/// The returned bytes use the host's object format (COFF on Windows, ELF on
+/// Linux, or Mach-O on macOS). Linking a standalone executable is a separate
+/// toolchain step and is not provided yet.
+pub fn emit_object(checked: &CheckedModule) -> Result<Vec<u8>, Vec<Diagnostic>> {
+    let program = ir::lower(checked)?;
+    let span = program
+        .functions
+        .first()
+        .map(|function| function.span)
+        .unwrap_or_default();
+    let isa_builder =
+        cranelift_native::builder().map_err(|error| vec![Diagnostic::new(error, span)])?;
+    let isa = isa_builder
+        .finish(settings::Flags::new(settings::builder()))
+        .map_err(|error| vec![Diagnostic::new(error.to_string(), span)])?;
+    let object_builder = ObjectBuilder::new(isa, "tyvera", default_libcall_names())
+        .map_err(|error| vec![Diagnostic::new(error.to_string(), span)])?;
+    let mut module = ObjectModule::new(object_builder);
+    let declarations = declare_functions(&mut module, &program, Linkage::Export)?;
+    for function in &program.functions {
+        compile_function(&mut module, function, &declarations)?;
+    }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if let Some(main) = program
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        && main.params.is_empty()
+        && main.result == IrType::Int
+    {
+        emit_windows_start_stub(&mut module, declarations["main"], main.span)?;
+    }
+    module
+        .finish()
+        .emit()
+        .map_err(|error| vec![Diagnostic::new(error.to_string(), span)])
+}
+
+/// Link a supported module into a standalone Windows console executable.
+pub fn build_executable(checked: &CheckedModule, output: &Path) -> Result<(), Vec<Diagnostic>> {
+    let program = ir::lower(checked)?;
+    let Some(main) = program
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+    else {
+        return Err(vec![Diagnostic::new(
+            "standalone build requires fn main() -> Int",
+            Span::default(),
+        )]);
+    };
+    if !main.params.is_empty() || main.result != IrType::Int {
+        return Err(vec![Diagnostic::new(
+            "standalone build requires fn main() -> Int",
+            main.span,
+        )]);
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (program, output);
+        Err(vec![Diagnostic::new(
+            "standalone executable linking is currently implemented only for Windows",
+            main.span,
+        )])
+    }
+
+    #[cfg(all(windows, not(target_arch = "x86_64")))]
+    {
+        let _ = (program, output);
+        Err(vec![Diagnostic::new(
+            "standalone executable linking is currently implemented only for Windows x64",
+            main.span,
+        )])
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        let object = emit_object(checked)?;
+        let (linker, kernel32) = find_windows_link_tools()
+            .map_err(|message| vec![Diagnostic::new(message, main.span)])?;
+        if let Some(parent) = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|error| {
+                vec![Diagnostic::new(
+                    format!("could not create output directory: {error}"),
+                    main.span,
+                )]
+            })?;
+        }
+        let id = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        let temporary_object =
+            env::temp_dir().join(format!("tyvera-{}-{id}.obj", std::process::id()));
+        fs::write(&temporary_object, object).map_err(|error| {
+            vec![Diagnostic::new(
+                format!("could not write temporary object file: {error}"),
+                main.span,
+            )]
+        })?;
+
+        let result = Command::new(&linker)
+            .arg("/nologo")
+            .arg("/SUBSYSTEM:CONSOLE")
+            .arg("/ENTRY:tyvera_start")
+            .arg("/NODEFAULTLIB")
+            .arg("/MACHINE:X64")
+            .arg(format!("/OUT:{}", output.display()))
+            .arg(&temporary_object)
+            .arg(&kernel32)
+            .output();
+        let _ = fs::remove_file(&temporary_object);
+        let result = result.map_err(|error| {
+            vec![Diagnostic::new(
+                format!(
+                    "could not start the MSVC linker '{}': {error}",
+                    linker.display()
+                ),
+                main.span,
+            )]
+        })?;
+        if !result.status.success() {
+            return Err(vec![Diagnostic::new(
+                format!(
+                    "MSVC linker failed: {}",
+                    String::from_utf8_lossy(&result.stderr).trim()
+                ),
+                main.span,
+            )]);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn find_windows_link_tools() -> Result<(PathBuf, PathBuf), String> {
+    let program_files_x86 = env::var_os("ProgramFiles(x86)")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)"));
+    let vswhere = program_files_x86
+        .join("Microsoft Visual Studio")
+        .join("Installer")
+        .join("vswhere.exe");
+    if !vswhere.is_file() {
+        return Err(format!(
+            "Visual Studio linker discovery failed: '{}' was not found",
+            vswhere.display()
+        ));
+    }
+    let linker_output = Command::new(&vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-find",
+            r"VC\Tools\MSVC\*\bin\Hostx64\x64\link.exe",
+        ])
+        .output()
+        .map_err(|error| format!("could not run vswhere.exe: {error}"))?;
+    if !linker_output.status.success() {
+        return Err("vswhere.exe could not locate the MSVC linker".to_owned());
+    }
+    let linker = String::from_utf8_lossy(&linker_output.stdout)
+        .lines()
+        .next()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| "MSVC link.exe was not found in Visual Studio Build Tools".to_owned())?;
+
+    let sdk_lib = env::var_os("WindowsSdkDir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| program_files_x86.join(r"Windows Kits\10"))
+        .join("Lib");
+    let versions = fs::read_dir(&sdk_lib)
+        .map_err(|error| format!("could not inspect Windows SDK libraries: {error}"))?;
+    let mut candidates = versions
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let version = entry.file_name().to_string_lossy().to_string();
+            let version_key = version
+                .split('.')
+                .map(str::parse::<u64>)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            let library = entry.path().join(r"um\x64\kernel32.lib");
+            library.is_file().then_some((version_key, library))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    let kernel32 = candidates.pop().map(|(_, path)| path).ok_or_else(|| {
+        format!(
+            "kernel32.lib was not found under '{}' (install the Windows SDK with the MSVC Build Tools)",
+            sdk_lib.display()
+        )
+    })?;
+    Ok((linker, kernel32))
+}
+
+fn declare_functions<M: Module>(
+    module: &mut M,
     program: &Program,
+    linkage: Linkage,
 ) -> Result<HashMap<String, FuncId>, Vec<Diagnostic>> {
     let mut declarations = HashMap::new();
     for function in &program.functions {
@@ -95,15 +309,63 @@ fn declare_functions(
             ));
         }
         let id = module
-            .declare_function(&function.name, Linkage::Local, &signature)
+            .declare_function(&backend_function_name(&function.name), linkage, &signature)
             .map_err(|error| vec![Diagnostic::new(error.to_string(), function.span)])?;
         declarations.insert(function.name.clone(), id);
     }
     Ok(declarations)
 }
 
-fn compile_function(
-    module: &mut JITModule,
+fn backend_function_name(name: &str) -> String {
+    format!("__tyvera_fn_{name}")
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn emit_windows_start_stub(
+    module: &mut ObjectModule,
+    main_id: FuncId,
+    span: Span,
+) -> Result<(), Vec<Diagnostic>> {
+    let mut exit_signature = module.make_signature();
+    exit_signature.params.push(AbiParam::new(types::I32));
+    let exit_id = module
+        .declare_function("ExitProcess", Linkage::Import, &exit_signature)
+        .map_err(|error| vec![Diagnostic::new(error.to_string(), span)])?;
+
+    let start_signature = module.make_signature();
+    let start_id = module
+        .declare_function("tyvera_start", Linkage::Export, &start_signature)
+        .map_err(|error| vec![Diagnostic::new(error.to_string(), span)])?;
+    let mut context = module.make_context();
+    context.func.signature = start_signature;
+    context.func.name = UserFuncName::user(0, start_id.as_u32());
+    let mut builder_context = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
+        let entry = builder.create_block();
+        builder.switch_to_block(entry);
+        let main_ref = module.declare_func_in_func(main_id, builder.func);
+        let main_call = builder.ins().call(main_ref, &[]);
+        let result = builder.inst_results(main_call)[0];
+        let exit_code = builder.ins().ireduce(types::I32, result);
+        let exit_ref = module.declare_func_in_func(exit_id, builder.func);
+        builder.ins().call(exit_ref, &[exit_code]);
+        builder.ins().return_(&[]);
+        builder.seal_all_blocks();
+        builder.finalize(module.target_config());
+    }
+    context
+        .verify(module.isa())
+        .map_err(|error| vec![Diagnostic::new(error.to_string(), span)])?;
+    module
+        .define_function(start_id, &mut context)
+        .map_err(|error| vec![Diagnostic::new(error.to_string(), span)])?;
+    module.clear_context(&mut context);
+    Ok(())
+}
+
+fn compile_function<M: Module>(
+    module: &mut M,
     function: &Function,
     declarations: &HashMap<String, FuncId>,
 ) -> Result<(), Vec<Diagnostic>> {
@@ -175,14 +437,14 @@ fn compile_function(
     Ok(())
 }
 
-struct FunctionCompiler<'a> {
+struct FunctionCompiler<'a, M: Module> {
     builder: FunctionBuilder<'a>,
-    module: &'a mut JITModule,
+    module: &'a mut M,
     declarations: &'a HashMap<String, FuncId>,
     scopes: Vec<HashMap<String, LocalBinding>>,
 }
 
-impl FunctionCompiler<'_> {
+impl<M: Module> FunctionCompiler<'_, M> {
     fn new_variable(&mut self, ty: IrType, span: Span) -> Result<Variable, Vec<Diagnostic>> {
         let Some(clif_type) = clif_type(ty) else {
             return Err(vec![Diagnostic::new(
@@ -552,7 +814,7 @@ mod tests {
     use crate::parser::parse;
     use crate::typecheck::check;
 
-    use super::run;
+    use super::{emit_object, run};
 
     #[test]
     fn jits_and_executes_an_integer_program_with_calls_and_branches() {
@@ -603,5 +865,15 @@ mod tests {
         .unwrap();
         let checked = check(&module).unwrap();
         assert_eq!(run(&checked, "main").unwrap(), 42);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn emits_a_windows_coff_object_file() {
+        let module = parse("module object_test; pub fn main() -> Int { return 42; }").unwrap();
+        let checked = check(&module).unwrap();
+        let object = emit_object(&checked).unwrap();
+        assert!(object.len() > 64);
+        assert_eq!(&object[..2], &[0x64, 0x86]);
     }
 }
