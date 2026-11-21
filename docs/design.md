@@ -22,8 +22,10 @@ Those languages are design references, not compatibility targets.
   cancellation propagation, and a cooperative scheduler before any parallel
   scheduler is considered.
 - **Modules:** one module declaration per source file, explicit imports, and
-  `pub` exports. Resolution will be deterministic and independent of the
-  current working directory.
+  `pub` exports. The resolver loads transitive source files relative to their
+  importers in dependency-first order, rejects cycles and duplicate module
+  names, and confines resolved paths to the entry directory tree. Cross-module
+  symbol lookup and type checking remain pending.
 - **Standard library:** small, layered packages for core values, collections,
   text, errors, I/O, and task/channel primitives. Platform services stay
   behind portable interfaces.
@@ -58,6 +60,10 @@ typed fields, generation-checked handles, a remembered set for old-to-young
 stores, minor/full collection, and survivor promotion. The native IR does not
 allocate these objects yet, and deterministic ownership for external resources
 has not been implemented.
+
+`src/resolver.rs` loads and parses a source import graph. It does not yet
+connect imported declarations to type checking or code generation; use
+`tyvera modules <entry.tyv>` to inspect the resolved dependency order.
 
 Before native compilation is called complete, Tyvera must type-check programs,
 lower them to a documented typed IR, link the runtime, generate a native

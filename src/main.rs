@@ -31,7 +31,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     };
     if args.len() != expected_args {
         return Err(
-            "usage: tyvera <parse|check|run|lex> <source.tyv>\n       tyvera object <source.tyv> <output.obj>\n       tyvera build <source.tyv> <output.exe>"
+            "usage: tyvera <parse|check|run|modules|lex> <source.tyv>\n       tyvera object <source.tyv> <output.obj>\n       tyvera build <source.tyv> <output.exe>"
                 .into(),
         );
     }
@@ -95,6 +95,24 @@ fn run(args: Vec<String>) -> Result<(), String> {
             })?;
             println!("{result}");
         }
+        "modules" => {
+            let graph = tyvera::resolver::load_module_graph(path).map_err(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| format!("{path}: module resolution error: {diagnostic}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })?;
+            for loaded in graph.modules() {
+                let name = loaded
+                    .module
+                    .name
+                    .as_ref()
+                    .map(|name| name.text.as_str())
+                    .unwrap_or("<unnamed>");
+                println!("{name}: {}", loaded.path.display());
+            }
+        }
         "object" => {
             let module = parse(&source)
                 .map_err(|diagnostic| format_diagnostic(path, &source, &diagnostic))?;
@@ -157,7 +175,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         },
         _ => {
             return Err(format!(
-                "unknown command '{command}'; expected 'parse', 'check', 'run', 'object', 'build', or 'lex'"
+                "unknown command '{command}'; expected 'parse', 'check', 'run', 'modules', 'object', 'build', or 'lex'"
             ));
         }
     }
@@ -174,12 +192,12 @@ fn format_diagnostic(path: &str, source: &str, diagnostic: &tyvera::Diagnostic) 
 
 fn print_help() {
     println!("Tyvera 0.1.0 — native compiler prototype");
-    println!("usage: tyvera <parse|check|run|lex> <source.tyv>");
+    println!("usage: tyvera <parse|check|run|modules|lex> <source.tyv>");
     println!("       tyvera object <source.tyv> <output.obj>");
     println!("       tyvera build <source.tyv> <output.exe>");
     println!("       tyvera --version");
     println!();
     println!(
-        "'parse' checks syntax; 'check' checks types; 'run' JIT-compiles fn main() -> Int; 'object' emits native object code; 'build' links a Windows x64 executable."
+        "'parse' checks syntax; 'check' checks types; 'run' JIT-compiles fn main() -> Int; 'modules' resolves source imports; 'object' emits native object code; 'build' links a Windows x64 executable."
     );
 }

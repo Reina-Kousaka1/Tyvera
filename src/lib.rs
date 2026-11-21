@@ -10,6 +10,7 @@ pub mod ir;
 pub mod lexer;
 pub mod native;
 pub mod parser;
+pub mod resolver;
 pub mod runtime;
 pub mod token;
 pub mod typecheck;

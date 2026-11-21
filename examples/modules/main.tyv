@@ -1,0 +1,7 @@
+module app;
+
+import "math" as math;
+
+pub fn main() -> Int {
+    return 0;
+}
