@@ -1,0 +1,7 @@
+module hello;
+
+pub fn main() -> Int {
+    let greeting: String = "Hello, Tyvera!";
+    print(greeting);
+    return 0;
+}

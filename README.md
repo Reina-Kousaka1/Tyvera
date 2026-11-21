@@ -1,25 +1,42 @@
 # Tyvera
 
-Tyvera is being rebuilt **from zero** as an independent programming language.
+Tyvera is an independent, statically typed programming language being rebuilt
+from the ground up. Its design draws on B, ABC, Modula-3, and Go without aiming
+for source or runtime compatibility with them.
 
-## New design influences
+## Current implementation
 
-- **B:** minimal, systems-oriented foundations
-- **ABC:** readability and expressive collections
-- **Modula-3:** static types, modules, interfaces and contracts
-- **Go:** typed channels, lightweight concurrency and simple tooling
+The repository currently contains a tested syntax front end: a UTF-8 lexer,
+byte-based source spans, diagnostics, an abstract syntax tree, a Pratt parser,
+and a small `lex`/`parse` command-line tool. It accepts the grammar in
+[`docs/language-v0.md`](docs/language-v0.md).
 
-The language will use managed memory by default, with explicitly delimited low-level capabilities. The exact grammar, runtime, collector, and backend are **not implemented yet**.
+This is **not yet a complete compiler**. Name resolution, static type
+checking, executable code generation, a runtime, memory management,
+concurrency, and the standard library remain to be implemented. `tyvera parse`
+checks syntax only and does not claim that a program is well-typed or runnable.
 
-## Status
+## Build and use
 
-**Ground-zero reboot.** This branch intentionally contains no legacy parser, compiler, interpreter, runtime, tests, or generated code. New components must be designed and implemented from scratch, with tests written for the new specification.
+Requires Rust and Cargo (edition 2024 support).
 
-The prior implementation is retained in Git history and other existing branches, not in this branch's source tree.
+```powershell
+cargo test
+cargo run -- parse examples/hello.tyv
+cargo run -- lex examples/hello.tyv
+```
 
-## Repository layout
+The command-line tool also supports `tyvera --help` and `tyvera --version`.
 
-- `docs/design.md`: initial language charter and open decisions
-- `LICENSE`: GPLv3
+## Design and status
 
-Do not treat design examples as executable Tyvera until a tested implementation exists.
+- [`docs/language-v0.md`](docs/language-v0.md): current syntax draft and
+  language commitments
+- [`docs/design.md`](docs/design.md): architecture decisions and implementation
+  gates
+- [`LICENSE`](LICENSE): GNU GPL version 3
+
+The rewrite branch preserves the repository's Git history and GPLv3 license,
+but its source tree starts from the reset commit rather than the legacy
+implementation. See the design document for the remaining work before Tyvera
+can be considered a native compiler and runtime.

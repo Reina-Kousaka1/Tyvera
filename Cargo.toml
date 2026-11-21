@@ -1,0 +1,14 @@
+[package]
+name = "tyvera"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "The Tyvera compiler and language tools"
+
+[lib]
+name = "tyvera"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tyvera"
+path = "src/main.rs"

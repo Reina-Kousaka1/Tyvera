@@ -1,38 +1,59 @@
-# Tyvera reboot: design charter
+# Tyvera architecture decisions
 
-Status: initial design, not a language specification or implementation.
+Tyvera is an independent language influenced by B, ABC, Modula-3, and Go.
+Those languages are design references, not compatibility targets.
 
-## Goals
+## Selected direction
 
-1. Independent statically typed language with a small coherent core.
-2. Readable syntax and explicit modular interfaces.
-3. Typed, structured concurrency (channels/tasks), with defined cancellation and shutdown.
-4. Managed memory by default; explicit, restricted low-level memory operations.
-5. Native execution as a long-term goal; no backend selected yet.
-6. Portable tooling and reproducible tests, including Linux/ARM64 and Windows as targets.
+- **Implementation language:** Rust, edition 2024. The compiler itself is a
+  native executable and has no third-party dependencies in the initial
+  front-end slice.
+- **Compilation pipeline:** UTF-8 source and byte spans → tokens → AST →
+  name/module resolution → static type checking → typed IR → native backend.
+  Each stage owns its diagnostics and consumes explicit input from the prior
+  stage.
+- **Native backend:** Cranelift is the initial candidate for portable machine
+  code generation. It will be introduced only with a type-checked executable
+  vertical slice, not as an unused dependency.
+- **Runtime memory:** non-moving generational tracing for ordinary safe heap
+  objects, deterministic scoped ownership for external/linear resources, and
+  explicit unsafe boundaries for raw allocation, pinning, and FFI.
+- **Concurrency:** typed tasks and channels, structured child-task ownership,
+  cancellation propagation, and a cooperative scheduler before any parallel
+  scheduler is considered.
+- **Modules:** one module declaration per source file, explicit imports, and
+  `pub` exports. Resolution will be deterministic and independent of the
+  current working directory.
+- **Standard library:** small, layered packages for core values, collections,
+  text, errors, I/O, and task/channel primitives. Platform services stay
+  behind portable interfaces.
 
-## Inspirations, not dependencies
+## Front-end crate boundaries
 
-- B: minimalism and system-level perspective, **not** its untyped semantics.
-- ABC: approachable source notation and collection ergonomics.
-- Modula-3: module boundaries, nominal interfaces, static type contracts.
-- Go: concurrency and practical tooling, **not** source or binary compatibility.
+The current Rust crate keeps source spans and diagnostics independent from
+syntax. `lexer` owns tokenization, `ast` owns syntax data, and `parser` builds
+the AST using a Pratt expression parser. Future `resolve`, `types`, `ir`,
+`codegen`, and `runtime` modules will not reach back into source text to infer
+facts that an earlier stage should retain.
 
-## Decisions pending
+## Current status and gates
 
-- Exact grammar and file/module naming
-- Primitive types, generics, sum types and error model
-- GC design, FFI boundaries, unsafe-memory ownership and pinning
-- Channel semantics, task scheduling and data-race prevention
-- Compiler pipeline, IR, native code generation and bootstrapping language
-- Package/build conventions and standard-library surface
+The branch starts from the clean reset commit, preserving the repository's
+history and GPLv3 license. The first implementation milestone is the language
+syntax, lexer, parser, AST, conformance tests, and parse/lex CLI. These do not
+yet provide semantic checking or executable programs.
 
-## First implementation milestones
+Before native compilation is called complete, Tyvera must type-check programs,
+lower them to a documented typed IR, link the runtime, generate a native
+executable, and pass checked-in end-to-end tests on supported targets.
 
-1. Publish grammar and semantic test cases.
-2. Implement new lexer and parser, including source-location diagnostics.
-3. Implement new AST and type checker.
-4. Implement an executable reference runtime or compiler, with conformance tests.
-5. Add typed tasks/channels, memory safety and platform APIs incrementally.
+## Deferred decisions
 
-All old implementation files are intentionally absent from this reboot branch. Do not import legacy code as the basis for the rewrite. Preserve the GPLv3 license and Git history.
+- Generic declaration syntax and constraints
+- Interface/trait method dispatch and contracts
+- Error propagation syntax and ABI
+- Exact tracing-collector safepoints and concurrent collection policy
+- The syntax and static guarantees of resource scopes and `unsafe`
+- Channel buffering, close behavior, fairness, and cancellation races
+- Package manifest and cross-module build graph
+- FFI ABI and target support matrix
