@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::process::ExitCode;
-use tyvera::{lex, parse};
+use tyvera::{check, lex, parse};
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -43,6 +43,30 @@ fn run(args: Vec<String>) -> Result<(), String> {
             ),
             Err(diagnostic) => return Err(format_diagnostic(path, &source, &diagnostic)),
         },
+        "check" => {
+            let module = parse(&source)
+                .map_err(|diagnostic| format_diagnostic(path, &source, &diagnostic))?;
+            match check(&module) {
+                Ok(checked) => println!(
+                    "type check ok: module {} ({} typed expressions)",
+                    checked
+                        .module
+                        .name
+                        .as_ref()
+                        .map(|name| name.text.as_str())
+                        .unwrap_or("<anonymous>"),
+                    checked.expression_types.len()
+                ),
+                Err(diagnostics) => {
+                    let rendered = diagnostics
+                        .iter()
+                        .map(|diagnostic| format_diagnostic(path, &source, diagnostic))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(rendered);
+                }
+            }
+        }
         "lex" => match lex(&source) {
             Ok(tokens) => {
                 for token in tokens {
@@ -63,7 +87,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         },
         _ => {
             return Err(format!(
-                "unknown command '{command}'; expected 'parse' or 'lex'"
+                "unknown command '{command}'; expected 'parse', 'check', or 'lex'"
             ));
         }
     }
@@ -80,10 +104,10 @@ fn format_diagnostic(path: &str, source: &str, diagnostic: &tyvera::Diagnostic) 
 
 fn print_help() {
     println!("Tyvera 0.1.0 — native compiler frontend");
-    println!("usage: tyvera <parse|lex> <source.tyv>");
+    println!("usage: tyvera <parse|check|lex> <source.tyv>");
     println!("       tyvera --version");
     println!();
     println!(
-        "'parse' checks lexical and grammatical validity only; type checking and code generation are not implemented yet."
+        "'parse' checks syntax; 'check' also checks the supported single-module type rules. Code generation is not implemented yet."
     );
 }

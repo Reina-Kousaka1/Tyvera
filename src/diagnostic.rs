@@ -1,7 +1,7 @@
 use std::fmt;
 
 /// A byte range in the original UTF-8 source, with an exclusive end.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Span {
     pub start: usize,
     pub end: usize,

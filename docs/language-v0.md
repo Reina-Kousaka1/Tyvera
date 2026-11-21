@@ -122,9 +122,19 @@ allowed inside a string literal.
 
 The language is statically typed, nominal by default, and has no implicit
 numeric narrowing. `nil` is valid only for optional/reference-compatible
-types. A complete type checker will define overload resolution, generic
-constraints, and exhaustive enum matching before those features become part
-of the executable language.
+types. Overload resolution, generic constraints, and exhaustive enum matching
+are deferred until those features are implemented.
+
+The current checker validates built-in and declared types, aliases, function
+signatures and calls, struct field access, enum constructors, local bindings,
+assignments, operators, arrays, and return paths in a single module. It does
+not resolve imports or generic declarations. The parser accepts generic type
+application syntax, but `tyvera check` reports it as unsupported until generic
+declarations and their type rules exist.
+
+The current checker also reserves the prelude function `print(String) ->
+Unit`. This is a type-checking intrinsic only; no runtime implementation is
+available yet.
 
 Memory is hybrid by policy:
 
@@ -142,5 +152,6 @@ cancelled-send/receive behavior will be specified before those operations are
 executable. The first runtime target is a cooperative scheduler; parallel
 execution requires a later memory-model revision.
 
-These are design commitments, not implemented guarantees in front-end draft
-0.1. The current compiler parses syntax only.
+The memory and concurrency rules above are design commitments, not implemented
+guarantees in front-end draft 0.1. The current tool can parse and type-check a
+subset of one module, but cannot generate or execute a program.

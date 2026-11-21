@@ -1,6 +1,6 @@
 use tyvera::{
     ast::{Expr, Item, Statement},
-    lex, parse,
+    check, lex, parse,
 };
 
 #[test]
@@ -10,6 +10,7 @@ fn lex_and_parse_the_checked_in_hello_program() {
     let module = parse(source).unwrap();
     assert_eq!(module.name.as_ref().unwrap().text, "hello");
     assert_eq!(module.items.len(), 1);
+    assert!(check(&module).is_ok());
 }
 
 #[test]

@@ -39,9 +39,12 @@ facts that an earlier stage should retain.
 ## Current status and gates
 
 The branch starts from the clean reset commit, preserving the repository's
-history and GPLv3 license. The first implementation milestone is the language
-syntax, lexer, parser, AST, conformance tests, and parse/lex CLI. These do not
-yet provide semantic checking or executable programs.
+history and GPLv3 license. The current implementation includes the documented
+syntax, lexer, parser, AST, parse/lex CLI, and an initial type checker for
+single-module programs. The checker resolves local declarations, aliases,
+struct fields, enum constructors, function calls, local bindings, and core
+expression types. It does not resolve imported modules or generic declarations.
+No code is executable yet.
 
 Before native compilation is called complete, Tyvera must type-check programs,
 lower them to a documented typed IR, link the runtime, generate a native
