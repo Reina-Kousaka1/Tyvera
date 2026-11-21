@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use crate::ast::{BinaryOp, Block, ElseBranch, Item, UnaryOp};
 use crate::diagnostic::{Diagnostic, Span};
-use crate::typecheck::{CheckedModule, ValueType};
+use crate::typecheck::{CheckedModule, CheckedProgram, ValueType};
 
 /// A deliberately small typed IR used by the first native execution slice.
 #[derive(Clone, Debug, PartialEq)]
@@ -87,13 +90,56 @@ pub fn lower(checked: &CheckedModule) -> Result<Program, Vec<Diagnostic>> {
     Lowerer {
         checked,
         errors: Vec::new(),
+        module_ids: None,
+        current_module_id: None,
+        entry_module_id: None,
     }
     .run()
+}
+
+/// Lower all checked source modules into one program with unique function symbols.
+pub fn lower_graph(checked: &CheckedProgram) -> Result<Program, Vec<Diagnostic>> {
+    let module_ids = checked
+        .modules
+        .iter()
+        .enumerate()
+        .map(|(index, module)| (module.path.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let Some(entry_module_id) = module_ids.get(&checked.entry).copied() else {
+        return Err(vec![Diagnostic::new(
+            "checked program entry module was not found",
+            Span::default(),
+        )]);
+    };
+    let mut functions = Vec::new();
+    let mut errors = Vec::new();
+    for (module_id, source) in checked.modules.iter().enumerate() {
+        match (Lowerer {
+            checked: &source.checked,
+            errors: Vec::new(),
+            module_ids: Some(&module_ids),
+            current_module_id: Some(module_id),
+            entry_module_id: Some(entry_module_id),
+        })
+        .run()
+        {
+            Ok(program) => functions.extend(program.functions),
+            Err(mut diagnostics) => errors.append(&mut diagnostics),
+        }
+    }
+    if errors.is_empty() {
+        Ok(Program { functions })
+    } else {
+        Err(errors)
+    }
 }
 
 struct Lowerer<'a> {
     checked: &'a CheckedModule,
     errors: Vec<Diagnostic>,
+    module_ids: Option<&'a HashMap<PathBuf, usize>>,
+    current_module_id: Option<usize>,
+    entry_module_id: Option<usize>,
 }
 
 impl Lowerer<'_> {
@@ -119,7 +165,7 @@ impl Lowerer<'_> {
             };
             let body = self.lower_block(&function.body);
             functions.push(Function {
-                name: function.name.text.clone(),
+                name: self.function_symbol(self.current_module_id, &function.name.text),
                 params,
                 result,
                 body,
@@ -130,6 +176,16 @@ impl Lowerer<'_> {
             Ok(Program { functions })
         } else {
             Err(self.errors)
+        }
+    }
+
+    fn function_symbol(&self, module_id: Option<usize>, name: &str) -> String {
+        match module_id {
+            None => name.to_owned(),
+            Some(module_id) if Some(module_id) == self.entry_module_id && name == "main" => {
+                "main".to_owned()
+            }
+            Some(module_id) => format!("__tyvera_m{module_id}_{name}"),
         }
     }
 
@@ -289,14 +345,47 @@ impl Lowerer<'_> {
                 span: *span,
             }),
             crate::ast::Expr::Call { callee, args, span } => {
-                let crate::ast::Expr::Name(name) = callee.as_ref() else {
-                    self.errors.push(Diagnostic::new(
-                        "native backend only supports direct function calls",
-                        callee.span(),
-                    ));
-                    return None;
+                let target_name = match callee.as_ref() {
+                    crate::ast::Expr::Name(name) if name.text == "print" => {
+                        self.errors.push(Diagnostic::new(
+                            "native print runtime has not been implemented yet",
+                            *span,
+                        ));
+                        return None;
+                    }
+                    crate::ast::Expr::Name(name) => {
+                        self.function_symbol(self.current_module_id, &name.text)
+                    }
+                    crate::ast::Expr::Field { .. } => {
+                        let Some(target) = self.checked.resolved_import_calls.get(span) else {
+                            self.errors.push(Diagnostic::new(
+                                "native backend could not resolve imported function call",
+                                callee.span(),
+                            ));
+                            return None;
+                        };
+                        let Some(module_id) = self
+                            .module_ids
+                            .and_then(|ids| ids.get(&target.module_path))
+                            .copied()
+                        else {
+                            self.errors.push(Diagnostic::new(
+                                "native backend could not find imported module in checked program",
+                                callee.span(),
+                            ));
+                            return None;
+                        };
+                        self.function_symbol(Some(module_id), &target.name)
+                    }
+                    _ => {
+                        self.errors.push(Diagnostic::new(
+                            "native backend only supports direct function calls",
+                            callee.span(),
+                        ));
+                        return None;
+                    }
                 };
-                if name.text == "print" {
+                if target_name == "print" {
                     self.errors.push(Diagnostic::new(
                         "native print runtime has not been implemented yet",
                         *span,
@@ -304,7 +393,7 @@ impl Lowerer<'_> {
                     return None;
                 }
                 Some(Expr::Call {
-                    name: name.text.clone(),
+                    name: target_name,
                     args: args
                         .iter()
                         .filter_map(|arg| self.lower_expression(arg))

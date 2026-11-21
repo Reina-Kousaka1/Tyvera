@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn typechecks_calls_to_public_imported_functions() {
+    fn typechecks_and_jits_calls_to_public_imported_functions() {
         let project = TempProject::new();
         let entry = project.write(
             "main.tyv",
@@ -310,6 +310,7 @@ mod tests {
                 .text,
             "app"
         );
+        assert_eq!(crate::native::run_graph(&checked).unwrap(), 42);
     }
 
     #[test]

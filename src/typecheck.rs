@@ -7,7 +7,21 @@ use crate::ast::{
 use crate::diagnostic::{Diagnostic, Span};
 use crate::resolver::ModuleGraph;
 
-type ImportNamespaces = HashMap<String, HashMap<String, Option<ValueType>>>;
+type ImportNamespaces = HashMap<String, HashMap<String, ImportedFunction>>;
+
+#[derive(Clone)]
+struct ImportedFunction {
+    module_path: PathBuf,
+    name: String,
+    signature: Option<ValueType>,
+}
+
+/// Target of a call resolved through an import alias.
+#[derive(Clone, Debug)]
+pub struct ResolvedFunction {
+    pub module_path: PathBuf,
+    pub name: String,
+}
 
 /// A checked module and the inferred type of each source expression.
 #[derive(Clone, Debug)]
@@ -15,6 +29,7 @@ pub struct CheckedModule {
     pub module: Module,
     pub expression_types: HashMap<Span, ValueType>,
     pub function_types: HashMap<String, ValueType>,
+    pub resolved_import_calls: HashMap<Span, ResolvedFunction>,
 }
 
 /// A checked module in a dependency-first source program.
@@ -128,7 +143,11 @@ pub fn check_graph(graph: &ModuleGraph) -> Result<CheckedProgram, Vec<Diagnostic
                     };
                     exports.insert(
                         function.name.text.clone(),
-                        importable.then(|| signature.clone()),
+                        ImportedFunction {
+                            module_path: import.path.clone(),
+                            name: function.name.text.clone(),
+                            signature: importable.then(|| signature.clone()),
+                        },
                     );
                 }
             }
@@ -212,6 +231,7 @@ struct Checker {
     functions: HashMap<String, ValueType>,
     constants: HashMap<String, ValueType>,
     imports: ImportNamespaces,
+    resolved_import_calls: HashMap<Span, ResolvedFunction>,
     scopes: Vec<HashMap<String, Local>>,
     expression_types: HashMap<Span, ValueType>,
     errors: Vec<Diagnostic>,
@@ -229,6 +249,7 @@ impl Checker {
             functions,
             constants: HashMap::new(),
             imports,
+            resolved_import_calls: HashMap::new(),
             scopes: Vec::new(),
             expression_types: HashMap::new(),
             errors: Vec::new(),
@@ -260,6 +281,7 @@ impl Checker {
                 module: self.module,
                 expression_types: self.expression_types,
                 function_types: self.functions,
+                resolved_import_calls: self.resolved_import_calls,
             })
         } else {
             Err(self.errors)
@@ -753,35 +775,48 @@ impl Checker {
                 span,
             } => self.infer_binary(left, *op, right, *span),
             Expr::Call { callee, args, span } => {
-                let callee_type = if let Expr::Field { object, field, .. } = callee.as_ref()
+                let imported = if let Expr::Field { object, field, .. } = callee.as_ref()
                     && let Expr::Name(alias) = object.as_ref()
                     && let Some(exports) = self.imports.get(&alias.text)
                 {
-                    match exports.get(&field.text) {
-                        Some(Some(signature)) => signature.clone(),
-                        Some(None) => {
+                    Some((
+                        alias.text.clone(),
+                        field.text.clone(),
+                        field.span,
+                        exports.get(&field.text).cloned(),
+                    ))
+                } else {
+                    None
+                };
+                let callee_type = match imported {
+                    Some((alias, field_name, field_span, Some(imported_function))) => {
+                        let Some(signature) = imported_function.signature else {
                             self.errors.push(Diagnostic::new(
                                 format!(
                                     "imported function '{}.{}' uses module-local types, which are not supported across imports yet",
-                                    alias.text, field.text
+                                    alias, field_name
                                 ),
-                                field.span,
+                                field_span,
                             ));
                             return None;
-                        }
-                        None => {
-                            self.errors.push(Diagnostic::new(
-                                format!(
-                                    "module '{}' has no exported function '{}'",
-                                    alias.text, field.text
-                                ),
-                                field.span,
-                            ));
-                            return None;
-                        }
+                        };
+                        self.resolved_import_calls.insert(
+                            *span,
+                            ResolvedFunction {
+                                module_path: imported_function.module_path,
+                                name: imported_function.name,
+                            },
+                        );
+                        signature
                     }
-                } else {
-                    self.infer_expr(callee, None)?
+                    Some((alias, field_name, field_span, None)) => {
+                        self.errors.push(Diagnostic::new(
+                            format!("module '{alias}' has no exported function '{field_name}'"),
+                            field_span,
+                        ));
+                        return None;
+                    }
+                    None => self.infer_expr(callee, None)?,
                 };
                 let ValueType::Function(params, result) = callee_type else {
                     self.errors.push(Diagnostic::new(

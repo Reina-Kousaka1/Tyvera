@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
-use tyvera::{check, lex, native, parse};
+use tyvera::{lex, native, parse};
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -68,22 +68,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
             );
         }
         "run" => {
-            let module = parse(&source)
-                .map_err(|diagnostic| format_diagnostic(path, &source, &diagnostic))?;
-            let checked = check(&module).map_err(|diagnostics| {
-                diagnostics
-                    .iter()
-                    .map(|diagnostic| format_diagnostic(path, &source, diagnostic))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })?;
-            let result = native::run(&checked, "main").map_err(|diagnostics| {
-                diagnostics
-                    .iter()
-                    .map(|diagnostic| format_diagnostic(path, &source, diagnostic))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })?;
+            let graph = tyvera::resolver::load_module_graph(path)
+                .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+            let checked = tyvera::typecheck::check_graph(&graph)
+                .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+            let result = native::run_graph(&checked)
+                .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
             println!("{result}");
         }
         "modules" => {
@@ -105,45 +95,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
             }
         }
         "object" => {
-            let module = parse(&source)
-                .map_err(|diagnostic| format_diagnostic(path, &source, &diagnostic))?;
-            let checked = check(&module).map_err(|diagnostics| {
-                diagnostics
-                    .iter()
-                    .map(|diagnostic| format_diagnostic(path, &source, diagnostic))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })?;
-            let object = native::emit_object(&checked).map_err(|diagnostics| {
-                diagnostics
-                    .iter()
-                    .map(|diagnostic| format_diagnostic(path, &source, diagnostic))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })?;
+            let checked = load_checked_graph(path)?;
+            let object = native::emit_object_graph(&checked)
+                .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
             let output_path = &args[2];
             fs::write(output_path, object)
                 .map_err(|error| format!("{output_path}: could not write object file: {error}"))?;
             println!("wrote native object: {output_path}");
         }
         "build" => {
-            let module = parse(&source)
-                .map_err(|diagnostic| format_diagnostic(path, &source, &diagnostic))?;
-            let checked = check(&module).map_err(|diagnostics| {
-                diagnostics
-                    .iter()
-                    .map(|diagnostic| format_diagnostic(path, &source, diagnostic))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })?;
+            let checked = load_checked_graph(path)?;
             let output_path = &args[2];
-            native::build_executable(&checked, Path::new(output_path)).map_err(|diagnostics| {
-                diagnostics
-                    .iter()
-                    .map(|diagnostic| format_diagnostic(path, &source, diagnostic))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })?;
+            native::build_executable_graph(&checked, Path::new(output_path))
+                .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
             println!("built native executable: {output_path}");
         }
         "lex" => match lex(&source) {
@@ -171,6 +135,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn load_checked_graph(path: &str) -> Result<tyvera::typecheck::CheckedProgram, String> {
+    let graph = tyvera::resolver::load_module_graph(path)
+        .map_err(|diagnostics| render_diagnostics(&diagnostics))?;
+    tyvera::typecheck::check_graph(&graph).map_err(|diagnostics| render_diagnostics(&diagnostics))
 }
 
 fn format_diagnostic(path: &str, source: &str, diagnostic: &tyvera::Diagnostic) -> String {

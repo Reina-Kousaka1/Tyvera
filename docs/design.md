@@ -36,26 +36,25 @@ Those languages are design references, not compatibility targets.
 
 The current Rust crate keeps source spans and diagnostics independent from
 syntax. `lexer` owns tokenization, `ast` owns syntax data, and `parser` builds
-the AST using a Pratt expression parser. `typecheck` validates a single-module
-subset and records expression types. `ir` lowers the scalar subset and `native`
-uses Cranelift to execute it. Future `resolve`, expanded `types`, AOT
-`codegen`, and `runtime` stages must not reach back into source text to infer
-facts that an earlier stage should retain.
+the AST using a Pratt expression parser. `resolver` loads source files and
+records import edges. `typecheck` validates local declarations and eligible
+public cross-module function calls. `ir` lowers checked source graphs to
+unique function symbols, and `native` uses Cranelift for JIT or object code.
+The graph path still lacks imported types, constants, re-exports, and runtime
+values.
 
 ## Current status and gates
 
 The branch starts from the clean reset commit, preserving the repository's
 history and GPLv3 license. The current implementation includes the documented
-syntax, lexer, parser, AST, parse/lex CLI, and an initial type checker for
-single-module programs. The checker resolves local declarations, aliases,
-struct fields, enum constructors, function calls, local bindings, and core
-expression types. It does not resolve imported modules or generic declarations.
-A Cranelift JIT runs the supported scalar subset (integer, float and Boolean
-values, direct calls, local assignment, branches, and loops) with `fn main() ->
-Int` as the entry point. `tyvera object` emits relocatable objects for that
-subset. `tyvera build` links standalone Windows x64 console executables through
-the installed MSVC linker and Windows SDK. Other target/linker combinations and
-the language runtime are not implemented yet.
+syntax, lexer, parser, AST, source graph loader, local type checker, and
+cross-module checking for public functions with module-independent signatures.
+A Cranelift JIT and the object/AOT paths lower all modules to unique function
+symbols and support the scalar subset (integer, float and Boolean values,
+direct calls, local assignment, branches, and loops), with root `fn main() ->
+Int` as the entry point. A Windows x64 linker path produces console
+executables. Other target/linker combinations and the integrated language
+runtime are not implemented yet.
 
 `src/runtime/gc.rs` now contains an early precise, non-moving heap prototype:
 typed fields, generation-checked handles, a remembered set for old-to-young
@@ -63,10 +62,9 @@ stores, minor/full collection, and survivor promotion. The native IR does not
 allocate these objects yet, and deterministic ownership for external resources
 has not been implemented.
 
-`src/resolver.rs` loads and parses a source import graph. The type checker
-resolves eligible public function calls across that graph. The native back end
-still compiles a single module at a time; use `tyvera modules <entry.tyv>` to
-inspect the resolved dependency order.
+`src/resolver.rs` loads and parses a source import graph. The type checker and
+scalar native back end resolve eligible public function calls across that
+graph. Use `tyvera modules <entry.tyv>` to inspect dependency order.
 
 Before native compilation is called complete, Tyvera must type-check programs,
 lower them to a documented typed IR, link the runtime, generate a native

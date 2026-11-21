@@ -17,7 +17,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::diagnostic::{Diagnostic, Span};
 use crate::ir::{self, Expr, Function, IrType, Program, Statement};
-use crate::typecheck::CheckedModule;
+use crate::typecheck::{CheckedModule, CheckedProgram};
 
 #[cfg(windows)]
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
@@ -32,7 +32,15 @@ struct LocalBinding {
 /// The result is the integer returned by `main`. This is an in-process JIT
 /// execution path; it does not yet emit a standalone executable.
 pub fn run(checked: &CheckedModule, entry: &str) -> Result<i64, Vec<Diagnostic>> {
-    let program = ir::lower(checked)?;
+    run_program(ir::lower(checked)?, entry)
+}
+
+/// Compile and execute the entry module of a checked multi-module program.
+pub fn run_graph(checked: &CheckedProgram) -> Result<i64, Vec<Diagnostic>> {
+    run_program(ir::lower_graph(checked)?, "main")
+}
+
+fn run_program(program: Program, entry: &str) -> Result<i64, Vec<Diagnostic>> {
     let Some(entry_function) = program
         .functions
         .iter()
@@ -91,7 +99,15 @@ pub fn run(checked: &CheckedModule, entry: &str) -> Result<i64, Vec<Diagnostic>>
 /// Linux, or Mach-O on macOS). Linking a standalone executable is a separate
 /// toolchain step and is not provided yet.
 pub fn emit_object(checked: &CheckedModule) -> Result<Vec<u8>, Vec<Diagnostic>> {
-    let program = ir::lower(checked)?;
+    emit_object_program(ir::lower(checked)?)
+}
+
+/// Emit a host-native object file from every module in a checked program.
+pub fn emit_object_graph(checked: &CheckedProgram) -> Result<Vec<u8>, Vec<Diagnostic>> {
+    emit_object_program(ir::lower_graph(checked)?)
+}
+
+fn emit_object_program(program: Program) -> Result<Vec<u8>, Vec<Diagnostic>> {
     let span = program
         .functions
         .first()
@@ -127,7 +143,18 @@ pub fn emit_object(checked: &CheckedModule) -> Result<Vec<u8>, Vec<Diagnostic>> 
 
 /// Link a supported module into a standalone Windows console executable.
 pub fn build_executable(checked: &CheckedModule, output: &Path) -> Result<(), Vec<Diagnostic>> {
-    let program = ir::lower(checked)?;
+    build_executable_program(ir::lower(checked)?, output)
+}
+
+/// Link all modules in a checked source graph into one executable.
+pub fn build_executable_graph(
+    checked: &CheckedProgram,
+    output: &Path,
+) -> Result<(), Vec<Diagnostic>> {
+    build_executable_program(ir::lower_graph(checked)?, output)
+}
+
+fn build_executable_program(program: Program, output: &Path) -> Result<(), Vec<Diagnostic>> {
     let Some(main) = program
         .functions
         .iter()
@@ -165,7 +192,7 @@ pub fn build_executable(checked: &CheckedModule, output: &Path) -> Result<(), Ve
 
     #[cfg(all(windows, target_arch = "x86_64"))]
     {
-        let object = emit_object(checked)?;
+        let object = emit_object_program(program.clone())?;
         let (linker, kernel32) = find_windows_link_tools()
             .map_err(|message| vec![Diagnostic::new(message, main.span)])?;
         if let Some(parent) = output

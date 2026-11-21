@@ -8,10 +8,10 @@ for source or runtime compatibility with them.
 
 The repository currently contains a tested front end: a UTF-8 lexer,
 byte-based source spans, diagnostics, an abstract syntax tree, a Pratt parser,
-a source-module graph loader, an initial single-module type checker, and a
-small `lex`/`parse`/`check`/`modules`/`run` command-line tool. A
-Cranelift-backed JIT can execute the supported scalar subset through
-`tyvera run`; the entry point is `fn main() -> Int`.
+a source-module graph loader, an initial type checker, and a small
+`lex`/`parse`/`check`/`modules`/`run` command-line tool. A Cranelift-backed JIT
+can execute the supported scalar subset through `tyvera run`; the entry point
+is `fn main() -> Int`.
 It accepts the grammar in
 [`docs/language-v0.md`](docs/language-v0.md).
 
@@ -20,13 +20,14 @@ supports calls to public functions whose signatures use built-in or otherwise
 module-independent types. Imported types, constants, re-exports, generic type
 checking, integration of the runtime and heap with compiled programs,
 concurrency, and the standard library remain to be implemented.
-`tyvera parse` checks syntax only. `tyvera check` validates the supported
-single-module type rules. `tyvera run` currently compiles only integer,
-floating-point, Boolean, local-variable, direct-call, and basic-control-flow
-programs into host machine code in memory; it does not emit a standalone
-executable. `tyvera object` emits a host-native relocatable object file for the
-same supported subset. `tyvera build` links a standalone Windows x64 console
-executable when Visual Studio Build Tools and the Windows SDK are installed.
+`tyvera parse` checks syntax only. `tyvera check` validates local rules and
+public imported function calls with module-independent signatures. `tyvera run`
+JIT-compiles the supported integer, floating-point, Boolean, local-variable,
+direct-call, and basic-control-flow subset from the whole source graph.
+`tyvera object` emits a host-native object file, and `tyvera build` links a
+Windows x64 console executable when Visual Studio Build Tools and the Windows
+SDK are installed. These back ends still reject strings, aggregate values,
+generic declarations, and most runtime features.
 
 ## Build and use
 
