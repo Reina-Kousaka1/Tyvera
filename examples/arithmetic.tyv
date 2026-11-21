@@ -1,0 +1,11 @@
+module arithmetic;
+
+fn double(value: Int) -> Int {
+    return value * 2;
+}
+
+pub fn main() -> Int {
+    var answer: Int = double(20);
+    answer = answer + 2;
+    return answer;
+}

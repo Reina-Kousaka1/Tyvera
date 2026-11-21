@@ -1,6 +1,6 @@
 use tyvera::{
     ast::{Expr, Item, Statement},
-    check, lex, parse,
+    check, lex, native, parse,
 };
 
 #[test]
@@ -28,4 +28,11 @@ fn parser_preserves_byte_spans_for_non_ascii_string_contents() {
         panic!("expected string binding");
     };
     assert_eq!(&source[span.start..span.end], "\"Grüße\"");
+}
+
+#[test]
+fn checked_arithmetic_example_runs_as_native_code() {
+    let module = parse(include_str!("../examples/arithmetic.tyv")).unwrap();
+    let checked = check(&module).unwrap();
+    assert_eq!(native::run(&checked, "main").unwrap(), 42);
 }

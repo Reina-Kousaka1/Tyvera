@@ -10,6 +10,7 @@ use crate::diagnostic::{Diagnostic, Span};
 pub struct CheckedModule {
     pub module: Module,
     pub expression_types: HashMap<Span, ValueType>,
+    pub function_types: HashMap<String, ValueType>,
 }
 
 /// Types after aliases have been expanded and user declarations resolved.
@@ -121,6 +122,7 @@ impl Checker {
             Ok(CheckedModule {
                 module: self.module,
                 expression_types: self.expression_types,
+                function_types: self.functions,
             })
         } else {
             Err(self.errors)

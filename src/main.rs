@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::process::ExitCode;
-use tyvera::{check, lex, parse};
+use tyvera::{check, lex, native, parse};
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -23,7 +23,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
     if args.len() != 2 {
-        return Err("usage: tyvera <parse|lex> <source.tyv>".into());
+        return Err("usage: tyvera <parse|check|run|lex> <source.tyv>".into());
     }
     let command = &args[0];
     let path = &args[1];
@@ -67,6 +67,25 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 }
             }
         }
+        "run" => {
+            let module = parse(&source)
+                .map_err(|diagnostic| format_diagnostic(path, &source, &diagnostic))?;
+            let checked = check(&module).map_err(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| format_diagnostic(path, &source, diagnostic))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })?;
+            let result = native::run(&checked, "main").map_err(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| format_diagnostic(path, &source, diagnostic))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })?;
+            println!("{result}");
+        }
         "lex" => match lex(&source) {
             Ok(tokens) => {
                 for token in tokens {
@@ -87,7 +106,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         },
         _ => {
             return Err(format!(
-                "unknown command '{command}'; expected 'parse', 'check', or 'lex'"
+                "unknown command '{command}'; expected 'parse', 'check', 'run', or 'lex'"
             ));
         }
     }
@@ -103,11 +122,11 @@ fn format_diagnostic(path: &str, source: &str, diagnostic: &tyvera::Diagnostic) 
 }
 
 fn print_help() {
-    println!("Tyvera 0.1.0 — native compiler frontend");
-    println!("usage: tyvera <parse|check|lex> <source.tyv>");
+    println!("Tyvera 0.1.0 — native compiler prototype");
+    println!("usage: tyvera <parse|check|run|lex> <source.tyv>");
     println!("       tyvera --version");
     println!();
     println!(
-        "'parse' checks syntax; 'check' also checks the supported single-module type rules. Code generation is not implemented yet."
+        "'parse' checks syntax; 'check' checks the supported single-module type rules; 'run' JIT-compiles and executes fn main() -> Int."
     );
 }
