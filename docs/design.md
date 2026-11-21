@@ -53,6 +53,12 @@ subset. `tyvera build` links standalone Windows x64 console executables through
 the installed MSVC linker and Windows SDK. Other target/linker combinations and
 the language runtime are not implemented yet.
 
+`src/runtime/gc.rs` now contains an early precise, non-moving heap prototype:
+typed fields, generation-checked handles, a remembered set for old-to-young
+stores, minor/full collection, and survivor promotion. The native IR does not
+allocate these objects yet, and deterministic ownership for external resources
+has not been implemented.
+
 Before native compilation is called complete, Tyvera must type-check programs,
 lower them to a documented typed IR, link the runtime, generate a native
 executable, and pass checked-in end-to-end tests on supported targets.
